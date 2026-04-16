@@ -10,8 +10,14 @@ import {
  *
  * v3 changes:
  *  - Switched from Chat Completions to Responses API (/v1/responses)
- *  - Two-stage scoring: Stage 1 (base) → Stage 2 (x_search for memePotential >= 50)
+ *  - Two-stage scoring: Stage 1 (base) → Stage 2 (x_search for memePotential >= 78)
  *  - Heuristic fallback aligned with AI scoring scale
+ *
+ * v3.1 cost optimizations:
+ *  - Feedback context built once per cycle (not per batch)
+ *  - Real token tracking from API usage field
+ *  - Batch size increased 5 → 8
+ *  - Stage 2 gating: threshold 78, cap 3, skip google_trends, novelty gate
  */
 class Scorer {
   constructor(config, logger, db) {
@@ -34,8 +40,9 @@ class Scorer {
     this.current = this._getRuntimeAiConfig();
 
     // Stage 2 threshold — only trends scoring >= this get x_search deep-dive
-    this.stage2Threshold = 70;
+    this.stage2Threshold = 78;
     this.stage2Model = 'grok-4-1-fast-non-reasoning';
+    this.stage2MaxCalls = 3; // cap per cycle to limit cost
 
     if (!this.current.enabled) {
       this.logger.warn('AI API key not set for selected provider — AI scoring disabled, using heuristics');
@@ -72,12 +79,35 @@ class Scorer {
     };
   }
 
+  // ─── Feedback context (built once per scoreTrends call) ────────────────────
+
+  _buildFeedbackContext() {
+    if (!this.db) return '';
+    try {
+      const liked    = this.db.getLikedNarratives(7, 8);
+      const disliked = this.db.getDislikedNarratives(7, 8);
+      let ctx = '';
+      if (liked.length > 0) {
+        ctx += '\n\n━━━ USER PREFERENCES (apply these) ━━━';
+        ctx += '\nUSER LIKED (boost similar narratives):';
+        ctx += '\n' + liked.map(t => `  + "${t.title}" [${t.category}]`).join('\n');
+      }
+      if (disliked.length > 0) {
+        ctx += '\nUSER DISLIKED (penalize similar narratives):';
+        ctx += '\n' + disliked.map(t => `  - "${t.title}" [${t.category}]`).join('\n');
+      }
+      return ctx;
+    } catch (e) {
+      return '';
+    }
+  }
+
   // ─── Main entry point ─────────────────────────────────────────────────────
 
   /**
    * Score a batch of trends.
-   * Stage 1: base AI scoring (no tools) in sub-batches of 5
-   * Stage 2: x_search deep-dive for trends with memePotential >= threshold
+   * Stage 1: base AI scoring (no tools) in sub-batches of 8
+   * Stage 2: x_search deep-dive for trends with memePotential >= 78 (max 3 per cycle)
    */
   async scoreTrends(trends) {
     if (trends.length === 0) return trends;
@@ -97,23 +127,29 @@ class Scorer {
       return trends.map(t => this._applyHeuristic(t));
     }
 
+    // Build feedback context ONCE for the whole cycle
+    const feedbackContext = this._buildFeedbackContext();
+    const systemPrompt    = SYSTEM_PROMPT + feedbackContext;
+
     // ── Stage 1: base scoring ──
-    const batchSize = 5;
+    const batchSize = 8;
     let stage1Results = [];
     const metrics = {
-      stage1Calls: 0,
-      stage1SystemChars: 0,
-      stage1UserChars: 0,
-      stage2Candidates: 0,
-      stage2Calls: 0,
-      stage2Success: 0,
-      stage2Failed: 0,
+      stage1Calls:        0,
+      stage1InputTokens:  0,
+      stage1OutputTokens: 0,
+      stage2Candidates:   0,
+      stage2Calls:        0,
+      stage2Success:      0,
+      stage2Failed:       0,
+      stage2InputTokens:  0,
+      stage2OutputTokens: 0,
     };
 
     for (let i = 0; i < trends.length; i += batchSize) {
       const batch = trends.slice(i, i + batchSize);
       try {
-        const scored = await this._analyzeBatchStage1(batch, metrics);
+        const scored = await this._analyzeBatchStage1(batch, metrics, systemPrompt);
         stage1Results.push(...scored);
       } catch (error) {
         this.logger.error(`Stage 1 batch failed: ${error.message}`);
@@ -129,9 +165,15 @@ class Scorer {
     const stage2Enabled = String(stage2EnabledRaw) !== '0';
 
     // ── Stage 2: x_search deep-dive for high-potential trends ──
-    const stage2Candidates = stage1Results.filter(
-      t => t.memePotential >= this.stage2Threshold
-    );
+    // Gates: threshold=78, max=3, skip google_trends, novelty gate
+    const stage2Candidates = stage1Results
+      .filter(t =>
+        t.memePotential >= this.stage2Threshold &&
+        t.source?.toLowerCase() !== 'google_trends' &&
+        t.clusterMetrics?.isNovel !== false
+      )
+      .slice(0, this.stage2MaxCalls);
+
     metrics.stage2Candidates = stage2Candidates.length;
 
     if (!stage2Enabled) {
@@ -151,14 +193,16 @@ class Scorer {
       }
 
       this.logger.info(
-        `Stage 2: ${stage2Candidates.length} trends scored >= ${this.stage2Threshold}, running x_search with ${stage2Cfg.model}`
+        `Stage 2: ${stage2Candidates.length} trends scored >= ${this.stage2Threshold} (cap=${this.stage2MaxCalls}), running x_search with ${stage2Cfg.model}`
       );
 
       for (const trend of stage2Candidates) {
         metrics.stage2Calls++;
         try {
-          await this._stage2DeepDive(trend, stage2Cfg);
+          const { inputTokens, outputTokens } = await this._stage2DeepDive(trend, stage2Cfg);
           metrics.stage2Success++;
+          metrics.stage2InputTokens  += inputTokens  || 0;
+          metrics.stage2OutputTokens += outputTokens || 0;
         } catch (error) {
           metrics.stage2Failed++;
           this.logger.warn(`Stage 2 failed for "${trend.title}": ${error.message}`);
@@ -171,12 +215,15 @@ class Scorer {
       this.logger.info('Stage 2: no trends above threshold, skipping x_search');
     }
 
-    const stage1TotalChars = metrics.stage1SystemChars + metrics.stage1UserChars;
-    const approxStage1Tokens = Math.ceil(stage1TotalChars / 4);
+    // Log real token counts
+    const totalIn  = metrics.stage1InputTokens  + metrics.stage2InputTokens;
+    const totalOut = metrics.stage1OutputTokens + metrics.stage2OutputTokens;
     this.logger.info(
-      `AI usage metrics: stage1_calls=${metrics.stage1Calls}, stage1_chars=${stage1TotalChars}, ` +
-      `stage1_tokens_est~${approxStage1Tokens}, stage2_candidates=${metrics.stage2Candidates}, ` +
-      `stage2_calls=${metrics.stage2Calls}, stage2_success=${metrics.stage2Success}, stage2_failed=${metrics.stage2Failed}`
+      `AI cost metrics: stage1_calls=${metrics.stage1Calls} ` +
+      `in=${metrics.stage1InputTokens} out=${metrics.stage1OutputTokens} | ` +
+      `stage2_calls=${metrics.stage2Calls}/${metrics.stage2Candidates} ` +
+      `in=${metrics.stage2InputTokens} out=${metrics.stage2OutputTokens} | ` +
+      `total_in=${totalIn} total_out=${totalOut} (real tokens from API)`
     );
 
     return stage1Results;
@@ -184,43 +231,27 @@ class Scorer {
 
   // ─── Stage 1: base scoring via Responses API (no tools) ────────────────────
 
-  async _analyzeBatchStage1(trends, metrics = null) {
-    const prompt = buildAnalysisPrompt(trends);
-
-    // Build feedback context from user reactions
-    let feedbackContext = '';
-    if (this.db) {
-      try {
-        const liked    = this.db.getLikedNarratives(7, 8);
-        const disliked = this.db.getDislikedNarratives(7, 8);
-        if (liked.length > 0) {
-          feedbackContext += '\n\n━━━ USER PREFERENCES (apply these) ━━━';
-          feedbackContext += '\nUSER LIKED (boost similar narratives):';
-          feedbackContext += '\n' + liked.map(t => `  + "${t.title}" [${t.category}]`).join('\n');
-        }
-        if (disliked.length > 0) {
-          feedbackContext += '\nUSER DISLIKED (penalize similar narratives):';
-          feedbackContext += '\n' + disliked.map(t => `  - "${t.title}" [${t.category}]`).join('\n');
-        }
-      } catch (e) { /* DB might not be ready yet */ }
-    }
-
-    const systemPrompt = SYSTEM_PROMPT + feedbackContext;
+  async _analyzeBatchStage1(trends, metrics = null, systemPrompt = null) {
+    const prompt  = buildAnalysisPrompt(trends);
+    const sysMsg  = systemPrompt || (SYSTEM_PROMPT + this._buildFeedbackContext());
 
     if (metrics) {
       metrics.stage1Calls += 1;
-      metrics.stage1SystemChars += systemPrompt.length;
-      metrics.stage1UserChars += prompt.length;
     }
 
-    const raw = await this._callResponsesAPI({
+    const { text: raw, inputTokens, outputTokens } = await this._callResponsesAPI({
       input: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user',   content: prompt        },
+        { role: 'system', content: sysMsg  },
+        { role: 'user',   content: prompt  },
       ],
       temperature: 0.25,
       // No tools for Stage 1
     });
+
+    if (metrics) {
+      metrics.stage1InputTokens  += inputTokens  || 0;
+      metrics.stage1OutputTokens += outputTokens || 0;
+    }
 
     let analyses;
     try {
@@ -250,7 +281,7 @@ class Scorer {
         memePotential:    Number(a.memePotential)  || 0,
         category:         a.category         || 'other',
         sentiment:        a.sentiment         || 'neutral',
-        aiExplanation:    a.explanation       || '',  // now in English
+        aiExplanation:    a.explanation       || '',  // in English
         whyItWillPump:    a.whyItWillPump     || '',
         predictedLifespan:a.predictedLifespan || 'unknown',
         isGenuinelyInteresting: a.isGenuinelyInteresting ?? true,
@@ -263,7 +294,7 @@ class Scorer {
   async _stage2DeepDive(trend, runtimeOverride) {
     const prompt = buildStage2Prompt(trend);
 
-    const raw = await this._callResponsesAPI({
+    const { text: raw, inputTokens, outputTokens } = await this._callResponsesAPI({
       input: [
         { role: 'system', content: STAGE2_SYSTEM_PROMPT },
         { role: 'user',   content: prompt               },
@@ -281,11 +312,11 @@ class Scorer {
       result = JSON.parse(clean);
     } catch (err) {
       this.logger.warn(`Stage 2 JSON parse failed for "${trend.title}": ${err.message}`);
-      return; // Keep Stage 1 scores
+      return { inputTokens, outputTokens }; // Keep Stage 1 scores
     }
 
     // Apply Stage 2 adjustments
-    const oldMeme = trend.memePotential;
+    const oldMeme  = trend.memePotential;
     const oldViral = trend.score;
 
     if (typeof result.memePotential === 'number') {
@@ -310,10 +341,15 @@ class Scorer {
       `Stage 2 "${trend.title}": meme ${oldMeme}→${trend.memePotential}, ` +
       `viral ${oldViral}→${trend.score}, buzz: ${trend.xSearchData.xBuzz}`
     );
+
+    return { inputTokens, outputTokens };
   }
 
   // ─── Responses API call ────────────────────────────────────────────────────
 
+  /**
+   * Call the Responses API and return { text, inputTokens, outputTokens }.
+   */
   async _callResponsesAPI({ input, tools, temperature, runtimeOverride = null }) {
     const runtime = runtimeOverride || this.current;
     const body = {
@@ -364,19 +400,21 @@ class Scorer {
       }
     }
 
-    // Responses API output format: data.output is an array of output items
-    // We need to find the message with type "message" and extract text content
-    return this._extractTextFromResponse(data);
+    return this._extractResponseData(data);
   }
 
   /**
-   * Extract text content from Responses API output.
-   * Format: { output: [{ type: "message", content: [{ type: "output_text", text: "..." }] }] }
+   * Extract text content and token counts from Responses API output.
+   * Format: { output: [{ type: "message", content: [{ type: "output_text", text: "..." }] }], usage: { input_tokens, output_tokens } }
    */
-  _extractTextFromResponse(data) {
+  _extractResponseData(data) {
     if (!data || !data.output) {
       throw new Error('Empty response from Responses API');
     }
+
+    // Real token counts from API (preferred over char estimation)
+    const inputTokens  = data.usage?.input_tokens  || 0;
+    const outputTokens = data.usage?.output_tokens || 0;
 
     // Collect all text from output_text blocks across all message items
     const textParts = [];
@@ -393,11 +431,11 @@ class Scorer {
 
     if (textParts.length === 0) {
       // Fallback: try legacy format or direct text
-      if (data.output_text) return data.output_text;
+      if (data.output_text) return { text: data.output_text, inputTokens, outputTokens };
       throw new Error('No text content in Responses API output');
     }
 
-    return textParts.join('\n');
+    return { text: textParts.join('\n'), inputTokens, outputTokens };
   }
 
   // ─── Heuristic fallback ────────────────────────────────────────────────────

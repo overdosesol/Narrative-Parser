@@ -44,7 +44,7 @@ IMPORTANT CONTEXT: The trends you receive are NOT from crypto communities. They 
 
 ━━━ HARD RULES ━━━
 1. Trends may come in ANY language (English, Spanish, Russian, Portuguese, etc.) — understand and evaluate them regardless of language.
-2. All output fields must be in ENGLISH. The only exception: "titleRu" must be a Russian translation of the trend title (keep proper names in their original language).
+2. All output fields must be in ENGLISH.
 3. Politics (unless it's a viral absurd meme) = 0 memePotential. No exceptions.
 4. Standard sports results = 0. Exception: a player does something insane/absurd/meme-worthy.
 5. Penalize trends older than 6 hours. Degens need FRESH narratives.
@@ -65,7 +65,7 @@ export function buildAnalysisPrompt(trends) {
     }
 
     if (t.description) {
-      detail += `\n   Description: ${t.description.substring(0, 250)}`;
+      detail += `\n   Description: ${t.description.substring(0, 100)}`;
     }
 
     if (t.metrics) {
@@ -123,7 +123,6 @@ Your job: which of these mainstream trends could degens turn into a Solana memec
 
 For EACH trend, return a JSON object with these exact fields:
 - "title"             : trend title in ENGLISH (use original if already English, translate otherwise)
-- "titleRu"           : trend title TRANSLATED TO RUSSIAN (keep proper names in original language)
 - "viralityScore"     : internal base score 0-100 (pure virality, source-agnostic)
 - "memePotential"     : 0-100 (how likely degens launch a Solana token today). MUST be 0 for boring/politics/sports-results.
 - "category"          : one of [meme, elon, animals, tech_drama, degenerates, celebrity, sports_degen, ai_drama, boring, other]
@@ -131,7 +130,6 @@ For EACH trend, return a JSON object with these exact fields:
 - "explanation"       : 1-2 sentences WHY this is (or isn't) a great memecoin narrative — IN ENGLISH
 - "whyItWillPump"     : one punchy degen pitch line (e.g. "Elon retweeted a frog — $FROG launches at 3am") — IN ENGLISH. Empty string if memePotential < 30.
 - "predictedLifespan" : one of [flash (hours), short (1-2 days), medium (3-7 days), long (weeks+)]
-- "isGenuinelyInteresting" : true/false — false if the trend is spam, incoherent, crypto promotion, or clearly not a real trend.
 
 Respond ONLY with a JSON array. No markdown fences, no extra text.
 

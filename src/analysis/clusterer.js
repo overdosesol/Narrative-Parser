@@ -239,7 +239,10 @@ class NarrativeClusterer {
     if (m.velocity > 0.3)                   return 'stage1';
     if (m.batchSize >= 2)                   return 'stage1';
 
-    // SAVE_ONLY: some signal but not enough to spend an LLM call on.
+    // SAVE_ONLY: low-engagement singleton with little DB history — not worth an LLM call.
+    // Also catches genuinely weak signals that don't meet any stage1 gate.
+    if (m.maxEngagement < 200 && m.batchSize <= 1 && m.dbRecentCount < 2) return 'save_only';
+
     return 'save_only';
   }
 }
