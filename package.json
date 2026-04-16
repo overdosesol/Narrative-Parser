@@ -1,0 +1,26 @@
+{
+  "name": "trendscout",
+  "version": "3.0.0",
+  "description": "24/7 AI-powered memecoin trend monitoring with multi-user Telegram bot and Solana Pay",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "trends",
+    "monitoring",
+    "ai",
+    "telegram",
+    "solana",
+    "memecoin"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^17.3.1",
+    "node-telegram-bot-api": "^0.67.0"
+  }
+}

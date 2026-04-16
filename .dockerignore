@@ -1,0 +1,9 @@
+node_modules
+data
+logs
+.env
+.env.*
+*.bat
+*.md
+.git
+.gitignore

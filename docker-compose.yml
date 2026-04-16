@@ -1,0 +1,69 @@
+services:
+  trendscout:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trendscout-app
+    restart: always
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: "--max-old-space-size=1024"
+      DB_PATH: /data/trendscout.db
+      LOG_FILE: /logs/trendscout.log
+      DASHBOARD_PORT: 8080
+      DASHBOARD_HOST: 0.0.0.0
+      ADMIN_PORT: 8081
+      ADMIN_HOST: 0.0.0.0
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+    
+    ports:
+      - "8080:8080"  # Main Dashboard
+      - "127.0.0.1:8081:8081"  # Admin Panel (localhost only)
+    
+    volumes:
+      # Персистентные данные
+      - trendscout_data:/data
+      # Логи
+      - trendscout_logs:/logs
+    
+    # Ограничение ресурсов
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    
+    # Network
+    networks:
+      - trendscout
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    
+    # Логирование
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "app=trendscout"
+
+volumes:
+  trendscout_data:
+    driver: local
+  trendscout_logs:
+    driver: local
+
+networks:
+  trendscout:
+    driver: bridge
