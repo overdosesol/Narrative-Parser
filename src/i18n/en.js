@@ -40,11 +40,14 @@ Use the menu below to configure your preferences.`,
   languageSet: (lang) => `\u{2705} Language set to <b>${lang === 'en' ? 'English' : '\u{420}\u{443}\u{441}\u{441}\u{43A}\u{438}\u{439}'}</b>`,
 
   // ── Threshold ──────────────────────────────────────────────────────────
-  thresholdTitle: (current) => `\u{1F3AF} <b>Alert Threshold</b>\n\nCurrent: <b>${current}/100</b>\n\nOnly trends with meme potential above this value will trigger alerts.\n\nChoose a preset:`,
+  thresholdTitle: (current) => `\u{1F3AF} <b>Alert Threshold</b>\n\nCurrent: <b>${current}/100</b>\n\nOnly trends with meme potential above this value will trigger alerts.\n\u2B50 Recommended: <b>75+</b>\n\nChoose a preset:`,
   thresholdSet: (val) => `\u{2705} Alert threshold set to <b>${val}/100</b>`,
-  thresholdLow: '\u{1F7E2} Low (40+) — More alerts',
-  thresholdMedium: '\u{1F7E1} Medium (60+) — Balanced',
-  thresholdHigh: '\u{1F534} High (80+) — Only bangers',
+  thresholdLow: '\u{1F7E2} Low (52+) \u2014 More alerts',
+  thresholdMedium: '\u{1F7E1} Medium (67+) \u2014 Balanced',
+  thresholdHigh: '\u{1F534} High (75+) \u2014 Only bangers',
+  thresholdCustomBtn: '\u270F\uFE0F Custom number',
+  thresholdCustomPrompt: '\u270F\uFE0F <b>Custom threshold</b>\n\nEnter a whole number from 1 to 100:',
+  thresholdCustomInvalid: '\u274C Invalid value. Please enter a whole number from 1 to 100.',
 
   // ── Subscription ───────────────────────────────────────────────────────
   subscriptionTitle: (plan, status, expires) => {
@@ -63,6 +66,9 @@ Use the menu below to configure your preferences.`,
   paymentMethod: '\u{1F4B0} <b>Payment</b>\n\nChoose payment method:',
   btnPaySOL: '\u{25C9} Pay with SOL',
   btnPayUSDC: '\u{25C9} Pay with USDC',
+  btnPayStars: (amount) => '\u2B50 Telegram Stars (' + amount + ' \u2B50)',
+  starsInvoiceTitle: (plan) => 'TrendScout \u2014 ' + plan,
+  starsInvoiceDesc: (plan) => 'Access to TrendScout ' + plan + '. Payment is confirmed instantly.',
   paymentInstructions: (amount, currency, address, reference) =>
     `\u{1F4B0} <b>Payment Instructions</b>\n\n` +
     `<b>Option 1 (Recommended):</b>\nScan the QR code below using your wallet (Phantom / Solflare). Amount and details will be filled automatically.\n\n` +
@@ -87,11 +93,21 @@ Use the menu below to configure your preferences.`,
   alertOpen: 'Open',
 
   // ── Top command ────────────────────────────────────────────────────────
-  topTitle: '\u{1F525} <b>TOP-10 MEMECOIN NARRATIVES (24H)</b> \u{1F525}\n',
+  topSelectorTitle: '\u{1F525} <b>Top Narratives</b>\n\nHow many trends to show?',
+  topBtnCount: (n) => '\u{1F4CA} TOP-' + n,
+  topTitle: (n) => '\u{1F525} <b>TOP-' + n + ' NARRATIVES \u00B7 24H</b>',
   topEmpty: '\u{1F937} No degen trends in the last 24 hours.',
-  topPotential: 'Potential',
-  topTgPost: 'TG Post',
-  topSource: 'Source',
+  topSource: 'Open',
+  topTgPost: 'TG',
+  topCatIcons: {
+    meme: '\u{1F923}', elon: '\u{1F680}', animals: '\u{1F43E}',
+    tech_drama: '\u{1F4BB}', degenerates: '\u{1F3B0}', celebrity: '\u{2B50}',
+    sports_degen: '\u{1F3C6}', ai_drama: '\u{1F916}', other: '\u{1F4CC}', boring: '\u{1F634}',
+  },
+  topLifeIcons: {
+    'flash (hours)': '\u26A1', 'short (1-2 days)': '\u{1F552}',
+    'medium (3-7 days)': '\u{1F4C5}', 'long (weeks+)': '\u{1F4C6}',
+  },
 
   // ── Status ─────────────────────────────────────────────────────────────
   paused: '\u{23F8}\u{FE0F} <b>Alerts paused.</b>\nUse /menu to resume.',

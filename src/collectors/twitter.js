@@ -180,7 +180,7 @@ class TwitterCollector extends BaseCollector {
     const text = tweet.text || tweet.full_text || tweet.rawContent || '';
     if (!text || text.length < 10) return null;
 
-    const author    = tweet.author?.userName || tweet.user?.screen_name || tweet.userName || 'unknown';
+    const author    = tweet.author?.userName || tweet.author?.username || tweet.user?.screen_name || tweet.userName || tweet.username || 'unknown';
     const url       = id ? `https://twitter.com/${author}/status/${id}` : '';
     const views     = tweet.viewCount    || tweet.viewsCount      || 0;
     const likes     = tweet.likeCount    || tweet.favoriteCount   || 0;
@@ -226,6 +226,16 @@ class TwitterCollector extends BaseCollector {
 
     const title = this._buildTitle(text, hashtags, tickers);
 
+    // Media thumbnail — works for both photos and videos (preview frame)
+    // Twitter API v2: tweet.media[].preview_image_url (videos) or .url (photos)
+    // Legacy/Apify: tweet.entities.media[].media_url_https
+    const media = tweet.media?.[0] || tweet.entities?.media?.[0] || null;
+    const thumbnailUrl = media?.preview_image_url
+      || media?.url
+      || media?.media_url_https
+      || media?.media_url
+      || null;
+
     return {
       externalId: `twitter_${id || Buffer.from(text.substring(0, 30)).toString('base64').substring(0, 12)}`,
       source: 'twitter',
@@ -245,6 +255,7 @@ class TwitterCollector extends BaseCollector {
         tickers,
         author: `@${author}`,
         searchQuery: query.substring(0, 60),
+        thumbnailUrl,
       },
     };
   }

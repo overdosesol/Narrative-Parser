@@ -38,7 +38,7 @@ export function narrativePhase(e, a = null) {
  * @returns {number}  0–100
  */
 export function narrativeRankScore(e, a, feedbackBias = 0) {
-  const base     = e * 0.40 + a * 0.60;
+  const base     = e * 0.15 + a * 0.85; // Variant A: adoption dominates ranking
   const modifier = 1 + Math.max(-1, Math.min(1, feedbackBias)) * 0.15;
   return Math.min(Math.round(base * modifier), 100);
 }

@@ -293,14 +293,9 @@ async function runScanCycle() {
         // Global virality gate (reduces noisy alerts even with high memePotential)
         if ((trend.score || 0) < globalViralityThreshold) continue;
 
-        // Emergence gate: only alert on narratives with real spread OR very high adoption.
-        // Threshold lowered 30 → 20 to catch early Reddit ideas boosted by ideaBoost.
-        // emergenceScore >= 20 = early signal (single platform, high upvotes)
-        // emergenceScore >= 30 = clear multi-platform spread
-        // adoptionScore  >= 60 = high-confidence meme potential even if just emerging
-        const emergence    = trend.emergenceScore || trend.clusterMetrics?.emergenceScore || 0;
-        const adoption     = trend.adoptionScore  || trend.memePotential || 0;
-        if (emergence < 20 && adoption < 60) continue;
+        // Emergence gate removed (Variant A): adoption score is the sole alert criterion.
+        // Emergence is kept as a display/sorting metric but does not gate alerts.
+        // The user's meme threshold (effectiveMemeThreshold) already filters by AI quality.
 
         // [JUNK_FILTER] skip viral-but-useless trends (politics, kpop, celeb noise)
         // Remove this block to disable. Threshold 35 = one strong category hit.

@@ -169,6 +169,14 @@ class TikTokCollector extends BaseCollector {
 
     const title = this._buildTitle(desc, hashtags, tickers, sourceHashtag);
 
+    // Cover image — TikTok API provides multiple thumbnail candidates
+    const thumbnailUrl = video.originCoverUrl
+      || video.covers?.[0]
+      || video.cover
+      || video.dynamicCover
+      || video.shareCover?.[0]
+      || null;
+
     return {
       externalId: `tiktok_${id || Buffer.from(desc.substring(0, 20)).toString('base64').substring(0, 10)}`,
       source: 'tiktok',
@@ -191,6 +199,7 @@ class TikTokCollector extends BaseCollector {
         // upvotes-equivalent
         upvotes: likes + shares * 3,
         velocity: Math.round(plays / Math.max(ageHours, 1)), // plays/hour
+        thumbnailUrl,
       },
     };
   }

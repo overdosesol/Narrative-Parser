@@ -626,6 +626,17 @@ class TrendDatabase {
     `).get(trendId) || { likes: 0, dislikes: 0, weightedScore: 0 };
   }
 
+  /**
+   * Get current vote for a specific user on a trend.
+   * Returns +1, -1, or null (no vote).
+   */
+  getUserVote(trendId, chatId) {
+    const row = this.db.prepare(
+      `SELECT vote FROM feedback_votes WHERE trend_id = ? AND chat_id = ?`
+    ).get(trendId, String(chatId));
+    return row ? row.vote : null;
+  }
+
   getLikedNarratives(days = 7, limit = 10) {
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     return this.db.prepare(`

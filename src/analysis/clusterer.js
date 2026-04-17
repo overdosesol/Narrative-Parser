@@ -531,8 +531,9 @@ class NarrativeClusterer {
     // STAGE1 — worthwhile signal, send to AI
     if (e >= this.STAGE1_EMERGENCE)   return 'stage1';
 
-    // Fallback: save without AI
-    return 'save_only';
+    // Fallback: send to AI — better to over-score than miss a trend
+    // (Variant A: emergence only drops true noise, AI adoption score decides quality)
+    return 'stage1';
   }
 }
 

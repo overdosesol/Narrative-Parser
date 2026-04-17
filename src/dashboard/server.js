@@ -411,11 +411,68 @@ class DashboardServer {
     try {
       const u = new URL(target);
       if (!['http:', 'https:'].includes(u.protocol)) return json(res, 400, { error: 'invalid url' });
+
+      const isTwitter = /^https?:\/\/(www\.)?(twitter|x)\.com\//i.test(target);
+      const isTiktok  = /^https?:\/\/(www\.|vm\.)?tiktok\.com\//i.test(target);
+
+      // ── Twitter/X: use api.fxtwitter.com JSON API ────────────────────────
+      // Use /i/status/{id} path — doesn't require a valid username (avoids 'unknown' author issue).
+      if (isTwitter) {
+        const m = target.match(/(?:twitter|x)\.com\/[^/?#]+\/status\/(\d+)/i);
+        if (!m) return json(res, 200, { imageUrl: null });
+        const [, tweetId] = m;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 6000);
+        try {
+          const r = await fetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {
+            signal: controller.signal,
+            headers: { 'User-Agent': 'TrendScout/3.0', 'Accept': 'application/json' },
+          });
+          clearTimeout(timer);
+          if (!r.ok) {
+            this.logger.info(`[Preview] fxtwitter ${r.status} for tweet ${tweetId}`);
+            return json(res, 200, { imageUrl: null });
+          }
+          const data = await r.json();
+          // media.all[0]: photo → .url, video → .thumbnail_url
+          const media = data?.tweet?.media?.all?.[0];
+          const imageUrl = media?.thumbnail_url || media?.url || null;
+          this.logger.info(`[Preview] tweet ${tweetId} → ${imageUrl ? 'has image' : 'no media'}`);
+          return json(res, 200, { imageUrl });
+        } catch (err) {
+          clearTimeout(timer);
+          this.logger.info(`[Preview] fxtwitter fetch error for tweet ${tweetId}: ${err.message}`);
+          return json(res, 200, { imageUrl: null });
+        }
+      }
+
+      // ── TikTok: official oEmbed JSON endpoint ────────────────────────────
+      if (isTiktok) {
+        const videoIdMatch = target.match(/\/video\/(\d+)/);
+        if (videoIdMatch) {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 5000);
+          try {
+            const r = await fetch(
+              `https://www.tiktok.com/oembed?url=${encodeURIComponent(target)}`,
+              { signal: controller.signal, headers: { 'User-Agent': 'TrendScout/3.0', 'Accept': 'application/json' } }
+            );
+            clearTimeout(timer);
+            if (r.ok) {
+              const data = await r.json();
+              return json(res, 200, { imageUrl: data.thumbnail_url || null });
+            }
+          } catch { clearTimeout(timer); }
+        }
+        return json(res, 200, { imageUrl: null });
+      }
+
+      // ── Generic: og:image from HTML ──────────────────────────────────────
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 4000);
       const r = await fetch(target, {
         signal: controller.signal,
-        headers: { 'User-Agent': 'TrendScout/3.0 (+https://trendscout.io)' }
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TrendScout/3.0)' },
       });
       clearTimeout(timer);
       const ct = r.headers.get('content-type') || '';

@@ -55,6 +55,9 @@ const config = {
   // Telegram
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+    // Telegram Stars prices (XTR). 1 XTR ≈ $0.02. Override via env.
+    starsTestPrice: parseInt(process.env.STARS_TEST_PRICE || '250', 10),  // ≈ $5
+    starsProPrice:  parseInt(process.env.STARS_PRO_PRICE  || '5000', 10), // ≈ $100
   },
 
   // Solana Pay
