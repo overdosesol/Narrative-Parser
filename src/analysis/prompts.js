@@ -40,6 +40,10 @@ IMPORTANT CONTEXT: The trends you receive are NOT from crypto communities. They 
   - A mega-account (90M followers, e.g. Elon) getting 30K likes = 0.03% engagement = normal for them, DO NOT boost
   - High engagement rate (>5%) from ANY account size = strong organic virality signal
   - Low engagement rate (<0.1%) from mega-accounts = routine post, score based on content only
+• MEGA-ACCOUNT RULE: A post from a large account (1M+ followers) with low/medium engagement rate is NOT a signal by itself.
+  Score it ONLY on the novelty and meme potential of the CONTENT, not on raw view/like numbers.
+  Ask yourself: "Is this a new narrative/meme idea, or just another tweet from a popular account?"
+  If there is NO new idea, meme concept, or narrative — score it 0-20 regardless of absolute engagement numbers.
 • When "Found in N sources" is shown, this means the trend was independently detected across multiple platforms — this is a STRONG virality signal, boost memePotential by 5-10 points per extra source.
 
 ━━━ HARD RULES ━━━
@@ -65,8 +69,14 @@ export function buildAnalysisPrompt(trends) {
     }
 
     if (t.description) {
-      detail += `\n   Description: ${t.description.substring(0, 100)}`;
+      detail += `\n   Description: ${t.description}`;
     }
+
+    // [MARKET_STAGE] optional context hint — remove 3 lines to disable
+    const _msHint = t.clusterMetrics?.marketStage && t.clusterMetrics.marketStage !== 'none'
+      ? { tokenizing: '⚠️ Market signal: TOKENIZING — launch discussions / pump.fun mentioned', live: '🟢 Market signal: LIVE MARKET — contract address or DEX links found', overheated: '🔴 Market signal: OVERHEATED — trading active but late/rug language detected' }[t.clusterMetrics.marketStage]
+      : null;
+    if (_msHint) detail += `\n   ${_msHint}`;
 
     if (t.metrics) {
       const m = t.metrics;

@@ -162,35 +162,44 @@ class DashboardServer {
   // ── Handlers ────────────────────────────────────────────────────────────────
 
   _handleTrends(req, res, url) {
-    const hours    = parseInt(url.searchParams.get('hours')    || '24',  10);
-    const limit    = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
-    const offset   = parseInt(url.searchParams.get('offset')   || '0',   10);
-    const category = url.searchParams.get('category') || null;
-    const source   = url.searchParams.get('source')   || null;
-    const minMeme  = parseInt(url.searchParams.get('minMeme')  || '0',   10);
-    const sortParam = url.searchParams.get('sort') || 'meme';
+    const hours       = parseInt(url.searchParams.get('hours')       || '24',  10);
+    const limit       = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
+    const offset      = parseInt(url.searchParams.get('offset')      || '0',   10);
+    const category    = url.searchParams.get('category')    || null;
+    const source      = url.searchParams.get('source')      || null;
+    const phase       = url.searchParams.get('phase')       || null;  // 'early'|'forming'|'strong'|'saturated'
+    const minMeme     = parseInt(url.searchParams.get('minMeme')     || '0',   10);
+    const minEmergence = parseInt(url.searchParams.get('minEmergence') || '0', 10);
+    const minPlatforms = parseInt(url.searchParams.get('minPlatforms') || '0', 10);
+
+    const sortParam = url.searchParams.get('sort') || 'rank';
     let orderBy;
-    if      (sortParam === 'time')     orderBy = 'first_seen_at DESC';
-    else if (sortParam === 'virality') orderBy = 'score DESC';
-    else                               orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC";
+    if      (sortParam === 'time')      orderBy = 'first_seen_at DESC';
+    else if (sortParam === 'virality')  orderBy = 'score DESC';
+    else if (sortParam === 'meme')      orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC";
+    else if (sortParam === 'emergence') orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) DESC";
+    else                                orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.rankScore') AS INT) DESC";
 
     const cutoff = new Date(Date.now() - hours * 3_600_000).toISOString();
     let query = `SELECT * FROM trends WHERE first_seen_at > ?`;
     const params = [cutoff];
 
-    if (category)        { query += ` AND category = ?`;    params.push(category); }
-    if (source)          { query += ` AND source = ?`;      params.push(source); }
-    if (minMeme > 0)     { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) >= ?`; params.push(minMeme); }
+    if (category)         { query += ` AND category = ?`;                                                                              params.push(category); }
+    if (source)           { query += ` AND source = ?`;                                                                                params.push(source); }
+    if (phase)            { query += ` AND JSON_EXTRACT(raw_metrics, '$.narrativePhase') = ?`;                                         params.push(phase); }
+    if (minMeme > 0)      { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) >= ?`;                            params.push(minMeme); }
+    if (minEmergence > 0) { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) >= ?`;                           params.push(minEmergence); }
+    if (minPlatforms > 1) { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) >= 16`; } // uniquePlatforms>=2 ≈ emergence>=16
 
     query += ` ORDER BY ${orderBy} LIMIT ? OFFSET ?`;
     params.push(limit, offset);
 
     const rows = this.db.db.prepare(query).all(...params);
-    const total = this.db.db.prepare(
-      `SELECT COUNT(*) as c FROM trends WHERE first_seen_at > ?` +
-      (category ? ` AND category = ?` : '') +
-      (source   ? ` AND source = ?`   : '')
-    ).get(...params.slice(0, category || source ? (category && source ? 3 : 2) : 1)).c;
+
+    // Count with same filters (minus limit/offset)
+    const countParams = params.slice(0, -2);
+    const countQuery = query.replace(/ORDER BY.*$/, '').replace(/^SELECT \*/, 'SELECT COUNT(*) as c');
+    const total = this.db.db.prepare(countQuery).get(...countParams)?.c ?? 0;
 
     const trends = rows.map(row => this._formatTrend(row));
 
@@ -374,6 +383,15 @@ class DashboardServer {
       sentiment:       row.sentiment,
       score:           row.score,
       memePotential:   metrics.memePotential || 0,
+      adoptionScore:   metrics.adoptionScore  ?? metrics.memePotential ?? 0,
+      emergenceScore:  metrics.emergenceScore ?? 0,
+      narrativePhase:  metrics.narrativePhase  ?? null,
+      rankScore:       metrics.rankScore       ?? null,
+      marketStage:     metrics.marketStage     ?? null, // [MARKET_STAGE]
+      junkPenalty:     metrics.junkPenalty     ?? 0,   // [JUNK_FILTER]
+      junkReasons:     metrics.junkReasons     ?? [],  // [JUNK_FILTER]
+      velocity:        metrics.velocity        ?? 0,
+      uniquePlatforms: metrics.uniquePlatforms ?? 1,
       aiExplanation:   row.ai_explanation,
       whyItWillPump:   metrics.whyItWillPump || '',
       predictedLifespan: row.predicted_lifespan,
@@ -867,7 +885,7 @@ class DashboardServer {
       color: var(--dim); font-weight: 600;
     }
 
-    /* ── Meme score (inline for cards) ── */
+    /* ── Meme score (inline for cards, legacy) ── */
     .meme-score { display: flex; align-items: center; gap: 8px; }
     .meme-num {
       font-size: 20px; font-weight: 800; font-family: 'JetBrains Mono', monospace;
@@ -884,6 +902,38 @@ class DashboardServer {
     }
     .meme-fill { height: 100%; border-radius: 4px; transition: width .4s ease; }
     .meme-label { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+
+    /* ── ScoreBar — reusable bar for emergence + adoption ── */
+    .score-bar-wrap { display: flex; flex-direction: column; gap: 2px; }
+    .score-bar-row  { display: flex; align-items: center; gap: 7px; }
+    .score-bar-label {
+      font-size: 10px; color: var(--dim); font-weight: 600;
+      white-space: nowrap; min-width: 86px;
+    }
+    .score-bar-track {
+      flex: 1; height: 5px; border-radius: 4px;
+      background: var(--border); overflow: hidden;
+    }
+    .score-bar-fill { height: 100%; border-radius: 4px; transition: width .4s ease; }
+    .score-bar-num {
+      font-size: 11px; font-weight: 800; font-family: 'JetBrains Mono', monospace;
+      min-width: 22px; text-align: right;
+    }
+    .score-bar-sub {
+      font-size: 10px; color: var(--dim); padding-left: 93px;
+      margin-top: -1px;
+    }
+
+    /* ── Two-bar container in card ── */
+    .card-score-bars { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+
+    /* ── Phase badge ── */
+    .phase-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 8px; border-radius: 5px;
+      font-size: 9px; font-weight: 800; letter-spacing: .8px;
+      white-space: nowrap; flex-shrink: 0;
+    }
 
     /* ── Badges ── */
     .badge {
@@ -1307,6 +1357,15 @@ const LIFESPAN_LABELS = {
 // Source link labels
 const SOURCE_LINK_LABELS = { reddit: '🟠 Reddit', twitter: '𝕏 Twitter', tiktok: '🎵 TikTok', google_trends: '🔍 Google' };
 
+// ── Phase constants ──────────────────────────────────────────────────────────
+const PHASE_META = {
+  early:     { label: 'EARLY',     color: '#3B82F6', bg: 'rgba(59,130,246,0.12)', hint: 'Первые сигналы — риск и потенциал' },
+  forming:   { label: 'FORMING',   color: '#EAB308', bg: 'rgba(234,179,8,0.12)',  hint: 'Нарратив развивается — золотое окно' },
+  strong:    { label: 'STRONG',    color: '#22C55E', bg: 'rgba(34,197,94,0.12)',  hint: 'Сильный сигнал — действуй быстро' },
+  saturated: { label: 'SATURATED', color: '#EF4444', bg: 'rgba(239,68,68,0.12)', hint: 'Нарратив переварен — поздно' },
+};
+const PHASE_DOT = { early: '🔵', forming: '🟡', strong: '🟢', saturated: '🔴' };
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function memeClass(v) {
   if (v >= 80) return 'hot';
@@ -1320,13 +1379,37 @@ function memeColor(v) {
   if (v >= 40) return 'linear-gradient(90deg, #fdcb6e, #ffeaa7)';
   return '#333348';
 }
+// Bar color for emergence/adoption scores
+function barColor(v) {
+  if (v >= 80) return '#22C55E';
+  if (v >= 60) return '#4ADE80';
+  if (v >= 30) return '#EAB308';
+  return '#4B5563';
+}
+function fmtVelocity(v) {
+  if (!v || v === 0) return null;
+  return v.toFixed(1) + '/ч ↑';
+}
 function fmtTime(iso) {
-  const d = new Date(iso);
+  if (!iso) return '—';
+  // SQLite CURRENT_TIMESTAMP → "YYYY-MM-DD HH:MM:SS" (no timezone).
+  // Without explicit 'Z', browsers parse it as LOCAL time → wrong diff.
+  // Force UTC by appending Z (server always stores UTC).
+  const normalised = (iso.includes('Z') || iso.includes('+'))
+    ? iso
+    : iso.replace(' ', 'T') + 'Z';
+  const d = new Date(normalised);
   const now = new Date();
-  const diff = Math.floor((now - d) / 60000);
-  if (diff < 1)   return 'только что';
-  if (diff < 60)  return diff + 'м назад';
-  if (diff < 1440) return Math.floor(diff/60) + 'ч назад';
+  const diff = Math.floor((now - d) / 60000); // minutes
+  if (isNaN(diff) || diff < 0) return '—';
+  if (diff < 1)    return 'только что';
+  if (diff < 60)   return diff + 'м назад';
+  if (diff < 1440) {
+    const h = Math.floor(diff / 60);
+    const m = diff % 60;
+    return m > 0 ? (h + '\u0447 ' + m + '\u043C \u043D\u0430\u0437\u0430\u0434') : (h + '\u0447 \u043D\u0430\u0437\u0430\u0434');
+  }
+  if (diff < 10080) return Math.floor(diff / 1440) + '\u0434 \u043D\u0430\u0437\u0430\u0434'; // up to 7 days
   return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
 }
 
@@ -1341,15 +1424,52 @@ function StatCard({ icon, value, suffix, label, sub }) {
   );
 }
 
+// Legacy — kept for backward compat (modal uses it)
 function MemeScore({ value }) {
-  return h('div', { className: 'meme-score' },
-    h('span', { className: 'meme-num ' + memeClass(value) }, value),
-    h('div', { className: 'meme-bar-wrap' },
-      h('div', { className: 'meme-bar' },
-        h('div', { className: 'meme-fill', style: { width: value + '%', background: memeColor(value) } })
-      )
-    )
+  return h(ScoreBar, { value, label: null });
+}
+
+// Generic score bar used for both emergence and adoption
+function ScoreBar({ value, label, sub, color }) {
+  const fill = color || barColor(value);
+  return h('div', { className: 'score-bar-wrap', title: label ? label + ': ' + value : value },
+    h('div', { className: 'score-bar-row' },
+      label ? h('span', { className: 'score-bar-label' }, label) : null,
+      h('div', { className: 'score-bar-track' },
+        h('div', { className: 'score-bar-fill', style: { width: Math.min(value, 100) + '%', background: fill } })
+      ),
+      h('span', { className: 'score-bar-num', style: { color: fill } }, value),
+    ),
+    sub ? h('div', { className: 'score-bar-sub' }, sub) : null
   );
+}
+
+// Phase badge shown in card header
+function PhaseBadge({ phase }) {
+  if (!phase) return null;
+  const m = PHASE_META[phase] || PHASE_META.early;
+  return h('span', {
+    className: 'phase-badge',
+    style: { background: m.bg, color: m.color, border: '1px solid ' + m.color },
+    title: m.hint
+  }, PHASE_DOT[phase] + ' ' + m.label);
+}
+
+// [MARKET_STAGE] badge — remove component + call in TrendCard to disable UI
+const MARKET_STAGE_UI = {
+  tokenizing: { icon: '🔄', label: 'TOKENIZING', color: '#F59E0B', bg: 'rgba(245,158,11,0.12)', hint: 'Launch discussions / pump.fun mentioned' },
+  live:       { icon: '🟢', label: 'LIVE',       color: '#10B981', bg: 'rgba(16,185,129,0.12)', hint: 'Contract address or DEX links found' },
+  overheated: { icon: '🔴', label: 'OVERHEATED', color: '#EF4444', bg: 'rgba(239,68,68,0.12)',  hint: 'Trading active — late/rug signals present' },
+};
+function MarketStageBadge({ stage }) {
+  if (!stage || stage === 'none') return null;
+  const m = MARKET_STAGE_UI[stage];
+  if (!m) return null;
+  return h('span', {
+    className: 'phase-badge',
+    style: { background: m.bg, color: m.color, border: '1px solid ' + m.color },
+    title: m.hint
+  }, m.icon + ' ' + m.label);
 }
 
 // ── ImageThumb ─────────────────────────────────────────────────────────────────
@@ -1389,6 +1509,22 @@ function TrendCard({ trend, onOpen, onCopy }) {
   const srcLinkCls = trend.source === 'reddit' ? ' trend-link-reddit'
     : trend.source === 'twitter' ? ' trend-link-twitter'
     : trend.source === 'tiktok' ? ' trend-link-tiktok' : '';
+
+  const phase       = trend.narrativePhase || null;
+  const emergence   = trend.emergenceScore || 0;
+  const adoption    = trend.adoptionScore  || trend.memePotential || 0;
+  const velocity    = trend.velocity       || 0;
+  const platforms   = trend.uniquePlatforms || 1;
+  const phaseMeta   = phase ? (PHASE_META[phase] || PHASE_META.early) : null;
+
+  // Compact meta: "2 плат · 0.8/ч ↑"
+  const metaParts = [];
+  if (platforms > 1) metaParts.push(platforms + ' плат');
+  const vel = fmtVelocity(velocity);
+  if (vel) metaParts.push(vel);
+  if (trend.timesSeen > 1) metaParts.push(trend.timesSeen + 'x видели');
+  const metaStr = metaParts.join(' · ');
+
   const descText = trend.whyItWillPump || trend.aiExplanation || '';
   const isPump = !!trend.whyItWillPump;
 
@@ -1397,12 +1533,19 @@ function TrendCard({ trend, onOpen, onCopy }) {
     onOpen && onOpen(trend);
   };
 
-  return h('div', { className: 'trend-card', onClick: handleClick },
-    // Header
+  // Left phase accent border color
+  const accentColor = phaseMeta ? phaseMeta.color : 'var(--border)';
+
+  return h('div', {
+    className: 'trend-card',
+    onClick: handleClick,
+    style: { borderLeft: '3px solid ' + accentColor }
+  },
+    // Header: phase badge + market stage badge + title + meta
     h('div', { className: 'card-header' },
-      h('div', { className: 'card-title', style: { flex: 1 } },
-        trend.title
-      ),
+      phase ? h(PhaseBadge, { phase }) : null,
+      h(MarketStageBadge, { stage: trend.marketStage }), // [MARKET_STAGE] remove to disable
+      h('div', { className: 'card-title', style: { flex: 1 } }, trend.title),
       h('div', { className: 'card-meta' },
         h('span', { className: 'badge ' + catCls }, catIco + ' ' + (trend.category || 'other')),
         h('div', { className: 'source-chip' }, srcIco, ' ', srcLbl),
@@ -1424,18 +1567,22 @@ function TrendCard({ trend, onOpen, onCopy }) {
         descText
           ? h('div', { className: 'card-desc' + (isPump ? ' pump' : '') }, isPump ? '⚡ ' + descText : descText)
           : null,
-        h('div', { className: 'card-stats' },
-          h('div', { className: 'card-stat' },
-            h('div', { className: 'card-stat-label' }, 'Meme Score'),
-            h(MemeScore, { value: trend.memePotential || 0 })
-          ),
-          h('div', { className: 'card-stat' },
-            h('div', { className: 'card-stat-label' }, 'Срок жизни'),
-            h('span', { className: 'lifespan' }, LIFESPAN_LABELS[trend.predictedLifespan] || '—')
-          )
+
+        // Two bars: Emergence + Adoption
+        h('div', { className: 'card-score-bars' },
+          h(ScoreBar, {
+            label: '🌊 Emergence',
+            value: emergence,
+            sub: metaStr || null,
+          }),
+          h(ScoreBar, {
+            label: '💊 Adoption',
+            value: adoption,
+            sub: LIFESPAN_LABELS[trend.predictedLifespan] || null,
+          })
         )
       ),
-      h(ImageThumb, { trend, size: 80 })
+      h(ImageThumb, { trend, size: 76 })
     ),
 
     // Footer
@@ -1443,10 +1590,10 @@ function TrendCard({ trend, onOpen, onCopy }) {
       ? h('div', { className: 'card-footer' },
           trend.url ? h('a', { className: 'trend-link' + srcLinkCls, href: trend.url, target: '_blank', rel: 'noopener', onClick: e => e.stopPropagation() }, linkLabel + ' →') : null,
           trend.tgMessageUrl ? h('a', { className: 'trend-link trend-link-tg', href: trend.tgMessageUrl, target: '_blank', rel: 'noopener', onClick: e => e.stopPropagation() }, '📨 Telegram') : null,
-          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: 'var(--dim)' } }, '↗ открыть детали')
+          h('span', { style: { marginLeft: 'auto', fontSize: 11, color: 'var(--dim)' } }, '↗ детали')
         )
       : h('div', { className: 'card-footer' },
-          h('span', { style: { fontSize: 11, color: 'var(--dim)' } }, '↗ открыть детали')
+          h('span', { style: { fontSize: 11, color: 'var(--dim)' } }, '↗ детали')
         )
   );
 }
@@ -1523,6 +1670,31 @@ function TrendModal({ trend, onClose }) {
         trend.aiExplanation ? h('div', { className: 'modal-section' },
           h('div', { className: 'modal-section-label' }, '🤖 AI Объяснение'),
           h('div', { className: 'modal-section-content' }, trend.aiExplanation)
+        ) : null,
+
+        // [MARKET_STAGE] market stage line in modal — remove block to disable
+        trend.marketStage && trend.marketStage !== 'none' ? h('div', { className: 'modal-section' },
+          h('div', { className: 'modal-section-label' }, '💹 Market Stage'),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+            h(MarketStageBadge, { stage: trend.marketStage }),
+            h('span', { style: { fontSize: 12, color: 'var(--dim)' } },
+              (MARKET_STAGE_UI[trend.marketStage] || {}).hint || ''
+            )
+          )
+        ) : null,
+
+        // Phase + two bars
+        trend.narrativePhase ? h('div', { className: 'modal-section' },
+          h('div', { className: 'modal-section-label' }, '🧭 Фаза нарратива'),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 } },
+            h(PhaseBadge, { phase: trend.narrativePhase }),
+            h('span', { style: { fontSize: 12, color: 'var(--dim)' } },
+              (PHASE_META[trend.narrativePhase] || PHASE_META.early).hint
+            )
+          ),
+          h(ScoreBar, { label: '🌊 Emergence', value: trend.emergenceScore || 0 }),
+          h('div', { style: { height: 4 } }),
+          h(ScoreBar, { label: '💊 Adoption',  value: trend.adoptionScore || trend.memePotential || 0 })
         ) : null,
 
         // Stats grid
@@ -1785,7 +1957,8 @@ function App() {
   const [minMeme,    setMinMeme]    = useState(0);
   const [offset,     setOffset]     = useState(0);
   const [scanning,   setScanning]   = useState(false);
-  const [sort,       setSort]       = useState('meme');
+  const [sort,       setSort]       = useState('rank');
+  const [phase,      setPhase]      = useState('');
   const [tick,       setTick]       = useState(0);
   const [view,       setView]       = useState('trends');
   const [modalTrend, setModalTrend] = useState(null);
@@ -1816,6 +1989,7 @@ function App() {
         '&sort=' + sort +
         (category ? '&category=' + category : '') +
         (source   ? '&source='   + source   : '') +
+        (phase    ? '&phase='    + phase    : '') +
         (minMeme > 0 ? '&minMeme=' + minMeme : '');
 
       const [st, tr, sr] = await Promise.all([
@@ -1829,7 +2003,7 @@ function App() {
       setSources(sr.sources || []);
     } catch (ex) { setError('Ошибка: ' + ex.message); }
     setLoading(false);
-  }, [hours, category, source, minMeme, offset, sort]);
+  }, [hours, category, source, phase, minMeme, offset, sort]);
 
   const scan = useCallback(async () => {
     setScanning(true);
@@ -1940,11 +2114,11 @@ function App() {
             h('option', { value: 168 }, '7 дней')
           ),
           h('select', { value: minMeme, onChange: ev => { setMinMeme(+ev.target.value); setOffset(0); }, style: { width: '100%' } },
-            h('option', { value: 0 },  'Meme ≥ 0'),
-            h('option', { value: 30 }, 'Meme ≥ 30'),
-            h('option', { value: 50 }, 'Meme ≥ 50'),
-            h('option', { value: 70 }, 'Meme ≥ 70'),
-            h('option', { value: 85 }, 'Meme ≥ 85')
+            h('option', { value: 0 },  'Adoption ≥ 0'),
+            h('option', { value: 30 }, 'Adoption ≥ 30'),
+            h('option', { value: 50 }, 'Adoption ≥ 50'),
+            h('option', { value: 70 }, 'Adoption ≥ 70'),
+            h('option', { value: 85 }, 'Adoption ≥ 85')
           ),
           h('select', { value: category, onChange: ev => { setCategory(ev.target.value); setOffset(0); }, style: { width: '100%' } },
             h('option', { value: '' }, 'Все категории'),
@@ -1993,11 +2167,22 @@ function App() {
             ['reddit','google_trends','twitter','tiktok'].map(s => h('option', { key: s, value: s }, SOURCE_ICONS[s] + ' ' + (SOURCE_LABELS[s] || s)))
           ),
           h('div', { className: 'toolbar-sep' }),
+          h('span', { className: 'toolbar-label' }, 'Фаза:'),
+          h('select', { value: phase, onChange: ev => { setPhase(ev.target.value); setOffset(0); } },
+            h('option', { value: '' }, 'Все фазы'),
+            h('option', { value: 'early'     }, '🔵 Early'),
+            h('option', { value: 'forming'   }, '🟡 Forming'),
+            h('option', { value: 'strong'    }, '🟢 Strong'),
+            h('option', { value: 'saturated' }, '🔴 Saturated')
+          ),
+          h('div', { className: 'toolbar-sep' }),
           h('span', { className: 'toolbar-label' }, 'Сортировка:'),
           h('select', { value: sort, onChange: ev => { setSort(ev.target.value); setOffset(0); } },
-            h('option', { value: 'meme'     }, '🔥 Топ (Meme Score)'),
-            h('option', { value: 'time'     }, '🕐 Новые сначала'),
-            h('option', { value: 'virality' }, '📊 Виральность')
+            h('option', { value: 'rank'      }, '⚡ Rank (Emergence+Adoption)'),
+            h('option', { value: 'meme'      }, '💊 Топ Adoption'),
+            h('option', { value: 'emergence' }, '🌊 Топ Emergence'),
+            h('option', { value: 'time'      }, '🕐 Новые сначала'),
+            h('option', { value: 'virality'  }, '📊 Виральность')
           ),
           h('div', { className: 'toolbar-sep' }),
           h('div', { className: 'search-wrap' },

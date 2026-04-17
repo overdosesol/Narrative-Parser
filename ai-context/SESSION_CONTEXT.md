@@ -17,10 +17,14 @@
 
 ## Бизнес-правила (актуально)
 
-- Планы: `free`, `test`, `pro`
-- `test`: $5, 1 день, one-time на аккаунт, все источники включены, X Analysis недоступен
-- `pro`: $100, 30 дней
-- Alerts: безлимит для всех планов (`alert_limit = -1`)
+- Планы: `free`, `test`, `pro`, **`admin`**
+  - `free`: бесплатно, Reddit + Google Trends, history_days=3
+  - `test`: $5, 1 день, one-time на аккаунт, все источники включены, X Analysis недоступен
+  - `pro`: $100, 30 дней, все источники, X Analysis, api_access=1
+  - `admin`: бесплатно, все источники, alert_limit=-1, history_days=-1 (безлимит), api_access=1
+- Alerts: безлимит для всех планов (`alert_limit = -1`); history_days = -1 означает безлимит (не применяется в query-логике)
+- В меню выбора подписки (Telegram) теперь отображается Free-план с описанием (на RU и EN)
+- В поле "Дней" (бывш. "История (дней)") в админке — поддержка чекбокса ∞ (устанавливает -1); то же для Алертов/день
 
 ## Важные технические решения
 
@@ -39,7 +43,25 @@
   - `score (virality) >= global viralityThreshold`
 - `alertThreshold` из dashboard теперь реально применяется как global floor (раньше фактически не участвовал в send-loop)
 - Добавлен глобальный setting `viralityThreshold` (default: 70), доступен в dashboard settings API/UI
-- **NarrativeClusterer** (pre-AI слой): Aggregator → Clusterer → Scorer; Jaccard threshold=0.40; routing: `priority`/`stage1`/`save_only`/`drop`; low-engagement singleton gate: maxEngagement<200 && batchSize<=1 && dbRecentCount<2 → save_only
+- **NarrativeClusterer** (pre-AI слой): Aggregator → Clusterer → Scorer; Jaccard threshold=0.40; routing: `priority`/`stage1`/`save_only`/`drop`; routing теперь через `emergenceScore` (не прямые условия)
+- **EmergenceScore** (0–100): три пути — `max(spread, breakout) + ideaBoost`, cap 100
+  - Spread: платформы(0–30)+velocity(0–25)+organicSpread(0–20)+noveltyStage(0–15)+authorDiversity(0–10)
+  - Breakout: для одиночного вирусного поста (views/likes/retweets/engRate) — detects Twitter/TikTok breakout; dampened by `_normalizeBreakoutByFollowers(score, peakFollowers, engRate)` для мега-аккаунтов
+  - **IdeaBoost** (additive, 0–12): Reddit upvotes >=10k→+5, >=15k→+8, >=30k→+10, >=60k→+12; метод `_computeIdeaBoost(items)`
+  - **isEarlyIdea** flag: `emergence 20–50 && upvotes >= 10k` — добавляется в `clusterMetrics`
+- **AdoptionScore** (0–100): alias для `memePotential` из AI (Stage 1); семантика = "насколько нарратив мемный и липкий"
+- **narrativePhase**: `early`/`forming`/`strong`/`saturated`; вычисляется после AI из emergence+adoption; `saturated` = adoption>=60 && emergence<25
+- **rankScore**: `e*0.4 + a*0.6` (с опциональным feedback bias ±15%); default sort в dashboard
+- **Alert gate**: `emergence >= 20 || adoption >= 60` — иначе алерт не отправляется (снижено с 30 → 20 для ранних Reddit сигналов)
+- **JunkFilter** (изолированный optional слой): `src/analysis/junk-filter.js`; call sites помечены `[JUNK_FILTER]`
+  - `calculateJunkPenalty(items, clusterMetrics)` → `{ junkPenalty: 0–100, junkReasons: string[] }`
+  - Penalties: politics +40, kpop/fandom +30, celeb-noise +20, no-meme-shape +15
+  - Safe-signal override: animal/absurd/meme/heartwarming → делим raw на 3 (или 4 при ≥2 сигналах)
+  - Alert gate: `junkPenalty >= 35` → skip (в `index.js`)
+  - Сохраняется в `raw_metrics` + `_formatTrend` → dashboard API
+  - Отключить: удалить import + `base.junkPenalty` блок в `clusterer.js` + gate в `index.js`
+- **MarketStage** (изолированный optional слой): feature flag `MARKET_STAGE_DETECTION=1`; 4 состояния: `none/tokenizing/live/overheated`; вся логика в `src/analysis/market-stage.js`; call sites помечены `[MARKET_STAGE]` (~10 строк в 6 файлах); по умолчанию ВЫКЛЮЧЕНО
+- **Dashboard**: `TrendCard` — два бара (🌊 Emergence, 💊 Adoption) + phase accent border + `PhaseBadge`; sort: rank(default)/meme/emergence/time/virality; filter by phase: early/forming/strong/saturated
 - **Inference cost optimizations (v3.1)**:
   - Feedback context строится один раз на цикл в `_buildFeedbackContext()`, не на каждый batch
   - `_callResponsesAPI` возвращает `{ text, inputTokens, outputTokens }` (реальные токены из `data.usage`)
@@ -57,6 +79,19 @@
 
 - Используются: `ai-context/AGENT_RULES.md`, `ai-context/SESSION_CONTEXT.md`, `ai-context/WORKLOG.md`
 - `ai-context/NEXT_STEPS.md` удалён (по решению владельца)
+
+## Feedback (взвешенный фидбек)
+
+- **Реакции**: только 👍 и 👎 обрабатываются; все остальные смайлики игнорируются
+- **Хранение**: новая таблица `feedback_votes` — `UNIQUE(trend_id, chat_id)`, один голос на пользователя на тренд; поля: `vote (+1/-1)`, `weight`, `plan_name`
+- **Взвешивание**: метод `_feedbackWeight(chatId)` в `telegram.js` — достаёт план пользователя из БД, применяет веса из settings
+- **Пересчёт**: `trends.user_feedback` = `ROUND(SUM(vote * weight))` по `feedback_votes` после каждого голоса
+- **Настройка в админке** (BotPage): секция "👍 Взвешенный фидбек"
+  - Toggle вкл/выкл (`feedbackWeightingEnabled`)
+  - 4 числовых поля: `feedbackWeightAdmin` (def=3), `feedbackWeightPro` (def=2), `feedbackWeightTest` (def=1), `feedbackWeightFree` (def=1)
+  - API: `GET/POST /api/feedback-config`
+- **Режим выключено**: учитываются ТОЛЬКО голоса Admin (weight=1); все остальные получают weight=0 → не влияют на `user_feedback`
+- **Статистика**: `db.getFeedbackStats(trendId)` → `{ likes, dislikes, weightedScore }`
 
 ## Известные нюансы
 

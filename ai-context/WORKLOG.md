@@ -119,6 +119,27 @@
 
 ---
 
+## 2026-04-16 (remove suggestedTicker end-to-end)
+
+- Model/session: GPT Codex
+- Цель: полностью удалить тикерную AI-логику (`suggestedTicker`) из пайплайна, хранения и UI
+- Изменения (файлы):
+  - `src/analysis/prompts.js`: удалено требование поля `suggestedTicker` из Stage 1 prompt; удалена строка `Suggested ticker` из Stage 2 prompt builder
+  - `src/analysis/scorer.js`: удалён маппинг `suggestedTicker` из Stage 1 ответа; удалён `suggestedTicker` из `_applyHeuristic()` и `_fallback()`
+  - `src/db/database.js`: в `saveTrend()` из `raw_metrics` удалена запись `suggestedTicker`
+  - `src/dashboard/server.js`: удалено чтение `metrics.suggestedTicker` в `_formatTrend`; удалены UI-блоки «Тикер» из карточки и modal; удалены CSS-классы `.ticker` и `.ticker-none`
+  - `src/notifications/telegram.js`: удалено чтение `suggestedTicker` при формировании top trends
+  - `src/i18n/en.js`, `src/i18n/ru.js`: удалён неиспользуемый ключ `alertTickers`
+- Проверка/деплой:
+  - Выполнен `node --check` для всех изменённых файлов (`prompts.js`, `scorer.js`, `database.js`, `server.js`, `telegram.js`, `en.js`, `ru.js`) — без синтаксических ошибок
+  - Выполнен прод-деплой через `deploy.ps1` на `37.1.196.83` (Docker), получен `DEPLOY_SUCCESS`
+  - Проверен `GET /api/health` на `http://37.1.196.83:8080/api/health` — `{"ok":true,...}`
+  - Проверена запись в БД (`/data/trendscout.db`): в последних строках (`id=419,420`) поле `suggestedTicker` отсутствует; в более старых строках поле остаётся как legacy
+- Риски/заметки:
+  - Старые записи в БД могут содержать `suggestedTicker` в `raw_metrics`, но новый код это поле не читает и не отображает
+
+---
+
 ## 2026-04-16 (inference cost optimization)
 
 - Model/session: Claude Sonnet 4.6
@@ -154,6 +175,229 @@
 
 ---
 
+## 2026-04-17 (Emergence + Adoption двухскоровая система)
+
+- Model/session: Claude Sonnet 4.6
+- Цель: разделить оценку нарративов на два независимых измерения (распространение vs. мемный потенциал); дать трейдеру чёткий сигнал о фазе нарратива
+- Изменения (файлы):
+  - `src/analysis/clusterer.js`:
+    - Добавлен `_computeEmergenceScore(m)`: 5 компонентов, max=100 (платформы 0–30, velocity 0–25, organicSpread 0–20, noveltyStage 0–15, authorDiversity 0–10)
+    - `_computeMetrics()` теперь вызывает `_computeEmergenceScore` и сохраняет в `metrics.emergenceScore`
+    - `_decide()` переписан: routing по `emergenceScore` вместо набора разрозненных условий; DROP только если emergence И velocity И uniquePlatforms низкие (высокий dbRecentCount один по себе больше не дропает)
+    - Добавлены явные константы `DROP_VELOCITY_MAX`, `DROP_EMERGENCE_MAX`, `SAVE_EMERGENCE_MAX`, `SAVE_ENGAGEMENT_MAX`, `PRIORITY_EMERGENCE`, `STAGE1_EMERGENCE`
+  - `src/analysis/scorer.js`:
+    - Экспортированы `narrativePhase(e, a)` и `narrativeRankScore(e, a, bias)` как named exports (для использования в index.js и server.js в будущем)
+    - `_analyzeBatchStage1` вычисляет `adoption`, `emergence`, `phase`, `rankScore` для каждого тренда
+    - Поля добавлены: `adoptionScore`, `emergenceScore`, `narrativePhase`, `rankScore`
+    - `_stage2DeepDive` пересчитывает `adoptionScore`, `narrativePhase`, `rankScore` после Stage 2 корректировки
+    - Heuristic fallback (`_applyHeuristic`, `_fallback`) также заполняет новые поля
+  - `src/db/database.js`:
+    - `saveTrend()` теперь сохраняет `adoptionScore`, `emergenceScore`, `narrativePhase`, `rankScore` в `raw_metrics`
+  - `src/index.js`:
+    - Alert candidates сортируются по `rankScore` (fallback: `memePotential`)
+    - Добавлен emergence gate в alert loop: `emergence >= 30 || adoption >= 60` — без этого алерт не отправляется
+  - `src/dashboard/server.js` (API):
+    - `_handleTrends()`: новые фильтры `phase`, `minEmergence`, `minPlatforms`; новые sort варианты `rank` (default) и `emergence`; count query вычисляется правильно из тех же параметров
+    - `_formatTrend()`: экспортирует `adoptionScore`, `emergenceScore`, `narrativePhase`, `rankScore`, `velocity`, `uniquePlatforms`
+  - `src/dashboard/server.js` (UI):
+    - Добавлены константы: `PHASE_META`, `PHASE_DOT`
+    - Добавлены helper-функции: `barColor(v)`, `fmtVelocity(v)`
+    - Новые компоненты: `ScoreBar`, `PhaseBadge`
+    - `TrendCard` переработан: phase accent border, `PhaseBadge` в header, два бара (`🌊 Emergence` + `💊 Adoption`) вместо одного `MemeScore`, compact meta (платформы · velocity · timesSeen)
+    - `TrendModal` stats: добавлена секция фазы с `PhaseBadge` + hint + два `ScoreBar`
+    - App state: добавлен `phase` useState; default sort изменён на `'rank'`
+    - Toolbar: добавлен select фазы (🔵🟡🟢🔴), сортировка обновлена (Rank, Adoption, Emergence, Новые, Виральность)
+    - Sidebar: метка `Meme ≥ N` переименована в `Adoption ≥ N`
+    - CSS: добавлены `.score-bar-*`, `.card-score-bars`, `.phase-badge`
+- Проверка/деплой:
+  - Ожидает деплоя владельцем (`deploy.sh` / `deploy.ps1`)
+  - Новые поля заполняются `null`/`0` для исторических трендов (backward compat)
+- Риски/заметки:
+  - `narrativePhase` для старых трендов в DB будет `null` → phase filter вернёт 0 для старых записей, это ок
+  - emergence gate в alert loop (`emergence < 30 && adoption < 60 → пропустить`) может первое время блокировать часть алертов, пока накопится история. Если слишком агрессивно — снизить порог emergence до 20 или убрать gate временно
+  - `uniquePlatforms` в `_formatTrend` берётся из `raw_metrics` (сохраняется через clusterMetrics) — для старых трендов будет 1 (default), что корректно
+
+---
+
+## 2026-04-17 (EmergenceScore — breakout-based path для вирусных одиночных постов)
+
+- Model/session: Claude Sonnet 4.6
+- Цель: поддержать кейс "один пост но 1M+ views" без поломки spread-based логики
+- Изменения (файлы):
+  - `src/analysis/clusterer.js` — только этот файл:
+    - `_computeEmergenceScore(m)` → `_computeEmergenceScore(m, items = [])` — добавлен второй аргумент
+    - Внутри: spread-логика вынесена в `spreadScore` (без изменений)
+    - Добавлен вызов `this._computeBreakoutScore(items)` → `breakoutScore`
+    - Финал: `Math.min(Math.max(spreadScore, breakoutScore), 100)` — лучший из двух путей
+    - Добавлен новый метод `_computeBreakoutScore(items)` (изолированный):
+      - Компоненты: views/plays (0–35), likes/upvotes (0–30), retweets/shares (0–20), engagementRate (0–15)
+      - Reddit upvotes подставляются как likes fallback; TikTok plays — как views fallback
+    - `_computeMetrics()`: передаёт `items` → `_computeEmergenceScore(base, items)` (1 строка)
+- Примеры поведения после патча:
+  - 1 твит, 1.2M views, 45K likes, 8K RT, 4% ER → breakout=28+24+14+8=74; spread≈15 (только novelty) → emergenceScore=74 ✓
+  - 5 постов, 2 платформы, velocity=1.2 → spread=16+18+8+10+7=59; breakout=низкий → emergenceScore=59 ✓
+  - 1 пост Reddit, 60K upvotes, низкий ER → breakout=0+24+0+0=24; spread≈15 → emergenceScore=24 (сохраняем))
+- Как удалить:
+  - Удалить метод `_computeBreakoutScore`
+  - Откатить `_computeEmergenceScore` сигнатуру к `(m)`, убрать breakoutScore + Math.max
+  - Откатить вызов в `_computeMetrics` к `_computeEmergenceScore(base)`
+
+---
+
+## 2026-04-17 (early idea boost — Reddit + alert gate)
+
+- Цель: не дропать ранние Reddit нарративы с высокими upvotes до того, как они попали на другие платформы
+- Изменения (файлы):
+  - `src/analysis/clusterer.js`:
+    - Добавлен метод `_computeIdeaBoost(items)`: Reddit upvotes >= 10k → +5, >= 15k → +8, >= 30k → +10, >= 60k → +12; читает `m.upvotes || m.score`
+    - `_computeEmergenceScore(m, items)` обновлён: `Math.min(Math.max(spread, breakout) + ideaBoost, 100)` — ideaBoost аддитивен, не заменяет spread/breakout
+    - `_computeMetrics()` добавляет `isEarlyIdea` в `base`: `emergence 20–50 && upvotes >= 10k`; флаг для downstream-логики
+  - `src/index.js`:
+    - Alert gate: `emergence < 30` → `emergence < 20`; комментарий обновлён
+- Проверка:
+  - Syntax check clusterer.js через `node --input-type=module` eval → OK
+- Риски/заметки:
+  - ideaBoost максимум +12 → не делает Reddit доминирующим; одиночный пост 60k upvotes без spread даст emergence≈27 (novelty=15 + ideaBoost=12), что ровно выше нового gate=20
+  - Для отключения: удалить `_computeIdeaBoost()` + строки `ideaBoost` в `_computeEmergenceScore` + `isEarlyIdea` в `_computeMetrics`
+  - Alert gate 20→30 можно вернуть если уровень шума вырастет
+
+---
+
+## 2026-04-17 (follower-aware breakout dampening)
+
+- Цель: убрать спам от постов крупных аккаунтов (Elon и т.п.), у которых всегда высокое абсолютное engagement
+- Изменения (файлы):
+  - `src/analysis/clusterer.js`:
+    - `_computeBreakoutScore(items)`: теперь отслеживает `peakFollowers` — followers автора с пиковым количеством views/plays/likes; `maxEngagementRate` уже собирался
+    - Добавлен метод `_normalizeBreakoutByFollowers(score, followers, engagementRate)`:
+      - `followers < 100K` → no dampening (нет данных или маленький аккаунт)
+      - `engagementRate >= 5%` → no dampening (genuinely viral regardless of size)
+      - `engagementRate >= 2%` → × 0.85
+      - `followers > 50M` → × 0.40 (e.g. Elon рутинный пост)
+      - `followers > 10M` → × 0.55
+      - `followers > 1M`  → × 0.72
+      - иначе → × 1.0
+    - Dampening применяется ТОЛЬКО к breakout component; spread и ideaBoost не затронуты
+  - `src/analysis/prompts.js`:
+    - Добавлено правило MEGA-ACCOUNT RULE в ━━━ ENGAGEMENT CONTEXT ━━━: модель должна оценивать контент нарратива, а не абсолютные метрики, если аккаунт крупный и engagement rate низкий
+- Проверка:
+  - Syntax check clusterer.js → OK
+- Практический эффект (примеры):
+  - Elon (90M fol.), 1M views, 30K likes, engRate=0.03% → factor=0.40; breakoutScore например 65 → 26 (не dominant)
+  - Elon, тот же пост НО engRate=6% → factor=1.0 (реально вирусный контент, не дампим)
+  - 500K аккаунт, 500K views, engRate=0.8% → factor=0.72
+  - Мелкий аккаунт (50K fol.), 200K views → no dampening (followers < 100K)
+- Как отключить: в `_computeBreakoutScore` заменить `return this._normalizeBreakoutByFollowers(raw, ...)` на `return raw;`
+
+---
+
+## 2026-04-17 (Market Stage Detection — опциональный изолированный слой)
+
+- Model/session: Claude Sonnet 4.6
+- Цель: детектировать признаки токенизации нарратива без угадывания тикера; изолированный feature flag слой
+- Feature flag: `MARKET_STAGE_DETECTION=1` (env var). По умолчанию ВЫКЛЮЧЕНО.
+- Изменения (файлы):
+  - `src/analysis/market-stage.js` (NEW):
+    - Все сигналы и логика в одном файле: `COIN_WORDS`, `INTENT_PHRASES`, `TRADING_DOMAINS`, `LATE_PHRASES`, `RE_PUMP_FUN_WITH_CA`, `RE_CA_WITH_CONTEXT`
+    - `detectMarketSignals(items)` → signals object (hasCoinLanguage, hasLaunchIntent, hasCA, hasTradingLink, hasPumpFunLink, hasOverboughtLang, coinLangScore)
+    - `resolveMarketStage(signals)` → `'none'|'tokenizing'|'live'|'overheated'`
+    - `applyStage2MarketPatch(trend, stage2Result)` → опциональный upgrade/downgrade после x_search
+    - `marketStageAlertLine(stage)` / `marketStagePromptHint(stage)` — текстовые хелперы
+    - Нет зависимостей от остального проекта; нет ML; нет onchain-вызовов
+  - `src/analysis/clusterer.js`:
+    - Static import в начале файла (no side effects)
+    - Constructor: `this._marketStageEnabled = process.env.MARKET_STAGE_DETECTION === '1'`
+    - `route()`: опциональный блок `if (this._marketStageEnabled)` после `_computeMetrics()`, wrapped в try/catch; записывает `metrics.marketStage` и `metrics.marketSignals`
+  - `src/analysis/prompts.js`:
+    - `buildAnalysisPrompt()`: 3 строки, tagged `[MARKET_STAGE]`, добавляют hint-строку к описанию тренда если marketStage != 'none'
+  - `src/analysis/scorer.js`:
+    - Import `applyStage2MarketPatch` (tagged `[MARKET_STAGE]`)
+    - `_analyzeBatchStage1`: `marketStage: trend.clusterMetrics?.marketStage ?? null` в возвращаемом объекте
+    - `_stage2DeepDive`: `applyStage2MarketPatch(trend, result)` после пересчёта phase (1 строка, tagged)
+    - `_applyHeuristic`, `_fallback`: `marketStage` прокидывается из clusterMetrics
+  - `src/db/database.js`:
+    - `saveTrend()`: `marketStage: trend.marketStage ?? null` в JSON (1 строка, tagged)
+  - `src/dashboard/server.js`:
+    - `_formatTrend()`: `marketStage: metrics.marketStage ?? null` (1 строка, tagged)
+    - Новый компонент `MarketStageBadge({ stage })` с `MARKET_STAGE_UI` константами (tokenizing=amber, live=emerald, overheated=red)
+    - `TrendCard`: `h(MarketStageBadge, { stage: trend.marketStage })` в header (1 строка, tagged)
+    - `TrendModal`: секция `💹 Market Stage` с badge + hint (tagged block)
+- Чтобы удалить feature полностью:
+  1. Удалить `src/analysis/market-stage.js`
+  2. Удалить строки, помеченные `[MARKET_STAGE]` в 6 файлах (~10 строк итого)
+- Проверка/деплой:
+  - Деплой: `deploy.sh` / `deploy.ps1`
+  - Для включения: добавить `MARKET_STAGE_DETECTION=1` в `.env`
+  - По умолчанию feature выключена — нулевой impact на production до включения
+- Риски/заметки:
+  - Ложные срабатывания на "token" / "coin" в бытовом контексте смягчены порогом coinLangScore >= 4 (для hasCoinLanguage) и >= 6 (для tokenizing без hasLaunchIntent)
+  - CA detection требует контекстного якоря (ca:, contract:, address:, mint:, token:) — без него base58 не матчится
+  - `marketSignals` объект сохраняется только в `clusterMetrics` (in-memory), в DB идёт только `marketStage` строка
+  - Stage 2 patch (`applyStage2MarketPatch`) срабатывает только при `existingCoins.length > 0 && xBuzz in ['high','explosive']` или при rug-языке в adjustment — консервативно
+
+---
+
+## 2026-04-18 (план admin + UI планов)
+
+- Цель: добавить план Admin с полным безлимитом; улучшить UI планов в админке
+- Изменения:
+  - `src/db/schema.sql`: добавлен план `admin` (price=0, все источники, alert_limit=-1, history_days=-1, api_access=1)
+  - `src/db/database.js`: добавлен INSERT в normalizePlans транзакцию для плана `admin` с ON CONFLICT DO UPDATE
+  - `src/admin/server.js`:
+    - CSS: `.badge-admin` — красноватый (rgba 239,68,68)
+    - Компонент `UnlimitedInput`: число + чекбокс ∞; value=-1 = безлимит; используется для `alert_limit` и `history_days`
+    - Заголовок "История (дней)" → "Дней"
+  - `src/i18n/ru.js`, `src/i18n/en.js`: в `paymentTitle` добавлено описание Free-плана (первым блоком, с пометкой "текущий")
+- Проверка: `node --check` всех изменённых файлов → OK
+
+---
+
+## 2026-04-18 (взвешенный фидбек + только 👍👎)
+
+- Цель: счётчик лайков/дизлайков, веса по плану, настройка в админке, только палец вверх/вниз
+- Изменения:
+  - `src/db/database.js`:
+    - Новая таблица `feedback_votes` (trend_id, chat_id UNIQUE, vote, weight, plan_name) + индексы
+    - `recordFeedback(trendId, chatId, vote, weight, planName)`: upsert/delete + пересчёт `trends.user_feedback` как ROUND(SUM(vote*weight))
+    - `getFeedbackStats(trendId)` → `{ likes, dislikes, weightedScore }`
+  - `src/notifications/telegram.js`:
+    - LIKED = [👍], DISLIKED = [👎] — только эти два, все остальные игнорируются
+    - `_feedbackWeight(chatId)` → `{ weight, planName }`: lookup плана пользователя, применяет веса из settings
+    - Режим "выключено": Admin weight=1, все остальные weight=0
+    - `recordFeedback` теперь принимает (trendId, chatId, vote, weight, planName)
+  - `src/admin/server.js`:
+    - Методы `_getFeedbackConfig()`, `_setFeedbackConfig()` — читают/пишут 5 settings-ключей
+    - Endpoint `GET/POST /api/feedback-config`
+    - State: `fbCfg`, `fbSaving`; `saveFbCfg()` async handler
+    - UI-секция "👍 Взвешенный фидбек": toggle вкл/выкл + 4 карточки с весами (Admin/Pro/Test/Free)
+    - Подсказка динамически меняется: при выключении показывает ⚠️ "учитываются только Admin"
+- Проверка: `node --check` всех 3 файлов → OK
+- Риски/заметки:
+  - `message_reaction` update содержит `user.id` только для не-анонимных реакций; анонимные (group bots) пропускаются
+  - Старые вызовы `recordFeedback(id, ±1)` больше не работают — сигнатура изменена; убедись что других caller'ов нет (grep показал только telegram.js)
+
+---
+
+## 2026-04-18 (junkPenalty filter)
+
+- Цель: отсечь вирусный мусор (политика, K-pop, celebrity noise) без изменения emergence/adoption/rankScore
+- Новый файл: `src/analysis/junk-filter.js`
+  - `calculateJunkPenalty(items, clusterMetrics)` → `{ junkPenalty, junkReasons }`
+  - Penalties (аддитивные): politics +40, kpop/fandom +30, celeb-noise +20, no-meme-shape +15
+  - Safe-signal override: если есть животное / абсурд / мем-форма / heartwarming → raw / 3 (или /4 при ≥2 сигналах)
+  - Cap 100
+- Изменения:
+  - `src/analysis/clusterer.js`: import `calculateJunkPenalty`; в `_computeMetrics` — вызов в try/catch, `base.junkPenalty` + `base.junkReasons`; помечено `[JUNK_FILTER]`
+  - `src/index.js`: gate `junkPenalty >= 35 → continue` с debug-логом; помечено `[JUNK_FILTER]`
+  - `src/db/database.js`: `junkPenalty` и `junkReasons` сохраняются в `raw_metrics`
+  - `src/dashboard/server.js`: `_formatTrend` возвращает `junkPenalty` и `junkReasons`
+- Проверка: `node --check` всех изменённых файлов + eval clusterer.js → OK
+- Как отключить: удалить import + `[JUNK_FILTER]` блок в clusterer.js + gate в index.js
+- Порог 35 означает: одно сильное совпадение (politics/kpop) или два слабых (celeb + no-meme-shape) → drop
+- Safe override предотвращает false positives: "weird bear crashes government meeting" = politics +40, animal → /3 = 13 → проходит
+
+---
+
 ## TEMPLATE (копировать для новых записей)
 
 ### YYYY-MM-DD HH:MM
@@ -163,24 +407,3 @@
 - Изменения (файлы):
 - Проверка/деплой:
 - Риски/заметки:
-
----
-
-## 2026-04-16 (remove suggestedTicker end-to-end)
-
-- Model/session: GPT Codex
-- Цель: полностью удалить тикерную AI-логику (`suggestedTicker`) из пайплайна, хранения и UI
-- Изменения (файлы):
-  - `src/analysis/prompts.js`: удалено требование поля `suggestedTicker` из Stage 1 prompt; удалена строка `Suggested ticker` из Stage 2 prompt builder
-  - `src/analysis/scorer.js`: удалён маппинг `suggestedTicker` из Stage 1 ответа; удалён `suggestedTicker` из `_applyHeuristic()` и `_fallback()`
-  - `src/db/database.js`: в `saveTrend()` из `raw_metrics` удалена запись `suggestedTicker`
-  - `src/dashboard/server.js`: удалено чтение `metrics.suggestedTicker` в `_formatTrend`; удалены UI-блоки «Тикер» из карточки и modal; удалены CSS-классы `.ticker` и `.ticker-none`
-  - `src/notifications/telegram.js`: удалено чтение `suggestedTicker` при формировании top trends
-  - `src/i18n/en.js`, `src/i18n/ru.js`: удалён неиспользуемый ключ `alertTickers`
-- Проверка/деплой:
-  - Выполнен `node --check` для всех изменённых файлов (`prompts.js`, `scorer.js`, `database.js`, `server.js`, `telegram.js`, `en.js`, `ru.js`) — без синтаксических ошибок
-  - Выполнен прод-деплой через `deploy.ps1` на `37.1.196.83` (Docker), получен `DEPLOY_SUCCESS`
-  - Проверен `GET /api/health` на `http://37.1.196.83:8080/api/health` — `{"ok":true,...}`
-  - Проверена запись в БД (`/data/trendscout.db`): в последних строках (`id=419,420`) поле `suggestedTicker` отсутствует; в более старых строках поле остаётся как legacy
-- Риски/заметки:
-  - Старые записи в БД могут содержать `suggestedTicker` в `raw_metrics`, но новый код это поле не читает и не отображает

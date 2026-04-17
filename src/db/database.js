@@ -61,6 +61,22 @@ class TrendDatabase {
       )
     `);
 
+    // Weighted feedback votes (one row per user per trend)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS feedback_votes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        trend_id   INTEGER NOT NULL REFERENCES trends(id),
+        chat_id    TEXT NOT NULL,
+        vote       INTEGER NOT NULL,   -- +1 liked, -1 disliked
+        weight     REAL NOT NULL DEFAULT 1.0,
+        plan_name  TEXT NOT NULL DEFAULT 'free',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(trend_id, chat_id)
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_feedback_votes_trend ON feedback_votes(trend_id)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_feedback_votes_chat  ON feedback_votes(chat_id)`);
+
     // Plan normalization (v3 pricing/policy)
     const normalizePlans = this.db.transaction(() => {
       this.db.prepare(`
@@ -90,6 +106,18 @@ class TrendDatabase {
       this.db.prepare(`
         INSERT INTO plans (name, price_usd, sources, alert_limit, history_days, api_access, description)
         VALUES ('pro', 100, 'reddit,google_trends,twitter,tiktok', -1, 30, 1, 'Pro - 30 days, unlimited alerts, all sources')
+        ON CONFLICT(name) DO UPDATE SET
+          price_usd=excluded.price_usd,
+          sources=excluded.sources,
+          alert_limit=excluded.alert_limit,
+          history_days=excluded.history_days,
+          api_access=excluded.api_access,
+          description=excluded.description
+      `).run();
+
+      this.db.prepare(`
+        INSERT INTO plans (name, price_usd, sources, alert_limit, history_days, api_access, description)
+        VALUES ('admin', 0, 'reddit,google_trends,twitter,tiktok', -1, -1, 1, 'Admin plan - unlimited everything')
         ON CONFLICT(name) DO UPDATE SET
           price_usd=excluded.price_usd,
           sources=excluded.sources,
@@ -441,7 +469,14 @@ class TrendDatabase {
       trend.predictedLifespan || null,
       JSON.stringify({
         ...(trend.metrics || {}),
-        memePotential: trend.memePotential
+        memePotential:  trend.memePotential,
+        adoptionScore:  trend.adoptionScore  ?? trend.memePotential ?? 0,
+        emergenceScore: trend.emergenceScore ?? trend.clusterMetrics?.emergenceScore ?? 0,
+        narrativePhase: trend.narrativePhase  ?? null,
+        rankScore:      trend.rankScore       ?? null,
+        marketStage:    trend.marketStage     ?? null, // [MARKET_STAGE] remove to disable
+        junkPenalty:    trend.junkPenalty     ?? trend.clusterMetrics?.junkPenalty  ?? 0, // [JUNK_FILTER]
+        junkReasons:    trend.clusterMetrics?.junkReasons ?? [],                           // [JUNK_FILTER]
       })
     );
 
@@ -545,8 +580,50 @@ class TrendDatabase {
     return this.db.prepare(`SELECT * FROM trends WHERE tg_message_id = ?`).get(tgMessageId);
   }
 
-  recordFeedback(trendId, feedback) {
-    this.db.prepare(`UPDATE trends SET user_feedback = user_feedback + ? WHERE id = ?`).run(feedback, trendId);
+  /**
+   * Record a weighted vote for a trend from a specific user.
+   *
+   * @param {number} trendId
+   * @param {string} chatId    — Telegram chat_id of the voter
+   * @param {number} vote      — +1 liked, -1 disliked, 0 = remove vote
+   * @param {number} weight    — plan-based weight (default 1)
+   * @param {string} planName  — plan name for audit ('free','test','pro','admin')
+   */
+  recordFeedback(trendId, chatId, vote, weight = 1, planName = 'free') {
+    if (vote === 0) {
+      // Reaction removed — delete the user's vote
+      this.db.prepare(`DELETE FROM feedback_votes WHERE trend_id = ? AND chat_id = ?`).run(trendId, String(chatId));
+    } else {
+      // Upsert: one vote per user per trend (changing vote replaces old one)
+      this.db.prepare(`
+        INSERT INTO feedback_votes (trend_id, chat_id, vote, weight, plan_name)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(trend_id, chat_id) DO UPDATE SET
+          vote=excluded.vote, weight=excluded.weight,
+          plan_name=excluded.plan_name, created_at=CURRENT_TIMESTAMP
+      `).run(trendId, String(chatId), vote, weight, planName);
+    }
+
+    // Recompute weighted sum and store in trends.user_feedback
+    const { weighted } = this.db.prepare(`
+      SELECT COALESCE(SUM(vote * weight), 0) AS weighted FROM feedback_votes WHERE trend_id = ?
+    `).get(trendId);
+    this.db.prepare(`UPDATE trends SET user_feedback = ? WHERE id = ?`).run(Math.round(weighted), trendId);
+  }
+
+  /**
+   * Get feedback stats for a trend: like/dislike counts + weighted score.
+   * @param {number} trendId
+   * @returns {{ likes: number, dislikes: number, weightedScore: number }}
+   */
+  getFeedbackStats(trendId) {
+    return this.db.prepare(`
+      SELECT
+        COUNT(CASE WHEN vote > 0 THEN 1 END)       AS likes,
+        COUNT(CASE WHEN vote < 0 THEN 1 END)        AS dislikes,
+        COALESCE(SUM(vote * weight), 0)             AS weightedScore
+      FROM feedback_votes WHERE trend_id = ?
+    `).get(trendId) || { likes: 0, dislikes: 0, weightedScore: 0 };
   }
 
   getLikedNarratives(days = 7, limit = 10) {

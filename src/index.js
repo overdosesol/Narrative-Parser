@@ -247,10 +247,11 @@ async function runScanCycle() {
     );
     logger.info(`Sending alerts to ${activeUsers.length} active user(s)`);
 
-    // Sort by meme potential descending
+    // Sort by rankScore (emergence + adoption combined) descending
+    // Falls back to memePotential for trends scored before the new system
     const alertCandidates = validTrends
       .filter(t => t._dbId)
-      .sort((a, b) => (b.memePotential || 0) - (a.memePotential || 0));
+      .sort((a, b) => (b.rankScore || b.memePotential || 0) - (a.rankScore || a.memePotential || 0));
 
     for (const user of activeUsers) {
       // Skip suspended users
@@ -286,11 +287,29 @@ async function runScanCycle() {
           break;
         }
 
-        // Check user's meme potential threshold
+        // Check user's meme/adoption threshold
         if ((trend.memePotential || 0) < effectiveMemeThreshold) continue;
 
         // Global virality gate (reduces noisy alerts even with high memePotential)
         if ((trend.score || 0) < globalViralityThreshold) continue;
+
+        // Emergence gate: only alert on narratives with real spread OR very high adoption.
+        // Threshold lowered 30 → 20 to catch early Reddit ideas boosted by ideaBoost.
+        // emergenceScore >= 20 = early signal (single platform, high upvotes)
+        // emergenceScore >= 30 = clear multi-platform spread
+        // adoptionScore  >= 60 = high-confidence meme potential even if just emerging
+        const emergence    = trend.emergenceScore || trend.clusterMetrics?.emergenceScore || 0;
+        const adoption     = trend.adoptionScore  || trend.memePotential || 0;
+        if (emergence < 20 && adoption < 60) continue;
+
+        // [JUNK_FILTER] skip viral-but-useless trends (politics, kpop, celeb noise)
+        // Remove this block to disable. Threshold 35 = one strong category hit.
+        const junkPenalty = trend.junkPenalty ?? trend.clusterMetrics?.junkPenalty ?? 0;
+        if (junkPenalty >= 35) {
+          const reasons = trend.clusterMetrics?.junkReasons?.join(',') || '';
+          logger.debug(`[JunkFilter] SKIP "${trend.title?.substring(0, 50)}" junk=${junkPenalty} (${reasons})`);
+          continue;
+        }
 
         // Check if this trend's source is disabled by this user
         if (userDisabledSources.includes(trend.source?.toLowerCase())) continue;

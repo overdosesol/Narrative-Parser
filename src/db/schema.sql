@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS plans (
 INSERT OR IGNORE INTO plans (name, price_usd, sources, alert_limit, history_days, api_access, description) VALUES
   ('free',    0,    'reddit,google_trends', -1, 3,  0, 'Free tier - unlimited alerts'),
   ('test',    5,    'reddit,google_trends,twitter,tiktok', -1, 1,  0, 'Test plan - one-time, 1 day, all sources, no X analysis'),
-  ('pro',     100,  'reddit,google_trends,twitter,tiktok', -1, 30, 1, 'Pro - 30 days, unlimited alerts, all sources');
+  ('pro',     100,  'reddit,google_trends,twitter,tiktok', -1, 30, 1, 'Pro - 30 days, unlimited alerts, all sources'),
+  ('admin',   0,    'reddit,google_trends,twitter,tiktok', -1, -1, 1, 'Admin plan - unlimited everything');
 
 -- -- Users (multi-user via Telegram) ----------------------
 CREATE TABLE IF NOT EXISTS users (

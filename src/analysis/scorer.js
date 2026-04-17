@@ -4,6 +4,44 @@ import {
   STAGE2_SYSTEM_PROMPT,
   buildStage2Prompt,
 } from './prompts.js';
+// [MARKET_STAGE] optional import — remove this line + applyStage2MarketPatch call to disable
+import { applyStage2MarketPatch } from './market-stage.js';
+
+// ─── Emergence + Adoption helpers (used by scorer and server) ─────────────────
+
+/**
+ * Determine narrative phase from emergenceScore (pre-AI) and adoptionScore (post-AI).
+ * @param {number} e  emergenceScore 0–100
+ * @param {number|null} a  adoptionScore 0–100 (null = AI hasn't run yet)
+ * @returns {'early'|'forming'|'strong'|'saturated'}
+ */
+export function narrativePhase(e, a = null) {
+  if (a === null) {
+    // Pre-AI phase estimate based only on emergence
+    if (e < 20) return 'early';
+    if (e < 45) return 'forming';
+    return 'strong';
+  }
+  // Post-AI: high adoption but emergence dropping = narrative already "spent"
+  if (a >= 60 && e < 25) return 'saturated';
+  if (e >= 55 && a >= 55) return 'strong';
+  if (e >= 30 || a >= 35) return 'forming';
+  return 'early';
+}
+
+/**
+ * Combined rank score for sorting — emergence + adoption weighted, optionally
+ * adjusted by user feedback bias.
+ * @param {number} e  emergenceScore 0–100
+ * @param {number} a  adoptionScore 0–100
+ * @param {number} feedbackBias  -1.0 to +1.0 (0 = no feedback)
+ * @returns {number}  0–100
+ */
+export function narrativeRankScore(e, a, feedbackBias = 0) {
+  const base     = e * 0.40 + a * 0.60;
+  const modifier = 1 + Math.max(-1, Math.min(1, feedbackBias)) * 0.15;
+  return Math.min(Math.round(base * modifier), 100);
+}
 
 /**
  * AI Scorer — uses xAI Responses API to analyze trend virality and meme potential.
@@ -272,16 +310,28 @@ class Scorer {
       const originalEnTitle = trend.originalTitle || trend.title;
       const aiEnTitle       = a.title    || originalEnTitle;
       const aiRuTitle       = a.titleRu  || null;
+
+      const adoption  = Number(a.memePotential) || 0;
+      const emergence = trend.clusterMetrics?.emergenceScore ?? 0;
+      const phase     = narrativePhase(emergence, adoption);
+      const rankScore = narrativeRankScore(emergence, adoption);
+
       return {
         ...trend,
-        originalTitle:    originalEnTitle,   // always English source
-        title:            aiRuTitle || aiEnTitle, // Russian if available (stored in DB for RU display)
-        titleEn:          aiEnTitle,             // English version always available
+        // [MARKET_STAGE] carry through from clusterMetrics if present
+        marketStage: trend.clusterMetrics?.marketStage ?? null,
+        originalTitle:    originalEnTitle,
+        title:            aiRuTitle || aiEnTitle,
+        titleEn:          aiEnTitle,
         score:            Number(a.viralityScore) || this._heuristicScore(trend),
-        memePotential:    Number(a.memePotential)  || 0,
+        memePotential:    adoption,
+        adoptionScore:    adoption,    // semantic alias
+        emergenceScore:   emergence,   // from clusterMetrics
+        narrativePhase:   phase,       // 'early'|'forming'|'strong'|'saturated'
+        rankScore,                     // combined sort score
         category:         a.category         || 'other',
         sentiment:        a.sentiment         || 'neutral',
-        aiExplanation:    a.explanation       || '',  // in English
+        aiExplanation:    a.explanation       || '',
         whyItWillPump:    a.whyItWillPump     || '',
         predictedLifespan:a.predictedLifespan || 'unknown',
         isGenuinelyInteresting: a.isGenuinelyInteresting ?? true,
@@ -337,9 +387,18 @@ class Scorer {
       adjustment:    result.adjustment     || '',
     };
 
+    // Recalculate adoption + phase after Stage 2 adjustments
+    trend.adoptionScore  = trend.memePotential;
+    trend.narrativePhase = narrativePhase(trend.emergenceScore ?? 0, trend.adoptionScore);
+    trend.rankScore      = narrativeRankScore(trend.emergenceScore ?? 0, trend.adoptionScore);
+
+    // [MARKET_STAGE] optional patch — remove 1 line to disable
+    if (process.env.MARKET_STAGE_DETECTION === '1') applyStage2MarketPatch(trend, result);
+
     this.logger.info(
       `Stage 2 "${trend.title}": meme ${oldMeme}→${trend.memePotential}, ` +
-      `viral ${oldViral}→${trend.score}, buzz: ${trend.xSearchData.xBuzz}`
+      `viral ${oldViral}→${trend.score}, buzz: ${trend.xSearchData.xBuzz}, ` +
+      `phase: ${trend.narrativePhase}`
     );
 
     return { inputTokens, outputTokens };
@@ -441,10 +500,17 @@ class Scorer {
   // ─── Heuristic fallback ────────────────────────────────────────────────────
 
   _applyHeuristic(trend) {
+    const adoption  = this._heuristicMemePotential(trend);
+    const emergence = trend.clusterMetrics?.emergenceScore ?? 0;
     return {
       ...trend,
       score:            this._heuristicScore(trend),
-      memePotential:    this._heuristicMemePotential(trend),
+      memePotential:    adoption,
+      adoptionScore:    adoption,
+      emergenceScore:   emergence,
+      narrativePhase:   narrativePhase(emergence, adoption),
+      rankScore:        narrativeRankScore(emergence, adoption),
+      marketStage:      trend.clusterMetrics?.marketStage ?? null, // [MARKET_STAGE]
       category:         'other',
       sentiment:        'neutral',
       aiExplanation:    'AI scoring disabled — heuristic score applied',
@@ -455,17 +521,26 @@ class Scorer {
   }
 
   _fallback(trends, reason) {
-    return trends.map(t => ({
-      ...t,
-      score:            this._heuristicScore(t),
-      memePotential:    this._heuristicMemePotential(t),
-      category:         'other',
-      sentiment:        'neutral',
-      aiExplanation:    reason,
-      whyItWillPump:    '',
-      predictedLifespan:'unknown',
-      isGenuinelyInteresting: true,
-    }));
+    return trends.map(t => {
+      const adoption  = this._heuristicMemePotential(t);
+      const emergence = t.clusterMetrics?.emergenceScore ?? 0;
+      return {
+        ...t,
+        score:            this._heuristicScore(t),
+        memePotential:    adoption,
+        adoptionScore:    adoption,
+        emergenceScore:   emergence,
+        narrativePhase:   narrativePhase(emergence, adoption),
+        rankScore:        narrativeRankScore(emergence, adoption),
+        marketStage:      t.clusterMetrics?.marketStage ?? null, // [MARKET_STAGE]
+        category:         'other',
+        sentiment:        'neutral',
+        aiExplanation:    reason,
+        whyItWillPump:    '',
+        predictedLifespan:'unknown',
+        isGenuinelyInteresting: true,
+      };
+    });
   }
 
   // ─── Heuristic scoring (aligned with AI 0-100 scale) ──────────────────────

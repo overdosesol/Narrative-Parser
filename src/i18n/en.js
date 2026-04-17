@@ -59,7 +59,7 @@ Use the menu below to configure your preferences.`,
   planPro: 'Pro ($100 / 30 days)',
 
   // ── Payment ────────────────────────────────────────────────────────────
-  paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🧪 <b>Test — $5 / 1 day (one-time)</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis is not available\n\n🚀 <b>Pro — $100 / 30 days</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis included',
+  paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🆓 <b>Free — free forever (current)</b>\n• Sources: Reddit, Google Trends\n• Unlimited alerts\n• Twitter, TikTok and X Analysis not available\n\n🧪 <b>Test — $5 / 1 day (one-time)</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis is not available\n\n🚀 <b>Pro — $100 / 30 days</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis included',
   paymentMethod: '\u{1F4B0} <b>Payment</b>\n\nChoose payment method:',
   btnPaySOL: '\u{25C9} Pay with SOL',
   btnPayUSDC: '\u{25C9} Pay with USDC',

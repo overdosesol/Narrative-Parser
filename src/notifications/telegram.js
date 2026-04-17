@@ -622,46 +622,87 @@ class TelegramNotifier {
   // ── Reactions feedback ────────────────────────────────────────────────────
 
   _setupReactions() {
+    // Only 👍 and 👎 are treated as feedback signals.
+    // All other emojis are intentionally ignored.
+    const LIKED    = ['\u{1F44D}']; // 👍
+    const DISLIKED = ['\u{1F44E}']; // 👎
+
     this.bot.on('message_reaction', (update) => {
       try {
         const msgId = update.message_id;
         const newReactions = update.new_reaction || [];
         const oldReactions = update.old_reaction || [];
 
-        const added = newReactions.filter(r => !oldReactions.find(o => o.emoji === r.emoji));
+        // Identify the reactor — available in private chats / non-anon group reactions
+        const reactorChatId = String(update.user?.id || update.actor_chat?.id || '');
+        if (!reactorChatId) return; // anonymous reaction — skip
+
+        const added   = newReactions.filter(r => !oldReactions.find(o => o.emoji === r.emoji));
         const removed = oldReactions.filter(r => !newReactions.find(n => n.emoji === r.emoji));
 
-        const LIKED = ['\u{1F44D}', '\u{1F525}', '\u{2764}\u{FE0F}', '\u{1F929}', '\u{1F680}', '\u{26A1}'];
-        const DISLIKED = ['\u{1F44E}', '\u{1F92E}', '\u{1F4A9}', '\u{1F914}'];
+        // Only process if there's anything relevant to 👍/👎
+        const anyRelevant = [...added, ...removed].some(r =>
+          LIKED.includes(r.emoji) || DISLIKED.includes(r.emoji)
+        );
+        if (!anyRelevant) return;
+
+        const trend = this.db?.getTrendByTgMessageId(msgId);
+        if (!trend) return;
+
+        // Resolve voter's plan and compute weight
+        const { weight, planName } = this._feedbackWeight(reactorChatId);
 
         for (const reaction of added) {
-          let feedback = 0;
-          if (LIKED.includes(reaction.emoji)) feedback = +1;
-          else if (DISLIKED.includes(reaction.emoji)) feedback = -1;
-          if (feedback !== 0) {
-            const trend = this.db?.getTrendByTgMessageId(msgId);
-            if (trend) {
-              this.db.recordFeedback(trend.id, feedback);
-              this.logger.info(`Feedback ${feedback > 0 ? '+1' : '-1'} for "${trend.title}"`);
-            }
+          if (LIKED.includes(reaction.emoji)) {
+            this.db.recordFeedback(trend.id, reactorChatId, +1, weight, planName);
+            this.logger.info(`Feedback +1 (w=${weight}, plan=${planName}) for "${trend.title}"`);
+          } else if (DISLIKED.includes(reaction.emoji)) {
+            this.db.recordFeedback(trend.id, reactorChatId, -1, weight, planName);
+            this.logger.info(`Feedback -1 (w=${weight}, plan=${planName}) for "${trend.title}"`);
           }
         }
 
         for (const reaction of removed) {
-          let feedback = 0;
-          if (LIKED.includes(reaction.emoji)) feedback = -1;
-          else if (DISLIKED.includes(reaction.emoji)) feedback = +1;
-          if (feedback !== 0) {
-            const trend = this.db?.getTrendByTgMessageId(msgId);
-            if (trend) {
-              this.db.recordFeedback(trend.id, feedback);
-            }
+          if (LIKED.includes(reaction.emoji) || DISLIKED.includes(reaction.emoji)) {
+            // Remove vote entirely (vote=0)
+            this.db.recordFeedback(trend.id, reactorChatId, 0, 0, planName);
+            this.logger.info(`Feedback removed (plan=${planName}) for "${trend.title}"`);
           }
         }
       } catch (err) {
         this.logger.error(`Reaction processing error: ${err.message}`);
       }
     });
+  }
+
+  /**
+   * Resolve feedback weight for a reactor based on their plan.
+   * Falls back to weight=1 if weighting is disabled or user not found.
+   *
+   * @param {string} chatId
+   * @returns {{ weight: number, planName: string }}
+   */
+  _feedbackWeight(chatId) {
+    const enabled = this.db?.getSetting('feedbackWeightingEnabled', '1') !== '0';
+
+    let planName = 'free';
+    try {
+      const user = this.db?.getUserByChatId(chatId);
+      if (user?.plan_name) planName = user.plan_name;
+    } catch (_) { /* user not found — default to free */ }
+
+    // Weighting off → only admin votes count (weight=1), all others are ignored (weight=0)
+    if (!enabled) return { weight: planName === 'admin' ? 1 : 0, planName };
+
+    const weights = {
+      admin: parseFloat(this.db?.getSetting('feedbackWeightAdmin', '3') || '3'),
+      pro:   parseFloat(this.db?.getSetting('feedbackWeightPro',   '2') || '2'),
+      test:  parseFloat(this.db?.getSetting('feedbackWeightTest',  '1') || '1'),
+      free:  parseFloat(this.db?.getSetting('feedbackWeightFree',  '1') || '1'),
+    };
+
+    const weight = weights[planName] ?? 1;
+    return { weight, planName };
   }
 
   // ── Utility ───────────────────────────────────────────────────────────────

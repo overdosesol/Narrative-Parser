@@ -59,7 +59,7 @@ export default {
   planPro: 'Pro ($100 / 30 \u{0434}\u{043D}\u{0435}\u{0439})',
 
   // ── Payment ────────────────────────────────────────────────────────────
-  paymentTitle: '💰 <b>Выберите план:</b>\n\n🧪 <b>Test — $5 / 1 день (один раз)</b>\n• Все источники (Reddit, Google, Twitter, TikTok)\n• Безлимит алертов\n• X Analysis недоступен\n\n🚀 <b>Pro — $100 / 30 дней</b>\n• Все источники (Reddit, Google, Twitter, TikTok)\n• Безлимит алертов\n• Доступен X Analysis',
+  paymentTitle: '💰 <b>Выберите план:</b>\n\n🆓 <b>Free — бесплатно (текущий)</b>\n• Источники: Reddit, Google Trends\n• Безлимит алертов\n• Twitter, TikTok и X Analysis недоступны\n\n🧪 <b>Test — $5 / 1 день (один раз)</b>\n• Все источники (Reddit, Google, Twitter, TikTok)\n• Безлимит алертов\n• X Analysis недоступен\n\n🚀 <b>Pro — $100 / 30 дней</b>\n• Все источники (Reddit, Google, Twitter, TikTok)\n• Безлимит алертов\n• Доступен X Analysis',
   paymentMethod: '\u{1F4B0} <b>\u{041E}\u{043F}\u{043B}\u{0430}\u{0442}\u{0430}</b>\n\n\u{0412}\u{044B}\u{0431}\u{0435}\u{0440}\u{0438}\u{0442}\u{0435} \u{0441}\u{043F}\u{043E}\u{0441}\u{043E}\u{0431} \u{043E}\u{043F}\u{043B}\u{0430}\u{0442}\u{044B}:',
   btnPaySOL: '\u{25C9} \u{041E}\u{043F}\u{043B}\u{0430}\u{0442}\u{0438}\u{0442}\u{044C} \u{0447}\u{0435}\u{0440}\u{0435}\u{0437} SOL',
   btnPayUSDC: '\u{25C9} \u{041E}\u{043F}\u{043B}\u{0430}\u{0442}\u{0438}\u{0442}\u{044C} \u{0447}\u{0435}\u{0440}\u{0435}\u{0437} USDC',

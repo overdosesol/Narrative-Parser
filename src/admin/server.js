@@ -159,7 +159,17 @@ class AdminServer {
   }
 
   _getPlans() {
-    return this.db.db.prepare(`SELECT * FROM plans ORDER BY price_usd ASC`).all();
+    // Explicit order: free → test → pro → admin
+    return this.db.db.prepare(`
+      SELECT * FROM plans
+      ORDER BY CASE name
+        WHEN 'free'  THEN 1
+        WHEN 'test'  THEN 2
+        WHEN 'pro'   THEN 3
+        WHEN 'admin' THEN 4
+        ELSE 99
+      END
+    `).all();
   }
 
   _updatePlan(id, fields) {
@@ -168,6 +178,24 @@ class AdminServer {
     const vals = Object.entries(fields).filter(([k]) => allowed.includes(k)).map(([,v]) => v);
     if (!sets.length) return;
     this.db.db.prepare(`UPDATE plans SET ${sets.join(',')} WHERE id=?`).run(...vals, id);
+  }
+
+  _getFeedbackConfig() {
+    return {
+      enabled:     this.db.getSetting('feedbackWeightingEnabled', '1') !== '0',
+      weightAdmin: parseFloat(this.db.getSetting('feedbackWeightAdmin', '3') || '3'),
+      weightPro:   parseFloat(this.db.getSetting('feedbackWeightPro',   '2') || '2'),
+      weightTest:  parseFloat(this.db.getSetting('feedbackWeightTest',  '1') || '1'),
+      weightFree:  parseFloat(this.db.getSetting('feedbackWeightFree',  '1') || '1'),
+    };
+  }
+
+  _setFeedbackConfig({ enabled, weightAdmin, weightPro, weightTest, weightFree }) {
+    if (enabled !== undefined) this.db.setSetting('feedbackWeightingEnabled', enabled ? '1' : '0');
+    if (weightAdmin !== undefined) this.db.setSetting('feedbackWeightAdmin', String(parseFloat(weightAdmin) || 1));
+    if (weightPro   !== undefined) this.db.setSetting('feedbackWeightPro',   String(parseFloat(weightPro)   || 1));
+    if (weightTest  !== undefined) this.db.setSetting('feedbackWeightTest',  String(parseFloat(weightTest)  || 1));
+    if (weightFree  !== undefined) this.db.setSetting('feedbackWeightFree',  String(parseFloat(weightFree)  || 1));
   }
 
   _getAiConfig() {
@@ -281,7 +309,8 @@ class AdminServer {
     const plan = this.db.db.prepare(`SELECT id, name FROM plans WHERE name = ?`).get(planName);
     if (!plan) throw new Error(`Plan not found: ${planName}`);
 
-    if (plan.name === 'free') {
+    if (plan.name === 'free' || plan.name === 'admin') {
+      // Free and Admin plans have no expiry
       this.db.db.prepare(`
         UPDATE users
         SET plan_id = ?, subscription_expires_at = NULL, status = 'active'
@@ -580,6 +609,17 @@ class AdminServer {
         return json(res, 200, { ok: true });
       }
 
+      // ── Feedback Config ──
+      if (path === '/api/feedback-config' && method === 'GET') {
+        return json(res, 200, this._getFeedbackConfig());
+      }
+
+      if (path === '/api/feedback-config' && method === 'POST') {
+        const body = await parseBody(req);
+        this._setFeedbackConfig(body);
+        return json(res, 200, { ok: true, ...this._getFeedbackConfig() });
+      }
+
       // ── AI Config ──
       if (path === '/api/ai-config' && method === 'GET') {
         return json(res, 200, this._getAiConfig());
@@ -754,6 +794,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .badge-active{background:rgba(16,185,129,.15);color:var(--green)}
 .badge-blocked{background:rgba(239,68,68,.15);color:var(--red)}
 .badge-free{background:rgba(148,163,184,.1);color:var(--text2)}
+.badge-admin{background:rgba(239,68,68,.15);color:#f87171}
 .badge-basic{background:rgba(59,130,246,.15);color:var(--blue)}
 .badge-pro{background:rgba(124,58,237,.15);color:var(--accent)}
 .badge-elite{background:rgba(245,158,11,.15);color:var(--yellow)}
@@ -965,8 +1006,10 @@ function UsersPage() {
     await action('/api/users/' + u.id + '/status', 'POST', { status: next });
   };
 
-  const fmt = dt => dt ? new Date(dt).toLocaleDateString('ru') : '—';
-  const fmtDt = dt => dt ? new Date(dt).toLocaleString('ru',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+  // SQLite stores timestamps as "YYYY-MM-DD HH:MM:SS" without timezone → force UTC
+  const utcDate = dt => { if (!dt) return null; const s = dt.includes('Z')||dt.includes('+') ? dt : dt.replace(' ','T')+'Z'; return new Date(s); };
+  const fmt   = dt => { const d = utcDate(dt); return d ? d.toLocaleDateString('ru') : '—'; };
+  const fmtDt = dt => { const d = utcDate(dt); return d ? d.toLocaleString('ru',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—'; };
 
   return React.createElement('div',null,
     React.createElement('div',{className:'page-header'},
@@ -981,6 +1024,7 @@ function UsersPage() {
           React.createElement('option',{value:'free'},'Free'),
           React.createElement('option',{value:'test'},'Test'),
           React.createElement('option',{value:'pro'},'Pro'),
+          React.createElement('option',{value:'admin'},'Admin'),
         ),
         React.createElement('select',{className:'filter',value:statusF,onChange:e=>setStatusF(e.target.value)},
           React.createElement('option',{value:''},'Все статусы'),
@@ -1020,6 +1064,7 @@ function UsersPage() {
                   React.createElement('option',{value:'free'},'Free'),
                   React.createElement('option',{value:'test'},'Test'),
                   React.createElement('option',{value:'pro'},'Pro'),
+                  React.createElement('option',{value:'admin'},'Admin'),
                 ),
                 React.createElement('input',{
                   className:'plan-input',
@@ -1082,7 +1127,8 @@ function PaymentsPage() {
     } catch(e){ setMsg(e.message); }
   };
 
-  const fmtDt = dt => dt ? new Date(dt).toLocaleString('ru',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+  const utcDate2 = dt => { if (!dt) return null; const s = dt.includes('Z')||dt.includes('+') ? dt : dt.replace(' ','T')+'Z'; return new Date(s); };
+  const fmtDt = dt => { const d = utcDate2(dt); return d ? d.toLocaleString('ru',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—'; };
   const fmtMoney = (amount, currency) => {
     if (amount === null || amount === undefined) return '—';
     const c = (currency || 'SOL').toUpperCase();
@@ -1294,6 +1340,34 @@ function StatsPage() {
   );
 }
 
+// Input that toggles between a number and ∞ (value=-1).
+// Used for alert_limit and history_days in plan rows.
+function UnlimitedInput({value, onChange}) {
+  const isUnlimited = value === -1 || value === '-1';
+  return React.createElement('div',{style:{display:'flex',alignItems:'center',gap:4}},
+    React.createElement('input',{
+      className:'plan-input',
+      type:'number',
+      disabled:isUnlimited,
+      value: isUnlimited ? '' : (value ?? ''),
+      style:{width:56, opacity: isUnlimited ? 0.35 : 1},
+      onChange: e => onChange(parseInt(e.target.value) || 0)
+    }),
+    React.createElement('label',{
+      title:'Безлимит',
+      style:{display:'flex',alignItems:'center',gap:3,cursor:'pointer',fontSize:13,color:'var(--text2)',userSelect:'none'}
+    },
+      React.createElement('input',{
+        type:'checkbox',
+        checked:isUnlimited,
+        style:{accentColor:'var(--accent)',width:13,height:13,cursor:'pointer'},
+        onChange: e => onChange(e.target.checked ? -1 : 0)
+      }),
+      '∞'
+    )
+  );
+}
+
 function BotPage() {
   const [plans, setPlans] = useState([]);
   const [broadcasts, setBroadcasts] = useState([]);
@@ -1303,6 +1377,8 @@ function BotPage() {
   const [aiModelsError, setAiModelsError] = useState('');
   const [editedPlans, setEditedPlans] = useState({});
   const [msg, setMsg] = useState('');
+  const [fbCfg, setFbCfg] = useState({ enabled:true, weightAdmin:3, weightPro:2, weightTest:1, weightFree:1 });
+  const [fbSaving, setFbSaving] = useState(false);
   const [bcast, setBcast] = useState('');
   const [bcastPlan, setBcastPlan] = useState('all');
   const [bcastResult, setBcastResult] = useState(null);
@@ -1349,6 +1425,7 @@ function BotPage() {
     loadBroadcasts();
     loadAiConfig();
     loadAiModels();
+    api('/api/feedback-config').then(c=>setFbCfg(c)).catch(()=>{});
   },[]);
 
   const setPlanField = (id, field, val) => {
@@ -1366,6 +1443,16 @@ function BotPage() {
       setEditedPlans(prev=>{ const n={...prev}; delete n[plan.id]; return n; });
     } catch(e){ setMsg('Ошибка: '+e.message); }
     finally { setSavingPlan(false); setTimeout(()=>setMsg(''),3000); }
+  };
+
+  const saveFbCfg = async () => {
+    setFbSaving(true);
+    try {
+      const saved = await api('/api/feedback-config', 'POST', fbCfg);
+      setFbCfg(saved);
+      setMsg('✓ Настройки фидбека сохранены');
+    } catch(e){ setMsg('Ошибка: '+e.message); }
+    finally { setFbSaving(false); setTimeout(()=>setMsg(''),3000); }
   };
 
   const sendBroadcast = async () => {
@@ -1439,7 +1526,7 @@ function BotPage() {
     }
   };
 
-  const fmtDt = dt => dt ? new Date(dt).toLocaleString('ru',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+  const fmtDt = dt => { if (!dt) return '—'; const s = dt.includes('Z')||dt.includes('+') ? dt : dt.replace(' ','T')+'Z'; return new Date(s).toLocaleString('ru',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); };
 
   return React.createElement('div',null,
     React.createElement('div',{className:'page-header'},
@@ -1573,7 +1660,7 @@ function BotPage() {
           React.createElement('span',null,'План'),
           React.createElement('span',null,'Цена (USD)'),
           React.createElement('span',null,'Алертов/день'),
-          React.createElement('span',null,'История (дней)'),
+          React.createElement('span',null,'Дней'),
           React.createElement('span',null,''),
         ),
         plans.map(p=>{
@@ -1581,8 +1668,8 @@ function BotPage() {
           return React.createElement('div',{key:p.id,className:'plan-row'},
             React.createElement('span',null,React.createElement('span',{className:'badge badge-'+p.name},p.name)),
             React.createElement('input',{className:'plan-input',type:'number',step:'0.01',defaultValue:p.price_usd||0,onChange:e=>setPlanField(p.id,'price_usd',parseFloat(e.target.value))}),
-            React.createElement('input',{className:'plan-input',type:'number',defaultValue:p.alert_limit,onChange:e=>setPlanField(p.id,'alert_limit',parseInt(e.target.value))}),
-            React.createElement('input',{className:'plan-input',type:'number',defaultValue:p.history_days,onChange:e=>setPlanField(p.id,'history_days',parseInt(e.target.value))}),
+            React.createElement(UnlimitedInput,{value:(editedPlans[p.id]?.alert_limit??p.alert_limit),onChange:v=>setPlanField(p.id,'alert_limit',v)}),
+            React.createElement(UnlimitedInput,{value:(editedPlans[p.id]?.history_days??p.history_days),onChange:v=>setPlanField(p.id,'history_days',v)}),
             editedPlans[p.id]
               ? React.createElement('button',{className:'btn btn-primary btn-sm',onClick:()=>savePlan(p),disabled:savingPlan},'Сохранить')
               : React.createElement('span',{style:{fontSize:12,color:'var(--text2)'}},p.sources?'src: '+p.sources:'')
@@ -1590,6 +1677,57 @@ function BotPage() {
         })
       ),
       msg&&React.createElement('div',{className:'mt16',style:{}},React.createElement('span',{className:msg.includes('Ошибка')?'error-msg':'success-msg'},msg))
+    ),
+
+    // ── Feedback Weighting ──────────────────────────────────────────────
+    React.createElement('div',{className:'broadcast-box'},
+      React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:14}},
+        React.createElement('h3',{style:{margin:0}},'👍 Взвешенный фидбек'),
+        React.createElement('label',{style:{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:13}},
+          React.createElement('input',{
+            type:'checkbox', checked:!!fbCfg.enabled,
+            style:{accentColor:'var(--accent)',width:15,height:15,cursor:'pointer'},
+            onChange:e=>setFbCfg(prev=>({...prev,enabled:e.target.checked}))
+          }),
+          React.createElement('span',{style:{color: fbCfg.enabled?'var(--accent)':'var(--text2)'}},
+            fbCfg.enabled ? 'Включено' : 'Выключено'
+          )
+        )
+      ),
+      React.createElement('p',{style:{fontSize:12,color:'var(--text2)',marginTop:0,marginBottom:14}},
+        fbCfg.enabled
+          ? 'Реакции 👍 и 👎 учитываются с разным весом в зависимости от плана. Влияет на rankScore нарратива.'
+          : '⚠️ Взвешивание выключено — учитываются только голоса Admin. Остальные игнорируются.'
+      ),
+      React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,opacity: fbCfg.enabled?1:0.4,pointerEvents: fbCfg.enabled?'auto':'none'}},
+        ...[
+          {key:'weightAdmin', label:'👑 Admin',  color:'#f87171'},
+          {key:'weightPro',   label:'🚀 Pro',    color:'var(--accent)'},
+          {key:'weightTest',  label:'🧪 Test',   color:'var(--text2)'},
+          {key:'weightFree',  label:'🆓 Free',   color:'var(--text2)'},
+        ].map(({key,label,color})=>
+          React.createElement('div',{key,style:{background:'var(--bg3)',borderRadius:8,padding:'10px 12px',border:'1px solid var(--border)'}},
+            React.createElement('div',{style:{fontSize:12,color,fontWeight:600,marginBottom:6}},label),
+            React.createElement('div',{style:{display:'flex',alignItems:'center',gap:6}},
+              React.createElement('input',{
+                className:'plan-input',type:'number',min:0.1,max:10,step:0.1,
+                style:{width:64},
+                value: fbCfg[key] ?? 1,
+                onChange: e=>setFbCfg(prev=>({...prev,[key]:parseFloat(e.target.value)||1}))
+              }),
+              React.createElement('span',{style:{fontSize:11,color:'var(--text2)'}},'× вес')
+            )
+          )
+        )
+      ),
+      React.createElement('div',{style:{marginTop:14,display:'flex',alignItems:'center',gap:12}},
+        React.createElement('button',{className:'btn btn-primary btn-sm',onClick:saveFbCfg,disabled:fbSaving},
+          fbSaving ? 'Сохранение...' : 'Сохранить'
+        ),
+        React.createElement('span',{style:{fontSize:11,color:'var(--text2)'}},
+          'Применяется к новым реакциям мгновенно, без перезапуска'
+        )
+      )
     )
   );
 }
