@@ -180,7 +180,39 @@ class TrendDatabase {
     });
     normalizePlans();
 
+    // Migration: avatar cache for Telegram profile photos
+    // (SQLite has no IF NOT EXISTS for ADD COLUMN — check via pragma)
+    try {
+      const cols = this.db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
+      if (!cols.includes('avatar_file_id')) {
+        this.db.prepare(`ALTER TABLE users ADD COLUMN avatar_file_id TEXT`).run();
+      }
+      if (!cols.includes('avatar_file_unique_id')) {
+        this.db.prepare(`ALTER TABLE users ADD COLUMN avatar_file_unique_id TEXT`).run();
+      }
+      if (!cols.includes('avatar_checked_at')) {
+        this.db.prepare(`ALTER TABLE users ADD COLUMN avatar_checked_at DATETIME`).run();
+      }
+    } catch (e) {
+      this.logger.warn(`Avatar column migration skipped: ${e.message}`);
+    }
+
     this.logger.info('Database schema applied');
+  }
+
+  /**
+   * Persist a user's latest Telegram profile-photo file reference.
+   * `fileUniqueId` stays stable across Telegram CDN rotations — use it to
+   * invalidate on-disk caches when the user changes their photo.
+   */
+  setUserAvatar(userId, fileId, fileUniqueId) {
+    this.db.prepare(`
+      UPDATE users
+         SET avatar_file_id        = ?,
+             avatar_file_unique_id = ?,
+             avatar_checked_at     = CURRENT_TIMESTAMP
+       WHERE id = ?
+    `).run(fileId || null, fileUniqueId || null, userId);
   }
 
   // ── User Management ───────────────────────────────────────────────────────

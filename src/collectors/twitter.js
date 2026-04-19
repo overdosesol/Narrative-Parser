@@ -226,31 +226,52 @@ class TwitterCollector extends BaseCollector {
 
     const title = this._buildTitle(text, hashtags, tickers);
 
-    // Media thumbnail — works for both photos and videos (preview frame)
+    // Media — works for both photos and videos (preview frame)
     // Twitter API v2: tweet.media[].preview_image_url (videos) or .url (photos)
     // Legacy/Apify: tweet.entities.media[].media_url_https
-    const media = tweet.media?.[0] || tweet.entities?.media?.[0] || null;
-    const mediaType = media?.type || null;
-    // Photos: the original-quality URL lives in .media_url_https / .url.
-    //         Avoid preview_image_url (smaller) when we have the real one.
-    // Videos/GIFs: only a preview frame is available.
-    let thumbnailUrl;
-    if (mediaType === 'photo') {
-      thumbnailUrl = media?.media_url_https || media?.url || media?.media_url || media?.preview_image_url || null;
-    } else {
-      thumbnailUrl = media?.preview_image_url || media?.media_url_https || media?.url || media?.media_url || null;
-    }
-    // Force pbs.twimg.com to the original-resolution variant.
-    if (thumbnailUrl && /pbs\.twimg\.com\//.test(thumbnailUrl)) {
+    const mediaList = tweet.media?.length ? tweet.media
+                    : (tweet.entities?.media || []);
+    const pickUrl = (m) => {
+      if (!m) return null;
+      const isPhoto = m?.type === 'photo' || !m?.type;
+      return isPhoto
+        ? (m.media_url_https || m.url || m.media_url || m.preview_image_url || null)
+        : (m.preview_image_url || m.media_url_https || m.url || m.media_url || null);
+    };
+    const upgrade = (u) => {
+      if (!u || !/pbs\.twimg\.com\//.test(u)) return u;
       try {
-        const u = new URL(thumbnailUrl);
-        u.searchParams.set('name', 'orig');
-        if (!u.searchParams.get('format')) {
-          const ext = u.pathname.match(/\.(jpe?g|png|webp)$/i)?.[1] || 'jpg';
-          u.searchParams.set('format', ext.toLowerCase().replace('jpeg', 'jpg'));
+        const url = new URL(u);
+        url.searchParams.set('name', 'orig');
+        if (!url.searchParams.get('format')) {
+          const ext = url.pathname.match(/\.(jpe?g|png|webp)$/i)?.[1] || 'jpg';
+          url.searchParams.set('format', ext.toLowerCase().replace('jpeg', 'jpg'));
         }
-        thumbnailUrl = u.toString();
-      } catch (_) { /* keep original */ }
+        return url.toString();
+      } catch (_) { return u; }
+    };
+    // All photo URLs (preserve order, dedupe); cap 10 for Telegram media group.
+    const imageUrls = [];
+    for (const m of mediaList) {
+      const raw = pickUrl(m);
+      const url = upgrade(raw);
+      if (url && !imageUrls.includes(url)) imageUrls.push(url);
+      if (imageUrls.length >= 10) break;
+    }
+    const thumbnailUrl = imageUrls[0] || null;
+
+    // Best video URL — scan media for type=video/animated_gif and pick the
+    // highest-bitrate MP4 variant. Twitter videos carry audio in the variant.
+    let videoUrl = null;
+    for (const m of mediaList) {
+      const type = m?.type;
+      if (type !== 'video' && type !== 'animated_gif') continue;
+      const variants = m.video_info?.variants || m.variants || [];
+      const mp4s = variants
+        .filter(v => (v.content_type || v.contentType || '').includes('mp4') || /\.mp4(\?|$)/i.test(v.url || ''))
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      const best = mp4s[0]?.url;
+      if (best) { videoUrl = best; break; }
     }
 
     return {
@@ -273,6 +294,8 @@ class TwitterCollector extends BaseCollector {
         author: `@${author}`,
         searchQuery: query.substring(0, 60),
         thumbnailUrl,
+        imageUrls,
+        videoUrl,
       },
     };
   }

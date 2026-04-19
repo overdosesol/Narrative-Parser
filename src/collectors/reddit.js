@@ -211,6 +211,63 @@ class RedditCollector extends BaseCollector {
     return null;
   }
 
+  /**
+   * Pick a direct, Telegram-friendly MP4 URL for a Reddit video post.
+   * Returns null if the post isn't video-y.
+   *
+   * Caveat: v.redd.it uses DASH, so `fallback_url` is VIDEO-ONLY (no audio).
+   * Muxing would require FFmpeg — out of scope. We accept silent playback.
+   */
+  _bestVideo(post) {
+    if (!post) return null;
+
+    // 1. Native Reddit-hosted video (v.redd.it) — silent MP4
+    const rv = post.media?.reddit_video || post.secure_media?.reddit_video;
+    if (rv?.fallback_url) return rv.fallback_url.split('?')[0];
+
+    // 2. Reddit's video preview (e.g. for cross-posted/gif-as-video content)
+    const prev = post.preview?.reddit_video_preview;
+    if (prev?.fallback_url) return prev.fallback_url.split('?')[0];
+
+    // 3. Direct link — .mp4 / .webm
+    const directUrl = post.url_overridden_by_dest || post.url || '';
+    if (/\.(mp4|webm)(\?|$)/i.test(directUrl)) return directUrl;
+
+    // 4. Imgur .gifv → swap to .mp4 (their HTML wrapper is not playable)
+    if (/imgur\.com\/\w+\.gifv$/i.test(directUrl)) {
+      return directUrl.replace(/\.gifv$/i, '.mp4');
+    }
+
+    // 5. oEmbed video (YouTube/Vimeo embeds aren't direct MP4 — skip)
+    return null;
+  }
+
+  /**
+   * Collect ALL image URLs from a post — primarily for Reddit galleries.
+   * Returns up to 10 URLs (Telegram media-group cap). Order preserved.
+   * For single-image posts returns [bestImage] (array of 1).
+   */
+  _allImages(post) {
+    if (!post) return [];
+    const out = [];
+
+    // Gallery: full order from gallery_data.items
+    if (post.is_gallery && post.media_metadata && post.gallery_data?.items?.length) {
+      for (const gi of post.gallery_data.items) {
+        const item = post.media_metadata[gi.media_id];
+        const url  = item?.s?.u || item?.s?.gif;
+        if (url && !out.includes(url)) out.push(url);
+        if (out.length >= 10) break;
+      }
+      if (out.length) return out;
+    }
+
+    // Non-gallery: fall back to best single image
+    const best = this._bestImage(post);
+    if (best) out.push(best);
+    return out;
+  }
+
   _normalize(post, requestedSub) {
     if (!post || !post.title) return null;
 
@@ -257,6 +314,8 @@ class RedditCollector extends BaseCollector {
         subreddit:   sub,
         flair:       post.link_flair_text || '',
         imageUrl:    this._bestImage(post),
+        imageUrls:   this._allImages(post),
+        videoUrl:    this._bestVideo(post),
         // For scorer compatibility
         score,
       },

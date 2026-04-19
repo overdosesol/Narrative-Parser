@@ -1,5 +1,8 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { randomBytes } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { spawn } from 'child_process';
 import { formatTelegramAlert, formatTwitterResult } from './formatter.js';
 import { getTranslations } from '../i18n/index.js';
 import TwitterChecker from '../collectors/twitter-check.js';
@@ -82,6 +85,9 @@ class TelegramNotifier {
       const user = this.db.getOrCreateUser(chatId, username);
       const t = getTranslations(user.language);
       const payload = (match && match[1] || '').trim();
+
+      // Fire-and-forget avatar refresh — cosmetic, must not block /start
+      this.refreshUserAvatar(chatId, user.id).catch(() => {});
 
       // ── Dashboard login deep-link: /start auth_<sessionId> ───────────
       const authMatch = payload.match(/^auth_([a-f0-9]{32})$/i);
@@ -764,23 +770,147 @@ class TelegramNotifier {
     try {
       const t = getTranslations(user.language);
       const message = formatTelegramAlert(trend, user.language);
-      const imageUrl = trend.metrics?.imageUrl;
+      const chatId = user.telegram_chat_id;
+
+      // Collect all available images (deduped). Prefer the array collected by
+      // collectors + clusterer; fall back to the single imageUrl.
+      const rawUrls = Array.isArray(trend.metrics?.imageUrls) && trend.metrics.imageUrls.length
+        ? trend.metrics.imageUrls
+        : (trend.metrics?.imageUrl ? [trend.metrics.imageUrl] : []);
+      const imageUrls = [];
+      for (const u of rawUrls) {
+        if (u && !imageUrls.includes(u)) imageUrls.push(u);
+        if (imageUrls.length >= 10) break;
+      }
+
+      const videoUrl = trend.metrics?.videoUrl || null;
+
+      // Telegram media-group caption cap is 1024 chars. If message is longer,
+      // send album without caption and post the full text as a follow-up.
+      const CAPTION_MAX = 1024;
+      const fitsInCaption = message.length <= CAPTION_MAX;
+
       let sentMsg;
 
-      if (imageUrl) {
+      // Prefer video over stills when present. If it's a pure gallery (>=2
+      // photos and no single video), images win — multi-image posts aren't
+      // videos anyway, and media groups can't mix here without the video
+      // likely exceeding 50MB by URL.
+      if (videoUrl && imageUrls.length < 2) {
+        // For Reddit DASH (v.redd.it): try to mux audio for a non-silent alert.
+        // Falls back to original silent URL if ffmpeg missing / no audio track.
+        let videoSource = videoUrl;
+        if (/v\.redd\.it/i.test(videoUrl)) {
+          try {
+            const muxed = await this._muxRedditVideo(videoUrl);
+            if (muxed) videoSource = muxed; // local file path, uploaded as multipart
+          } catch (e) {
+            this.logger.warn(`[Video] mux attempt failed: ${e.message}`);
+          }
+        }
         try {
-          sentMsg = await this.bot.sendPhoto(user.telegram_chat_id, imageUrl, {
-            caption: message,
+          sentMsg = await this.bot.sendVideo(chatId, videoSource, {
+            caption: fitsInCaption ? message : undefined,
+            parse_mode: 'HTML',
+            supports_streaming: true,
+          });
+          if (!fitsInCaption) {
+            await this.bot.sendMessage(chatId, message, {
+              parse_mode: 'HTML',
+              disable_web_page_preview: true,
+              reply_to_message_id: sentMsg?.message_id,
+            });
+          }
+        } catch (err) {
+          // Common causes: >50MB, bad codec, Telegram can't fetch URL. Fall
+          // back to the still-frame path.
+          this.logger.warn(`sendVideo failed (${err.message}) — falling back to image`);
+          const fallbackImg = imageUrls[0] || trend.metrics?.thumbnailUrl || null;
+          if (fallbackImg) {
+            try {
+              sentMsg = await this.bot.sendPhoto(chatId, fallbackImg, {
+                caption: fitsInCaption ? message : undefined,
+                parse_mode: 'HTML',
+              });
+              if (!fitsInCaption) {
+                await this.bot.sendMessage(chatId, message, {
+                  parse_mode: 'HTML',
+                  disable_web_page_preview: true,
+                  reply_to_message_id: sentMsg?.message_id,
+                });
+              }
+            } catch {
+              sentMsg = await this.bot.sendMessage(chatId, message, {
+                parse_mode: 'HTML',
+                disable_web_page_preview: false,
+              });
+            }
+          } else {
+            sentMsg = await this.bot.sendMessage(chatId, message, {
+              parse_mode: 'HTML',
+              disable_web_page_preview: false,
+            });
+          }
+        }
+      } else if (imageUrls.length >= 2) {
+        try {
+          const media = imageUrls.map((u, i) => ({
+            type: 'photo',
+            media: u,
+            ...(i === 0 && fitsInCaption ? { caption: message, parse_mode: 'HTML' } : {}),
+          }));
+          const group = await this.bot.sendMediaGroup(chatId, media);
+          sentMsg = Array.isArray(group) ? group[0] : group;
+          if (!fitsInCaption) {
+            // Follow-up text (replied to the first media item) for the full body
+            await this.bot.sendMessage(chatId, message, {
+              parse_mode: 'HTML',
+              disable_web_page_preview: true,
+              reply_to_message_id: sentMsg?.message_id,
+            });
+          }
+        } catch (err) {
+          this.logger.warn(`sendMediaGroup failed (${err.message}) — falling back to sendPhoto`);
+          try {
+            sentMsg = await this.bot.sendPhoto(chatId, imageUrls[0], {
+              caption: fitsInCaption ? message : undefined,
+              parse_mode: 'HTML',
+            });
+            if (!fitsInCaption) {
+              await this.bot.sendMessage(chatId, message, {
+                parse_mode: 'HTML',
+                disable_web_page_preview: true,
+                reply_to_message_id: sentMsg?.message_id,
+              });
+            }
+          } catch {
+            sentMsg = await this.bot.sendMessage(chatId, message, {
+              parse_mode: 'HTML',
+              disable_web_page_preview: false,
+            });
+          }
+        }
+      } else if (imageUrls.length === 1) {
+        try {
+          sentMsg = await this.bot.sendPhoto(chatId, imageUrls[0], {
+            caption: fitsInCaption ? message : undefined,
             parse_mode: 'HTML',
           });
+          if (!fitsInCaption) {
+            await this.bot.sendMessage(chatId, message, {
+              parse_mode: 'HTML',
+              disable_web_page_preview: true,
+              reply_to_message_id: sentMsg?.message_id,
+            });
+          }
         } catch {
-          sentMsg = await this.bot.sendMessage(user.telegram_chat_id, message, {
+          sentMsg = await this.bot.sendMessage(chatId, message, {
             parse_mode: 'HTML',
             disable_web_page_preview: false,
           });
         }
       } else {
-        sentMsg = await this.bot.sendMessage(user.telegram_chat_id, message, {
+        sentMsg = await this.bot.sendMessage(chatId, message, {
           parse_mode: 'HTML',
           disable_web_page_preview: false,
         });
@@ -978,6 +1108,237 @@ class TelegramNotifier {
 
     const weight = weights[planName] ?? 1;
     return { weight, planName };
+  }
+
+  // ── Telegram profile photos (used by dashboard avatar) ───────────────────
+
+  /**
+   * Fetch the user's latest Telegram profile photo and persist its file_id.
+   * Silent on error — avatars are cosmetic and must never break login.
+   *
+   * @param {string|number} chatId   Telegram chat id / user id
+   * @param {number}        userId   internal users.id (for UPDATE)
+   * @param {object} [opts]
+   * @param {boolean} [opts.force=false]  skip freshness check, always refresh
+   * @returns {Promise<boolean>}  true if we stored a new avatar
+   */
+  async refreshUserAvatar(chatId, userId, opts = {}) {
+    if (!this.bot || !userId) {
+      this.logger?.debug?.(`[Avatar] skip refresh: bot=${!!this.bot} userId=${userId}`);
+      return false;
+    }
+    try {
+      // Always read the previously-stored unique_id so we can clean up stale
+      // disk cache on change / removal.
+      const prevRow = this.db.db.prepare(
+        `SELECT avatar_checked_at, avatar_file_id, avatar_file_unique_id FROM users WHERE id = ?`
+      ).get(userId);
+      const prevUid = prevRow?.avatar_file_unique_id || null;
+
+      // Freshness guard — refresh at most once every 6h unless forced
+      if (!opts.force && prevRow?.avatar_checked_at) {
+        const age = Date.now() - new Date(prevRow.avatar_checked_at).getTime();
+        if (age < 6 * 3_600_000) {
+          this.logger?.debug?.(`[Avatar] fresh (age=${Math.round(age/60000)}min, hasAvatar=${!!prevRow.avatar_file_id}), skip`);
+          return false;
+        }
+      }
+
+      this.logger?.info?.(`[Avatar] fetching for chat=${chatId} userId=${userId}`);
+      const res = await this.bot.getUserProfilePhotos(chatId, { limit: 1 });
+      const count = res?.total_count || 0;
+      if (!count || !res?.photos?.[0]?.length) {
+        this.logger?.info?.(`[Avatar] no photo for chat=${chatId} (total_count=${count}) — privacy or none`);
+        this.db.setUserAvatar(userId, null, null);
+        this._deleteAvatarFile(prevUid);
+        return false;
+      }
+      // Largest size is the last element in the array (sorted by resolution)
+      const sizes = res.photos[0];
+      const best  = sizes[sizes.length - 1];
+      const newUid = best.file_unique_id || null;
+
+      this.db.setUserAvatar(userId, best.file_id, newUid);
+
+      // Delete the old cached file if the unique_id actually changed
+      if (prevUid && prevUid !== newUid) {
+        this._deleteAvatarFile(prevUid);
+      }
+
+      this.logger?.info?.(`[Avatar] saved for chat=${chatId} file_id=${best.file_id?.substring(0,20)}... size=${best.width}x${best.height}${prevUid && prevUid !== newUid ? ' (replaced previous)' : ''}`);
+      return true;
+    } catch (e) {
+      this.logger?.warn?.(`[Avatar] refresh failed for chat ${chatId}: ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Remove a cached avatar JPEG from disk by its file_unique_id.
+   * Silent if the file doesn't exist. Guards against path traversal by
+   * stripping anything that isn't a safe base64url-ish character.
+   */
+  _deleteAvatarFile(fileUniqueId) {
+    if (!fileUniqueId) return;
+    const safe = String(fileUniqueId).replace(/[^A-Za-z0-9_-]/g, '');
+    if (!safe) return;
+    const file = path.join(process.cwd(), 'data', 'avatars', `${safe}.jpg`);
+    try {
+      fs.unlinkSync(file);
+      this.logger?.info?.(`[Avatar] deleted stale cache file ${safe}.jpg`);
+    } catch (e) {
+      if (e.code !== 'ENOENT') {
+        this.logger?.warn?.(`[Avatar] failed to delete ${safe}.jpg: ${e.message}`);
+      }
+    }
+  }
+
+  // ── Reddit video + audio muxing ───────────────────────────────────────────
+  // Reddit's v.redd.it serves DASH: `fallback_url` is video-only, audio is a
+  // separate MP4 segment. We mux them with ffmpeg (stream-copy, no re-encode)
+  // so alerts play with sound. If ffmpeg is missing or the video has no audio
+  // track, caller falls back to the silent URL transparently.
+
+  _redditVideoId(url) {
+    const m = /v\.redd\.it\/([a-z0-9]+)/i.exec(url || '');
+    return m ? m[1] : null;
+  }
+
+  /**
+   * Probe known Reddit DASH audio paths, return the first that responds 200.
+   * Ordered by current-to-legacy probability.
+   */
+  async _findRedditAudioUrl(videoUrl) {
+    const m = /^(https:\/\/v\.redd\.it\/[a-z0-9]+)\//i.exec(videoUrl);
+    if (!m) return null;
+    const base = m[1];
+    // Reddit switched video segments from DASH_* to CMAF_* in 2025.
+    // Audio segments followed suit; keep legacy names as fallback so older
+    // posts (still on DASH) continue to play with sound.
+    const candidates = [
+      `${base}/CMAF_AUDIO_128.mp4`,
+      `${base}/CMAF_AUDIO_64.mp4`,
+      `${base}/CMAF_audio.mp4`,
+      `${base}/DASH_AUDIO_128.mp4`,
+      `${base}/DASH_AUDIO_64.mp4`,
+      `${base}/DASH_audio.mp4`,
+      `${base}/audio`,
+    ];
+    const tried = [];
+    for (const u of candidates) {
+      try {
+        const r = await fetch(u, { method: 'HEAD' });
+        tried.push(`${u.split('/').pop()}=${r.status}`);
+        if (r.ok) return u;
+      } catch (e) {
+        tried.push(`${u.split('/').pop()}=ERR`);
+      }
+    }
+    this.logger?.warn?.(`[Video] no reddit audio found — tried [${tried.join(', ')}]`);
+    return null;
+  }
+
+  /**
+   * Mux a v.redd.it video with its audio track. Returns a local file path
+   * ready for sendVideo multipart upload, or null if anything went wrong.
+   * Results are cached under data/video-cache/<id>.mp4 and re-used.
+   */
+  async _muxRedditVideo(videoUrl) {
+    const id = this._redditVideoId(videoUrl);
+    if (!id) return null;
+
+    const cacheDir = path.join(process.cwd(), 'data', 'video-cache');
+    try { fs.mkdirSync(cacheDir, { recursive: true }); } catch {}
+    const outPath = path.join(cacheDir, `${id}.mp4`);
+
+    // Cache hit — reuse
+    if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+      return outPath;
+    }
+
+    const audioUrl = await this._findRedditAudioUrl(videoUrl);
+    if (!audioUrl) {
+      this.logger?.warn?.(`[Video] no audio track for reddit ${id} — silent fallback`);
+      return null;
+    }
+
+    return new Promise((resolve) => {
+      const args = [
+        '-y',
+        '-loglevel', 'error',
+        '-i', videoUrl,
+        '-i', audioUrl,
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        outPath,
+      ];
+      let stderr = '';
+      let proc;
+      try {
+        proc = spawn('ffmpeg', args);
+      } catch (e) {
+        this.logger?.warn?.(`[Video] ffmpeg spawn failed: ${e.message}`);
+        return resolve(null);
+      }
+      proc.stderr?.on('data', d => { stderr += d.toString(); });
+      proc.on('error', (e) => {
+        if (e.code === 'ENOENT') {
+          this.logger?.warn?.(`[Video] ffmpeg not found in PATH — install it to enable Reddit audio`);
+        } else {
+          this.logger?.warn?.(`[Video] ffmpeg error: ${e.message}`);
+        }
+        resolve(null);
+      });
+      proc.on('exit', (code) => {
+        if (code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+          this.logger?.info?.(`[Video] muxed reddit ${id} (+audio, ${Math.round(fs.statSync(outPath).size / 1024)}KB)`);
+          resolve(outPath);
+        } else {
+          this.logger?.warn?.(`[Video] ffmpeg failed (exit=${code}): ${stderr.slice(0, 200)}`);
+          try { fs.unlinkSync(outPath); } catch {}
+          resolve(null);
+        }
+      });
+    });
+  }
+
+  /**
+   * Remove cached muxed videos older than `maxAgeDays` (default 7).
+   * Safe to call on startup / cron. No-op if cache dir missing.
+   */
+  cleanupVideoCache(maxAgeDays = 7) {
+    const dir = path.join(process.cwd(), 'data', 'video-cache');
+    if (!fs.existsSync(dir)) return;
+    const cutoff = Date.now() - maxAgeDays * 86_400_000;
+    let removed = 0;
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name);
+        try {
+          if (fs.statSync(p).mtimeMs < cutoff) {
+            fs.unlinkSync(p);
+            removed++;
+          }
+        } catch {}
+      }
+      if (removed) this.logger?.info?.(`[Video] cleaned ${removed} stale video cache file(s)`);
+    } catch {}
+  }
+
+  /**
+   * Resolve a Telegram file_id to a full CDN URL.
+   * Returned links live for ~1h on Telegram's side; do not persist them.
+   */
+  async getFileUrl(fileId) {
+    if (!this.bot || !fileId) return null;
+    try {
+      const file = await this.bot.getFile(fileId);
+      if (!file?.file_path) return null;
+      return `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+    } catch (e) {
+      this.logger?.warn?.(`[Avatar] getFile failed: ${e.message}`);
+      return null;
+    }
   }
 
   // ── Utility ───────────────────────────────────────────────────────────────

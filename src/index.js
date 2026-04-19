@@ -30,6 +30,8 @@ const scorer     = new Scorer(config, logger, db);
 
 // ── Initialize Telegram Bot ─────────────────────────────────────────────────
 const telegram = new TelegramNotifier(config, logger, db); // solanaMonitor injected below
+// Prune muxed video cache on startup (files older than 7 days)
+try { telegram.cleanupVideoCache(7); } catch {}
 
 // ── Initialize Solana Pay Monitor ───────────────────────────────────────────
 const solanaMonitor = new SolanaPayMonitor(

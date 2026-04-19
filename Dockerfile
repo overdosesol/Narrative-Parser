@@ -32,6 +32,7 @@ RUN apk add --no-cache \
     sqlite-dev \
     curl \
     ca-certificates \
+    ffmpeg \
     tini
 
 # node:18-alpine already has user 'node' (uid/gid 1000) - use it directly

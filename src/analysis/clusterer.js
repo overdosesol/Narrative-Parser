@@ -94,6 +94,43 @@ class NarrativeClusterer {
       // Attach cluster context so scorer can use emergenceScore + phase
       cluster.representative.clusterMetrics = metrics;
 
+      // Aggregate image URLs across the cluster — gives alerts a mini gallery
+      // when the same narrative hits multiple platforms. Dedup, cap at 10.
+      try {
+        const gallery = [];
+        const push = (u) => {
+          if (u && !gallery.includes(u)) gallery.push(u);
+        };
+        // Representative first so caption lands under its primary image
+        const rep = cluster.representative;
+        (rep.metrics?.imageUrls || []).forEach(push);
+        push(rep.metrics?.imageUrl);
+        push(rep.metrics?.thumbnailUrl);
+        for (const item of cluster.items) {
+          if (item === rep) continue;
+          (item.metrics?.imageUrls || []).forEach(push);
+          push(item.metrics?.imageUrl);
+          push(item.metrics?.thumbnailUrl);
+          if (gallery.length >= 10) break;
+        }
+        if (gallery.length > 1) {
+          rep.metrics = rep.metrics || {};
+          rep.metrics.imageUrls = gallery.slice(0, 10);
+        }
+
+        // Video: representative wins; otherwise fall back to the first cluster
+        // item that has one. Single `videoUrl` — we don't ship multi-video alerts.
+        if (!rep.metrics?.videoUrl) {
+          for (const item of cluster.items) {
+            if (item.metrics?.videoUrl) {
+              rep.metrics = rep.metrics || {};
+              rep.metrics.videoUrl = item.metrics.videoUrl;
+              break;
+            }
+          }
+        }
+      } catch (_) { /* never break pipeline on image aggregation */ }
+
       if (decision === 'drop') {
         droppedCount++;
         this.logger.debug(

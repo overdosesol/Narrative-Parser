@@ -13,6 +13,7 @@
 
 import http from 'http';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { timingSafeEqual } from 'crypto';
 
@@ -168,6 +169,15 @@ class DashboardServer {
     if (path === '/api/auth/verify'   && method === 'POST') return this._handleAuthVerify(req, res);
     if (path === '/api/auth/status'   && method === 'GET')  return this._handleAuthStatus(req, res, url);
 
+    // Reddit video proxy — public. <video> elements can't send custom
+    // Authorization headers; and the content itself is already a public
+    // Reddit CDN stream (we just mux video+audio). Route validates the
+    // ?src= query against the v.redd.it pattern, so it can't be abused
+    // as a generic proxy.
+    if (path.match(/^\/api\/video\/reddit\/[a-z0-9]+\.mp4$/i) && method === 'GET') {
+      return this._handleRedditVideo(req, res, path);
+    }
+
     // ── Bearer-token auth ──────────────────────────────────────────────────
     // Every /api/* route below this point requires a valid session token
     // issued by the Telegram bot login flow. The token is passed as either:
@@ -194,6 +204,8 @@ class DashboardServer {
 
     // Auth routes requiring a session
     if (path === '/api/auth/me'     && method === 'GET')  return this._handleAuthMe(req, res);
+    if (path === '/api/auth/avatar' && method === 'GET')  return this._handleAuthAvatar(req, res);
+    if (path === '/api/auth/avatar/debug' && method === 'GET') return this._handleAuthAvatarDebug(req, res);
     if (path === '/api/auth/logout' && method === 'POST') return this._handleAuthLogout(req, res);
 
     // SSE stream — pushed updates from server (new scans, etc.)
@@ -276,6 +288,10 @@ class DashboardServer {
   }
 
   _handleAuthMe(req, res) {
+    // Opportunistic avatar refresh (internally rate-limited to ~6h)
+    if (this.telegram && req.user?.id && req.user?.telegram_chat_id) {
+      this.telegram.refreshUserAvatar(req.user.telegram_chat_id, req.user.id).catch(() => {});
+    }
     return json(res, 200, { user: this._publicUser(req.user) });
   }
 
@@ -289,13 +305,126 @@ class DashboardServer {
     if (!user) return null;
     return {
       chatId:     String(user.telegram_chat_id || user.chat_id || ''),
-      username:   user.username || null,
+      username:   user.username || user.telegram_username || null,
       language:   user.language || 'en',
       plan:       user.plan_name || 'free',
       status:     user.status || 'active',
       threshold:  user.alert_threshold ?? null,
       subscriptionExpiresAt: user.subscription_expires_at || null,
+      // Avatar — present iff we've successfully fetched a profile photo from TG.
+      // Cache-busting key: fileUniqueId changes when user updates their photo.
+      hasAvatar:  !!user.avatar_file_id,
+      avatarKey:  user.avatar_file_unique_id || null,
     };
+  }
+
+  // ── Avatar debug — force-refresh + dump status (for triage) ─────────────
+  async _handleAuthAvatarDebug(req, res) {
+    const user = req.user;
+    const info = {
+      userId: user?.id,
+      chatId: user?.telegram_chat_id,
+      username: user?.telegram_username,
+      hasTelegram: !!this.telegram,
+      hasBot: !!this.telegram?.bot,
+      dbColumns: {
+        avatar_file_id:        user?.avatar_file_id || null,
+        avatar_file_unique_id: user?.avatar_file_unique_id || null,
+        avatar_checked_at:     user?.avatar_checked_at || null,
+      },
+    };
+
+    if (!this.telegram || !this.telegram.bot) {
+      return json(res, 200, { ...info, error: 'Telegram bot not attached to dashboard process' });
+    }
+
+    try {
+      const ok = await this.telegram.refreshUserAvatar(user.telegram_chat_id, user.id, { force: true });
+      // Re-read row to show post-state
+      const fresh = this.db.getUserByChatId(user.telegram_chat_id);
+      return json(res, 200, {
+        ...info,
+        refreshResult: ok,
+        afterRefresh: {
+          avatar_file_id:        fresh?.avatar_file_id || null,
+          avatar_file_unique_id: fresh?.avatar_file_unique_id || null,
+          avatar_checked_at:     fresh?.avatar_checked_at || null,
+        },
+      });
+    } catch (e) {
+      return json(res, 200, { ...info, error: e.message, stack: e.stack });
+    }
+  }
+
+  // ── Avatar proxy ────────────────────────────────────────────────────────
+  // Streams the user's Telegram profile photo via a local disk cache.
+  // Cache key: avatar_file_unique_id (stable per-photo across CDN rotations).
+  async _handleAuthAvatar(req, res) {
+    const user = req.user;
+    if (!user?.avatar_file_id) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'No avatar' }));
+    }
+    if (!this.telegram) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Telegram bot not available' }));
+    }
+
+    const dir = path.join(process.cwd(), 'data', 'avatars');
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+
+    const cacheKey = (user.avatar_file_unique_id || user.avatar_file_id)
+      .replace(/[^A-Za-z0-9_-]/g, '_');
+    const cachePath = path.join(dir, cacheKey + '.jpg');
+
+    // Serve from disk cache if present
+    try {
+      const st = fs.statSync(cachePath);
+      if (st.size > 0) {
+        res.writeHead(200, {
+          'Content-Type':  'image/jpeg',
+          'Content-Length': st.size,
+          'Cache-Control': 'private, max-age=604800, immutable',
+        });
+        return fs.createReadStream(cachePath).pipe(res);
+      }
+    } catch { /* miss — fall through to fetch */ }
+
+    // Miss: resolve file path from Telegram, download, tee to cache + response
+    try {
+      const url = await this.telegram.getFileUrl(user.avatar_file_id);
+      if (!url) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'File not available' }));
+      }
+      const tgRes = await fetch(url);
+      if (!tgRes.ok || !tgRes.body) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Telegram CDN error' }));
+      }
+
+      const ct = tgRes.headers.get('content-type') || 'image/jpeg';
+      res.writeHead(200, {
+        'Content-Type':  ct,
+        'Cache-Control': 'private, max-age=604800, immutable',
+      });
+
+      // Buffer the whole body once — small files (<200 KB), lets us write to
+      // disk AND respond without fighting stream tee semantics.
+      const buf = Buffer.from(await tgRes.arrayBuffer());
+      try { fs.writeFileSync(cachePath, buf); } catch (e) {
+        this.logger.warn(`[Avatar] cache write failed: ${e.message}`);
+      }
+      res.end(buf);
+    } catch (e) {
+      this.logger.warn(`[Avatar] proxy failed: ${e.message}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Avatar fetch failed' }));
+      } else {
+        try { res.end(); } catch {}
+      }
+    }
   }
 
   // ── Handlers ────────────────────────────────────────────────────────────────
@@ -370,7 +499,7 @@ class DashboardServer {
 
     const statsUserId = String(req.user?.telegram_chat_id || '').trim() || null;
     const topTrends = this.db.db.prepare(
-      `SELECT * FROM trends WHERE first_seen_at > ? ORDER BY CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC LIMIT 5`
+      `SELECT * FROM trends WHERE first_seen_at > ? ORDER BY CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC LIMIT 10`
     ).all(cutoff).map(r => this._formatTrend(r, statsUserId));
 
     const avgScore = this.db.db.prepare(
@@ -643,6 +772,21 @@ class DashboardServer {
         if (/b\.thumbs\.redditmedia\.com/i.test(raw)) return null;
         return raw;
       })(),
+      imageUrls:       Array.isArray(metrics.imageUrls)
+        ? metrics.imageUrls.filter(u => u && !/b\.thumbs\.redditmedia\.com/i.test(u)).slice(0, 10)
+        : [],
+      videoUrl:        (() => {
+        const v = metrics.videoUrl;
+        if (!v) return null;
+        // For Reddit DASH videos, route through our muxing proxy so the
+        // browser gets an MP4 with audio (ffmpeg muxes video+audio lazily).
+        // Pass the original URL as ?src= — the resolution segment varies
+        // (DASH_720 / DASH_480 / …) and we want the proxy to fetch the
+        // exact stream Reddit indexed for this post.
+        const m = /^https:\/\/v\.redd\.it\/([a-z0-9]+)\//i.exec(v);
+        if (m) return `/api/video/reddit/${m[1]}.mp4?src=${encodeURIComponent(v)}`;
+        return v;
+      })(),
       feedback,
     };
   }
@@ -764,6 +908,81 @@ class DashboardServer {
       return json(res, 200, { imageUrl: ogImage || null });
     } catch {
       return json(res, 200, { imageUrl: null });
+    }
+  }
+
+  // ── Reddit video proxy ────────────────────────────────────────────────────
+  // Serves muxed (video+audio) Reddit MP4s out of the same ffmpeg cache used
+  // by Telegram alerts. If the file isn't cached yet, we kick off a mux pass
+  // on demand and stream the result. Supports HTTP Range so the browser can
+  // seek and start playback before the whole file is buffered.
+  async _handleRedditVideo(req, res, reqPath) {
+    try {
+      const id = reqPath.match(/\/api\/video\/reddit\/([a-z0-9]+)\.mp4$/i)?.[1];
+      if (!id) { res.writeHead(400).end('bad id'); return; }
+
+      // Pull the original v.redd.it source from ?src= so we mux the exact
+      // stream Reddit indexed (resolution segment varies per post).
+      const u = new URL(req.url, 'http://localhost');
+      const srcRaw = u.searchParams.get('src') || '';
+      const sourceUrl = /^https:\/\/v\.redd\.it\/[a-z0-9]+\//i.test(srcRaw)
+        ? srcRaw
+        : `https://v.redd.it/${id}/DASH_720.mp4`;  // best-effort fallback
+
+      const cacheDir = path.join(process.cwd(), 'data', 'video-cache');
+      const filePath = path.join(cacheDir, `${id}.mp4`);
+
+      // Cache miss — mux on demand. Telegram helper handles audio discovery
+      // and ffmpeg invocation; returns null if no audio / ffmpeg missing.
+      if (!fs.existsSync(filePath)) {
+        if (!this.telegram?._muxRedditVideo) {
+          res.writeHead(503).end('video muxer unavailable');
+          return;
+        }
+        const muxed = await this.telegram._muxRedditVideo(sourceUrl);
+        if (!muxed || !fs.existsSync(filePath)) {
+          // No audio track or mux failed — 302 to the silent original so
+          // the <video> tag still plays something.
+          res.writeHead(302, { Location: sourceUrl });
+          res.end();
+          return;
+        }
+      }
+
+      // Range-aware streaming — browsers send Range for video seeking.
+      const stat = fs.statSync(filePath);
+      const total = stat.size;
+      const range = req.headers.range;
+
+      // Common headers — allow caching (content is immutable per id)
+      const baseHeaders = {
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'public, max-age=86400, immutable',
+      };
+
+      if (!range) {
+        res.writeHead(200, { ...baseHeaders, 'Content-Length': total });
+        fs.createReadStream(filePath).pipe(res);
+        return;
+      }
+
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      const start = m && m[1] ? parseInt(m[1], 10) : 0;
+      const end   = m && m[2] ? parseInt(m[2], 10) : total - 1;
+      if (isNaN(start) || isNaN(end) || start > end || end >= total) {
+        res.writeHead(416, { 'Content-Range': `bytes */${total}` }).end();
+        return;
+      }
+      res.writeHead(206, {
+        ...baseHeaders,
+        'Content-Range':  `bytes ${start}-${end}/${total}`,
+        'Content-Length': end - start + 1,
+      });
+      fs.createReadStream(filePath, { start, end }).pipe(res);
+    } catch (err) {
+      this.logger?.warn?.(`[Video] proxy error: ${err.message}`);
+      try { res.writeHead(500).end('video proxy error'); } catch {}
     }
   }
 
@@ -1045,6 +1264,31 @@ class DashboardServer {
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.18); }
 
+    /* Main feed scrollbar — fat and clearly visible so it's easy to grab
+       without fighting the adjacent column resizer handle. */
+    .main-feed::-webkit-scrollbar { width: 14px; }
+    .main-feed::-webkit-scrollbar-track {
+      background: rgba(255,255,255,.02);
+      border-left: 1px solid var(--border);
+    }
+    .main-feed::-webkit-scrollbar-thumb {
+      background: rgba(var(--accent-rgb), .35);
+      border: 3px solid transparent;
+      background-clip: padding-box;
+      border-radius: 10px;
+      min-height: 40px;
+    }
+    .main-feed::-webkit-scrollbar-thumb:hover {
+      background: rgba(var(--accent-rgb), .6);
+      background-clip: padding-box;
+    }
+    .main-feed::-webkit-scrollbar-thumb:active {
+      background: rgba(var(--accent-rgb), .85);
+      background-clip: padding-box;
+    }
+    /* Firefox */
+    .main-feed { scrollbar-width: auto; scrollbar-color: rgba(var(--accent-rgb), .45) transparent; }
+
     /* ── Animations ── */
     @keyframes pulse    { 0%,100%{opacity:1} 50%{opacity:.2} }
     @keyframes spin     { to { transform: rotate(360deg); } }
@@ -1132,6 +1376,10 @@ class DashboardServer {
       border: 1px solid rgba(var(--accent-rgb), .35);
       color: var(--text); font-size: 11px; font-weight: 800;
       letter-spacing: 0; margin: -2px 0;
+      overflow: hidden;
+    }
+    .nav-account-avatar img {
+      width: 100%; height: 100%; object-fit: cover; display: block;
     }
     .nav-account-name {
       max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1729,13 +1977,24 @@ class DashboardServer {
     .table-title { font-size: 13px; font-weight: 700; color: var(--text); }
     .table-count { font-size: 10px; color: var(--dim); font-family: 'JetBrains Mono', monospace; font-weight: 500; }
 
-    /* ── Pagination ── */
-    .pagination {
-      display: flex; gap: 7px; align-items: center;
-      justify-content: center; padding: 12px;
-      border-top: 1px solid var(--border);
+    /* ── Infinite-scroll sentinel ── */
+    .feed-sentinel {
+      display: flex; align-items: center; justify-content: center;
+      min-height: 56px; padding: 14px 12px 22px;
+      color: var(--dim);
     }
-    .page-info { font-size: 11px; color: var(--dim); font-family: 'JetBrains Mono', monospace; }
+    .feed-sentinel-end { opacity: 0.6; }
+    .feed-sentinel-hint {
+      font-size: 11px; font-family: 'JetBrains Mono', monospace;
+      letter-spacing: 0.1em; opacity: .55;
+    }
+    .feed-loading-more {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 12px; color: var(--dim); font-weight: 500;
+    }
+    .loading-spinner.small {
+      width: 14px; height: 14px; border-width: 2px;
+    }
 
     /* ── Loading / Empty ── */
     .loading-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; gap: 14px; }
@@ -1773,6 +2032,10 @@ class DashboardServer {
       background: linear-gradient(135deg, rgba(var(--accent-rgb), .4), rgba(var(--accent-rgb), .12));
       border: 2px solid rgba(var(--accent-rgb), .5);
       box-shadow: 0 4px 16px rgba(var(--accent-rgb), .25), inset 0 1px 0 rgba(255,255,255,.1);
+      overflow: hidden;
+    }
+    .account-avatar-big img {
+      width: 100%; height: 100%; object-fit: cover; display: block;
     }
     .account-hero-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
     .account-hero-name {
@@ -2216,6 +2479,9 @@ class DashboardServer {
       content: '';
       position: absolute; top: 0; bottom: 0; left: -3px; right: -3px;
     }
+    /* Right-side resizer must NOT eat into the main-feed scrollbar — extend
+       the grab area only toward the panel side. */
+    .col-resizer-right::after { left: 0; right: -5px; }
     .col-resizer:hover { background: rgba(var(--accent-rgb), .08); }
     .col-resizer:hover::before {
       background: var(--accent);
@@ -2519,6 +2785,16 @@ class DashboardServer {
     /* Compact density — tighter frame */
     body.prefs-compact .feed-image-wrap,
     body.prefs-compact .feed-image { max-height: 280px; }
+    /* Inline video player — matches .feed-image geometry */
+    .feed-video-wrap { background: #000; }
+    .feed-video {
+      width: 100%;
+      height: auto;
+      max-height: 380px;
+      display: block;
+      outline: none;
+    }
+    body.prefs-compact .feed-video { max-height: 280px; }
     .feed-image-placeholder {
       height: 140px; width: 100%;
       display: flex; align-items: center; justify-content: center;
@@ -3109,10 +3385,7 @@ const I18N = {
     'settings.col_right_desc': 'Insights / stats panel width. Currently {px}px.',
 
     'settings.behavior': '🔄 Behavior',
-    'settings.behavior_desc': 'Auto-refresh and source visibility in the feed.',
-    'settings.autorefresh': 'Auto-refresh',
-    'settings.autorefresh_off': 'Off — refresh manually with R.',
-    'settings.autorefresh_on': 'Every {s} seconds.',
+    'settings.behavior_desc': 'Source visibility in the feed. New data arrives live — no auto-refresh timer needed.',
     'settings.hidden': 'Hidden sources',
     'settings.hidden_count': '{n} hidden. Visual filter in this browser only.',
     'settings.hidden_none': 'Nothing hidden — click sources in the sidebar to hide them.',
@@ -3363,10 +3636,7 @@ const I18N = {
     'settings.col_right_desc': 'Панель инсайтов и статистики. Сейчас {px}px.',
 
     'settings.behavior': '🔄 Поведение',
-    'settings.behavior_desc': 'Автообновление и видимость источников в фиде.',
-    'settings.autorefresh': 'Автообновление',
-    'settings.autorefresh_off': 'Выключено — обновляй вручную клавишей R.',
-    'settings.autorefresh_on': 'Каждые {s} секунд.',
+    'settings.behavior_desc': 'Видимость источников в фиде. Новые данные приходят в реальном времени — таймер автообновления не нужен.',
     'settings.hidden': 'Скрытые источники',
     'settings.hidden_count': 'Сейчас скрыто: {n}. Это только визуальная фильтрация в твоём браузере.',
     'settings.hidden_none': 'Ничего не скрыто — можешь скрывать источники кликом в сайдбаре.',
@@ -3638,12 +3908,39 @@ function ImageThumb({ trend, size = 80 }) {
   );
 }
 
-// ── FeedImage — inline image for feed cards (lazy-fetch with placeholder) ────
+// ── Persist <video> volume/mute across all players via localStorage ─────────
+// Pass this function as the ref prop of a video element. On mount we apply
+// the stored volume/muted, and on every volumechange we write back, so the
+// next video the user opens starts at the same level.
+const VIDEO_VOLUME_KEY = 'catalyst_video_volume';
+const VIDEO_MUTED_KEY  = 'catalyst_video_muted';
+function videoVolumeRef(el) {
+  if (!el || el.__volumeHooked) return;
+  el.__volumeHooked = true;
+  try {
+    const v = parseFloat(localStorage.getItem(VIDEO_VOLUME_KEY));
+    if (!isNaN(v) && v >= 0 && v <= 1) el.volume = v;
+    const m = localStorage.getItem(VIDEO_MUTED_KEY);
+    if (m === '1') el.muted = true;
+  } catch {}
+  el.addEventListener('volumechange', () => {
+    try {
+      localStorage.setItem(VIDEO_VOLUME_KEY, String(el.volume));
+      localStorage.setItem(VIDEO_MUTED_KEY,  el.muted ? '1' : '0');
+    } catch {}
+  });
+}
+
+// ── FeedImage — inline image / video for feed cards ──────────────────────────
+// When the trend has a videoUrl we render an HTML5 <video> player with the
+// image as its poster (so the card still looks the same until the user clicks
+// play). Click/drag on the player doesn't bubble up to the card's onClick —
+// otherwise pressing play would open the trend modal.
 function FeedImage({ trend }) {
   const [imgUrl, setImgUrl] = useState(trend.imageUrl || null);
   const [tried,  setTried]  = useState(!!trend.imageUrl);
   const [failed, setFailed] = useState(false);
-  const srcIco = SOURCE_ICONS[trend.source] || '📡';
+  const [videoFailed, setVideoFailed] = useState(false);
 
   useEffect(() => {
     if (!tried && !imgUrl && trend.url) {
@@ -3655,15 +3952,35 @@ function FeedImage({ trend }) {
     }
   }, [trend.url]);
 
-  if (failed || (!imgUrl && tried)) return null;
-  if (!imgUrl) return null;
+  const hasVideo = !!trend.videoUrl && !videoFailed;
 
-  return h('div', { className: 'feed-image-wrap' },
-    h('img', {
-      className: 'feed-image',
-      src: imgUrl, alt: '',
-      onError: () => { setImgUrl(null); setFailed(true); },
-      loading: 'lazy',
+  if (!hasVideo) {
+    if (failed || (!imgUrl && tried)) return null;
+    if (!imgUrl) return null;
+    return h('div', { className: 'feed-image-wrap' },
+      h('img', {
+        className: 'feed-image',
+        src: imgUrl, alt: '',
+        onError: () => { setImgUrl(null); setFailed(true); },
+        loading: 'lazy',
+      })
+    );
+  }
+
+  // Video branch — inline player with image as poster
+  return h('div', {
+      className: 'feed-image-wrap feed-video-wrap',
+      onClick: e => e.stopPropagation(),  // don't open modal when scrubbing
+    },
+    h('video', {
+      ref: videoVolumeRef,
+      className: 'feed-image feed-video',
+      src: trend.videoUrl,
+      poster: imgUrl || undefined,
+      controls: true,
+      preload: 'none',
+      playsInline: true,
+      onError: () => setVideoFailed(true),  // fall back to still image
     })
   );
 }
@@ -3745,7 +4062,7 @@ function FeedbackBar({ trend, variant }) {
   );
 }
 
-function FeedCard({ trend, onOpen, onCopy }) {
+function FeedCard({ trend, onOpen }) {
   useLang();
   const catCls = CAT_CLS[trend.category] || 'cat-other';
   const catIco = CAT_ICONS[trend.category] || '📌';
@@ -3849,11 +4166,6 @@ function FeedCard({ trend, onOpen, onCopy }) {
         href: trend.tgMessageUrl, target: '_blank', rel: 'noopener',
         onClick: e => e.stopPropagation()
       }, '📨 TG') : null,
-      h('button', {
-        className: 'feed-action-btn',
-        onClick: e => { e.stopPropagation(); onCopy && onCopy(trend.title); },
-        title: t('feed.copy_title')
-      }, '📋'),
       h(FeedbackBar, { trend }),
       metaParts.length
         ? h('span', { className: 'feed-action-btn details-hint', style: { cursor: 'default' } }, metaParts.join(' · '))
@@ -3866,11 +4178,11 @@ function FeedCard({ trend, onOpen, onCopy }) {
 const TrendCard = FeedCard;
 
 // ── RightPanel — AIO Feeds-style column with Top narratives / Pulse / Activity ─
-function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOpenTrend, onToggleSource }) {
+function RightPanel({ stats, hours, onOpenTrend }) {
   useLang();
   // Top narratives from server-side stats (real top by adoption for the full window)
   // stats.topTrends is populated by /api/stats — same data as /top in TG bot
-  const topTrends = (stats && stats.topTrends ? stats.topTrends : []).slice(0, 5);
+  const topTrends = (stats && stats.topTrends ? stats.topTrends : []).slice(0, 10);
 
   const topCategories = (stats && stats.byCategory ? stats.byCategory : []).slice(0, 5);
   const maxCatCount = topCategories.length ? Math.max(...topCategories.map(c => c.count)) : 1;
@@ -3878,8 +4190,6 @@ function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOp
   const totalSignals = stats ? stats.total || 0 : 0;
   const totalAlerts  = stats ? stats.alerts || 0 : 0;
   const avgScore     = stats ? stats.avgScore || 0 : 0;
-  const hidden = hiddenSources || new Set();
-  const activeSources = (sources || []).filter(s => !hidden.has(s.source)).length;
 
   return h('div', { className: 'right-panel-sticky' },
    h('div', { className: 'right-panel' },  // inner scroll container via right-panel-inner wrapper below
@@ -3912,33 +4222,6 @@ function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOp
               h('div', { className: 'empty-feed-icon' }, '📭'),
               h('div', { className: 'empty-feed-text' }, t('right.no_signals'))
             )
-      )
-    ),
-
-    h('div', { className: 'right-sep' }),
-
-    // ── Source Pulse ──
-    h('div', { className: 'right-section' },
-      h('div', { className: 'right-section-head' },
-        h('span', { className: 'right-section-title' }, t('right.source_pulse')),
-        h('span', { className: 'right-section-count' }, t('right.live_count', { a: activeSources, t: (sources || []).length }))
-      ),
-      h('div', { className: 'right-section-body' },
-        (allSourceStats || []).map(row => {
-          const visible = !hidden.has(row.source);
-          const cnt = row.count || 0;
-          return h('div', {
-            key: row.source,
-            'data-src': row.source,
-            className: 'pulse-row' + (visible ? '' : ' off'),
-            onClick: () => onToggleSource && onToggleSource(row.source),
-            title: visible ? t('tooltip.hide_source') : t('tooltip.show_source')
-          },
-            h('span', { className: 'pulse-icon' }, SOURCE_ICONS[row.source] || '📡'),
-            h('span', { className: 'pulse-name' }, SOURCE_LABELS[row.source] || row.source),
-            h('span', { className: 'pulse-count' + (cnt >= 50 ? ' hot' : '') }, cnt)
-          );
-        })
       )
     ),
 
@@ -4023,12 +4306,23 @@ function TrendModal({ trend, onClose }) {
       // Body
       h('div', { className: 'modal-body' },
 
-        // Image
+        // Media — video with image poster if available, otherwise just image
         imgLoading
           ? h('div', { className: 'modal-image-loading' })
-          : imgUrl
-            ? h('img', { className: 'modal-image', src: imgUrl, alt: '', onError: () => setImgUrl(null), loading: 'lazy' })
-            : null,
+          : trend.videoUrl
+            ? h('video', {
+                ref: videoVolumeRef,
+                className: 'modal-image',
+                style: { height: 'auto', maxHeight: 420, objectFit: 'contain', background: '#000' },
+                src: trend.videoUrl,
+                poster: imgUrl || undefined,
+                controls: true,
+                preload: 'metadata',
+                playsInline: true,
+              })
+            : imgUrl
+              ? h('img', { className: 'modal-image', src: imgUrl, alt: '', onError: () => setImgUrl(null), loading: 'lazy' })
+              : null,
 
         // Title
         h('div', { className: 'modal-title' }, trend.title),
@@ -4379,7 +4673,6 @@ const DEFAULT_PREFS = {
   density:       'comfortable', // 'compact' | 'comfortable'
   showImages:    true,
   animations:    true,
-  refreshSec:    90,   // 0 = off
   fontSize:      14,   // 12..16
   colLeft:       240,  // left sidebar width in px (180..360)
   colRight:      300,  // right panel width in px (240..420)
@@ -4628,21 +4921,6 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
       h('div', { className: 'settings-card-title' }, t('settings.behavior')),
       h('div', { className: 'settings-card-desc' }, t('settings.behavior_desc')),
       h(Row, {
-        icon: '⏱', title: t('settings.autorefresh'),
-        desc: prefs.refreshSec === 0
-          ? t('settings.autorefresh_off')
-          : t('settings.autorefresh_on', { s: prefs.refreshSec }),
-        control: h('div', { className: 'seg-group seg-compact' },
-          [{ v: 0, l: 'Off' }, { v: 30, l: '30s' }, { v: 60, l: '1m' }, { v: 90, l: '90s' }, { v: 300, l: '5m' }].map(o =>
-            h('button', {
-              key: o.v,
-              className: 'seg-btn' + (prefs.refreshSec === o.v ? ' active' : ''),
-              onClick: () => update({ refreshSec: o.v })
-            }, o.l)
-          )
-        )
-      }),
-      h(Row, {
         icon: '👁', title: t('settings.hidden'),
         desc: hiddenSourcesCount
           ? t('settings.hidden_count', { n: hiddenSourcesCount })
@@ -4677,6 +4955,9 @@ function AccountPanel({ onBack, user, onLogout }) {
   const avatarLetter = (user && user.username)
     ? user.username.charAt(0).toUpperCase()
     : '👤';
+  const avatarSrc = user?.hasAvatar
+    ? '/api/auth/avatar?token=' + encodeURIComponent(AUTH_TOKEN) + '&k=' + encodeURIComponent(user.avatarKey || '')
+    : null;
 
   const subExpiry = user?.subscriptionExpiresAt
     ? new Date(user.subscriptionExpiresAt).toLocaleDateString(localeTag(), { day: '2-digit', month: 'short', year: 'numeric' })
@@ -4690,7 +4971,11 @@ function AccountPanel({ onBack, user, onLogout }) {
 
     // Profile hero
     h('div', { className: 'settings-card account-hero' },
-      h('div', { className: 'account-avatar-big' }, avatarLetter),
+      h('div', { className: 'account-avatar-big' },
+        avatarSrc
+          ? h('img', { src: avatarSrc, alt: user?.username || 'avatar', onError: (e) => { e.target.style.display = 'none'; } })
+          : avatarLetter
+      ),
       h('div', { className: 'account-hero-main' },
         h('div', { className: 'account-hero-name' },
           user?.username ? '@' + user.username : t('settings.tg_chatid', { id: user?.chatId || '—' })
@@ -5037,11 +5322,14 @@ function App() {
   // Refresh pulse — stays on for at least MIN_PULSE_MS so the animation is visible
   // even when fetchData resolves in <200ms.
   const [refreshPulse, setRefreshPulse] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [hiddenSources, setHiddenSources] = useState(() => {
     try { return new Set(JSON.parse(localStorage.getItem('ts_hidden_sources') || '[]')); }
     catch (e) { return new Set(); }
   });
   const toastId = useRef(0);
+  const sentinelRef = useRef(null);
+  const mainFeedRef = useRef(null);
   const LIMIT = 25;
 
   // addToast helper — auto-dismiss after 4s
@@ -5055,7 +5343,11 @@ function App() {
     const started = Date.now();
     const MIN_PULSE_MS = 650; // minimum duration the refresh indicator stays visible
     setRefreshAt(Date.now() + 90000);
-    setLoading(true); setRefreshPulse(true); setError('');
+    // Offset > 0 means the user scrolled — append next page, don't replace.
+    const shouldAppend = offset > 0;
+    if (shouldAppend) setLoadingMore(true);
+    else { setLoading(true); setRefreshPulse(true); }
+    setError('');
     try {
       const q = '?hours=' + hours + '&limit=' + LIMIT + '&offset=' + offset +
         '&sort=' + sort +
@@ -5070,11 +5362,54 @@ function App() {
         api('/sources'),
       ]);
       setStats(st);
-      setTrends(tr.trends || []);
       setTotal(tr.total  || 0);
+      if (shouldAppend) {
+        const incoming = tr.trends || [];
+        setTrends(prev => {
+          // Dedupe by id in case page boundary shifted due to new inserts
+          const have = new Set(prev.map(x => x.id));
+          return [...prev, ...incoming.filter(x => !have.has(x.id))];
+        });
+      } else {
+        setTrends(tr.trends || []);
+      }
       setSources(sr.sources || []);
     } catch (ex) { setError(t('toast.error_prefix', { e: ex.message })); }
-    setLoading(false);
+    if (shouldAppend) setLoadingMore(false);
+    else setLoading(false);
+    const elapsed = Date.now() - started;
+    const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
+    setTimeout(() => setRefreshPulse(false), remaining);
+  }, [hours, category, source, phase, minMeme, offset, sort]);
+
+  // Full refresh for SSE 'refresh' events and the manual refresh button.
+  // Refetches from the top with a big enough limit to cover every page the
+  // user has already scrolled through, then replaces the list. Keeps scroll
+  // position since React reuses nodes by stable id key.
+  const refreshAll = useCallback(async () => {
+    const started = Date.now();
+    const MIN_PULSE_MS = 650;
+    setRefreshAt(Date.now() + 90000);
+    setRefreshPulse(true);
+    setError('');
+    try {
+      const fetchLimit = Math.max(LIMIT, offset + LIMIT);
+      const q = '?hours=' + hours + '&limit=' + fetchLimit + '&offset=0' +
+        '&sort=' + sort +
+        (category ? '&category=' + category : '') +
+        (source   ? '&source='   + source   : '') +
+        (phase    ? '&phase='    + phase    : '') +
+        (minMeme > 0 ? '&minMeme=' + minMeme : '');
+      const [st, tr, sr] = await Promise.all([
+        api('/stats?hours=' + hours),
+        api('/trends' + q),
+        api('/sources'),
+      ]);
+      setStats(st);
+      setTotal(tr.total || 0);
+      setTrends(tr.trends || []);
+      setSources(sr.sources || []);
+    } catch (ex) { setError(t('toast.error_prefix', { e: ex.message })); }
     const elapsed = Date.now() - started;
     const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
     setTimeout(() => setRefreshPulse(false), remaining);
@@ -5096,21 +5431,14 @@ function App() {
   const handleLogout   = useCallback(() => { setAuthToken(''); setMe(false); }, []);
 
   // Only fetch trends/stats/sources after we have a valid session.
+  // Fresh data arrives via SSE ('refresh' event from the scanner) — no polling.
   useEffect(() => { if (me && me !== true) fetchData(); }, [fetchData, me]);
-  // Auto-refresh interval driven by user preference (0 = off)
-  const [refreshSec, setRefreshSec] = useState(() => {
-    try { return (loadPrefs().refreshSec | 0); } catch (e) { return 90; }
-  });
-  useEffect(() => {
-    const onPrefs = (ev) => { if (ev && ev.detail) setRefreshSec(ev.detail.refreshSec | 0); };
-    window.addEventListener('ts:prefs', onPrefs);
-    return () => window.removeEventListener('ts:prefs', onPrefs);
-  }, []);
-  useEffect(() => {
-    if (!refreshSec) return;
-    const t = setInterval(fetchData, refreshSec * 1000);
-    return () => clearInterval(t);
-  }, [fetchData, refreshSec]);
+
+  // Keep a ref to the latest refreshAll so the SSE effect below doesn't need
+  // to reconnect every time a filter / offset changes (refreshAll's identity
+  // changes on every state transition).
+  const refreshAllRef = useRef(refreshAll);
+  useEffect(() => { refreshAllRef.current = refreshAll; }, [refreshAll]);
 
   // ── Live stream (Server-Sent Events) — push-based real-time refresh ─────────
   useEffect(() => {
@@ -5122,7 +5450,10 @@ function App() {
 
     const scheduleRefresh = (delay = 600) => {
       if (refreshTimer) clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(() => { refreshTimer = null; fetchData(); }, delay);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        refreshAllRef.current?.();
+      }, delay);
     };
 
     const connect = () => {
@@ -5156,7 +5487,31 @@ function App() {
       if (refreshTimer) clearTimeout(refreshTimer);
       if (es) { try { es.close(); } catch (e) {} }
     };
-  }, [fetchData]);
+  }, []);
+
+  // ── Infinite scroll ────────────────────────────────────────────────────────
+  // Auto-load the next page when the sentinel div enters the main feed's
+  // scroll viewport. Disabled while searching (search filters loaded data).
+  useEffect(() => {
+    const node = sentinelRef.current;
+    if (!node) return;
+    if (search.trim()) return;            // no auto-load during active search
+    if (loading || loadingMore) return;   // don't stack requests
+    if (trends.length === 0) return;      // nothing to page from yet
+    if (trends.length >= total) return;   // loaded everything
+
+    const io = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        setOffset(o => o + LIMIT);
+      }
+    }, {
+      root: mainFeedRef.current || null,  // use main-feed as scroll root
+      rootMargin: '300px',                // pre-load before user hits bottom
+      threshold: 0,
+    });
+    io.observe(node);
+    return () => io.disconnect();
+  }, [search, loading, loadingMore, trends.length, total]);
   useEffect(() => {
     const handleNavigate = (event) => {
       const nextView = event && event.detail ? event.detail.view : null;
@@ -5177,11 +5532,11 @@ function App() {
         if (view !== 'trends') { setView('trends'); return; }
         return;
       }
-      if (e.key === 'r' || e.key === 'R') { fetchData(); addToast(t('toast.refreshing'), 'info'); return; }
+      if (e.key === 'r' || e.key === 'R') { refreshAll(); addToast(t('toast.refreshing'), 'info'); return; }
     };
     window.addEventListener('keydown', fn);
     return () => window.removeEventListener('keydown', fn);
-  }, [fetchData, addToast, modalTrend, view]);
+  }, [refreshAll, addToast, modalTrend, view]);
 
   // Visual-only source filter. Does NOT touch the collectors —
   // real enable/disable lives in the admin panel. This only hides
@@ -5208,21 +5563,6 @@ function App() {
     setHours(24); setMinMeme(0); setCategory(''); setSource(''); setSort('rank'); setOffset(0);
     addToast(t('toast.filters_reset'), 'info');
   };
-
-  const copyToClipboard = useCallback((text) => {
-    navigator.clipboard.writeText(text).then(
-      () => addToast(t('toast.copied'), 'success'),
-      () => addToast(t('toast.copy_failed'), 'error')
-    );
-  }, [addToast]);
-
-  const pages = Math.ceil(total / LIMIT);
-  const page  = Math.floor(offset / LIMIT);
-  const fixedSourceOrder = ['reddit', 'google_trends', 'twitter', 'tiktok'];
-  const allSourceStats = fixedSourceOrder.map(name => {
-    const hit = (stats?.bySource || []).find(s => s.source === name);
-    return { source: name, count: hit ? hit.count : 0 };
-  });
 
   // Client-side search filter (doesn't reset pagination) + visual source filter
   const searchFiltered = search.trim()
@@ -5271,9 +5611,15 @@ function App() {
             : t('nav.account'),
         },
           h('span', { className: 'nav-account-avatar' },
-            (me && me !== true && me.username)
-              ? me.username.charAt(0).toUpperCase()
-              : '👤'
+            (me && me !== true && me.hasAvatar)
+              ? h('img', {
+                  src: '/api/auth/avatar?token=' + encodeURIComponent(AUTH_TOKEN) + '&k=' + encodeURIComponent(me.avatarKey || ''),
+                  alt: me.username || 'avatar',
+                  onError: (e) => { e.target.style.display = 'none'; },
+                })
+              : (me && me !== true && me.username)
+                ? me.username.charAt(0).toUpperCase()
+                : '👤'
           ),
           h('span', { className: 'nav-account-name' },
             (me && me !== true && me.username)
@@ -5442,7 +5788,7 @@ function App() {
           h(ColumnResizer, { side: 'left' }),
 
           // ── Main feed ──
-          h('main', { className: 'main-feed' },
+          h('main', { className: 'main-feed', ref: mainFeedRef },
             error ? h('div', { className: 'error-bar', style: { marginBottom: 12 } }, '⚠️ ', error) : null,
 
             h('div', { className: 'feed-panel' + (refreshPulse && trends.length > 0 ? ' is-refreshing' : '') },
@@ -5480,7 +5826,7 @@ function App() {
                     ),
                     h('button', {
                       className: 'btn btn-ghost' + (refreshPulse ? ' is-spinning' : ''),
-                      onClick: () => { if (!loading) { fetchData(); addToast(t('toast.refreshing'), 'info'); } },
+                      onClick: () => { if (!loading) { refreshAll(); addToast(t('toast.refreshing'), 'info'); } },
                       disabled: loading,
                       style: { fontSize: 11, padding: '6px 10px' },
                       title: t('feed.refresh_tip')
@@ -5509,15 +5855,27 @@ function App() {
                       h('div', { className: 'empty-feed-sub' }, t('feed.empty.hint'))
                     )
                   : h('div', { className: 'feed-list' + (refreshPulse ? ' is-refreshing' : '') },
-                      visibleTrends.map(t => h(FeedCard, { key: t.id, trend: t, onOpen: setModalTrend, onCopy: copyToClipboard }))
+                      visibleTrends.map(t => h(FeedCard, { key: t.id, trend: t, onOpen: setModalTrend }))
                     ),
 
-              // Pagination
-              !search.trim() && pages > 1 ? h('div', { className: 'pagination', style: { padding: '10px 14px 14px' } },
-                h('button', { className: 'btn btn-ghost', onClick: () => setOffset(Math.max(0, offset - LIMIT)), disabled: page === 0 }, t('pagination.prev')),
-                h('span', { className: 'page-info' }, (page + 1) + ' / ' + pages),
-                h('button', { className: 'btn btn-ghost', onClick: () => setOffset(offset + LIMIT), disabled: page >= pages - 1 }, t('pagination.next'))
-              ) : null
+              // Infinite-scroll sentinel + "loading more" spinner.
+              // Sentinel is observed by IntersectionObserver which bumps offset
+              // when it scrolls into view. Hidden during search / once all
+              // loaded. Keeps a small bottom pad so it's actually reachable.
+              !search.trim() && trends.length > 0 && trends.length < total
+                ? h('div', { ref: sentinelRef, className: 'feed-sentinel' },
+                    loadingMore
+                      ? h('div', { className: 'feed-loading-more' },
+                          h('div', { className: 'loading-spinner small' }),
+                          h('span', null, t('feed.loading'))
+                        )
+                      : h('span', { className: 'feed-sentinel-hint' }, '↓')
+                  )
+                : (!search.trim() && trends.length > 0 && trends.length >= total
+                    ? h('div', { className: 'feed-sentinel feed-sentinel-end' },
+                        h('span', { className: 'feed-sentinel-hint' }, '— ' + t('feed.panel.count_signals', { n: total }) + ' —')
+                      )
+                    : null)
             )
           ),
 
@@ -5527,12 +5885,8 @@ function App() {
           // ── Right panel ──
           h(RightPanel, {
             stats,
-            sources,
-            allSourceStats,
             hours,
-            hiddenSources,
             onOpenTrend: setModalTrend,
-            onToggleSource: toggle,
           })
     ),
 

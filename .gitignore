@@ -3,6 +3,7 @@ node_modules/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/avatars/
 logs/
 
 # Claude Code worktrees (temporary isolated copies, not for version control)
