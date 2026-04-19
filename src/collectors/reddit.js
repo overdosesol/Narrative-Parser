@@ -168,6 +168,49 @@ class RedditCollector extends BaseCollector {
       .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'");
   }
 
+  /**
+   * Pick the best available image URL from a Reddit post.
+   * Priority:
+   *   1. Direct image post (.jpg/.png/.gif/.webp)
+   *   2. Video/GIF preview thumbnail at source resolution
+   *   3. Reddit preview at source resolution (full-quality)
+   *   4. First image from a gallery (source resolution)
+   *   5. Low-res thumbnail (last resort — 140×140, what was used before the fix)
+   *
+   * NB: reddit JSON is fetched with ?raw_json=1 so URLs are NOT HTML-escaped.
+   */
+  _bestImage(post) {
+    if (!post) return null;
+
+    // 1. Direct image link (i.redd.it, i.imgur.com, etc.)
+    const directUrl = post.url_overridden_by_dest || post.url;
+    if (directUrl && /\.(jpe?g|png|gif|webp)(\?|$)/i.test(directUrl)) {
+      return directUrl;
+    }
+
+    // 2. Preview source (full-quality preview that Reddit itself generates)
+    const previewSrc = post.preview?.images?.[0]?.source?.url;
+    if (previewSrc) return previewSrc;
+
+    // 3. Video/GIF post — preview.reddit_video_preview or media.oembed.thumbnail
+    const videoPreview = post.preview?.reddit_video_preview?.fallback_url;
+    if (videoPreview) return videoPreview;
+    const oembedThumb = post.media?.oembed?.thumbnail_url;
+    if (oembedThumb) return oembedThumb;
+
+    // 4. Galleries — first item's source URL
+    if (post.is_gallery && post.media_metadata) {
+      const firstId = post.gallery_data?.items?.[0]?.media_id;
+      const item = firstId && post.media_metadata[firstId];
+      const srcUrl = item?.s?.u || item?.s?.gif;
+      if (srcUrl) return srcUrl;
+    }
+
+    // 5. Low-res thumbnail fallback
+    if (post.thumbnail?.startsWith('http')) return post.thumbnail;
+    return null;
+  }
+
   _normalize(post, requestedSub) {
     if (!post || !post.title) return null;
 
@@ -213,7 +256,7 @@ class RedditCollector extends BaseCollector {
         engagement,
         subreddit:   sub,
         flair:       post.link_flair_text || '',
-        imageUrl:    post.thumbnail?.startsWith('http') ? post.thumbnail : null,
+        imageUrl:    this._bestImage(post),
         // For scorer compatibility
         score,
       },

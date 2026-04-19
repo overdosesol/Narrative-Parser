@@ -69,6 +69,25 @@ function json(res, status, data) {
   res.end(payload);
 }
 
+/**
+ * Normalize pbs.twimg.com URLs to the original-resolution variant.
+ * Twitter serves multiple sizes via ?name=small|medium|large|orig; we want the
+ * largest. No-op for non-twimg URLs.
+ */
+function upgradeTwimgUrl(u) {
+  if (!u || !/pbs\.twimg\.com\//.test(u)) return u;
+  try {
+    const url = new URL(u);
+    url.searchParams.set('name', 'orig');
+    // Some responses omit the format param — twimg requires it alongside name=
+    if (!url.searchParams.get('format')) {
+      const ext = url.pathname.match(/\.(jpe?g|png|webp)$/i)?.[1] || 'jpg';
+      url.searchParams.set('format', ext.toLowerCase().replace('jpeg', 'jpg'));
+    }
+    return url.toString();
+  } catch { return u; }
+}
+
 function html(res, content) {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(content);
@@ -616,7 +635,14 @@ class DashboardServer {
       firstSeen:       row.first_seen_at,
       lastSeen:        row.last_seen_at,
       timesSeen:       row.times_seen,
-      imageUrl:        metrics.imageUrl || metrics.thumbnailUrl || metrics.thumbnail || null,
+      imageUrl:        (() => {
+        const raw = metrics.imageUrl || metrics.thumbnailUrl || metrics.thumbnail || null;
+        if (!raw) return null;
+        // Reddit's b.thumbs.redditmedia.com is a 140×140 thumbnail — drop it so the
+        // client falls back to /api/preview (og:image is source-quality).
+        if (/b\.thumbs\.redditmedia\.com/i.test(raw)) return null;
+        return raw;
+      })(),
       feedback,
     };
   }
@@ -650,9 +676,13 @@ class DashboardServer {
             return json(res, 200, { imageUrl: null });
           }
           const data = await r.json();
-          // media.all[0]: photo → .url, video → .thumbnail_url
+          // media.all[0]: photo → .url (full-res), video → .thumbnail_url (frame)
           const media = data?.tweet?.media?.all?.[0];
-          const imageUrl = media?.thumbnail_url || media?.url || null;
+          const rawUrl = media?.type === 'photo'
+            ? (media.url || media.thumbnail_url)
+            : (media?.thumbnail_url || media?.url) || null;
+          // Force pbs.twimg.com to original resolution
+          const imageUrl = rawUrl ? upgradeTwimgUrl(rawUrl) : null;
           this.logger.info(`[Preview] tweet ${tweetId} → ${imageUrl ? 'has image' : 'no media'}`);
           return json(res, 200, { imageUrl });
         } catch (err) {
@@ -660,6 +690,41 @@ class DashboardServer {
           this.logger.info(`[Preview] fxtwitter fetch error for tweet ${tweetId}: ${err.message}`);
           return json(res, 200, { imageUrl: null });
         }
+      }
+
+      // ── Reddit: fetch post JSON and pick source-quality image ────────────
+      const isReddit = /^https?:\/\/(www\.|old\.|new\.)?reddit\.com\//i.test(target);
+      if (isReddit) {
+        try {
+          const jsonUrl = target.replace(/\/?(\?.*)?$/, '') + '.json?raw_json=1';
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 5000);
+          const r = await fetch(jsonUrl, {
+            signal: controller.signal,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (compatible; Catalyst/3.0)',
+              'Accept': 'application/json',
+            },
+          });
+          clearTimeout(timer);
+          if (r.ok) {
+            const data = await r.json();
+            const post = data?.[0]?.data?.children?.[0]?.data;
+            if (post) {
+              const directUrl = post.url_overridden_by_dest || post.url;
+              let imageUrl = null;
+              if (directUrl && /\.(jpe?g|png|gif|webp)(\?|$)/i.test(directUrl)) imageUrl = directUrl;
+              else if (post.preview?.images?.[0]?.source?.url) imageUrl = post.preview.images[0].source.url;
+              else if (post.preview?.reddit_video_preview?.fallback_url) imageUrl = post.preview.reddit_video_preview.fallback_url;
+              else if (post.is_gallery && post.media_metadata) {
+                const firstId = post.gallery_data?.items?.[0]?.media_id;
+                const item = firstId && post.media_metadata[firstId];
+                imageUrl = item?.s?.u || item?.s?.gif || null;
+              }
+              if (imageUrl) return json(res, 200, { imageUrl });
+            }
+          }
+        } catch (e) { /* fall through to og:image */ }
       }
 
       // ── TikTok: official oEmbed JSON endpoint ────────────────────────────
@@ -716,41 +781,249 @@ class DashboardServer {
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
+    /* ===== THEME SYSTEM =====
+       Default = "midnight" (deep ink + electric cyan).
+       Switch via <body data-theme="teal|abyss|violet|acid|sunset|cyberpunk">.
+       Component colors should use var(--accent), var(--accent-rgb), etc. so they retint on theme change. */
     :root {
-      --bg:          #08080f;
-      --surface:     #0d0d18;
-      --card:        #101020;
-      --card2:       #13132a;
-      --card3:       #181832;
-      --border:      rgba(255,255,255,.055);
-      --border2:     rgba(255,255,255,.09);
-      --border3:     rgba(255,255,255,.14);
-      --text:        #e4eaf8;
-      --text2:       #c8d3e8;
-      --muted:       #8594b0;
-      --dim:         #4a5470;
-      --accent:      #6272ff;
-      --accent2:     #818cf8;
-      --accent-glow: rgba(98,114,255,.15);
-      --green:       #00d4aa;
-      --green2:      #2dddb8;
-      --red:         #ff4560;
-      --red2:        #ff7088;
-      --orange:      #ff9f43;
-      --orange2:     #ffd089;
-      --yellow:      #f6c453;
-      --yellow2:     #ffe39d;
+      /* Structural (mostly theme-invariant, but overridden per theme for real differentiation) */
+      --bg:          #060811;
+      --surface:     #0b0e1c;
+      --card:        #0f1328;
+      --card2:       #141935;
+      --card3:       #1b2146;
+      --border:      rgba(160,180,255,.07);
+      --border2:     rgba(160,180,255,.11);
+      --border3:     rgba(160,180,255,.17);
+      --text:        #e6ecff;
+      --text2:       #c2cbe8;
+      --muted:       #7f8bac;
+      --dim:         #48527a;
+
+      /* Accent (primary) */
+      --accent:      #00e5ff;
+      --accent2:     #5eead4;
+      --accent-rgb:  0,229,255;
+      --accent-glow: rgba(0,229,255,.18);
+
+      /* Semantic palette */
+      --green:       #34e0a1;
+      --green2:      #6bf0bd;
+      --green-rgb:   52,224,161;
+      --red:         #ff3d6e;
+      --red2:        #ff7099;
+      --red-rgb:     255,61,110;
+      --orange:      #ffa641;
+      --orange2:     #ffcb87;
+      --orange-rgb:  255,166,65;
+      --yellow:      #f6d34a;
+      --yellow2:     #ffe89d;
       --blue:        #38bdf8;
-      --pink:        #e879f9;
-      --teal:        #06b6d4;
+      --pink:        #f472b6;
+      --teal:        #14e0d1;
       --purple:      #a78bfa;
+
       --radius:      10px;
       --radius-sm:   8px;
       --radius-xs:   6px;
-      --shadow:      0 4px 20px rgba(0,0,0,.5);
-      --shadow-lg:   0 8px 40px rgba(0,0,0,.65);
+      --shadow:      0 4px 20px rgba(0,0,0,.55);
+      --shadow-lg:   0 8px 40px rgba(0,0,0,.7);
       --glass:       rgba(255,255,255,.03);
       --glass2:      rgba(255,255,255,.055);
+    }
+
+    /* --- Teal / Bioluminescent --- */
+    body[data-theme="teal"] {
+      --bg:          #04131a;
+      --surface:     #07202a;
+      --card:        #0a2a37;
+      --card2:       #0f3645;
+      --card3:       #164656;
+      --border:      rgba(94,234,212,.08);
+      --border2:     rgba(94,234,212,.14);
+      --border3:     rgba(94,234,212,.22);
+      --text:        #e5fbf6;
+      --text2:       #bfefe4;
+      --muted:       #6fae9f;
+      --dim:         #3d6b62;
+      --accent:      #2dd4bf;
+      --accent2:     #5eead4;
+      --accent-rgb:  45,212,191;
+      --accent-glow: rgba(45,212,191,.22);
+      --green:       #5eead4;
+      --green2:      #99f6e4;
+      --green-rgb:   94,234,212;
+      --red:         #ff6b6b;
+      --red2:        #ff9090;
+      --red-rgb:     255,107,107;
+      --orange:      #fbbf24;
+      --orange2:     #fcd34d;
+      --orange-rgb:  251,191,36;
+      --yellow:      #fde68a;
+      --yellow2:     #fef3c7;
+    }
+
+    /* --- Abyss / Very Dark --- */
+    body[data-theme="abyss"] {
+      --bg:          #000000;
+      --surface:     #050508;
+      --card:        #0a0a0f;
+      --card2:       #0f0f17;
+      --card3:       #16161f;
+      --border:      rgba(255,255,255,.04);
+      --border2:     rgba(255,255,255,.07);
+      --border3:     rgba(255,255,255,.12);
+      --text:        #e0e0ea;
+      --text2:       #b5b5c4;
+      --muted:       #6a6a7a;
+      --dim:         #3a3a44;
+      --accent:      #9ca3af;
+      --accent2:     #d1d5db;
+      --accent-rgb:  156,163,175;
+      --accent-glow: rgba(156,163,175,.14);
+      --green:       #4ade80;
+      --green2:      #86efac;
+      --green-rgb:   74,222,128;
+      --red:         #f87171;
+      --red2:        #fca5a5;
+      --red-rgb:     248,113,113;
+      --orange:      #fb923c;
+      --orange2:     #fdba74;
+      --orange-rgb:  251,146,60;
+      --yellow:      #facc15;
+      --yellow2:     #fde047;
+      --shadow:      0 4px 20px rgba(0,0,0,.8);
+      --shadow-lg:   0 8px 40px rgba(0,0,0,.9);
+    }
+
+    /* --- Violet / Twilight --- */
+    body[data-theme="violet"] {
+      --bg:          #0d0520;
+      --surface:     #17092e;
+      --card:        #1e0c3c;
+      --card2:       #28114d;
+      --card3:       #341761;
+      --border:      rgba(196,181,253,.08);
+      --border2:     rgba(196,181,253,.13);
+      --border3:     rgba(196,181,253,.2);
+      --text:        #f3ecff;
+      --text2:       #d9ccf5;
+      --muted:       #9d8ec2;
+      --dim:         #5c4e7e;
+      --accent:      #c084fc;
+      --accent2:     #e9d5ff;
+      --accent-rgb:  192,132,252;
+      --accent-glow: rgba(192,132,252,.22);
+      --green:       #34d399;
+      --green2:      #6ee7b7;
+      --green-rgb:   52,211,153;
+      --red:         #fb7185;
+      --red2:        #fda4af;
+      --red-rgb:     251,113,133;
+      --orange:      #f59e0b;
+      --orange2:     #fbbf24;
+      --orange-rgb:  245,158,11;
+      --yellow:      #fcd34d;
+      --yellow2:     #fde68a;
+      --pink:        #f0abfc;
+      --purple:      #d8b4fe;
+    }
+
+    /* --- Acid / Toxic Green --- */
+    body[data-theme="acid"] {
+      --bg:          #060a04;
+      --surface:     #0a120a;
+      --card:        #0e1a0c;
+      --card2:       #142413;
+      --card3:       #1d311a;
+      --border:      rgba(163,230,53,.08);
+      --border2:     rgba(163,230,53,.15);
+      --border3:     rgba(163,230,53,.24);
+      --text:        #eaffd0;
+      --text2:       #cef29a;
+      --muted:       #84a368;
+      --dim:         #4a6237;
+      --accent:      #a3e635;
+      --accent2:     #d9f99d;
+      --accent-rgb:  163,230,53;
+      --accent-glow: rgba(163,230,53,.28);
+      --green:       #84cc16;
+      --green2:      #bef264;
+      --green-rgb:   132,204,22;
+      --red:         #f43f5e;
+      --red2:        #fb7185;
+      --red-rgb:     244,63,94;
+      --orange:      #f97316;
+      --orange2:     #fb923c;
+      --orange-rgb:  249,115,22;
+      --yellow:      #eab308;
+      --yellow2:     #facc15;
+      --pink:        #ec4899;
+    }
+
+    /* --- Sunset / Bonus warm --- */
+    body[data-theme="sunset"] {
+      --bg:          #140610;
+      --surface:     #200a18;
+      --card:        #2a0f1e;
+      --card2:       #3a1528;
+      --card3:       #4d1d34;
+      --border:      rgba(251,146,60,.08);
+      --border2:     rgba(251,146,60,.14);
+      --border3:     rgba(251,146,60,.22);
+      --text:        #fff1e6;
+      --text2:       #f5d5bd;
+      --muted:       #b38670;
+      --dim:         #6b4a3c;
+      --accent:      #fb7185;
+      --accent2:     #fda4af;
+      --accent-rgb:  251,113,133;
+      --accent-glow: rgba(251,113,133,.22);
+      --green:       #4ade80;
+      --green2:      #86efac;
+      --green-rgb:   74,222,128;
+      --red:         #ef4444;
+      --red2:        #f87171;
+      --red-rgb:     239,68,68;
+      --orange:      #fb923c;
+      --orange2:     #fdba74;
+      --orange-rgb:  251,146,60;
+      --yellow:      #fbbf24;
+      --yellow2:     #fcd34d;
+      --pink:        #f472b6;
+    }
+
+    /* --- Cyberpunk / Magenta + Cyan --- */
+    body[data-theme="cyberpunk"] {
+      --bg:          #0a0418;
+      --surface:     #130827;
+      --card:        #1a0b36;
+      --card2:       #251048;
+      --card3:       #32155e;
+      --border:      rgba(236,72,153,.09);
+      --border2:     rgba(236,72,153,.16);
+      --border3:     rgba(236,72,153,.26);
+      --text:        #fdf0ff;
+      --text2:       #f0c8ff;
+      --muted:       #b182c2;
+      --dim:         #64476f;
+      --accent:      #f0abfc;
+      --accent2:     #22d3ee;
+      --accent-rgb:  240,171,252;
+      --accent-glow: rgba(240,171,252,.28);
+      --green:       #22d3ee;
+      --green2:      #67e8f9;
+      --green-rgb:   34,211,238;
+      --red:         #ef4444;
+      --red2:        #f87171;
+      --red-rgb:     239,68,68;
+      --orange:      #fb923c;
+      --orange2:     #fdba74;
+      --orange-rgb:  251,146,60;
+      --yellow:      #fde047;
+      --yellow2:     #fef08a;
+      --pink:        #ec4899;
+      --purple:      #c084fc;
     }
 
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -778,7 +1051,7 @@ class DashboardServer {
     @keyframes fadeIn   { from { opacity:0; transform: translateY(5px); } to { opacity:1; transform: translateY(0); } }
     @keyframes slideIn  { from { opacity:0; transform: translateX(-10px); } to { opacity:1; transform: translateX(0); } }
     @keyframes shimmer  { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
-    @keyframes glow     { 0%,100% { box-shadow: 0 0 6px rgba(98,114,255,.3); } 50% { box-shadow: 0 0 16px rgba(98,114,255,.5); } }
+    @keyframes glow     { 0%,100% { box-shadow: 0 0 6px rgba(var(--accent-rgb), .3); } 50% { box-shadow: 0 0 16px rgba(var(--accent-rgb), .5); } }
 
     /* ── Nav ── */
     .nav {
@@ -790,11 +1063,11 @@ class DashboardServer {
       padding: 0 18px;
       height: 50px;
       display: flex; align-items: center; gap: 14px;
-      box-shadow: 0 1px 0 rgba(98,114,255,.04), 0 6px 16px rgba(0,0,0,.25);
+      box-shadow: 0 1px 0 rgba(var(--accent-rgb), .04), 0 6px 16px rgba(0,0,0,.25);
     }
     .nav::after {
       content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
-      background: linear-gradient(90deg, transparent 0%, rgba(98,114,255,.22) 20%, rgba(98,114,255,.22) 80%, transparent 100%);
+      background: linear-gradient(90deg, transparent 0%, rgba(var(--accent-rgb), .22) 20%, rgba(var(--accent-rgb), .22) 80%, transparent 100%);
       pointer-events: none;
     }
     .nav-logo {
@@ -807,9 +1080,9 @@ class DashboardServer {
       font-size: 18px; line-height: 1;
       display: inline-flex; align-items: center; justify-content: center;
       width: 28px; height: 28px; border-radius: 8px;
-      background: linear-gradient(135deg, rgba(98,114,255,.22), rgba(98,114,255,.05));
-      border: 1px solid rgba(98,114,255,.28);
-      box-shadow: 0 2px 10px rgba(98,114,255,.18), inset 0 1px 0 rgba(255,255,255,.05);
+      background: linear-gradient(135deg, rgba(var(--accent-rgb), .22), rgba(var(--accent-rgb), .05));
+      border: 1px solid rgba(var(--accent-rgb), .28);
+      box-shadow: 0 2px 10px rgba(var(--accent-rgb), .18), inset 0 1px 0 rgba(255,255,255,.05);
     }
     .nav-logo-text {
       background: linear-gradient(180deg, #fff 0%, #cfd4ff 100%);
@@ -819,7 +1092,7 @@ class DashboardServer {
     .nav-version {
       font-size: 9px; font-weight: 700; letter-spacing: .4px;
       color: var(--accent2); background: var(--accent-glow);
-      border: 1px solid rgba(98,114,255,.22); border-radius: 6px;
+      border: 1px solid rgba(var(--accent-rgb), .22); border-radius: 6px;
       padding: 2px 7px; font-family: 'JetBrains Mono', monospace;
       text-transform: uppercase;
     }
@@ -838,7 +1111,7 @@ class DashboardServer {
       letter-spacing: .4px; text-transform: uppercase;
       transition: border-color .2s, background .2s;
     }
-    .status-pill:hover { border-color: rgba(98,114,255,.3); }
+    .status-pill:hover { border-color: rgba(var(--accent-rgb), .3); }
     .status-pill.live  { color: var(--green2); }
     .status-pill.live:hover { border-color: rgba(34,197,94,.35); }
     .status-pill.paused { color: var(--red2); }
@@ -881,7 +1154,7 @@ class DashboardServer {
       color: var(--muted); cursor: pointer; padding: 2px 6px; border-radius: 4px;
       transition: all .15s;
     }
-    .sidebar-section-link:hover { color: var(--accent2); background: rgba(98,114,255,.08); }
+    .sidebar-section-link:hover { color: var(--accent2); background: rgba(var(--accent-rgb), .08); }
 
     /* ── Source items (brand-colored, feed-like rows) ── */
     .source-item {
@@ -926,7 +1199,7 @@ class DashboardServer {
       padding: 2px 7px; border-radius: 5px; min-width: 26px; text-align: center;
       border: 1px solid var(--border);
     }
-    .source-count.hot { color: var(--accent2); background: rgba(98,114,255,.1); border-color: rgba(98,114,255,.22); }
+    .source-count.hot { color: var(--accent2); background: rgba(var(--accent-rgb), .1); border-color: rgba(var(--accent-rgb), .22); }
     .source-eye {
       position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
       font-size: 11px; opacity: 0; transition: opacity .15s;
@@ -966,7 +1239,7 @@ class DashboardServer {
     .seg-btn.active {
       background: var(--accent-glow);
       color: var(--accent2);
-      box-shadow: 0 0 0 1px rgba(98,114,255,.2);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .2);
     }
     .seg-group.seg-compact .seg-btn { padding: 5px 2px; font-size: 11px; }
 
@@ -979,23 +1252,61 @@ class DashboardServer {
       font-size: 10.5px; font-weight: 600; cursor: pointer;
       transition: all .15s; font-family: inherit;
     }
-    .sb-reset-btn:hover { color: var(--red2); border-color: rgba(255,69,96,.35); background: rgba(255,69,96,.04); }
+    .sb-reset-btn:hover { color: var(--red2); border-color: rgba(var(--red-rgb), .35); background: rgba(var(--red-rgb), .04); }
 
-    /* ── Sidebar footer (stats/settings row) ── */
+    /* ── Sidebar footer (unified bottom nav: Feed / Stats / Settings) ── */
     .sidebar-footer {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
-      padding: 6px 2px 4px;
+      margin-top: auto;
+      padding: 10px 4px 4px;
+      border-top: 1px solid var(--border);
+      background: linear-gradient(180deg, transparent 0%, rgba(0,0,0,.15) 100%);
+    }
+    .sb-foot-nav {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
+      padding: 4px; border-radius: 10px;
+      background: rgba(0,0,0,.18);
+      border: 1px solid var(--border);
     }
     .sb-foot-btn {
-      display: flex; flex-direction: column; align-items: center; gap: 3px;
-      padding: 9px 6px; border-radius: 8px;
-      background: rgba(255,255,255,.025); border: 1px solid var(--border);
+      position: relative;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+      padding: 9px 4px 8px; border-radius: 7px;
+      background: transparent; border: 1px solid transparent;
       cursor: pointer; transition: all .15s;
-      color: var(--muted); font-size: 10.5px; font-weight: 600;
+      color: var(--muted); font-size: 10px; font-weight: 600;
+      letter-spacing: .2px;
+      text-align: center;
+      overflow: hidden;
     }
-    .sb-foot-btn .sb-foot-ico { font-size: 15px; filter: saturate(.8); }
-    .sb-foot-btn:hover { color: var(--text); background: rgba(255,255,255,.05); border-color: var(--border2); }
-    .sb-foot-btn.active { color: var(--accent2); background: var(--accent-glow); border-color: rgba(98,114,255,.25); }
+    .sb-foot-btn .sb-foot-ico { font-size: 15px; filter: saturate(.75); transition: filter .15s, transform .15s; }
+    .sb-foot-btn:hover { color: var(--text); background: rgba(255,255,255,.04); }
+    .sb-foot-btn:hover .sb-foot-ico { filter: saturate(1.1); transform: scale(1.05); }
+    .sb-foot-btn.active {
+      color: var(--accent2);
+      background: var(--accent-glow);
+      border-color: rgba(var(--accent-rgb), .3);
+      box-shadow: 0 2px 8px rgba(var(--accent-rgb), .15), inset 0 1px 0 rgba(255,255,255,.04);
+    }
+    .sb-foot-btn.active::before {
+      content: '';
+      position: absolute; top: 0; left: 20%; right: 20%; height: 2px;
+      background: linear-gradient(90deg, transparent, var(--accent), transparent);
+      border-radius: 0 0 2px 2px;
+    }
+    .sb-foot-btn.active .sb-foot-ico { filter: saturate(1.2) drop-shadow(0 0 4px var(--accent-glow)); }
+    .sb-foot-kbd {
+      position: absolute; top: 4px; right: 5px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 8.5px; font-weight: 700;
+      color: var(--dim);
+      padding: 1px 4px; border-radius: 3px;
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--border);
+      opacity: .7;
+      transition: opacity .15s, color .15s;
+    }
+    .sb-foot-btn:hover .sb-foot-kbd { opacity: 1; color: var(--muted); }
+    .sb-foot-btn.active .sb-foot-kbd { color: var(--accent2); background: rgba(var(--accent-rgb), .12); border-color: rgba(var(--accent-rgb), .2); opacity: 1; }
 
     /* ── Main content ── */
     .main {
@@ -1014,7 +1325,7 @@ class DashboardServer {
     .session-tag {
       font-size: 9px; font-weight: 800; letter-spacing: 1.6px; text-transform: uppercase;
       color: var(--accent2); padding: 2px 7px; border-radius: 4px;
-      background: rgba(98,114,255,.1); border: 1px solid rgba(98,114,255,.2);
+      background: rgba(var(--accent-rgb), .1); border: 1px solid rgba(var(--accent-rgb), .2);
     }
     .session-title { font-size: 13px; font-weight: 700; color: var(--text); letter-spacing: -.3px; }
     .session-chips { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-left: auto; }
@@ -1036,7 +1347,7 @@ class DashboardServer {
     .hero-copy { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
     .hero-chip-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
     .hero-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 5px; border: 1px solid var(--border2); background: rgba(255,255,255,.03); color: var(--muted); font-size: 11px; font-weight: 500; }
-    .hero-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green2); box-shadow: 0 0 6px rgba(0,212,170,.5); }
+    .hero-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green2); box-shadow: 0 0 6px rgba(var(--green-rgb), .5); }
     .hero-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .hero-side-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .hero-mini-card { border-radius: 8px; border: 1px solid var(--border); background: rgba(255,255,255,.025); padding: 10px; }
@@ -1065,7 +1376,7 @@ class DashboardServer {
     .stat-card:nth-child(2) { animation-delay: .04s; }
     .stat-card:nth-child(3) { animation-delay: .08s; }
     .stat-card:nth-child(4) { animation-delay: .12s; }
-    .stat-card:hover { border-color: rgba(98,114,255,.28); transform: translateY(-1px); }
+    .stat-card:hover { border-color: rgba(var(--accent-rgb), .28); transform: translateY(-1px); }
     .stat-card::after {
       content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
       background: linear-gradient(90deg, var(--accent), transparent);
@@ -1109,7 +1420,7 @@ class DashboardServer {
       font-size: 11px; font-weight: 600; color: var(--muted);
       white-space: nowrap; position: relative; overflow: hidden;
     }
-    .control-btn:hover { border-color: rgba(98,114,255,.28); background: rgba(98,114,255,.07); color: var(--accent2); transform: translateY(-1px); }
+    .control-btn:hover { border-color: rgba(var(--accent-rgb), .28); background: rgba(var(--accent-rgb), .07); color: var(--accent2); transform: translateY(-1px); }
     .control-btn:active { transform: translateY(0); }
     .control-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none !important; }
     .control-icon { font-size: 17px; display: block; line-height: 1; }
@@ -1117,7 +1428,7 @@ class DashboardServer {
     .control-status {
       position: absolute; top: 5px; right: 5px;
       width: 5px; height: 5px; border-radius: 50%;
-      background: var(--green2); box-shadow: 0 0 5px rgba(0,212,170,.6);
+      background: var(--green2); box-shadow: 0 0 5px rgba(var(--green-rgb), .6);
     }
     .control-status.off { background: var(--red2); box-shadow: none; }
     .control-status.idle { background: var(--dim); box-shadow: none; }
@@ -1130,7 +1441,7 @@ class DashboardServer {
       border: 1px solid var(--border); border-radius: var(--radius-xs);
       cursor: pointer; transition: all .15s; font-size: 11px; font-weight: 600; color: var(--text2);
     }
-    .source-control-btn:hover { border-color: rgba(98,114,255,.22); background: rgba(98,114,255,.05); }
+    .source-control-btn:hover { border-color: rgba(var(--accent-rgb), .22); background: rgba(var(--accent-rgb), .05); }
     .source-control-btn.disabled { border-color: var(--border); background: transparent; color: var(--dim); }
     .source-control-toggle {
       width: 26px; height: 14px; border-radius: 7px; background: var(--green);
@@ -1159,8 +1470,8 @@ class DashboardServer {
     }
     select:hover { border-color: var(--border2); color: var(--text); }
     select:focus {
-      border-color: rgba(98,114,255,.3); color: var(--text);
-      box-shadow: 0 0 0 1px rgba(98,114,255,.2);
+      border-color: rgba(var(--accent-rgb), .3); color: var(--text);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .2);
       background-color: var(--accent-glow);
     }
     select option { background: var(--surface); color: var(--text); }
@@ -1174,13 +1485,13 @@ class DashboardServer {
     }
     .btn-primary {
       background: var(--accent-glow); color: var(--accent2);
-      border-color: rgba(98,114,255,.3);
-      box-shadow: 0 0 0 1px rgba(98,114,255,.1) inset;
+      border-color: rgba(var(--accent-rgb), .3);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .1) inset;
     }
     .btn-primary:hover {
-      background: rgba(98,114,255,.18); color: var(--text);
-      border-color: rgba(98,114,255,.5);
-      box-shadow: 0 0 14px rgba(98,114,255,.18);
+      background: rgba(var(--accent-rgb), .18); color: var(--text);
+      border-color: rgba(var(--accent-rgb), .5);
+      box-shadow: 0 0 14px rgba(var(--accent-rgb), .18);
     }
     .btn-primary:active { transform: translateY(1px); }
     .btn-ghost {
@@ -1212,8 +1523,8 @@ class DashboardServer {
       cursor: pointer;
     }
     .trend-card:hover {
-      border-color: rgba(98,114,255,.28);
-      background: rgba(98,114,255,.025);
+      border-color: rgba(var(--accent-rgb), .28);
+      background: rgba(var(--accent-rgb), .025);
     }
 
     /* ── Card header row ── */
@@ -1253,7 +1564,7 @@ class DashboardServer {
     /* ── Score / meme bars ── */
     .meme-score { display: flex; align-items: center; gap: 7px; }
     .meme-num { font-size: 17px; font-weight: 800; font-family: 'JetBrains Mono', monospace; line-height: 1; }
-    .meme-num.hot  { color: var(--red2); text-shadow: 0 0 10px rgba(255,69,96,.35); }
+    .meme-num.hot  { color: var(--red2); text-shadow: 0 0 10px rgba(var(--red-rgb), .35); }
     .meme-num.warm { color: var(--orange); }
     .meme-num.ok   { color: var(--yellow); }
     .meme-num.cold { color: var(--dim); }
@@ -1352,7 +1663,7 @@ class DashboardServer {
 
     /* ── Error ── */
     .error-bar {
-      background: rgba(255,69,96,.07); border: 1px solid rgba(255,69,96,.2);
+      background: rgba(var(--red-rgb), .07); border: 1px solid rgba(var(--red-rgb), .2);
       color: var(--red2); padding: 10px 14px; border-radius: 8px;
       margin-bottom: 12px; font-size: 12px; font-weight: 500;
       display: flex; align-items: center; gap: 8px;
@@ -1369,6 +1680,67 @@ class DashboardServer {
     }
     .settings-card-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 3px; }
     .settings-card-desc  { font-size: 11px; color: var(--muted); margin-bottom: 16px; }
+
+    /* Theme picker swatches */
+    .theme-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 10px;
+    }
+    .theme-swatch {
+      position: relative;
+      display: flex; flex-direction: column; gap: 6px;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border2);
+      background: var(--card2);
+      cursor: pointer;
+      color: var(--text);
+      font-family: inherit;
+      transition: transform .12s ease, border-color .12s ease, box-shadow .12s ease;
+      overflow: hidden;
+    }
+    .theme-swatch:hover {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(0,0,0,.35);
+    }
+    .theme-swatch.active {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--accent-glow), 0 6px 18px rgba(0,0,0,.45);
+    }
+    .theme-swatch-label {
+      font-size: 11px; font-weight: 600; color: var(--text2);
+      margin-top: 4px;
+      letter-spacing: .2px;
+    }
+    .theme-swatch-dot {
+      display: inline-block;
+      width: 100%; height: 14px; border-radius: 6px;
+      border: 1px solid rgba(255,255,255,.06);
+    }
+    /* midnight (default / no attr) */
+    .theme-swatch[data-theme-preview="midnight"]  .theme-swatch-dot-bg     { background: #060811; }
+    .theme-swatch[data-theme-preview="midnight"]  .theme-swatch-dot-accent { background: linear-gradient(90deg,#00e5ff,#5eead4); }
+    .theme-swatch[data-theme-preview="midnight"]  .theme-swatch-dot-card   { background: #141935; }
+    .theme-swatch[data-theme-preview="teal"]      .theme-swatch-dot-bg     { background: #04131a; }
+    .theme-swatch[data-theme-preview="teal"]      .theme-swatch-dot-accent { background: linear-gradient(90deg,#2dd4bf,#5eead4); }
+    .theme-swatch[data-theme-preview="teal"]      .theme-swatch-dot-card   { background: #0f3645; }
+    .theme-swatch[data-theme-preview="abyss"]     .theme-swatch-dot-bg     { background: #000000; }
+    .theme-swatch[data-theme-preview="abyss"]     .theme-swatch-dot-accent { background: linear-gradient(90deg,#9ca3af,#d1d5db); }
+    .theme-swatch[data-theme-preview="abyss"]     .theme-swatch-dot-card   { background: #0f0f17; }
+    .theme-swatch[data-theme-preview="violet"]    .theme-swatch-dot-bg     { background: #0d0520; }
+    .theme-swatch[data-theme-preview="violet"]    .theme-swatch-dot-accent { background: linear-gradient(90deg,#c084fc,#e9d5ff); }
+    .theme-swatch[data-theme-preview="violet"]    .theme-swatch-dot-card   { background: #28114d; }
+    .theme-swatch[data-theme-preview="acid"]      .theme-swatch-dot-bg     { background: #060a04; }
+    .theme-swatch[data-theme-preview="acid"]      .theme-swatch-dot-accent { background: linear-gradient(90deg,#a3e635,#d9f99d); }
+    .theme-swatch[data-theme-preview="acid"]      .theme-swatch-dot-card   { background: #142413; }
+    .theme-swatch[data-theme-preview="sunset"]    .theme-swatch-dot-bg     { background: #140610; }
+    .theme-swatch[data-theme-preview="sunset"]    .theme-swatch-dot-accent { background: linear-gradient(90deg,#fb7185,#fda4af); }
+    .theme-swatch[data-theme-preview="sunset"]    .theme-swatch-dot-card   { background: #3a1528; }
+    .theme-swatch[data-theme-preview="cyberpunk"] .theme-swatch-dot-bg     { background: #0a0418; }
+    .theme-swatch[data-theme-preview="cyberpunk"] .theme-swatch-dot-accent { background: linear-gradient(90deg,#f0abfc,#22d3ee); }
+    .theme-swatch[data-theme-preview="cyberpunk"] .theme-swatch-dot-card   { background: #251048; }
     .stats-view { display: grid; gap: 12px; }
     .stats-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
     .stats-block { padding: 14px 16px; }
@@ -1387,7 +1759,7 @@ class DashboardServer {
     .stats-list-value { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: var(--accent2); font-size: 11px; white-space: nowrap; }
     .stats-top-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .stats-top-card { padding: 11px; border-radius: 8px; border: 1px solid var(--border); background: rgba(255,255,255,.018); cursor: pointer; transition: border-color .15s, background .15s; }
-    .stats-top-card:hover { border-color: rgba(98,114,255,.25); background: rgba(98,114,255,.05); }
+    .stats-top-card:hover { border-color: rgba(var(--accent-rgb), .25); background: rgba(var(--accent-rgb), .05); }
     .stats-top-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
     .stats-top-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--muted); font-size: 10px; }
     .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 13px 0; border-top: 1px solid var(--border); }
@@ -1401,11 +1773,11 @@ class DashboardServer {
     .settings-actions { display: flex; gap: 10px; margin-top: 10px; justify-content: flex-end; }
     .settings-flash {
       margin-left: auto; font-size: 11px; font-weight: 600; color: var(--accent2);
-      background: var(--accent-glow); border: 1px solid rgba(98,114,255,.22);
+      background: var(--accent-glow); border: 1px solid rgba(var(--accent-rgb), .22);
       padding: 4px 10px; border-radius: 999px; letter-spacing: .2px;
       animation: fadeIn .2s ease;
     }
-    .settings-info { border-style: dashed; background: linear-gradient(180deg, rgba(98,114,255,.05), transparent); }
+    .settings-info { border-style: dashed; background: linear-gradient(180deg, rgba(var(--accent-rgb), .05), transparent); }
 
     /* ── Preference toggle switch ── */
     .pref-toggle {
@@ -1445,7 +1817,7 @@ class DashboardServer {
       cursor: pointer; text-align: center; transition: all .15s ease;
     }
     .preset-card:hover { border-color: var(--border3); background: var(--card3); transform: translateY(-1px); }
-    .preset-card.active { border-color: var(--accent); background: rgba(98,114,255,.1); box-shadow: 0 0 0 1px var(--accent); }
+    .preset-card.active { border-color: var(--accent); background: rgba(var(--accent-rgb), .1); box-shadow: 0 0 0 1px var(--accent); }
     .preset-icon  { font-size: 20px; }
     .preset-label { font-size: 11px; font-weight: 700; color: var(--text); }
     .preset-hint  { font-size: 9px; color: var(--muted); line-height: 1.3; }
@@ -1460,7 +1832,7 @@ class DashboardServer {
       margin-top: auto;
     }
     .sidebar-settings-btn:hover { background: rgba(255,255,255,.04); color: var(--text); }
-    .sidebar-settings-btn.active { background: rgba(98,114,255,.1); color: var(--accent2); border-color: rgba(98,114,255,.2); }
+    .sidebar-settings-btn.active { background: rgba(var(--accent-rgb), .1); color: var(--accent2); border-color: rgba(var(--accent-rgb), .2); }
 
     /* ── Card image thumbnail ── */
     .card-image-wrap { flex-shrink: 0; border-radius: 7px; overflow: hidden; background: var(--card3); border: 1px solid var(--border); position: relative; }
@@ -1503,11 +1875,11 @@ class DashboardServer {
       pointer-events: auto; min-width: 230px; max-width: 320px;
       backdrop-filter: blur(10px);
     }
-    .toast.success { border-color: rgba(0,212,170,.25); }
+    .toast.success { border-color: rgba(var(--green-rgb), .25); }
     .toast.success .toast-icon { color: var(--green2); }
-    .toast.error   { border-color: rgba(255,69,96,.25); }
+    .toast.error   { border-color: rgba(var(--red-rgb), .25); }
     .toast.error   .toast-icon { color: var(--red2); }
-    .toast.info    { border-color: rgba(98,114,255,.25); }
+    .toast.info    { border-color: rgba(var(--accent-rgb), .25); }
     .toast.info    .toast-icon { color: var(--accent2); }
     .toast-icon { font-size: 13px; flex-shrink: 0; }
     .toast-msg  { flex: 1; line-height: 1.4; }
@@ -1546,7 +1918,7 @@ class DashboardServer {
       color: var(--muted); border-radius: 6px; padding: 5px 9px;
       cursor: pointer; font-size: 12px; transition: all .12s; flex-shrink: 0;
     }
-    .modal-close:hover { background: rgba(255,69,96,.12); color: var(--red2); border-color: rgba(255,69,96,.25); }
+    .modal-close:hover { background: rgba(var(--red-rgb), .12); color: var(--red2); border-color: rgba(var(--red-rgb), .25); }
     .modal-body { flex: 1; overflow-y: auto; padding: 16px 16px 36px; display: flex; flex-direction: column; gap: 14px; }
 
     /* ── Modal image ── */
@@ -1562,7 +1934,7 @@ class DashboardServer {
     .modal-section { display: flex; flex-direction: column; gap: 7px; }
     .modal-section-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); font-weight: 700; }
     .modal-section-content { font-size: 12px; color: var(--text2); line-height: 1.55; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 11px 13px; }
-    .modal-section-content.pump { color: var(--orange); border-color: rgba(255,159,67,.15); background: rgba(255,159,67,.05); }
+    .modal-section-content.pump { color: var(--orange); border-color: rgba(var(--orange-rgb), .15); background: rgba(var(--orange-rgb), .05); }
     .modal-stats-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }
     .modal-stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; }
     .modal-stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: .7px; color: var(--dim); font-weight: 600; }
@@ -1623,7 +1995,7 @@ class DashboardServer {
       height: 2px;
       background: linear-gradient(90deg,
         transparent 0%,
-        rgba(98,114,255,.6) 50%,
+        rgba(var(--accent-rgb), .6) 50%,
         transparent 100%);
       background-size: 40% 100%;
       background-repeat: no-repeat;
@@ -1643,7 +2015,7 @@ class DashboardServer {
     .feed-panel-head {
       padding: 14px 16px 12px;
       border-bottom: 1px solid var(--border);
-      background: linear-gradient(180deg, rgba(98,114,255,.03), transparent);
+      background: linear-gradient(180deg, rgba(var(--accent-rgb), .03), transparent);
     }
     .feed-panel-top {
       display: flex; align-items: center; gap: 12px; margin-bottom: 11px;
@@ -1651,7 +2023,7 @@ class DashboardServer {
     .feed-panel-icon {
       width: 32px; height: 32px; border-radius: 9px;
       background: var(--accent-glow);
-      border: 1px solid rgba(98,114,255,.28);
+      border: 1px solid rgba(var(--accent-rgb), .28);
       display: flex; align-items: center; justify-content: center;
       font-size: 15px; flex-shrink: 0;
     }
@@ -1662,7 +2034,7 @@ class DashboardServer {
     .feed-panel-count {
       font-family: 'JetBrains Mono', monospace; font-size: 10px;
       color: var(--accent2); background: var(--accent-glow);
-      border: 1px solid rgba(98,114,255,.22); border-radius: 5px;
+      border: 1px solid rgba(var(--accent-rgb), .22); border-radius: 5px;
       padding: 2px 7px; font-weight: 700;
     }
     .feed-panel-sub {
@@ -1685,9 +2057,9 @@ class DashboardServer {
     .feed-search input::placeholder { color: var(--dim); }
     .feed-search input:hover { border-color: var(--border2); }
     .feed-search input:focus {
-      outline: none; border-color: rgba(98,114,255,.3);
+      outline: none; border-color: rgba(var(--accent-rgb), .3);
       background: var(--accent-glow);
-      box-shadow: 0 0 0 1px rgba(98,114,255,.2);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .2);
     }
     .feed-search-icon {
       position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
@@ -1712,7 +2084,7 @@ class DashboardServer {
     .feed-chip.active {
       background: var(--accent-glow);
       color: var(--accent2);
-      box-shadow: 0 0 0 1px rgba(98,114,255,.2);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .2);
     }
     .feed-chip .chip-count {
       font-family: 'JetBrains Mono', monospace; font-size: 9.5px;
@@ -1751,16 +2123,16 @@ class DashboardServer {
     .fb-btn:disabled { opacity: .6; cursor: wait; }
 
     .fb-like.active {
-      background: rgba(0,212,170,.12);
+      background: rgba(var(--green-rgb), .12);
       color: var(--green2);
-      box-shadow: 0 0 0 1px rgba(0,212,170,.25);
+      box-shadow: 0 0 0 1px rgba(var(--green-rgb), .25);
     }
     .fb-like.active .fb-ico { filter: saturate(1.1) brightness(1.05); }
 
     .fb-dislike.active {
-      background: rgba(255,69,96,.1);
+      background: rgba(var(--red-rgb), .1);
       color: var(--red2);
-      box-shadow: 0 0 0 1px rgba(255,69,96,.22);
+      box-shadow: 0 0 0 1px rgba(var(--red-rgb), .22);
     }
     .fb-dislike.active .fb-ico { filter: saturate(1.1) brightness(1.05); }
 
@@ -1837,21 +2209,34 @@ class DashboardServer {
       margin-bottom: 8px;
     }
     .feed-desc.pump {
-      background: linear-gradient(90deg, rgba(255,159,67,.06), transparent);
+      background: linear-gradient(90deg, rgba(var(--orange-rgb), .06), transparent);
       border-left: 2px solid var(--orange);
       padding: 6px 10px; border-radius: 4px;
       color: var(--orange); font-weight: 500;
     }
 
+    /* Feed image — Twitter/Mario Nawfal style: bounded, fully visible (contain),
+       with a subtle dark backdrop filling the letterbox area. Never stretched. */
     .feed-image-wrap {
-      border-radius: 8px; overflow: hidden;
-      margin: 8px 0 10px; max-height: 260px;
-      background: var(--card3); border: 1px solid var(--border);
+      position: relative;
+      border-radius: 14px; overflow: hidden;
+      margin: 8px 0 10px;
+      background: #0a0a12;
+      border: 1px solid var(--border);
       display: flex; align-items: center; justify-content: center;
+      /* Cap height so portraits don't eat the whole feed */
+      max-height: 380px;
     }
     .feed-image {
-      width: 100%; height: auto; max-height: 260px; object-fit: cover; display: block;
+      display: block;
+      width: 100%;
+      height: auto;
+      max-height: 380px;
+      object-fit: contain;   /* show the whole picture, no cropping/stretching */
     }
+    /* Compact density — tighter frame */
+    body.prefs-compact .feed-image-wrap,
+    body.prefs-compact .feed-image { max-height: 280px; }
     .feed-image-placeholder {
       height: 140px; width: 100%;
       display: flex; align-items: center; justify-content: center;
@@ -1896,11 +2281,11 @@ class DashboardServer {
       border-color: var(--border3); transform: translateY(-1px);
     }
     .feed-action-btn.primary {
-      background: linear-gradient(135deg, rgba(98,114,255,.15), rgba(98,114,255,.05));
-      border-color: rgba(98,114,255,.3); color: var(--accent2);
+      background: linear-gradient(135deg, rgba(var(--accent-rgb), .15), rgba(var(--accent-rgb), .05));
+      border-color: rgba(var(--accent-rgb), .3); color: var(--accent2);
     }
     .feed-action-btn.primary:hover {
-      background: linear-gradient(135deg, rgba(98,114,255,.25), rgba(98,114,255,.1));
+      background: linear-gradient(135deg, rgba(var(--accent-rgb), .25), rgba(var(--accent-rgb), .1));
       border-color: var(--accent);
     }
     .feed-action-btn.tg { color: #3b9dff; border-color: rgba(59,157,255,.25); }
@@ -1990,7 +2375,7 @@ class DashboardServer {
       font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;
       color: var(--accent2); flex-shrink: 0;
       padding: 2px 7px; background: var(--accent-glow);
-      border-radius: 5px; border: 1px solid rgba(98,114,255,.22);
+      border-radius: 5px; border: 1px solid rgba(var(--accent-rgb), .22);
       min-width: 28px; text-align: center;
     }
 
@@ -2032,7 +2417,7 @@ class DashboardServer {
       padding: 2px 7px; border-radius: 5px; min-width: 26px; text-align: center;
       border: 1px solid var(--border);
     }
-    .pulse-count.hot { color: var(--accent2); background: var(--accent-glow); border-color: rgba(98,114,255,.22); }
+    .pulse-count.hot { color: var(--accent2); background: var(--accent-glow); border-color: rgba(var(--accent-rgb), .22); }
 
     /* ── Activity summary ── */
     .activity-grid {
@@ -2101,7 +2486,7 @@ class DashboardServer {
     }
     .statusbar::before {
       content: ''; position: absolute; left: 0; right: 0; top: -1px; height: 1px;
-      background: linear-gradient(90deg, transparent 0%, rgba(98,114,255,.2) 15%, rgba(98,114,255,.2) 85%, transparent 100%);
+      background: linear-gradient(90deg, transparent 0%, rgba(var(--accent-rgb), .2) 15%, rgba(var(--accent-rgb), .2) 85%, transparent 100%);
       pointer-events: none;
     }
     .statusbar-dot {
@@ -2182,6 +2567,583 @@ function setAuthToken(tok) {
 }
 function onAuthChange(fn) { authListeners.add(fn); return () => authListeners.delete(fn); }
 
+// ── I18N ──────────────────────────────────────────────────────────────────
+// Dashboard is bilingual. English is primary with a light degen / crypto-twitter
+// flavor; Russian is a faithful second. Strings are resolved via t(key, args)
+// where {token} placeholders are substituted from args.
+const LANG_KEY = 'ts_lang';
+const SUPPORTED_LANGS = ['en', 'ru'];
+function detectLang() {
+  try {
+    const saved = localStorage.getItem(LANG_KEY);
+    if (saved && SUPPORTED_LANGS.indexOf(saved) >= 0) return saved;
+  } catch (e) {}
+  return 'en';
+}
+let CURRENT_LANG = detectLang();
+const langListeners = new Set();
+function setLang(l) {
+  if (SUPPORTED_LANGS.indexOf(l) < 0) return;
+  CURRENT_LANG = l;
+  try { localStorage.setItem(LANG_KEY, l); } catch (e) {}
+  try { document.documentElement.setAttribute('lang', l); } catch (e) {}
+  langListeners.forEach(fn => { try { fn(l); } catch (e) {} });
+}
+function onLangChange(fn) { langListeners.add(fn); return () => langListeners.delete(fn); }
+try { document.documentElement.setAttribute('lang', CURRENT_LANG); } catch (e) {}
+
+// ── THEME ────────────────────────────────────────────────────────────────
+// Six dark themes, no light mode. Applied via <body data-theme="...">.
+// "midnight" is the default and uses no data-theme attribute (the :root block).
+const THEME_KEY = 'ts_theme';
+const SUPPORTED_THEMES = ['midnight', 'teal', 'abyss', 'violet', 'acid', 'sunset', 'cyberpunk'];
+const THEME_META = {
+  midnight:  { icon: '🌌', labelEn: 'Midnight',  labelRu: 'Полночь' },
+  teal:      { icon: '🌊', labelEn: 'Teal',      labelRu: 'Бирюза' },
+  abyss:     { icon: '🕳️', labelEn: 'Abyss',     labelRu: 'Бездна' },
+  violet:    { icon: '🔮', labelEn: 'Violet',    labelRu: 'Фиолет' },
+  acid:      { icon: '☢️', labelEn: 'Acid',      labelRu: 'Кислота' },
+  sunset:    { icon: '🌅', labelEn: 'Sunset',    labelRu: 'Закат' },
+  cyberpunk: { icon: '🌆', labelEn: 'Cyberpunk', labelRu: 'Киберпанк' },
+};
+function detectTheme() {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved && SUPPORTED_THEMES.indexOf(saved) >= 0) return saved;
+  } catch (e) {}
+  return 'midnight';
+}
+let CURRENT_THEME = detectTheme();
+const themeListeners = new Set();
+function applyThemeAttr(theme) {
+  try {
+    if (theme && theme !== 'midnight') document.body.setAttribute('data-theme', theme);
+    else document.body.removeAttribute('data-theme');
+  } catch (e) {}
+}
+function setTheme(theme) {
+  if (SUPPORTED_THEMES.indexOf(theme) < 0) return;
+  CURRENT_THEME = theme;
+  try { localStorage.setItem(THEME_KEY, theme); } catch (e) {}
+  applyThemeAttr(theme);
+  themeListeners.forEach(fn => { try { fn(theme); } catch (e) {} });
+}
+function onThemeChange(fn) { themeListeners.add(fn); return () => themeListeners.delete(fn); }
+// Apply on load (body may not exist yet; retry on DOMContentLoaded)
+try { applyThemeAttr(CURRENT_THEME); } catch (e) {}
+try { document.addEventListener('DOMContentLoaded', () => applyThemeAttr(CURRENT_THEME)); } catch (e) {}
+
+const I18N = {
+  en: {
+    // App
+    'app.title': 'Catalyst',
+    'app.subtitle': 'Narrative Terminal',
+    'app.loading': 'Loading…',
+    'app.please_wait': 'Hold up…',
+    'app.back': '← Back',
+    'app.cancel': '← Cancel',
+    'app.esc_close': '✕ Esc',
+
+    // Status bar
+    'status.live': 'LIVE',
+    'status.offline': 'OFFLINE',
+    'status.signals': 'signals',
+    'status.alerts': 'alerts',
+    'status.sources': 'sources',
+    'status.updating': '⏳ updating',
+    'status.kbd.refresh': 'refresh',
+    'status.kbd.close': 'close',
+
+    // Nav
+    'nav.live': 'Live',
+    'nav.offline': 'Offline',
+    'nav.stats': 'Stats',
+    'nav.settings': 'Settings',
+    'nav.feed': 'Feed',
+
+    // Time
+    'time.just_now': 'just now',
+    'time.min_ago': '{n}m ago',
+    'time.hours_min_ago': '{h}h {m}m ago',
+    'time.hours_ago': '{h}h ago',
+    'time.days_ago': '{d}d ago',
+
+    // Lifespan
+    'lifespan.flash': '⚡ Hours',
+    'lifespan.short': '📅 1-2 days',
+    'lifespan.medium': '🗓 3-7 days',
+    'lifespan.long': '📆 Weeks+',
+    'lifespan.unknown': '—',
+
+    // Phase hints
+    'phase.early.hint': 'First signals — all risk, all upside',
+    'phase.forming.hint': 'Narrative forming — golden window to ape',
+    'phase.strong.hint': 'Strong signal — move fast or get left',
+    'phase.saturated.hint': 'Narrative cooked — ngmi if you enter now',
+
+    // Sentiment
+    'sentiment.positive': '😊 Bullish AF',
+    'sentiment.negative': '😠 Bearish',
+    'sentiment.neutral': '😐 Mid',
+
+    // Bars / scores
+    'bar.emergence': '🌊 Emergence',
+    'bar.adoption': '💊 Adoption',
+
+    // Feed card
+    'feed.details': '📖 Details',
+    'feed.open_source': 'Open',
+    'feed.copy_title': 'Copy title',
+    'feed.category_tip': 'Category',
+    'feedback.like': 'Smash that like',
+    'feedback.unlike': 'Undo like',
+    'feedback.dislike': 'Dislike',
+    'feedback.undislike': 'Undo dislike',
+
+    // Feed panel
+    'feed.panel.title': 'Narrative Feed',
+    'feed.panel.count_signals': '{n} signals',
+    'feed.panel.sub': 'Live narrative tracker · {active}/{total} sources · {h}h window',
+    'feed.search_placeholder': 'Search narratives…',
+    'feed.refresh_tip': 'Refresh (R)',
+    'feed.refreshing': 'Refreshing…',
+    'feed.loading': 'Loading narratives…',
+    'feed.empty.no_match': 'No matches for "{q}"',
+    'feed.empty.no_data': 'No narratives found — loosen the filters',
+    'feed.empty.hint': 'Hint: widen the time window or clear filters',
+    'feed.filter.all': 'All',
+
+    // Pagination
+    'pagination.prev': '← Prev',
+    'pagination.next': 'Next →',
+
+    // Sidebar
+    'sidebar.sources': 'Sources',
+    'sidebar.filters': 'Filters',
+    'sidebar.show_all': 'Show all',
+    'sidebar.reset': 'Reset',
+    'sidebar.window': '⏱ Window',
+    'sidebar.adoption': '💎 Adoption',
+    'sidebar.category': '📂 Category',
+    'sidebar.all_categories': 'All categories',
+    'sidebar.sort': '🔀 Sort',
+    'sort.rank': 'Rank',
+    'sort.meme': 'Top adoption',
+    'sort.emergence': 'Top emergence',
+    'sort.time': 'Newest',
+    'sort.virality': 'Virality',
+    'tooltip.hide_source': 'Hide from feed (visual only)',
+    'tooltip.show_source': 'Show in feed',
+    'tooltip.show_all': 'Show all',
+    'tooltip.reset': 'Reset',
+
+    // Hero bar (session/trends summary header)
+    'hero.window': 'Window',
+    'hero.signals': 'Signals',
+    'hero.alerts': 'Alerts',
+    'hero.stats': '📊 Stats',
+    'hero.scan_now': '⚡ Scan now',
+    'hero.scanning': '⏳ Scanning…',
+
+    // Right panel
+    'right.top_narratives': '🏆 Top Narratives',
+    'right.top_suffix': '{h}h · top {n}',
+    'right.no_signals': 'No signals yet',
+    'right.source_pulse': '📡 Source Pulse',
+    'right.live_count': '{a}/{t} live',
+    'right.activity': '📊 Activity',
+    'right.activity_hours': '{h}h',
+    'right.signals': 'Signals',
+    'right.alerts': 'Alerts',
+    'right.avg_virality': 'Avg virality',
+    'right.score.vrl': 'vrl',
+
+    // Trend modal
+    'modal.why_pump': "⚡ Why it'll moon",
+    'modal.ai_explanation': '🤖 AI alpha',
+    'modal.market_stage': '💹 Market Stage',
+    'modal.phase': '🧭 Narrative phase',
+    'modal.metrics': '📊 Stats',
+    'modal.meme_score': 'Meme Score',
+    'modal.lifespan': 'Lifespan',
+    'modal.virality': 'Virality',
+    'modal.sentiment': 'Vibe',
+    'modal.seen': 'Seen',
+    'modal.seen_suffix': 'x',
+    'modal.feedback': '💬 Your take',
+    'modal.links': '🔗 Links',
+    'modal.source_link': '{ico} Source →',
+    'modal.tg_link': '📨 Telegram',
+
+    // Control panel
+    'control.title': '⚙️ Controls',
+    'control.scan': 'Scan',
+    'control.health': 'Health',
+    'control.reload': 'Reload',
+    'control.stats': 'Stats',
+    'control.health_ok': '✅ Server alive · uptime {m}m',
+    'control.error': '❌ Error: {e}',
+    'control.enable_source': 'Enable source',
+    'control.disable_source': 'Disable source',
+
+    // Stats view
+    'stats.overview': '📊 Stats overview',
+    'stats.sources': 'Sources',
+    'stats.window': '{h}h window',
+    'stats.categories': 'Categories',
+    'stats.categories_sub': 'Top focus areas',
+    'stats.cluster_count': 'Narrative cluster count',
+    'stats.no_category_data': 'No category data yet',
+    'stats.top_narratives': 'Top narratives',
+    'stats.top_narratives_sub': 'Highest adoption right now',
+    'stats.no_trend_data': 'No trend data yet',
+
+    // Settings
+    'settings.title': '⚙️ Dashboard settings',
+    'settings.flash_reset': '✓ Settings reset',
+    'settings.flash_sources_shown': '✓ All sources visible',
+
+    'settings.appearance': '🎨 Appearance',
+    'settings.appearance_desc': 'Visual preferences — applied instantly, stored in this browser.',
+    'settings.density': 'Feed density',
+    'settings.density_desc': 'Compact shrinks padding and card size for dense scrolling.',
+    'settings.density.comfy': 'Comfy',
+    'settings.density.compact': 'Compact',
+    'settings.images': 'Show previews',
+    'settings.images_desc': 'Turn off to save bandwidth and declutter the feed.',
+    'settings.animations': 'UI animations',
+    'settings.animations_desc': 'Turn off to reduce load on slower devices.',
+    'settings.font_size': 'Font size',
+    'settings.font_size_desc': 'Base text size across the dashboard.',
+
+    'settings.behavior': '🔄 Behavior',
+    'settings.behavior_desc': 'Auto-refresh and source visibility in the feed.',
+    'settings.autorefresh': 'Auto-refresh',
+    'settings.autorefresh_off': 'Off — refresh manually with R.',
+    'settings.autorefresh_on': 'Every {s} seconds.',
+    'settings.hidden': 'Hidden sources',
+    'settings.hidden_count': '{n} hidden. Visual filter in this browser only.',
+    'settings.hidden_none': 'Nothing hidden — click sources in the sidebar to hide them.',
+    'settings.hidden_show_all': 'Show all',
+
+    'settings.language': '🌐 Language',
+    'settings.language_desc': 'Dashboard language. Bot stays in your Telegram language.',
+
+    'settings.theme': '🎨 Theme',
+    'settings.theme_desc': 'Pick your vibe. All dark — no white allowed.',
+
+    'settings.account': '👤 Account',
+    'settings.account_desc': 'Login goes through our Telegram bot. Your plan and settings are tied to this account.',
+    'settings.tg': 'Telegram',
+    'settings.tg_chatid': 'chat id: {id}',
+    'settings.plan': 'Plan',
+    'settings.plan_desc': 'Weights your likes/dislikes and unlocks premium features.',
+    'settings.logout': 'Log out',
+    'settings.logout_desc': "Unlink this browser. You'll need a fresh bot code to sign back in.",
+    'settings.logout_confirm': "Log out? You'll need to verify a fresh bot code to sign back in.",
+
+    'settings.reset_all': '↺ Reset all settings',
+    'settings.reset_all_confirm': 'Reset all dashboard settings to defaults?',
+
+    'plan.free': 'Free',
+    'plan.test': 'Test',
+    'plan.pro': 'Pro',
+    'plan.admin': 'Admin',
+
+    // Market stage hints
+    'market.tokenizing.hint': 'Launch discussions / pump.fun mentioned',
+    'market.live.hint': 'Contract address or DEX links found',
+    'market.overheated.hint': 'Trading active — late/rug signals present',
+
+    // Login
+    'login.subtitle': 'Sign in via Telegram',
+    'login.idle_desc': "No passwords here. Auth goes through our Telegram bot — you'll get a one-time code and paste it below.",
+    'login.idle_btn': '💬 Sign in with Telegram',
+    'login.code_desc': "Open the bot and hit Start — it'll send a 6-digit code. Paste it below:",
+    'login.bot_unavailable': 'Bot is temporarily unavailable. Try again later.',
+    'login.reopen_bot': '↗ Reopen the bot',
+    'login.verify_btn': 'Sign in',
+    'login.verifying': 'Verifying…',
+    'login.err_need_6': 'Enter the 6 digits from the bot message',
+
+    // Toasts
+    'toast.refreshing': 'Refreshing…',
+    'toast.copied': '📋 Copied!',
+    'toast.copy_failed': 'Copy failed',
+    'toast.all_sources_visible': '👁 All sources visible',
+    'toast.hidden_from_feed': '🙈 Hidden from feed: {name}',
+    'toast.shown_in_feed': '👁 Shown: {name}',
+    'toast.filters_reset': '♻️ Filters reset',
+    'toast.error_prefix': 'Error: {e}',
+  },
+
+  ru: {
+    // App
+    'app.title': 'Catalyst',
+    'app.subtitle': 'Narrative Terminal',
+    'app.loading': 'Загрузка…',
+    'app.please_wait': 'Подождите…',
+    'app.back': '← Назад',
+    'app.cancel': '← Отменить',
+    'app.esc_close': '✕ Esc',
+
+    // Status bar
+    'status.live': 'LIVE',
+    'status.offline': 'OFFLINE',
+    'status.signals': 'сигналы',
+    'status.alerts': 'алерты',
+    'status.sources': 'источники',
+    'status.updating': '⏳ обновляем',
+    'status.kbd.refresh': 'обновить',
+    'status.kbd.close': 'закрыть',
+
+    // Nav
+    'nav.live': 'Онлайн',
+    'nav.offline': 'Офлайн',
+    'nav.stats': 'Статистика',
+    'nav.settings': 'Настройки',
+    'nav.feed': 'Фид',
+
+    // Time
+    'time.just_now': 'только что',
+    'time.min_ago': '{n}м назад',
+    'time.hours_min_ago': '{h}ч {m}м назад',
+    'time.hours_ago': '{h}ч назад',
+    'time.days_ago': '{d}д назад',
+
+    // Lifespan
+    'lifespan.flash': '⚡ Часы',
+    'lifespan.short': '📅 1-2 дня',
+    'lifespan.medium': '🗓 3-7 дней',
+    'lifespan.long': '📆 Недели+',
+    'lifespan.unknown': '—',
+
+    // Phase hints
+    'phase.early.hint': 'Первые сигналы — риск и потенциал',
+    'phase.forming.hint': 'Нарратив развивается — золотое окно',
+    'phase.strong.hint': 'Сильный сигнал — действуй быстро',
+    'phase.saturated.hint': 'Нарратив переварен — поздно',
+
+    // Sentiment
+    'sentiment.positive': '😊 Позитив',
+    'sentiment.negative': '😠 Негатив',
+    'sentiment.neutral': '😐 Нейтраль',
+
+    // Bars / scores
+    'bar.emergence': '🌊 Emergence',
+    'bar.adoption': '💊 Adoption',
+
+    // Feed card
+    'feed.details': '📖 Подробнее',
+    'feed.open_source': 'Открыть',
+    'feed.copy_title': 'Скопировать заголовок',
+    'feed.category_tip': 'Категория',
+    'feedback.like': 'Лайк',
+    'feedback.unlike': 'Убрать лайк',
+    'feedback.dislike': 'Дизлайк',
+    'feedback.undislike': 'Убрать дизлайк',
+
+    // Feed panel
+    'feed.panel.title': 'Фид нарративов',
+    'feed.panel.count_signals': '{n} сигналов',
+    'feed.panel.sub': 'Живой трекер нарративов · {active}/{total} источников · окно {h}ч',
+    'feed.search_placeholder': 'Поиск нарративов…',
+    'feed.refresh_tip': 'Обновить (R)',
+    'feed.refreshing': 'Обновляю…',
+    'feed.loading': 'Загружаю нарративы…',
+    'feed.empty.no_match': 'Нет совпадений для «{q}»',
+    'feed.empty.no_data': 'Нарративы не найдены — попробуй другие фильтры',
+    'feed.empty.hint': 'Подсказка: увеличь окно или сбрось фильтры',
+    'feed.filter.all': 'Все',
+
+    // Pagination
+    'pagination.prev': '← Назад',
+    'pagination.next': 'Далее →',
+
+    // Sidebar
+    'sidebar.sources': 'Источники',
+    'sidebar.filters': 'Фильтры',
+    'sidebar.show_all': 'Показать все',
+    'sidebar.reset': 'Сбросить',
+    'sidebar.window': '⏱ Окно',
+    'sidebar.adoption': '💎 Adoption',
+    'sidebar.category': '📂 Категория',
+    'sidebar.all_categories': 'Все категории',
+    'sidebar.sort': '🔀 Сортировка',
+    'sort.rank': 'Рейтинг',
+    'sort.meme': 'Топ adoption',
+    'sort.emergence': 'Топ emergence',
+    'sort.time': 'Свежие',
+    'sort.virality': 'Виральность',
+    'tooltip.hide_source': 'Скрыть из фида (визуально)',
+    'tooltip.show_source': 'Показать в фиде',
+    'tooltip.show_all': 'Показать все',
+    'tooltip.reset': 'Сбросить',
+
+    // Hero bar
+    'hero.window': 'Окно',
+    'hero.signals': 'Сигналы',
+    'hero.alerts': 'Алерты',
+    'hero.stats': '📊 Статистика',
+    'hero.scan_now': '⚡ Сканировать',
+    'hero.scanning': '⏳ Сканирую…',
+
+    // Right panel
+    'right.top_narratives': '🏆 Топ нарративов',
+    'right.top_suffix': '{h}ч · топ {n}',
+    'right.no_signals': 'Пока нет сигналов',
+    'right.source_pulse': '📡 Пульс источников',
+    'right.live_count': '{a}/{t} активных',
+    'right.activity': '📊 Активность',
+    'right.activity_hours': '{h}ч',
+    'right.signals': 'Сигналы',
+    'right.alerts': 'Алерты',
+    'right.avg_virality': 'Ср. виральность',
+    'right.score.vrl': 'vrl',
+
+    // Trend modal
+    'modal.why_pump': '⚡ Почему запампит',
+    'modal.ai_explanation': '🤖 AI-объяснение',
+    'modal.market_stage': '💹 Стадия рынка',
+    'modal.phase': '🧭 Фаза нарратива',
+    'modal.metrics': '📊 Метрики',
+    'modal.meme_score': 'Meme Score',
+    'modal.lifespan': 'Срок жизни',
+    'modal.virality': 'Виральность',
+    'modal.sentiment': 'Сентимент',
+    'modal.seen': 'Видели',
+    'modal.seen_suffix': 'раз',
+    'modal.feedback': '💬 Ваша оценка',
+    'modal.links': '🔗 Ссылки',
+    'modal.source_link': '{ico} Источник →',
+    'modal.tg_link': '📨 Telegram',
+
+    // Control panel
+    'control.title': '⚙️ Управление',
+    'control.scan': 'Сканировать',
+    'control.health': 'Здоровье',
+    'control.reload': 'Перезагрузить',
+    'control.stats': 'Статистика',
+    'control.health_ok': '✅ Сервер живёт · uptime {m}м',
+    'control.error': '❌ Ошибка: {e}',
+    'control.enable_source': 'Включить источник',
+    'control.disable_source': 'Отключить источник',
+
+    // Stats view
+    'stats.overview': '📊 Обзор статистики',
+    'stats.sources': 'Источники',
+    'stats.window': 'окно {h}ч',
+    'stats.categories': 'Категории',
+    'stats.categories_sub': 'Топ категорий',
+    'stats.cluster_count': 'Кластер нарративов',
+    'stats.no_category_data': 'Ещё нет данных по категориям',
+    'stats.top_narratives': 'Топ нарративов',
+    'stats.top_narratives_sub': 'Самый высокий adoption сейчас',
+    'stats.no_trend_data': 'Ещё нет данных по трендам',
+
+    // Settings
+    'settings.title': '⚙️ Настройки дашборда',
+    'settings.flash_reset': '✓ Настройки сброшены',
+    'settings.flash_sources_shown': '✓ Все источники показаны',
+
+    'settings.appearance': '🎨 Внешний вид',
+    'settings.appearance_desc': 'Только визуальные предпочтения — применяются мгновенно и хранятся в этом браузере.',
+    'settings.density': 'Плотность фида',
+    'settings.density_desc': 'Compact уменьшает отступы и размер карточек для плотного просмотра.',
+    'settings.density.comfy': 'Comfy',
+    'settings.density.compact': 'Compact',
+    'settings.images': 'Показывать превью',
+    'settings.images_desc': 'Отключи чтобы экономить трафик и разгрузить фид.',
+    'settings.animations': 'Анимации интерфейса',
+    'settings.animations_desc': 'Отключи для снижения нагрузки на слабых устройствах.',
+    'settings.font_size': 'Размер шрифта',
+    'settings.font_size_desc': 'Базовый размер текста на дашборде.',
+
+    'settings.behavior': '🔄 Поведение',
+    'settings.behavior_desc': 'Автообновление и видимость источников в фиде.',
+    'settings.autorefresh': 'Автообновление',
+    'settings.autorefresh_off': 'Выключено — обновляй вручную клавишей R.',
+    'settings.autorefresh_on': 'Каждые {s} секунд.',
+    'settings.hidden': 'Скрытые источники',
+    'settings.hidden_count': 'Сейчас скрыто: {n}. Это только визуальная фильтрация в твоём браузере.',
+    'settings.hidden_none': 'Ничего не скрыто — можешь скрывать источники кликом в сайдбаре.',
+    'settings.hidden_show_all': 'Показать все',
+
+    'settings.language': '🌐 Язык',
+    'settings.language_desc': 'Язык дашборда. Бот остаётся на языке вашего Telegram.',
+
+    'settings.theme': '🎨 Тема',
+    'settings.theme_desc': 'Выбери настроение. Все тёмные — никакого белого.',
+
+    'settings.account': '👤 Аккаунт',
+    'settings.account_desc': 'Вход выполняется через Telegram-бота. Твой план и настройки привязаны к этому аккаунту.',
+    'settings.tg': 'Telegram',
+    'settings.tg_chatid': 'chat id: {id}',
+    'settings.plan': 'Тариф',
+    'settings.plan_desc': 'Влияет на вес твоих лайков/дизлайков и доступ к премиум-функциям.',
+    'settings.logout': 'Выйти',
+    'settings.logout_desc': 'Отвязать этот браузер. Для повторного входа потребуется новый код из бота.',
+    'settings.logout_confirm': 'Выйти из аккаунта? Нужно будет снова подтвердить код в Telegram.',
+
+    'settings.reset_all': '↺ Сбросить все настройки',
+    'settings.reset_all_confirm': 'Сбросить все настройки дашборда к значениям по умолчанию?',
+
+    'plan.free': 'Free',
+    'plan.test': 'Test',
+    'plan.pro': 'Pro',
+    'plan.admin': 'Admin',
+
+    // Market stage hints
+    'market.tokenizing.hint': 'Обсуждение запуска / упомянут pump.fun',
+    'market.live.hint': 'Найден контракт или ссылки на DEX',
+    'market.overheated.hint': 'Торги идут — поздно / признаки rug',
+
+    // Login
+    'login.subtitle': 'Вход через Telegram',
+    'login.idle_desc': 'Мы не храним пароли. Авторизация — через нашего Telegram-бота: ты получишь одноразовый код и введёшь его здесь.',
+    'login.idle_btn': '💬 Войти через Telegram',
+    'login.code_desc': 'Открой чат с ботом и нажми Start — он пришлёт шестизначный код. Введи его ниже:',
+    'login.bot_unavailable': 'Бот временно недоступен. Попробуйте позже.',
+    'login.reopen_bot': '↗ Открыть бота снова',
+    'login.verify_btn': 'Войти',
+    'login.verifying': 'Проверяем…',
+    'login.err_need_6': 'Введите 6 цифр из сообщения бота',
+
+    // Toasts
+    'toast.refreshing': 'Обновляю…',
+    'toast.copied': '📋 Скопировано!',
+    'toast.copy_failed': 'Не удалось скопировать',
+    'toast.all_sources_visible': '👁 Все источники видимы',
+    'toast.hidden_from_feed': '🙈 Скрыт в фиде: {name}',
+    'toast.shown_in_feed': '👁 Показан: {name}',
+    'toast.filters_reset': '♻️ Фильтры сброшены',
+    'toast.error_prefix': 'Ошибка: {e}',
+  },
+};
+
+function t(key, args) {
+  const dict = I18N[CURRENT_LANG] || I18N.en;
+  let str = dict[key];
+  if (str == null) str = (I18N.en[key] != null ? I18N.en[key] : key);
+  if (args) {
+    for (const k in args) {
+      str = str.split('{' + k + '}').join(String(args[k]));
+    }
+  }
+  return str;
+}
+function useLang() {
+  const [lang, setLangState] = useState(CURRENT_LANG);
+  useEffect(() => onLangChange(setLangState), []);
+  return lang;
+}
+function localeTag() { return CURRENT_LANG === 'ru' ? 'ru-RU' : 'en-US'; }
+function useTheme() {
+  const [theme, setThemeState] = useState(CURRENT_THEME);
+  useEffect(() => onThemeChange(setThemeState), []);
+  return theme;
+}
+
 const api = (path, opts = {}) => {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
   if (AUTH_TOKEN) headers['Authorization'] = 'Bearer ' + AUTH_TOKEN;
@@ -2205,24 +3167,31 @@ const SOURCE_LABELS = { reddit: 'Reddit', google_trends: 'Google', twitter: 'Twi
 const CAT_ICONS     = { meme:'😂', elon:'🚀', animals:'🐾', tech_drama:'💻', degenerates:'🎰', celebrity:'⭐', sports_degen:'🏆', ai_drama:'🤖', boring:'😴', other:'📌' };
 const CAT_CLS       = { meme:'cat-meme', elon:'cat-elon', animals:'cat-animals', tech_drama:'cat-tech_drama', degenerates:'cat-degenerates', celebrity:'cat-celebrity', sports_degen:'cat-sports_degen', ai_drama:'cat-ai_drama', boring:'cat-boring', other:'cat-other' };
 
-const LIFESPAN_LABELS = {
-  'flash (hours)':     '⚡ Часы',
-  'short (1-2 days)':  '📅 1-2 дня',
-  'medium (3-7 days)': '🗓 3-7 дней',
-  'long (weeks+)':     '📆 Недели+',
-  'unknown':           '—',
+// Lifespan key → i18n token. Resolve with lifespanLabel(key).
+const LIFESPAN_KEYS = {
+  'flash (hours)':     'lifespan.flash',
+  'short (1-2 days)':  'lifespan.short',
+  'medium (3-7 days)': 'lifespan.medium',
+  'long (weeks+)':     'lifespan.long',
+  'unknown':           'lifespan.unknown',
 };
+function lifespanLabel(k) {
+  const key = LIFESPAN_KEYS[k];
+  return key ? t(key) : '—';
+}
 
 // Source link labels
 const SOURCE_LINK_LABELS = { reddit: '🟠 Reddit', twitter: '𝕏 Twitter', tiktok: '🎵 TikTok', google_trends: '🔍 Google' };
 
 // ── Phase constants ──────────────────────────────────────────────────────────
+// hint resolves via t() — call phaseHint(phase) when you need the localized text.
 const PHASE_META = {
-  early:     { label: 'EARLY',     color: '#3B82F6', bg: 'rgba(59,130,246,0.12)', hint: 'Первые сигналы — риск и потенциал' },
-  forming:   { label: 'FORMING',   color: '#EAB308', bg: 'rgba(234,179,8,0.12)',  hint: 'Нарратив развивается — золотое окно' },
-  strong:    { label: 'STRONG',    color: '#22C55E', bg: 'rgba(34,197,94,0.12)',  hint: 'Сильный сигнал — действуй быстро' },
-  saturated: { label: 'SATURATED', color: '#EF4444', bg: 'rgba(239,68,68,0.12)', hint: 'Нарратив переварен — поздно' },
+  early:     { label: 'EARLY',     color: '#3B82F6', bg: 'rgba(59,130,246,0.12)', hintKey: 'phase.early.hint' },
+  forming:   { label: 'FORMING',   color: '#EAB308', bg: 'rgba(234,179,8,0.12)',  hintKey: 'phase.forming.hint' },
+  strong:    { label: 'STRONG',    color: '#22C55E', bg: 'rgba(34,197,94,0.12)',  hintKey: 'phase.strong.hint' },
+  saturated: { label: 'SATURATED', color: '#EF4444', bg: 'rgba(239,68,68,0.12)',  hintKey: 'phase.saturated.hint' },
 };
+function phaseHint(p) { const m = PHASE_META[p]; return m ? t(m.hintKey) : ''; }
 const PHASE_DOT = { early: '🔵', forming: '🟡', strong: '🟢', saturated: '🔴' };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2247,7 +3216,8 @@ function barColor(v) {
 }
 function fmtVelocity(v) {
   if (!v || v === 0) return null;
-  return v.toFixed(1) + '/ч ↑';
+  const unit = CURRENT_LANG === 'ru' ? '/ч' : '/h';
+  return v.toFixed(1) + unit + ' ↑';
 }
 function fmtTime(iso) {
   if (!iso) return '—';
@@ -2261,15 +3231,15 @@ function fmtTime(iso) {
   const now = new Date();
   const diff = Math.floor((now - d) / 60000); // minutes
   if (isNaN(diff) || diff < 0) return '—';
-  if (diff < 1)    return 'только что';
-  if (diff < 60)   return diff + 'м назад';
+  if (diff < 1)    return t('time.just_now');
+  if (diff < 60)   return t('time.min_ago', { n: diff });
   if (diff < 1440) {
-    const h = Math.floor(diff / 60);
-    const m = diff % 60;
-    return m > 0 ? (h + '\u0447 ' + m + '\u043C \u043D\u0430\u0437\u0430\u0434') : (h + '\u0447 \u043D\u0430\u0437\u0430\u0434');
+    const hr = Math.floor(diff / 60);
+    const m  = diff % 60;
+    return m > 0 ? t('time.hours_min_ago', { h: hr, m }) : t('time.hours_ago', { h: hr });
   }
-  if (diff < 10080) return Math.floor(diff / 1440) + '\u0434 \u043D\u0430\u0437\u0430\u0434'; // up to 7 days
-  return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+  if (diff < 10080) return t('time.days_ago', { d: Math.floor(diff / 1440) });
+  return d.toLocaleDateString(localeTag(), { day: '2-digit', month: '2-digit' });
 }
 
 // ── Components ───────────────────────────────────────────────────────────────
@@ -2305,29 +3275,32 @@ function ScoreBar({ value, label, sub, color }) {
 
 // Phase badge shown in card header
 function PhaseBadge({ phase }) {
+  useLang();
   if (!phase) return null;
   const m = PHASE_META[phase] || PHASE_META.early;
   return h('span', {
     className: 'phase-badge',
     style: { background: m.bg, color: m.color, border: '1px solid ' + m.color },
-    title: m.hint
+    title: phaseHint(phase)
   }, PHASE_DOT[phase] + ' ' + m.label);
 }
 
 // [MARKET_STAGE] badge — remove component + call in TrendCard to disable UI
 const MARKET_STAGE_UI = {
-  tokenizing: { icon: '🔄', label: 'TOKENIZING', color: '#F59E0B', bg: 'rgba(245,158,11,0.12)', hint: 'Launch discussions / pump.fun mentioned' },
-  live:       { icon: '🟢', label: 'LIVE',       color: '#10B981', bg: 'rgba(16,185,129,0.12)', hint: 'Contract address or DEX links found' },
-  overheated: { icon: '🔴', label: 'OVERHEATED', color: '#EF4444', bg: 'rgba(239,68,68,0.12)',  hint: 'Trading active — late/rug signals present' },
+  tokenizing: { icon: '🔄', label: 'TOKENIZING', color: '#F59E0B', bg: 'rgba(245,158,11,0.12)', hintKey: 'market.tokenizing.hint' },
+  live:       { icon: '🟢', label: 'LIVE',       color: '#10B981', bg: 'rgba(16,185,129,0.12)', hintKey: 'market.live.hint' },
+  overheated: { icon: '🔴', label: 'OVERHEATED', color: '#EF4444', bg: 'rgba(239,68,68,0.12)',  hintKey: 'market.overheated.hint' },
 };
+function marketStageHint(stage) { const m = MARKET_STAGE_UI[stage]; return m ? t(m.hintKey) : ''; }
 function MarketStageBadge({ stage }) {
+  useLang();
   if (!stage || stage === 'none') return null;
   const m = MARKET_STAGE_UI[stage];
   if (!m) return null;
   return h('span', {
     className: 'phase-badge',
     style: { background: m.bg, color: m.color, border: '1px solid ' + m.color },
-    title: m.hint
+    title: marketStageHint(stage)
   }, m.icon + ' ' + m.label);
 }
 
@@ -2448,7 +3421,7 @@ function FeedbackBar({ trend, variant }) {
       className: 'fb-btn fb-like' + (userVote === 1 ? ' active' : ''),
       onClick: e => { e.stopPropagation(); vote(1); },
       disabled: busy,
-      title: userVote === 1 ? 'Убрать лайк' : 'Лайк'
+      title: userVote === 1 ? t('feedback.unlike') : t('feedback.like')
     },
       h('span', { className: 'fb-ico' }, '👍'),
       h('span', { className: 'fb-count' }, likes)
@@ -2457,7 +3430,7 @@ function FeedbackBar({ trend, variant }) {
       className: 'fb-btn fb-dislike' + (userVote === -1 ? ' active' : ''),
       onClick: e => { e.stopPropagation(); vote(-1); },
       disabled: busy,
-      title: userVote === -1 ? 'Убрать дизлайк' : 'Дизлайк'
+      title: userVote === -1 ? t('feedback.undislike') : t('feedback.dislike')
     },
       h('span', { className: 'fb-ico' }, '👎'),
       h('span', { className: 'fb-count' }, dislikes)
@@ -2466,11 +3439,12 @@ function FeedbackBar({ trend, variant }) {
 }
 
 function FeedCard({ trend, onOpen, onCopy }) {
+  useLang();
   const catCls = CAT_CLS[trend.category] || 'cat-other';
   const catIco = CAT_ICONS[trend.category] || '📌';
   const srcIco = SOURCE_ICONS[trend.source] || '📡';
   const srcLbl = SOURCE_LABELS[trend.source] || trend.source;
-  const linkLabel = SOURCE_LINK_LABELS[trend.source] || 'Open';
+  const linkLabel = SOURCE_LINK_LABELS[trend.source] || t('feed.open_source');
 
   const phase     = trend.narrativePhase || null;
   const emergence = trend.emergenceScore || 0;
@@ -2514,7 +3488,7 @@ function FeedCard({ trend, onOpen, onCopy }) {
           h('div', { className: 'feed-badges' },
             phase ? h(PhaseBadge, { phase }) : null,
             h(MarketStageBadge, { stage: trend.marketStage }),
-            h('span', { className: 'badge ' + catCls, title: 'Категория' }, catIco + ' ' + (trend.category || 'other'))
+            h('span', { className: 'badge ' + catCls, title: t('feed.category_tip') }, catIco + ' ' + (trend.category || 'other'))
           )
         ),
         h('div', { className: 'feed-title' }, trend.title),
@@ -2534,7 +3508,7 @@ function FeedCard({ trend, onOpen, onCopy }) {
     h('div', { className: 'feed-scores' },
       h('div', { className: 'feed-score' },
         h('div', { className: 'feed-score-top' },
-          h('span', { className: 'feed-score-label' }, '🌊 Emergence'),
+          h('span', { className: 'feed-score-label' }, t('bar.emergence')),
           h('span', { className: 'feed-score-num', style: { color: emergenceColor } }, emergence)
         ),
         h('div', { className: 'feed-score-track' },
@@ -2543,7 +3517,7 @@ function FeedCard({ trend, onOpen, onCopy }) {
       ),
       h('div', { className: 'feed-score' },
         h('div', { className: 'feed-score-top' },
-          h('span', { className: 'feed-score-label' }, '💊 Adoption'),
+          h('span', { className: 'feed-score-label' }, t('bar.adoption')),
           h('span', { className: 'feed-score-num', style: { color: adoptionColor } }, adoption)
         ),
         h('div', { className: 'feed-score-track' },
@@ -2557,7 +3531,7 @@ function FeedCard({ trend, onOpen, onCopy }) {
       h('button', {
         className: 'feed-action-btn primary',
         onClick: e => { e.stopPropagation(); onOpen && onOpen(trend); }
-      }, '📖 Details'),
+      }, t('feed.details')),
       trend.url ? h('a', {
         className: 'feed-action-btn',
         href: trend.url, target: '_blank', rel: 'noopener',
@@ -2571,7 +3545,7 @@ function FeedCard({ trend, onOpen, onCopy }) {
       h('button', {
         className: 'feed-action-btn',
         onClick: e => { e.stopPropagation(); onCopy && onCopy(trend.title); },
-        title: 'Copy title'
+        title: t('feed.copy_title')
       }, '📋'),
       h(FeedbackBar, { trend }),
       metaParts.length
@@ -2586,6 +3560,7 @@ const TrendCard = FeedCard;
 
 // ── RightPanel — AIO Feeds-style column with Top narratives / Pulse / Activity ─
 function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOpenTrend, onToggleSource }) {
+  useLang();
   // Top narratives from server-side stats (real top by adoption for the full window)
   // stats.topTrends is populated by /api/stats — same data as /top in TG bot
   const topTrends = (stats && stats.topTrends ? stats.topTrends : []).slice(0, 5);
@@ -2606,21 +3581,21 @@ function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOp
     // ── Top Narratives ──
     h('div', { className: 'right-section' },
       h('div', { className: 'right-section-head' },
-        h('span', { className: 'right-section-title' }, '🏆 Top Narratives'),
-        h('span', { className: 'right-section-count' }, hours + 'h · top ' + topTrends.length)
+        h('span', { className: 'right-section-title' }, t('right.top_narratives')),
+        h('span', { className: 'right-section-count' }, t('right.top_suffix', { h: hours, n: topTrends.length }))
       ),
       h('div', { className: 'right-section-body' },
         topTrends.length
-          ? topTrends.map((t, i) => {
-              const adoptionVal = t.adoptionScore || t.memePotential || 0;
-              return h('div', { key: t.id, className: 'top-item', onClick: () => onOpenTrend && onOpenTrend(t) },
+          ? topTrends.map((tr, i) => {
+              const adoptionVal = tr.adoptionScore || tr.memePotential || 0;
+              return h('div', { key: tr.id, className: 'top-item', onClick: () => onOpenTrend && onOpenTrend(tr) },
                 h('div', { className: 'top-item-rank' + (i < 3 ? ' top-' + (i + 1) : '') }, i + 1),
                 h('div', { className: 'top-item-info' },
-                  h('div', { className: 'top-item-title', title: t.title }, t.title),
+                  h('div', { className: 'top-item-title', title: tr.title }, tr.title),
                   h('div', { className: 'top-item-meta' },
-                    h('span', null, SOURCE_ICONS[t.source] || '📡'),
-                    t.narrativePhase ? h('span', null, PHASE_DOT[t.narrativePhase] + ' ' + (PHASE_META[t.narrativePhase] || {}).label) : null,
-                    h('span', null, (t.score || t.virality || 0) + ' vrl')
+                    h('span', null, SOURCE_ICONS[tr.source] || '📡'),
+                    tr.narrativePhase ? h('span', null, PHASE_DOT[tr.narrativePhase] + ' ' + (PHASE_META[tr.narrativePhase] || {}).label) : null,
+                    h('span', null, (tr.score || tr.virality || 0) + ' ' + t('right.score.vrl'))
                   )
                 ),
                 h('div', { className: 'top-item-score' }, adoptionVal)
@@ -2628,7 +3603,7 @@ function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOp
             })
           : h('div', { className: 'empty-feed', style: { padding: '22px 10px' } },
               h('div', { className: 'empty-feed-icon' }, '📭'),
-              h('div', { className: 'empty-feed-text' }, 'No signals yet')
+              h('div', { className: 'empty-feed-text' }, t('right.no_signals'))
             )
       )
     ),
@@ -2638,8 +3613,8 @@ function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOp
     // ── Source Pulse ──
     h('div', { className: 'right-section' },
       h('div', { className: 'right-section-head' },
-        h('span', { className: 'right-section-title' }, '📡 Source Pulse'),
-        h('span', { className: 'right-section-count' }, activeSources + '/' + (sources || []).length + ' live')
+        h('span', { className: 'right-section-title' }, t('right.source_pulse')),
+        h('span', { className: 'right-section-count' }, t('right.live_count', { a: activeSources, t: (sources || []).length }))
       ),
       h('div', { className: 'right-section-body' },
         (allSourceStats || []).map(row => {
@@ -2650,7 +3625,7 @@ function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOp
             'data-src': row.source,
             className: 'pulse-row' + (visible ? '' : ' off'),
             onClick: () => onToggleSource && onToggleSource(row.source),
-            title: visible ? 'Скрыть из фида (визуально)' : 'Показать в фиде'
+            title: visible ? t('tooltip.hide_source') : t('tooltip.show_source')
           },
             h('span', { className: 'pulse-icon' }, SOURCE_ICONS[row.source] || '📡'),
             h('span', { className: 'pulse-name' }, SOURCE_LABELS[row.source] || row.source),
@@ -2665,21 +3640,21 @@ function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOp
     // ── Activity summary ──
     h('div', { className: 'right-section' },
       h('div', { className: 'right-section-head' },
-        h('span', { className: 'right-section-title' }, '📊 Activity'),
-        h('span', { className: 'right-section-count' }, hours + 'h')
+        h('span', { className: 'right-section-title' }, t('right.activity')),
+        h('span', { className: 'right-section-count' }, t('right.activity_hours', { h: hours }))
       ),
       h('div', { className: 'right-section-body' },
         h('div', { className: 'activity-grid' },
           h('div', { className: 'activity-cell' },
-            h('span', { className: 'activity-label' }, 'Signals'),
+            h('span', { className: 'activity-label' }, t('right.signals')),
             h('span', { className: 'activity-val accent' }, totalSignals)
           ),
           h('div', { className: 'activity-cell' },
-            h('span', { className: 'activity-label' }, 'Alerts'),
+            h('span', { className: 'activity-label' }, t('right.alerts')),
             h('span', { className: 'activity-val orange' }, totalAlerts)
           ),
           h('div', { className: 'activity-cell full' },
-            h('span', { className: 'activity-label' }, 'Avg virality'),
+            h('span', { className: 'activity-label' }, t('right.avg_virality')),
             h('span', { className: 'activity-val green' }, avgScore, h('span', { style: { fontSize: 11, color: 'var(--dim)', marginLeft: 4 } }, '/100'))
           )
         )
@@ -2695,6 +3670,7 @@ function RightPanel({ stats, sources, allSourceStats, hours, hiddenSources, onOp
 
 // ── TrendModal (side drawer) ───────────────────────────────────────────────────
 function TrendModal({ trend, onClose }) {
+  useLang();
   const [imgUrl, setImgUrl] = useState(trend.imageUrl || null);
   const [imgLoading, setImgLoading] = useState(!trend.imageUrl && !!trend.url);
   const catCls = CAT_CLS[trend.category] || 'cat-other';
@@ -2723,8 +3699,8 @@ function TrendModal({ trend, onClose }) {
 
   const sentCls = trend.sentiment === 'positive' ? 'sentiment-pos'
     : trend.sentiment === 'negative' ? 'sentiment-neg' : 'sentiment-neu';
-  const sentLabel = trend.sentiment === 'positive' ? '😊 Позитив'
-    : trend.sentiment === 'negative' ? '😠 Негатив' : '😐 Нейтраль';
+  const sentLabel = trend.sentiment === 'positive' ? t('sentiment.positive')
+    : trend.sentiment === 'negative' ? t('sentiment.negative') : t('sentiment.neutral');
 
   return h('div', { className: 'modal-overlay', onClick: e => { if (e.target === e.currentTarget) onClose(); } },
     h('div', { className: 'modal-drawer' },
@@ -2734,7 +3710,7 @@ function TrendModal({ trend, onClose }) {
         h('span', { className: 'badge ' + catCls }, catIco + ' ' + (trend.category || 'other')),
         h('div', { className: 'source-chip' }, srcIco, ' ', srcLbl),
         h('span', { className: 'time-cell', style: { fontSize: 11 } }, fmtTime(trend.firstSeen)),
-        h('button', { className: 'modal-close', onClick: onClose }, '✕ Esc')
+        h('button', { className: 'modal-close', onClick: onClose }, t('app.esc_close'))
       ),
 
       // Body
@@ -2757,80 +3733,80 @@ function TrendModal({ trend, onClose }) {
 
         // Why it'll pump
         trend.whyItWillPump ? h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, '⚡ Почему запампит'),
+          h('div', { className: 'modal-section-label' }, t('modal.why_pump')),
           h('div', { className: 'modal-section-content pump' }, trend.whyItWillPump)
         ) : null,
 
         // AI explanation
         trend.aiExplanation ? h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, '🤖 AI Объяснение'),
+          h('div', { className: 'modal-section-label' }, t('modal.ai_explanation')),
           h('div', { className: 'modal-section-content' }, trend.aiExplanation)
         ) : null,
 
         // [MARKET_STAGE] market stage line in modal — remove block to disable
         trend.marketStage && trend.marketStage !== 'none' ? h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, '💹 Market Stage'),
+          h('div', { className: 'modal-section-label' }, t('modal.market_stage')),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
             h(MarketStageBadge, { stage: trend.marketStage }),
             h('span', { style: { fontSize: 12, color: 'var(--dim)' } },
-              (MARKET_STAGE_UI[trend.marketStage] || {}).hint || ''
+              marketStageHint(trend.marketStage)
             )
           )
         ) : null,
 
         // Phase + two bars
         trend.narrativePhase ? h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, '🧭 Фаза нарратива'),
+          h('div', { className: 'modal-section-label' }, t('modal.phase')),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 } },
             h(PhaseBadge, { phase: trend.narrativePhase }),
             h('span', { style: { fontSize: 12, color: 'var(--dim)' } },
-              (PHASE_META[trend.narrativePhase] || PHASE_META.early).hint
+              phaseHint(trend.narrativePhase) || phaseHint('early')
             )
           ),
-          h(ScoreBar, { label: '🌊 Emergence', value: trend.emergenceScore || 0 }),
+          h(ScoreBar, { label: t('bar.emergence'), value: trend.emergenceScore || 0 }),
           h('div', { style: { height: 4 } }),
-          h(ScoreBar, { label: '💊 Adoption',  value: trend.adoptionScore || trend.memePotential || 0 })
+          h(ScoreBar, { label: t('bar.adoption'),  value: trend.adoptionScore || trend.memePotential || 0 })
         ) : null,
 
         // Stats grid
         h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, '📊 Метрики'),
+          h('div', { className: 'modal-section-label' }, t('modal.metrics')),
           h('div', { className: 'modal-stats-grid' },
             h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, 'Meme Score'),
+              h('div', { className: 'modal-stat-label' }, t('modal.meme_score')),
               h(MemeScore, { value: trend.memePotential || 0 })
             ),
             h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, 'Срок жизни'),
-              h('span', { className: 'lifespan' }, LIFESPAN_LABELS[trend.predictedLifespan] || '—')
+              h('div', { className: 'modal-stat-label' }, t('modal.lifespan')),
+              h('span', { className: 'lifespan' }, lifespanLabel(trend.predictedLifespan))
             ),
             h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, 'Виральность'),
+              h('div', { className: 'modal-stat-label' }, t('modal.virality')),
               h('span', { style: { fontFamily: 'JetBrains Mono', fontWeight: 700, color: 'var(--accent2)' } }, trend.score || 0)
             ),
             h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, 'Сентимент'),
+              h('div', { className: 'modal-stat-label' }, t('modal.sentiment')),
               h('span', { className: sentCls }, sentLabel)
             ),
             h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, 'Видели'),
-              h('span', { style: { fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700 } }, trend.timesSeen || 1, 'x')
+              h('div', { className: 'modal-stat-label' }, t('modal.seen')),
+              h('span', { style: { fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700 } }, trend.timesSeen || 1, t('modal.seen_suffix'))
             )
           )
         ),
 
         // Feedback
         h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, '💬 Ваша оценка'),
+          h('div', { className: 'modal-section-label' }, t('modal.feedback')),
           h(FeedbackBar, { trend, variant: 'modal' })
         ),
 
         // Actions
         h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, '🔗 Ссылки'),
+          h('div', { className: 'modal-section-label' }, t('modal.links')),
           h('div', { className: 'modal-actions' },
-            trend.url ? h('a', { className: 'trend-link' + srcLinkCls, href: trend.url, target: '_blank', rel: 'noopener' }, srcIco + ' Источник →') : null,
-            trend.tgMessageUrl ? h('a', { className: 'trend-link trend-link-tg', href: trend.tgMessageUrl, target: '_blank', rel: 'noopener' }, '📨 Telegram') : null
+            trend.url ? h('a', { className: 'trend-link' + srcLinkCls, href: trend.url, target: '_blank', rel: 'noopener' }, t('modal.source_link', { ico: srcIco })) : null,
+            trend.tgMessageUrl ? h('a', { className: 'trend-link trend-link-tg', href: trend.tgMessageUrl, target: '_blank', rel: 'noopener' }, t('modal.tg_link')) : null
           )
         )
       )
@@ -2850,20 +3826,22 @@ function Toasts({ toasts }) {
 
 // ── NavClock — isolated 1-second ticker (no App re-render) ───────────────────
 function NavClock({ refreshAt }) {
+  useLang();
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
   }, []);
   const refreshIn = Math.max(0, Math.ceil((refreshAt - now) / 1000));
   return h(React.Fragment, null,
     h('span', { className: 'refresh-badge' }, '\u21bb ' + refreshIn + 's'),
-    h('span', { className: 'nav-time' }, new Date(now).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }))
+    h('span', { className: 'nav-time' }, new Date(now).toLocaleTimeString(localeTag(), { hour: '2-digit', minute: '2-digit' }))
   );
 }
 
 // ── StatusBar — bottom strip ─────────────────────────────────────────────────
 function StatusBar({ stats, scanning, sources }) {
+  useLang();
   const active = (sources || []).filter(function(s) { return s.enabled; }).length;
   const total  = (sources || []).length;
   const paused = !!(stats && stats.paused);
@@ -2874,40 +3852,41 @@ function StatusBar({ stats, scanning, sources }) {
       style: { color: paused ? 'var(--red2)' : 'var(--green2)', fontWeight: 700 }
     },
       h('div', { className: 'statusbar-dot' + (paused ? ' paused' : '') }),
-      paused ? 'OFFLINE' : 'LIVE'
+      paused ? t('status.offline') : t('status.live')
     ),
     h('div', { className: 'statusbar-sep' }),
     h('span', { className: 'statusbar-item' },
-      h('span', { className: 'sb-key' }, 'signals'),
+      h('span', { className: 'sb-key' }, t('status.signals')),
       h('b', null, String(stats ? stats.total || 0 : 0))
     ),
     h('span', { className: 'statusbar-item' },
-      h('span', { className: 'sb-key' }, 'alerts'),
+      h('span', { className: 'sb-key' }, t('status.alerts')),
       h('b', null, String(stats ? stats.alerts || 0 : 0))
     ),
     h('span', { className: 'statusbar-item' },
-      h('span', { className: 'sb-key' }, 'sources'),
+      h('span', { className: 'sb-key' }, t('status.sources')),
       h('b', { style: { color: srcOk ? 'var(--green2)' : 'var(--orange)' } }, active + '/' + total)
     ),
     scanning
       ? h('span', { className: 'statusbar-item', style: { color: 'var(--accent2)' } },
-          h('span', { className: 'sb-key', style: { color: 'var(--accent2)' } }, '⏳ updating')
+          h('span', { className: 'sb-key', style: { color: 'var(--accent2)' } }, t('status.updating'))
         )
       : null,
     h('span', { className: 'statusbar-hint' },
-      h('span', { className: 'statusbar-kbd' }, h('b', null, 'R'), 'refresh'),
-      h('span', { className: 'statusbar-kbd' }, h('b', null, 'Esc'), 'close')
+      h('span', { className: 'statusbar-kbd' }, h('b', null, 'R'), t('status.kbd.refresh')),
+      h('span', { className: 'statusbar-kbd' }, h('b', null, 'Esc'), t('status.kbd.close'))
     )
   );
 }
 
 // ── ControlPanel ──────────────────────────────────────────────────────────────
 function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }) {
+  useLang();
   const CONTROL_BUTTONS = [
-    { id: 'scan',   icon: '⚡', label: 'Сканировать', action: 'scan',   disabled: scanning },
-    { id: 'health', icon: '🏥', label: 'Здоровье',    action: 'health', disabled: false },
-    { id: 'reload', icon: '↻',  label: 'Перезагрузить', action: 'reload', disabled: false },
-    { id: 'stats',  icon: '📊', label: 'Статистика',  action: 'stats',  disabled: false },
+    { id: 'scan',   icon: '⚡', label: t('control.scan'),   action: 'scan',   disabled: scanning },
+    { id: 'health', icon: '🏥', label: t('control.health'), action: 'health', disabled: false },
+    { id: 'reload', icon: '↻',  label: t('control.reload'), action: 'reload', disabled: false },
+    { id: 'stats',  icon: '📊', label: t('control.stats'),  action: 'stats',  disabled: false },
   ];
 
   const handleAction = async (action) => {
@@ -2916,9 +3895,9 @@ function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }
     } else if (action === 'health') {
       try {
         const res = await fetch('/api/health').then(r => r.json());
-        addToast && addToast('✅ Сервер живёт · uptime ' + Math.floor(res.uptime / 60) + 'м', 'success');
+        addToast && addToast(t('control.health_ok', { m: Math.floor(res.uptime / 60) }), 'success');
       } catch (e) {
-        addToast && addToast('❌ Ошибка: ' + e.message, 'error');
+        addToast && addToast(t('control.error', { e: e.message }), 'error');
       }
     } else if (action === 'reload') {
       location.reload();
@@ -2929,7 +3908,7 @@ function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }
 
   return h('div', { className: 'control-panel' },
     h('div', { className: 'control-panel-title' },
-      '⚙️ Управление'
+      t('control.title')
     ),
 
     h('div', { className: 'control-grid' },
@@ -2959,7 +3938,7 @@ function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }
                 key: src.source,
                 className: 'source-control-btn' + (src.enabled ? '' : ' disabled'),
                 onClick: () => onCollectorToggle(src.source),
-                title: src.enabled ? 'Отключить источник' : 'Включить источник',
+                title: src.enabled ? t('control.disable_source') : t('control.enable_source'),
               },
                 h('span', null, '📡 ' + (src.source === 'google_trends' ? 'Google' : src.source.charAt(0).toUpperCase() + src.source.slice(1))),
                 h('div', { className: 'source-control-toggle' })
@@ -2973,33 +3952,35 @@ function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }
 
 // ── SettingsPanel ─────────────────────────────────────────────────────────────
 function HeroPanel({ stats, hours, refreshIn, scanning, onScan, onOpenStats }) {
+  useLang();
   return h('div', { className: 'session-bar' },
-    h('span', { className: 'session-tag' }, stats && stats.paused ? 'PAUSED' : 'LIVE'),
-    h('div', { className: 'session-title' }, 'Catalyst — Narrative Terminal'),
+    h('span', { className: 'session-tag' }, stats && stats.paused ? t('status.offline') : t('status.live')),
+    h('div', { className: 'session-title' }, t('app.title') + ' — ' + t('app.subtitle')),
     h('div', { className: 'session-chips' },
       h('div', { className: 'session-chip' },
-        'Window ', h('span', { className: 'chip-val' }, hours + 'h')
+        t('hero.window') + ' ', h('span', { className: 'chip-val' }, hours + 'h')
       ),
       h('div', { className: 'session-chip' },
-        'Signals ', h('span', { className: 'chip-val' }, String(stats ? stats.total || 0 : 0))
+        t('hero.signals') + ' ', h('span', { className: 'chip-val' }, String(stats ? stats.total || 0 : 0))
       ),
       h('div', { className: 'session-chip' },
-        'Alerts ', h('span', { className: 'chip-val' }, String(stats ? stats.alerts || 0 : 0))
+        t('hero.alerts') + ' ', h('span', { className: 'chip-val' }, String(stats ? stats.alerts || 0 : 0))
       ),
       h('div', { className: 'session-chip', style: { cursor: 'pointer' }, onClick: onOpenStats },
-        '\ud83d\udcca Stats'
+        t('hero.stats')
       ),
       h('button', {
         className: 'btn btn-primary',
         onClick: onScan,
         disabled: scanning,
         style: { fontSize: 11, padding: '4px 11px' }
-      }, scanning ? '\u23f3 Scanning...' : '\u26a1 Scan now')
+      }, scanning ? t('hero.scanning') : t('hero.scan_now'))
     )
   );
 }
 
 function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
+  useLang();
   const sourceOrder = ['reddit', 'google_trends', 'twitter', 'tiktok'];
   const allSources = sourceOrder.map(name => {
     const hit = (stats?.bySource || []).find(s => s.source === name);
@@ -3010,14 +3991,14 @@ function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
 
   return h('div', { className: 'stats-view' },
     h('div', { className: 'settings-header' },
-      h('button', { className: 'btn btn-ghost', onClick: onBack }, '← Back'),
-      h('span', { className: 'settings-title' }, '📊 Stats overview')
+      h('button', { className: 'btn btn-ghost', onClick: onBack }, t('app.back')),
+      h('span', { className: 'settings-title' }, t('stats.overview'))
     ),
     h('div', { className: 'stats-grid' },
       h('section', { className: 'section-shell stats-block' },
         h('div', { className: 'stats-block-head' },
-          h('div', { className: 'stats-block-title' }, 'Sources'),
-          h('div', { className: 'stats-block-sub' }, hours + 'h window')
+          h('div', { className: 'stats-block-title' }, t('stats.sources')),
+          h('div', { className: 'stats-block-sub' }, t('stats.window', { h: hours }))
         ),
         h('div', { className: 'stats-list' },
           allSources.map(row =>
@@ -3033,8 +4014,8 @@ function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
       ),
       h('section', { className: 'section-shell stats-block' },
         h('div', { className: 'stats-block-head' },
-          h('div', { className: 'stats-block-title' }, 'Categories'),
-          h('div', { className: 'stats-block-sub' }, 'Top focus areas')
+          h('div', { className: 'stats-block-title' }, t('stats.categories')),
+          h('div', { className: 'stats-block-sub' }, t('stats.categories_sub'))
         ),
         h('div', { className: 'stats-list' },
           topCategories.length
@@ -3044,21 +4025,21 @@ function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
                     h('span', null, CAT_ICONS[row.category] || '📌'),
                     h('div', null,
                       h('div', { className: 'stats-list-name' }, row.category || 'other'),
-                      h('div', { className: 'stats-list-meta' }, 'Narrative cluster count')
+                      h('div', { className: 'stats-list-meta' }, t('stats.cluster_count'))
                     )
                   ),
                   h('span', { className: 'stats-list-value' }, String(row.count))
                 )
               )
             : h('div', { className: 'stats-list-row' },
-                h('span', { className: 'stats-list-meta' }, 'No category data yet')
+                h('span', { className: 'stats-list-meta' }, t('stats.no_category_data'))
               )
         )
       ),
       h('section', { className: 'section-shell stats-block' },
         h('div', { className: 'stats-block-head' },
-          h('div', { className: 'stats-block-title' }, 'Top narratives'),
-          h('div', { className: 'stats-block-sub' }, 'Highest adoption now')
+          h('div', { className: 'stats-block-title' }, t('stats.top_narratives')),
+          h('div', { className: 'stats-block-sub' }, t('stats.top_narratives_sub'))
         ),
         h('div', { className: 'stats-top-grid' },
           topTrends.length
@@ -3077,7 +4058,7 @@ function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
                 )
               )
             : h('div', { className: 'stats-list-row' },
-                h('span', { className: 'stats-list-meta' }, 'No trend data yet')
+                h('span', { className: 'stats-list-meta' }, t('stats.no_trend_data'))
               )
         )
       )
@@ -3118,6 +4099,8 @@ function applyPrefsToDOM(p) {
 try { applyPrefsToDOM(loadPrefs()); } catch (e) {}
 
 function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user, onLogout }) {
+  const lang = useLang();
+  const theme = useTheme();
   const [prefs, setPrefs] = useState(loadPrefs);
   const [flash, setFlash] = useState('');
 
@@ -3129,19 +4112,19 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
 
   const flashMsg = (m) => { setFlash(m); setTimeout(() => setFlash(''), 2000); };
 
-  const planLabels = { free: 'Free', test: 'Test', pro: 'Pro', admin: 'Admin' };
+  const planLabels = { free: t('plan.free'), test: t('plan.test'), pro: t('plan.pro'), admin: t('plan.admin') };
   const doLogout = async () => {
-    if (!confirm('Выйти из аккаунта? Нужно будет снова подтвердить код в Telegram.')) return;
+    if (!confirm(t('settings.logout_confirm'))) return;
     try { await api('/auth/logout', { method: 'POST' }); } catch (e) { /* token already invalid */ }
     if (onLogout) onLogout();
   };
 
   const resetAllPrefs = () => {
-    if (!confirm('Сбросить все настройки дашборда к значениям по умолчанию?')) return;
+    if (!confirm(t('settings.reset_all_confirm'))) return;
     const next = { ...DEFAULT_PREFS };
     setPrefs(next);
     savePrefs(next);
-    flashMsg('✓ Настройки сброшены');
+    flashMsg(t('settings.flash_reset'));
   };
 
   const Toggle = ({ on, onChange }) =>
@@ -3163,22 +4146,65 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
 
   return h('div', { className: 'settings-panel' },
     h('div', { className: 'settings-header' },
-      h('button', { className: 'btn btn-ghost', onClick: onBack }, '← Назад'),
-      h('span', { className: 'settings-title' }, '⚙️ Настройки дашборда'),
+      h('button', { className: 'btn btn-ghost', onClick: onBack }, t('app.back')),
+      h('span', { className: 'settings-title' }, t('settings.title')),
       flash ? h('span', { className: 'settings-flash' }, flash) : null
     ),
 
-    // ── Внешний вид ──
+    // ── Language ──
     h('div', { className: 'settings-card' },
-      h('div', { className: 'settings-card-title' }, '🎨 Внешний вид'),
+      h('div', { className: 'settings-card-title' }, t('settings.language')),
       h('div', { className: 'settings-card-desc' },
-        'Только визуальные предпочтения — применяются мгновенно и хранятся в этом браузере.'
+        t('settings.language_desc')
       ),
       h(Row, {
-        icon: '📐', title: 'Плотность фида',
-        desc: 'Compact уменьшает отступы и размер карточек для плотного просмотра.',
+        icon: '🌐', title: t('settings.language'),
+        desc: null,
         control: h('div', { className: 'seg-group seg-compact' },
-          [{ v: 'comfortable', l: 'Comfy' }, { v: 'compact', l: 'Compact' }].map(o =>
+          [{ v: 'en', l: '🇺🇸 EN' }, { v: 'ru', l: '🇷🇺 RU' }].map(o =>
+            h('button', {
+              key: o.v,
+              className: 'seg-btn' + (lang === o.v ? ' active' : ''),
+              onClick: () => setLang(o.v)
+            }, o.l)
+          )
+        )
+      })
+    ),
+
+    // ── Theme ──
+    h('div', { className: 'settings-card' },
+      h('div', { className: 'settings-card-title' }, t('settings.theme')),
+      h('div', { className: 'settings-card-desc' }, t('settings.theme_desc')),
+      h('div', { className: 'theme-grid' },
+        SUPPORTED_THEMES.map(tk => {
+          const meta = THEME_META[tk];
+          const label = lang === 'ru' ? meta.labelRu : meta.labelEn;
+          return h('button', {
+            key: tk,
+            className: 'theme-swatch' + (theme === tk ? ' active' : ''),
+            'data-theme-preview': tk,
+            onClick: () => setTheme(tk),
+            title: label,
+          },
+            h('span', { className: 'theme-swatch-dot theme-swatch-dot-bg' }),
+            h('span', { className: 'theme-swatch-dot theme-swatch-dot-accent' }),
+            h('span', { className: 'theme-swatch-dot theme-swatch-dot-card' }),
+            h('span', { className: 'theme-swatch-label' }, meta.icon + ' ' + label)
+          );
+        })
+      )
+    ),
+
+    // ── Appearance ──
+    h('div', { className: 'settings-card' },
+      h('div', { className: 'settings-card-title' }, t('settings.appearance')),
+      h('div', { className: 'settings-card-desc' }, t('settings.appearance_desc')),
+      h(Row, {
+        icon: '📐', title: t('settings.density'),
+        desc: t('settings.density_desc'),
+        control: h('div', { className: 'seg-group seg-compact' },
+          [{ v: 'comfortable', l: t('settings.density.comfy') }, { v: 'compact', l: t('settings.density.compact') }].map(o =>
             h('button', {
               key: o.v,
               className: 'seg-btn' + (prefs.density === o.v ? ' active' : ''),
@@ -3188,18 +4214,18 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
         )
       }),
       h(Row, {
-        icon: '🖼️', title: 'Показывать превью',
-        desc: 'Отключи чтобы экономить трафик и разгрузить фид.',
+        icon: '🖼️', title: t('settings.images'),
+        desc: t('settings.images_desc'),
         control: h(Toggle, { on: prefs.showImages, onChange: v => update({ showImages: v }) })
       }),
       h(Row, {
-        icon: '✨', title: 'Анимации интерфейса',
-        desc: 'Отключи для снижения нагрузки на слабых устройствах.',
+        icon: '✨', title: t('settings.animations'),
+        desc: t('settings.animations_desc'),
         control: h(Toggle, { on: prefs.animations, onChange: v => update({ animations: v }) })
       }),
       h(Row, {
-        icon: '🔠', title: 'Размер шрифта',
-        desc: 'Базовый размер текста на дашборде.',
+        icon: '🔠', title: t('settings.font_size'),
+        desc: t('settings.font_size_desc'),
         control: h('div', { className: 'seg-group seg-compact' },
           [{ v: 12, l: 'S' }, { v: 14, l: 'M' }, { v: 16, l: 'L' }].map(o =>
             h('button', {
@@ -3212,17 +4238,15 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
       })
     ),
 
-    // ── Поведение ──
+    // ── Behavior ──
     h('div', { className: 'settings-card' },
-      h('div', { className: 'settings-card-title' }, '🔄 Поведение'),
-      h('div', { className: 'settings-card-desc' },
-        'Автообновление и видимость источников в фиде.'
-      ),
+      h('div', { className: 'settings-card-title' }, t('settings.behavior')),
+      h('div', { className: 'settings-card-desc' }, t('settings.behavior_desc')),
       h(Row, {
-        icon: '⏱', title: 'Автообновление',
+        icon: '⏱', title: t('settings.autorefresh'),
         desc: prefs.refreshSec === 0
-          ? 'Выключено — обновляй вручную клавишей R.'
-          : 'Каждые ' + prefs.refreshSec + ' секунд.',
+          ? t('settings.autorefresh_off')
+          : t('settings.autorefresh_on', { s: prefs.refreshSec }),
         control: h('div', { className: 'seg-group seg-compact' },
           [{ v: 0, l: 'Off' }, { v: 30, l: '30s' }, { v: 60, l: '1m' }, { v: 90, l: '90s' }, { v: 300, l: '5m' }].map(o =>
             h('button', {
@@ -3234,46 +4258,44 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
         )
       }),
       h(Row, {
-        icon: '👁', title: 'Скрытые источники',
+        icon: '👁', title: t('settings.hidden'),
         desc: hiddenSourcesCount
-          ? 'Сейчас скрыто: ' + hiddenSourcesCount + '. Это только визуальная фильтрация в твоём браузере.'
-          : 'Ничего не скрыто — можешь скрывать источники кликом в сайдбаре.',
+          ? t('settings.hidden_count', { n: hiddenSourcesCount })
+          : t('settings.hidden_none'),
         control: h('button', {
           className: 'btn btn-ghost',
           disabled: !hiddenSourcesCount,
           onClick: () => {
-            if (onResetHiddenSources) { onResetHiddenSources(); flashMsg('✓ Все источники показаны'); }
+            if (onResetHiddenSources) { onResetHiddenSources(); flashMsg(t('settings.flash_sources_shown')); }
           }
-        }, 'Показать все')
+        }, t('settings.hidden_show_all'))
       })
     ),
 
-    // ── Аккаунт ──
+    // ── Account ──
     h('div', { className: 'settings-card' },
-      h('div', { className: 'settings-card-title' }, '👤 Аккаунт'),
-      h('div', { className: 'settings-card-desc' },
-        'Вход выполняется через Telegram-бота. Твой план и настройки привязаны к этому аккаунту.'
-      ),
+      h('div', { className: 'settings-card-title' }, t('settings.account')),
+      h('div', { className: 'settings-card-desc' }, t('settings.account_desc')),
       h(Row, {
-        icon: '💬', title: 'Telegram',
-        desc: user?.username ? ('@' + user.username) : ('chat id: ' + (user?.chatId || '—')),
+        icon: '💬', title: t('settings.tg'),
+        desc: user?.username ? ('@' + user.username) : t('settings.tg_chatid', { id: user?.chatId || '—' }),
         control: h('span', { className: 'pref-value' }, user?.chatId || '—')
       }),
       h(Row, {
-        icon: '💎', title: 'Тариф',
-        desc: 'Влияет на вес твоих лайков/дизлайков и доступ к премиум-функциям.',
+        icon: '💎', title: t('settings.plan'),
+        desc: t('settings.plan_desc'),
         control: h('span', { className: 'pref-value' }, planLabels[user?.plan] || user?.plan || '—')
       }),
       h(Row, {
-        icon: '🚪', title: 'Выйти',
-        desc: 'Отвязать этот браузер. Для повторного входа потребуется новый код из бота.',
-        control: h('button', { className: 'btn btn-ghost', onClick: doLogout }, 'Выйти')
+        icon: '🚪', title: t('settings.logout'),
+        desc: t('settings.logout_desc'),
+        control: h('button', { className: 'btn btn-ghost', onClick: doLogout }, t('settings.logout'))
       })
     ),
 
     // ── Reset ──
     h('div', { className: 'settings-actions' },
-      h('button', { className: 'btn btn-ghost', onClick: resetAllPrefs }, '↺ Сбросить все настройки')
+      h('button', { className: 'btn btn-ghost', onClick: resetAllPrefs }, t('settings.reset_all'))
     )
   );
 }
@@ -3285,6 +4307,7 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
 //   2. User clicks "Войти через Telegram" → bot issues a 6-digit code
 //   3. User enters code → POST /api/auth/verify → { token, user }
 function LoginScreen({ onLoggedIn }) {
+  const lang = useLang();
   const [phase, setPhase]       = useState('idle');        // idle | linking | code | verifying
   const [session, setSession]   = useState(null);          // { sessionId, botUrl }
   const [code, setCode]         = useState('');
@@ -3297,7 +4320,7 @@ function LoginScreen({ onLoggedIn }) {
       const r = await fetch('/api/auth/initiate', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || 'HTTP ' + r.status);
-      if (!data.botUrl) throw new Error('Бот временно недоступен. Попробуйте позже.');
+      if (!data.botUrl) throw new Error(t('login.bot_unavailable'));
       setSession(data);
       setPhase('code');
       try { window.open(data.botUrl, '_blank', 'noopener'); } catch (e) {}
@@ -3307,7 +4330,7 @@ function LoginScreen({ onLoggedIn }) {
 
   const submitCode = async () => {
     const clean = String(code || '').replace(/\D/g, '').slice(0, 6);
-    if (clean.length !== 6) { setError('Введите 6 цифр из сообщения бота'); return; }
+    if (clean.length !== 6) { setError(t('login.err_need_6')); return; }
     setLoading(true); setError('');
     try {
       const r = await fetch('/api/auth/verify', {
@@ -3339,15 +4362,37 @@ function LoginScreen({ onLoggedIn }) {
         boxShadow: '0 20px 60px rgba(0,0,0,0.45)'
       }
     },
+      // Language switcher — small, top-right corner, so first-time users can pick
+      h('div', {
+        style: {
+          display: 'flex', justifyContent: 'flex-end', gap: 6,
+          marginBottom: 10, marginTop: -6
+        }
+      },
+        [{ v: 'en', l: '🇺🇸 EN' }, { v: 'ru', l: '🇷🇺 RU' }].map(o =>
+          h('button', {
+            key: o.v,
+            onClick: () => setLang(o.v),
+            style: {
+              padding: '4px 10px', fontSize: 11,
+              background: lang === o.v ? 'rgba(var(--accent-rgb), 0.18)' : 'transparent',
+              color: lang === o.v ? '#9ea7ff' : 'var(--muted, #888)',
+              border: '1px solid ' + (lang === o.v ? 'rgba(var(--accent-rgb), 0.4)' : 'rgba(255,255,255,0.08)'),
+              borderRadius: 6, cursor: 'pointer'
+            }
+          }, o.l)
+        )
+      ),
+
       h('div', { style: { textAlign: 'center', marginBottom: '20px' } },
         h('div', { style: { fontSize: '44px', lineHeight: '1' } }, '🔥'),
-        h('div', { style: { fontSize: '22px', fontWeight: '700', marginTop: '8px' } }, 'Catalyst'),
-        h('div', { style: { fontSize: '13px', opacity: '0.65', marginTop: '4px' } }, 'Вход через Telegram')
+        h('div', { style: { fontSize: '22px', fontWeight: '700', marginTop: '8px' } }, t('app.title')),
+        h('div', { style: { fontSize: '13px', opacity: '0.65', marginTop: '4px' } }, t('login.subtitle'))
       ),
 
       phase === 'idle' && h('div', null,
         h('p', { style: { fontSize: '14px', lineHeight: '1.5', opacity: '0.85', marginBottom: '16px' } },
-          'Мы не храним пароли. Авторизация — через нашего Telegram-бота: ты получишь одноразовый код и введёшь его здесь.'
+          t('login.idle_desc')
         ),
         h('button', {
           className: 'btn',
@@ -3358,12 +4403,12 @@ function LoginScreen({ onLoggedIn }) {
           },
           disabled: loading,
           onClick: startLogin
-        }, loading ? 'Подождите…' : '💬 Войти через Telegram')
+        }, loading ? t('app.please_wait') : t('login.idle_btn'))
       ),
 
       phase === 'code' && h('div', null,
         h('p', { style: { fontSize: '14px', lineHeight: '1.5', opacity: '0.85', marginBottom: '12px' } },
-          'Открой чат с ботом и нажми Start — он пришлёт шестизначный код. Введи его ниже:'
+          t('login.code_desc')
         ),
         session?.botUrl && h('a', {
           href: session.botUrl, target: '_blank', rel: 'noopener',
@@ -3373,7 +4418,7 @@ function LoginScreen({ onLoggedIn }) {
             border: '1px solid rgba(34,158,217,0.35)', borderRadius: '8px',
             textDecoration: 'none', fontSize: '13px', marginBottom: '16px'
           }
-        }, '↗ Открыть бота снова'),
+        }, t('login.reopen_bot')),
         h('input', {
           type: 'text', inputMode: 'numeric', pattern: '[0-9]*', autoFocus: true,
           maxLength: 6, value: code,
@@ -3401,7 +4446,7 @@ function LoginScreen({ onLoggedIn }) {
           },
           disabled: loading || code.length !== 6,
           onClick: submitCode
-        }, loading ? 'Проверяем…' : 'Войти'),
+        }, loading ? t('login.verifying') : t('login.verify_btn')),
         h('button', {
           style: {
             width: '100%', marginTop: '10px', padding: '8px', fontSize: '12px',
@@ -3409,7 +4454,7 @@ function LoginScreen({ onLoggedIn }) {
             cursor: 'pointer'
           },
           onClick: () => { setPhase('idle'); setSession(null); setCode(''); setError(''); }
-        }, '← Отменить')
+        }, t('app.cancel'))
       ),
 
       error && h('div', {
@@ -3423,7 +4468,36 @@ function LoginScreen({ onLoggedIn }) {
   );
 }
 
+// Unified bottom nav — shown in both trends sidebar and settings/stats sidebar.
+// Single source of truth for "Feed / Stats / Settings" navigation.
+function BottomNav({ view, setView }) {
+  useLang(); // re-render on language switch
+  const tabs = [
+    { id: 'trends',   icon: '🔥', label: t('nav.feed'),     hint: '1' },
+    { id: 'stats',    icon: '📊', label: t('nav.stats'),    hint: '2' },
+    { id: 'settings', icon: '⚙️', label: t('nav.settings'), hint: '3' },
+  ];
+  return h('div', { className: 'sidebar-footer' },
+    h('div', { className: 'sb-foot-nav', role: 'tablist' },
+      tabs.map(tab => h('button', {
+        key: tab.id,
+        type: 'button',
+        role: 'tab',
+        'aria-selected': view === tab.id,
+        className: 'sb-foot-btn' + (view === tab.id ? ' active' : ''),
+        onClick: () => setView(tab.id),
+        title: tab.label + ' (' + tab.hint + ')',
+      },
+        h('span', { className: 'sb-foot-ico' }, tab.icon),
+        h('span', null, tab.label),
+        h('span', { className: 'sb-foot-kbd' }, tab.hint)
+      ))
+    )
+  );
+}
+
 function App() {
+  useLang();
   // Auth: null = checking, false = logged out, object = logged in
   const [me,         setMe]         = useState(AUTH_TOKEN ? null : false);
   const [stats,      setStats]      = useState(null);
@@ -3479,7 +4553,7 @@ function App() {
       setTrends(tr.trends || []);
       setTotal(tr.total  || 0);
       setSources(sr.sources || []);
-    } catch (ex) { setError('Ошибка: ' + ex.message); }
+    } catch (ex) { setError(t('toast.error_prefix', { e: ex.message })); }
     setLoading(false);
   }, [hours, category, source, phase, minMeme, offset, sort]);
 
@@ -3569,17 +4643,25 @@ function App() {
     return () => window.removeEventListener('dashboard:navigate', handleNavigate);
   }, []);
 
-  // Keyboard shortcuts: R=refresh, Esc=close modal
+  // Keyboard shortcuts: R=refresh, Esc=close modal/return to feed, 1/2/3=nav tabs
   useEffect(() => {
     const fn = e => {
       const tag = document.activeElement?.tagName?.toLowerCase();
       if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
-      if (e.key === 'Escape') { setModalTrend(null); return; }
-      if (e.key === 'r' || e.key === 'R') { fetchData(); addToast('Обновляю...', 'info'); return; }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === 'Escape') {
+        if (modalTrend) { setModalTrend(null); return; }
+        if (view !== 'trends') { setView('trends'); return; }
+        return;
+      }
+      if (e.key === 'r' || e.key === 'R') { fetchData(); addToast(t('toast.refreshing'), 'info'); return; }
+      if (e.key === '1') { setView('trends');   return; }
+      if (e.key === '2') { setView('stats');    return; }
+      if (e.key === '3') { setView('settings'); return; }
     };
     window.addEventListener('keydown', fn);
     return () => window.removeEventListener('keydown', fn);
-  }, [fetchData, addToast]);
+  }, [fetchData, addToast, modalTrend, view]);
 
   // Visual-only source filter. Does NOT touch the collectors —
   // real enable/disable lives in the admin panel. This only hides
@@ -3590,7 +4672,8 @@ function App() {
       const willHide = !next.has(name);
       if (willHide) next.add(name); else next.delete(name);
       try { localStorage.setItem('ts_hidden_sources', JSON.stringify([...next])); } catch (e) {}
-      addToast((willHide ? '🙈 Скрыт в фиде: ' : '👁 Показан: ') + (SOURCE_LABELS[name] || name), 'info');
+      const label = SOURCE_LABELS[name] || name;
+      addToast(willHide ? t('toast.hidden_from_feed', { name: label }) : t('toast.shown_in_feed', { name: label }), 'info');
       return next;
     });
   };
@@ -3599,17 +4682,17 @@ function App() {
     if (!hiddenSources.size) return;
     setHiddenSources(new Set());
     try { localStorage.setItem('ts_hidden_sources', '[]'); } catch (e) {}
-    addToast('👁 Все источники видимы', 'info');
+    addToast(t('toast.all_sources_visible'), 'info');
   };
   const resetFilters = () => {
     setHours(24); setMinMeme(0); setCategory(''); setSource(''); setSort('rank'); setOffset(0);
-    addToast('♻️ Фильтры сброшены', 'info');
+    addToast(t('toast.filters_reset'), 'info');
   };
 
   const copyToClipboard = useCallback((text) => {
     navigator.clipboard.writeText(text).then(
-      () => addToast('📋 Скопировано!', 'success'),
-      () => addToast('Не удалось скопировать', 'error')
+      () => addToast(t('toast.copied'), 'success'),
+      () => addToast(t('toast.copy_failed'), 'error')
     );
   }, [addToast]);
 
@@ -3639,7 +4722,7 @@ function App() {
   if (me === false) return h(LoginScreen, { onLoggedIn: handleLoggedIn });
   if (me === null)  return h('div', {
     style: { minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.7 }
-  }, 'Загрузка…');
+  }, t('app.loading'));
 
   return h('div', null,
     // Toast notifications (fixed top-right)
@@ -3655,15 +4738,15 @@ function App() {
     h('nav', { className: 'nav' },
       h('div', { className: 'nav-logo' },
         h('span', { className: 'nav-logo-icon' }, '🔥'),
-        h('span', { className: 'nav-logo-text' }, 'Catalyst')
+        h('span', { className: 'nav-logo-text' }, t('app.title'))
       ),
       h('span', { className: 'nav-version' }, 'v3'),
       h('div', { className: 'nav-sep' }),
-      h('span', { className: 'nav-subtitle' }, 'Narrative Terminal'),
+      h('span', { className: 'nav-subtitle' }, t('app.subtitle')),
       h('div', { className: 'nav-right' },
         h('div', { className: 'status-pill ' + (stats && stats.paused ? 'paused' : 'live') },
           h('div', { className: 'status-dot' + (stats && stats.paused ? ' paused' : '') }),
-          stats && stats.paused ? 'Offline' : 'Live'
+          stats && stats.paused ? t('nav.offline') : t('nav.live')
         ),
         h(NavClock, { refreshAt })
       )
@@ -3676,9 +4759,9 @@ function App() {
           // ── Sidebar ──
           h('aside', { className: 'sidebar' },
             h('div', { className: 'sidebar-section' },
-              h('span', null, 'Sources'),
+              h('span', null, t('sidebar.sources')),
               hiddenSources.size
-                ? h('span', { className: 'sidebar-section-link', onClick: showAllSources, title: 'Показать все' }, 'Show all')
+                ? h('span', { className: 'sidebar-section-link', onClick: showAllSources, title: t('tooltip.show_all') }, t('sidebar.show_all'))
                 : null
             ),
             ...sources.map(s => {
@@ -3689,7 +4772,7 @@ function App() {
                 'data-src': s.source,
                 className: 'source-item ' + (visible ? 'on' : 'off'),
                 onClick: () => toggle(s.source),
-                title: visible ? 'Скрыть из фида (визуально)' : 'Показать в фиде'
+                title: visible ? t('tooltip.hide_source') : t('tooltip.show_source')
               },
                 h('span', { className: 'source-icon' }, SOURCE_ICONS[s.source] || '📡'),
                 h('span', { className: 'source-name' }, SOURCE_LABELS[s.source] || s.source),
@@ -3701,9 +4784,9 @@ function App() {
             h('div', { className: 'sidebar-divider' }),
 
             h('div', { className: 'sidebar-section' },
-              h('span', null, 'Filters'),
+              h('span', null, t('sidebar.filters')),
               (hours !== 24 || minMeme !== 0 || category || sort !== 'rank')
-                ? h('span', { className: 'sidebar-section-link', onClick: resetFilters, title: 'Сбросить' }, 'Reset')
+                ? h('span', { className: 'sidebar-section-link', onClick: resetFilters, title: t('tooltip.reset') }, t('sidebar.reset'))
                 : null
             ),
             h('div', { className: 'sidebar-filters' },
@@ -3711,7 +4794,7 @@ function App() {
               // Time window (segmented)
               h('div', { className: 'filter-group' },
                 h('div', { className: 'filter-label' },
-                  h('span', null, '⏱ Window'),
+                  h('span', null, t('sidebar.window')),
                   h('span', { className: 'filter-val' }, hours < 24 ? hours + 'h' : (hours / 24) + 'd')
                 ),
                 h('div', { className: 'seg-group seg-compact' },
@@ -3728,7 +4811,7 @@ function App() {
               // Adoption threshold (segmented)
               h('div', { className: 'filter-group' },
                 h('div', { className: 'filter-label' },
-                  h('span', null, '💎 Adoption'),
+                  h('span', null, t('sidebar.adoption')),
                   h('span', { className: 'filter-val' }, '≥ ' + minMeme)
                 ),
                 h('div', { className: 'seg-group seg-compact' },
@@ -3744,31 +4827,31 @@ function App() {
 
               // Category (dropdown — too many options for segments)
               h('div', { className: 'filter-group' },
-                h('div', { className: 'filter-label' }, h('span', null, '📂 Category')),
+                h('div', { className: 'filter-label' }, h('span', null, t('sidebar.category'))),
                 h('select', {
                   value: category,
                   onChange: ev => { setCategory(ev.target.value); setOffset(0); },
                   style: { width: '100%' }
                 },
-                  h('option', { value: '' }, 'All categories'),
+                  h('option', { value: '' }, t('sidebar.all_categories')),
                   Object.keys(CAT_ICONS).map(c => h('option', { key: c, value: c }, CAT_ICONS[c] + ' ' + c))
                 )
               ),
 
               // Sort order (segmented icons)
               h('div', { className: 'filter-group' },
-                h('div', { className: 'filter-label' }, h('span', null, '🔀 Sort')),
+                h('div', { className: 'filter-label' }, h('span', null, t('sidebar.sort'))),
                 h('div', { className: 'seg-group seg-compact' },
                   [
-                    { v: 'rank',      l: '⚡', t: 'Rank' },
-                    { v: 'meme',      l: '💎', t: 'Top adoption' },
-                    { v: 'emergence', l: '🌊', t: 'Top emergence' },
-                    { v: 'time',      l: '🕐', t: 'Newest' },
-                    { v: 'virality',  l: '📊', t: 'Virality' },
+                    { v: 'rank',      l: '⚡', tip: t('sort.rank') },
+                    { v: 'meme',      l: '💎', tip: t('sort.meme') },
+                    { v: 'emergence', l: '🌊', tip: t('sort.emergence') },
+                    { v: 'time',      l: '🕐', tip: t('sort.time') },
+                    { v: 'virality',  l: '📊', tip: t('sort.virality') },
                   ].map(o =>
                     h('button', {
                       key: o.v,
-                      title: o.t,
+                      title: o.tip,
                       className: 'seg-btn' + (sort === o.v ? ' active' : ''),
                       onClick: () => { setSort(o.v); setOffset(0); }
                     }, o.l)
@@ -3779,25 +4862,8 @@ function App() {
 
             h('div', { style: { flex: 1 } }),
 
-            // Footer with Stats + Settings
-            h('div', { className: 'sidebar-footer' },
-              h('div', {
-                className: 'sb-foot-btn' + (view === 'stats' ? ' active' : ''),
-                onClick: () => setView('stats'),
-                title: 'Stats'
-              },
-                h('span', { className: 'sb-foot-ico' }, '📊'),
-                h('span', null, 'Stats')
-              ),
-              h('div', {
-                className: 'sb-foot-btn' + (view === 'settings' ? ' active' : ''),
-                onClick: () => setView('settings'),
-                title: 'Settings'
-              },
-                h('span', { className: 'sb-foot-ico' }, '⚙️'),
-                h('span', null, 'Settings')
-              )
-            )
+            // Unified bottom nav (Feed / Stats / Settings)
+            h(BottomNav, { view, setView })
           ),
 
           // ── Main feed ──
@@ -3812,15 +4878,19 @@ function App() {
                   h('div', { className: 'feed-panel-icon' }, '🔥'),
                   h('div', null,
                     h('div', { className: 'feed-panel-title' },
-                      'Narrative Feed',
+                      t('feed.panel.title'),
                       h('span', { className: 'feed-panel-count' },
                         search.trim()
                           ? visibleTrends.length + ' / ' + total
-                          : total + ' signals'
+                          : t('feed.panel.count_signals', { n: total })
                       )
                     ),
                     h('div', { className: 'feed-panel-sub' },
-                      'Live narrative tracker across ', (sources || []).filter(s => s.enabled).length, '/', (sources || []).length, ' sources · ', hours, 'h window'
+                      t('feed.panel.sub', {
+                        active: (sources || []).filter(s => s.enabled).length,
+                        total: (sources || []).length,
+                        h: hours
+                      })
                     )
                   ),
                   h('div', { className: 'feed-panel-actions' },
@@ -3828,17 +4898,17 @@ function App() {
                       h('span', { className: 'feed-search-icon' }, '🔍'),
                       h('input', {
                         type: 'text',
-                        placeholder: 'Search narratives...',
+                        placeholder: t('feed.search_placeholder'),
                         value: search,
                         onChange: e => setSearch(e.target.value),
                       })
                     ),
                     h('button', {
                       className: 'btn btn-ghost' + (loading ? ' is-spinning' : ''),
-                      onClick: () => { if (!loading) { fetchData(); addToast('Refreshing...', 'info'); } },
+                      onClick: () => { if (!loading) { fetchData(); addToast(t('toast.refreshing'), 'info'); } },
                       disabled: loading,
                       style: { fontSize: 11, padding: '6px 10px' },
-                      title: 'Refresh (R)'
+                      title: t('feed.refresh_tip')
                     }, h('span', { className: 'btn-refresh-ico' }, '↻'))
                   )
                 ),
@@ -3848,7 +4918,7 @@ function App() {
                   h('button', {
                     className: 'feed-chip' + (phase === '' ? ' active' : ''),
                     onClick: () => { setPhase(''); setOffset(0); }
-                  }, 'All ', h('span', { className: 'chip-count' }, total)),
+                  }, t('feed.filter.all') + ' ', h('span', { className: 'chip-count' }, total)),
                   ['early','forming','strong','saturated'].map(p =>
                     h('button', {
                       key: p,
@@ -3868,17 +4938,17 @@ function App() {
               (loading && trends.length === 0)
                 ? h('div', { className: 'loading-wrap', style: { padding: '60px 20px' } },
                     h('div', { className: 'loading-spinner' }),
-                    h('div', { className: 'loading-text' }, 'Loading narratives...')
+                    h('div', { className: 'loading-text' }, t('feed.loading'))
                   )
                 : visibleTrends.length === 0
                   ? h('div', { className: 'empty-feed' },
                       h('div', { className: 'empty-feed-icon' }, '🔍'),
                       h('div', { className: 'empty-feed-text' },
                         search.trim()
-                          ? 'No matches for "' + search + '"'
-                          : 'No narratives found — try different filters'
+                          ? t('feed.empty.no_match', { q: search })
+                          : t('feed.empty.no_data')
                       ),
-                      h('div', { className: 'empty-feed-sub' }, 'Hint: widen the time window or clear filters')
+                      h('div', { className: 'empty-feed-sub' }, t('feed.empty.hint'))
                     )
                   : h('div', { className: 'feed-list' + (loading ? ' is-refreshing' : '') },
                       visibleTrends.map(t => h(FeedCard, { key: t.id, trend: t, onOpen: setModalTrend, onCopy: copyToClipboard }))
@@ -3886,9 +4956,9 @@ function App() {
 
               // Pagination
               !search.trim() && pages > 1 ? h('div', { className: 'pagination', style: { padding: '10px 14px 14px' } },
-                h('button', { className: 'btn btn-ghost', onClick: () => setOffset(Math.max(0, offset - LIMIT)), disabled: page === 0 }, '← Prev'),
+                h('button', { className: 'btn btn-ghost', onClick: () => setOffset(Math.max(0, offset - LIMIT)), disabled: page === 0 }, t('pagination.prev')),
                 h('span', { className: 'page-info' }, (page + 1) + ' / ' + pages),
-                h('button', { className: 'btn btn-ghost', onClick: () => setOffset(offset + LIMIT), disabled: page >= pages - 1 }, 'Next →')
+                h('button', { className: 'btn btn-ghost', onClick: () => setOffset(offset + LIMIT), disabled: page >= pages - 1 }, t('pagination.next'))
               ) : null
             )
           ),
@@ -3908,9 +4978,9 @@ function App() {
           // Classic 2-col layout for settings / stats views
           h('aside', { className: 'sidebar' },
             h('div', { className: 'sidebar-section' },
-              h('span', null, 'Sources'),
+              h('span', null, t('sidebar.sources')),
               hiddenSources.size
-                ? h('span', { className: 'sidebar-section-link', onClick: showAllSources }, 'Show all')
+                ? h('span', { className: 'sidebar-section-link', onClick: showAllSources }, t('sidebar.show_all'))
                 : null
             ),
             ...sources.map(s => {
@@ -3921,7 +4991,7 @@ function App() {
                 'data-src': s.source,
                 className: 'source-item ' + (visible ? 'on' : 'off'),
                 onClick: () => toggle(s.source),
-                title: visible ? 'Скрыть из фида (визуально)' : 'Показать в фиде'
+                title: visible ? t('tooltip.hide_source') : t('tooltip.show_source')
               },
                 h('span', { className: 'source-icon' }, SOURCE_ICONS[s.source] || '📡'),
                 h('span', { className: 'source-name' }, SOURCE_LABELS[s.source] || s.source),
@@ -3931,22 +5001,7 @@ function App() {
             }),
             h('div', { className: 'sidebar-divider' }),
             h('div', { style: { flex: 1 } }),
-            h('div', { className: 'sidebar-footer' },
-              h('div', {
-                className: 'sb-foot-btn active',
-                onClick: () => setView('trends')
-              },
-                h('span', { className: 'sb-foot-ico' }, '🔥'),
-                h('span', null, 'Feed')
-              ),
-              h('div', {
-                className: 'sb-foot-btn' + (view === 'settings' ? ' active' : ''),
-                onClick: () => setView('settings')
-              },
-                h('span', { className: 'sb-foot-ico' }, '⚙️'),
-                h('span', null, 'Settings')
-              )
-            )
+            h(BottomNav, { view, setView })
           ),
           h('main', { className: 'main' },
             view === 'settings'

@@ -230,11 +230,28 @@ class TwitterCollector extends BaseCollector {
     // Twitter API v2: tweet.media[].preview_image_url (videos) or .url (photos)
     // Legacy/Apify: tweet.entities.media[].media_url_https
     const media = tweet.media?.[0] || tweet.entities?.media?.[0] || null;
-    const thumbnailUrl = media?.preview_image_url
-      || media?.url
-      || media?.media_url_https
-      || media?.media_url
-      || null;
+    const mediaType = media?.type || null;
+    // Photos: the original-quality URL lives in .media_url_https / .url.
+    //         Avoid preview_image_url (smaller) when we have the real one.
+    // Videos/GIFs: only a preview frame is available.
+    let thumbnailUrl;
+    if (mediaType === 'photo') {
+      thumbnailUrl = media?.media_url_https || media?.url || media?.media_url || media?.preview_image_url || null;
+    } else {
+      thumbnailUrl = media?.preview_image_url || media?.media_url_https || media?.url || media?.media_url || null;
+    }
+    // Force pbs.twimg.com to the original-resolution variant.
+    if (thumbnailUrl && /pbs\.twimg\.com\//.test(thumbnailUrl)) {
+      try {
+        const u = new URL(thumbnailUrl);
+        u.searchParams.set('name', 'orig');
+        if (!u.searchParams.get('format')) {
+          const ext = u.pathname.match(/\.(jpe?g|png|webp)$/i)?.[1] || 'jpg';
+          u.searchParams.set('format', ext.toLowerCase().replace('jpeg', 'jpg'));
+        }
+        thumbnailUrl = u.toString();
+      } catch (_) { /* keep original */ }
+    }
 
     return {
       externalId: `twitter_${id || Buffer.from(text.substring(0, 30)).toString('base64').substring(0, 12)}`,
