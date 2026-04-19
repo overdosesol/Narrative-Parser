@@ -1089,18 +1089,72 @@ class DashboardServer {
       -webkit-background-clip: text; background-clip: text;
       -webkit-text-fill-color: transparent;
     }
-    .nav-version {
-      font-size: 9px; font-weight: 700; letter-spacing: .4px;
-      color: var(--accent2); background: var(--accent-glow);
-      border: 1px solid rgba(var(--accent-rgb), .22); border-radius: 6px;
-      padding: 2px 7px; font-family: 'JetBrains Mono', monospace;
-      text-transform: uppercase;
+    /* Top-right nav buttons (account + settings shortcut) */
+    .nav-icon-btn {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 5px 10px 5px 6px;
+      background: rgba(255,255,255,.025);
+      border: 1px solid var(--border2);
+      border-radius: 999px;
+      color: var(--text2);
+      font-size: 11px; font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      transition: all .15s;
+      letter-spacing: .1px;
+      line-height: 1;
+    }
+    .nav-icon-btn:hover {
+      color: var(--text);
+      border-color: rgba(var(--accent-rgb), .35);
+      background: rgba(var(--accent-rgb), .06);
+    }
+    .nav-icon-btn.active {
+      color: var(--accent2);
+      background: var(--accent-glow);
+      border-color: rgba(var(--accent-rgb), .4);
+    }
+    .nav-icon-btn-ico {
+      font-size: 14px; line-height: 1;
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 22px; height: 22px;
+      margin: -2px 0;
+    }
+    .nav-icon-btn[aria-label] {
+      padding: 5px;
+      width: 32px; height: 32px;
+      justify-content: center;
+    }
+    .nav-account-avatar {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 22px; height: 22px; border-radius: 50%;
+      background: linear-gradient(135deg, rgba(var(--accent-rgb), .35), rgba(var(--accent-rgb), .12));
+      border: 1px solid rgba(var(--accent-rgb), .35);
+      color: var(--text); font-size: 11px; font-weight: 800;
+      letter-spacing: 0; margin: -2px 0;
+    }
+    .nav-account-name {
+      max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .nav-sep {
       width: 1px; height: 18px;
       background: linear-gradient(180deg, transparent, var(--border2), transparent);
     }
-    .nav-subtitle { font-size: 9px; color: var(--dim); letter-spacing: 1.6px; text-transform: uppercase; font-weight: 700; }
+    .nav-subtitle {
+      /* Absolutely centered across the whole nav bar, independent of logo/button widths */
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 9px; color: var(--dim); letter-spacing: 1.6px;
+      text-transform: uppercase; font-weight: 700;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    /* On narrow screens where centered text would overlap buttons, hide it */
+    @media (max-width: 900px) {
+      .nav-subtitle { display: none; }
+    }
     .nav-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
     .status-pill {
       display: flex; align-items: center; gap: 7px;
@@ -1155,6 +1209,49 @@ class DashboardServer {
       transition: all .15s;
     }
     .sidebar-section-link:hover { color: var(--accent2); background: rgba(var(--accent-rgb), .08); }
+
+    /* ── Sidebar phase chips (stacked vertical list) ── */
+    .sidebar-phase {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 5px;
+      padding: 2px 2px 4px;
+    }
+    .sidebar-phase > button:first-child { grid-column: 1 / -1; }
+    .phase-chip {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 7px 9px;
+      font-size: 10.5px; font-weight: 700; letter-spacing: .4px;
+      color: var(--muted);
+      background: rgba(255,255,255,.02);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      cursor: pointer;
+      font-family: inherit;
+      text-transform: uppercase;
+      transition: all .15s;
+      line-height: 1;
+      text-align: left;
+      width: 100%;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .phase-chip:hover { color: var(--text2); background: rgba(255,255,255,.04); border-color: var(--border2); }
+    .phase-chip-dot { font-size: 8px; line-height: 1; flex-shrink: 0; }
+    .phase-chip-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+    .phase-chip-count {
+      margin-left: auto; font-family: 'JetBrains Mono', monospace;
+      font-size: 10px; color: var(--dim); font-weight: 700;
+    }
+    .phase-chip.active {
+      color: var(--text);
+      background: rgba(var(--accent-rgb), .12);
+      border-color: rgba(var(--accent-rgb), .35);
+      box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), .1);
+    }
+    .phase-chip.active .phase-chip-count { color: var(--accent2); }
+    .phase-chip-early.active    { background: rgba(59,130,246,.15); border-color: rgba(59,130,246,.4); color: #93c5fd; }
+    .phase-chip-forming.active  { background: rgba(234,179,8,.15);  border-color: rgba(234,179,8,.45);  color: #fde047; }
+    .phase-chip-strong.active   { background: rgba(34,197,94,.15);  border-color: rgba(34,197,94,.45);  color: #86efac; }
+    .phase-chip-saturated.active{ background: rgba(239,68,68,.15);  border-color: rgba(239,68,68,.45);  color: #fca5a5; }
 
     /* ── Source items (brand-colored, feed-like rows) ── */
     .source-item {
@@ -1262,7 +1359,7 @@ class DashboardServer {
       background: linear-gradient(180deg, transparent 0%, rgba(0,0,0,.15) 100%);
     }
     .sb-foot-nav {
-      display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px;
       padding: 4px; border-radius: 10px;
       background: rgba(0,0,0,.18);
       border: 1px solid var(--border);
@@ -1294,19 +1391,6 @@ class DashboardServer {
       border-radius: 0 0 2px 2px;
     }
     .sb-foot-btn.active .sb-foot-ico { filter: saturate(1.2) drop-shadow(0 0 4px var(--accent-glow)); }
-    .sb-foot-kbd {
-      position: absolute; top: 4px; right: 5px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 8.5px; font-weight: 700;
-      color: var(--dim);
-      padding: 1px 4px; border-radius: 3px;
-      background: rgba(255,255,255,.04);
-      border: 1px solid var(--border);
-      opacity: .7;
-      transition: opacity .15s, color .15s;
-    }
-    .sb-foot-btn:hover .sb-foot-kbd { opacity: 1; color: var(--muted); }
-    .sb-foot-btn.active .sb-foot-kbd { color: var(--accent2); background: rgba(var(--accent-rgb), .12); border-color: rgba(var(--accent-rgb), .2); opacity: 1; }
 
     /* ── Main content ── */
     .main {
@@ -1673,6 +1757,38 @@ class DashboardServer {
     /* ── Settings panel ── */
     .settings-panel { padding: 20px 24px; max-width: 680px; animation: fadeIn .25s ease; }
     .settings-header { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
+
+    /* ── Account hero card ── */
+    .account-hero {
+      display: flex; align-items: center; gap: 18px;
+      background: linear-gradient(135deg, rgba(var(--accent-rgb), .09) 0%, var(--card) 70%);
+      border: 1px solid rgba(var(--accent-rgb), .2) !important;
+    }
+    .account-avatar-big {
+      flex-shrink: 0;
+      width: 64px; height: 64px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 28px; font-weight: 800; letter-spacing: -1px;
+      color: var(--text);
+      background: linear-gradient(135deg, rgba(var(--accent-rgb), .4), rgba(var(--accent-rgb), .12));
+      border: 2px solid rgba(var(--accent-rgb), .5);
+      box-shadow: 0 4px 16px rgba(var(--accent-rgb), .25), inset 0 1px 0 rgba(255,255,255,.1);
+    }
+    .account-hero-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+    .account-hero-name {
+      font-size: 18px; font-weight: 800; color: var(--text);
+      letter-spacing: -.3px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .account-hero-sub { display: flex; flex-wrap: wrap; gap: 6px; }
+    .account-hero-chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 9px; border-radius: 999px;
+      background: rgba(255,255,255,.04); border: 1px solid var(--border2);
+      font-size: 10.5px;
+    }
+    .account-hero-chip-k { color: var(--muted); font-weight: 700; letter-spacing: .3px; }
+    .account-hero-chip-v { color: var(--text2); font-family: 'JetBrains Mono', monospace; font-weight: 600; }
     .settings-title { font-size: 17px; font-weight: 800; color: var(--text); letter-spacing: -.3px; }
     .settings-card {
       background: var(--card); border: 1px solid var(--border);
@@ -1680,6 +1796,57 @@ class DashboardServer {
     }
     .settings-card-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 3px; }
     .settings-card-desc  { font-size: 11px; color: var(--muted); margin-bottom: 16px; }
+
+    /* ── Range slider (column width, etc.) ── */
+    .slider-wrap { display: flex; align-items: center; gap: 10px; min-width: 220px; }
+    .range-slider {
+      flex: 1; height: 22px; padding: 0;
+      -webkit-appearance: none; appearance: none;
+      background: transparent;
+      cursor: pointer;
+    }
+    .range-slider:focus { outline: none; }
+    .range-slider::-webkit-slider-runnable-track {
+      height: 4px; border-radius: 2px;
+      background: linear-gradient(90deg, var(--accent) 0%, var(--accent2) 100%);
+      opacity: .85;
+    }
+    .range-slider::-moz-range-track {
+      height: 4px; border-radius: 2px;
+      background: linear-gradient(90deg, var(--accent) 0%, var(--accent2) 100%);
+      opacity: .85;
+    }
+    .range-slider::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: var(--text); border: 2px solid var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow), 0 2px 6px rgba(0,0,0,.4);
+      margin-top: -6px; cursor: grab;
+      transition: transform .12s;
+    }
+    .range-slider::-moz-range-thumb {
+      width: 16px; height: 16px; border-radius: 50%;
+      background: var(--text); border: 2px solid var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow), 0 2px 6px rgba(0,0,0,.4);
+      cursor: grab;
+    }
+    .range-slider:active::-webkit-slider-thumb { transform: scale(1.15); cursor: grabbing; }
+    .range-slider:active::-moz-range-thumb     { transform: scale(1.15); cursor: grabbing; }
+    .slider-val {
+      min-width: 52px; text-align: right;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px; font-weight: 700;
+      color: var(--accent2);
+    }
+    .slider-reset {
+      width: 26px; height: 26px; border-radius: 50%;
+      background: rgba(255,255,255,.04); color: var(--muted);
+      border: 1px solid var(--border2);
+      cursor: pointer; font-size: 13px;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: all .15s;
+    }
+    .slider-reset:hover { color: var(--accent2); border-color: rgba(var(--accent-rgb), .35); background: var(--accent-glow); }
 
     /* Theme picker swatches */
     .theme-grid {
@@ -1893,7 +2060,72 @@ class DashboardServer {
     }
     .kbd { display: inline-block; background: rgba(255,255,255,.05); border: 1px solid var(--border2); border-radius: 4px; padding: 1px 5px; font-size: 9px; font-family: 'JetBrains Mono', monospace; color: var(--dim); }
 
-    /* ── Modal overlay ── */
+    /* ── Settings modal (centered, blurred backdrop) ── */
+    @keyframes sheetIn  { from { opacity:0; } to { opacity:1; } }
+    @keyframes sheetPop { from { opacity:0; transform: translateY(12px) scale(.97); } to { opacity:1; transform: translateY(0) scale(1); } }
+    .sheet-overlay {
+      position: fixed; inset: 0; z-index: 7000;
+      background: rgba(4,6,14,.55);
+      backdrop-filter: blur(14px) saturate(1.1);
+      -webkit-backdrop-filter: blur(14px) saturate(1.1);
+      animation: sheetIn .22s ease;
+      display: flex; align-items: center; justify-content: center;
+      padding: 28px 20px;
+      overflow-y: auto;
+    }
+    .sheet {
+      position: relative;
+      width: 100%; max-width: 760px;
+      max-height: calc(100vh - 56px);
+      background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
+      border: 1px solid var(--border2);
+      border-radius: 16px;
+      box-shadow: 0 24px 80px rgba(0,0,0,.7), 0 0 0 1px rgba(var(--accent-rgb), .08);
+      animation: sheetPop .28s cubic-bezier(.2,.8,.2,1);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .sheet-head {
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(var(--accent-rgb), .05), transparent);
+      flex-shrink: 0;
+    }
+    .sheet-title {
+      font-size: 14px; font-weight: 800; color: var(--text);
+      letter-spacing: -.2px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .sheet-title-ico { font-size: 18px; filter: saturate(1.2); }
+    .sheet-close {
+      margin-left: auto;
+      width: 30px; height: 30px;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: rgba(255,255,255,.04); border: 1px solid var(--border2);
+      color: var(--muted); border-radius: 8px;
+      cursor: pointer; font-size: 14px;
+      transition: all .12s;
+    }
+    .sheet-close:hover {
+      background: rgba(var(--red-rgb), .12); color: var(--red2);
+      border-color: rgba(var(--red-rgb), .3);
+    }
+    .sheet-body {
+      flex: 1; min-height: 0;
+      overflow-y: auto;
+      padding: 18px 20px 24px;
+    }
+    /* Hide the in-panel header (back button) when rendered inside a sheet —
+       the sheet has its own header and close button. */
+    .sheet-body .settings-header { display: none; }
+    .sheet-body .settings-panel  { padding-bottom: 0; }
+    @media (max-width: 700px) {
+      .sheet-overlay { padding: 10px; }
+      .sheet { border-radius: 12px; max-height: calc(100vh - 20px); }
+    }
+
+    /* ── Modal overlay (kept for TrendModal) ── */
     @keyframes modalIn  { from { opacity:0; } to { opacity:1; } }
     @keyframes drawerIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
     .modal-overlay {
@@ -1945,12 +2177,58 @@ class DashboardServer {
     .sentiment-neg { color: var(--red2);   font-weight: 600; }
     .sentiment-neu { color: var(--muted); }
 
-    /* ── Dashboard 3-column grid — app-shell, only feed scrolls ── */
+    /* ── Dashboard 3-column grid — app-shell, only feed scrolls ──
+       Column widths controlled via --col-left / --col-right CSS vars set
+       on <body> by the user's saved prefs. Middle column is 1fr.
+       Two 6px resizers separate the columns; user can drag them. */
+    :root {
+      --col-left:  240px;
+      --col-right: 300px;
+    }
     .dashboard-grid {
       display: grid;
-      grid-template-columns: 240px 1fr 300px;
+      grid-template-columns: var(--col-left) 6px 1fr 6px var(--col-right);
       height: calc(100vh - 50px - 28px); /* viewport - nav - statusbar */
       overflow: hidden;
+    }
+
+    /* Draggable column resizer handles */
+    .col-resizer {
+      position: relative;
+      cursor: col-resize;
+      background: transparent;
+      z-index: 5;
+      transition: background .18s ease;
+      touch-action: none;
+      user-select: none;
+    }
+    .col-resizer::before {
+      content: '';
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 2px; height: 36px;
+      border-radius: 2px;
+      background: var(--border3);
+      transition: background .15s, height .15s, width .15s, box-shadow .15s;
+    }
+    .col-resizer::after {
+      /* widen the grab area beyond the visual handle */
+      content: '';
+      position: absolute; top: 0; bottom: 0; left: -3px; right: -3px;
+    }
+    .col-resizer:hover { background: rgba(var(--accent-rgb), .08); }
+    .col-resizer:hover::before {
+      background: var(--accent);
+      height: 60px; width: 3px;
+      box-shadow: 0 0 10px var(--accent-glow);
+    }
+    body.is-resizing { cursor: col-resize !important; user-select: none; }
+    body.is-resizing * { cursor: col-resize !important; }
+    body.is-resizing .col-resizer { background: rgba(var(--accent-rgb), .14); }
+    body.is-resizing .col-resizer::before {
+      background: var(--accent);
+      height: 80px; width: 3px;
+      box-shadow: 0 0 14px var(--accent-glow), 0 0 28px var(--accent-glow);
     }
     .dashboard-grid > .sidebar {
       position: static !important;
@@ -1988,28 +2266,32 @@ class DashboardServer {
       display: flex; flex-direction: column;
       position: relative;
     }
-    /* Top progress bar shown while refreshing — kept subtle (stale-while-revalidate) */
+    /* Refresh indicator — thin top bar that fills across the panel.
+       Uses a scaling transform (not background-position) so it animates smoothly
+       and completes visibly even when fetchData resolves in <200ms.
+       The MIN_PULSE_MS timer in App keeps the class on for at least 650ms. */
     .feed-panel.is-refreshing::before {
       content: '';
       position: absolute; top: 0; left: 0; right: 0;
       height: 2px;
       background: linear-gradient(90deg,
-        transparent 0%,
-        rgba(var(--accent-rgb), .6) 50%,
-        transparent 100%);
-      background-size: 40% 100%;
-      background-repeat: no-repeat;
-      animation: feedProgress 1.1s ease-in-out infinite;
-      z-index: 2; pointer-events: none;
+        rgba(var(--accent-rgb), 0) 0%,
+        rgba(var(--accent-rgb), .85) 50%,
+        rgba(var(--accent-rgb), .25) 100%);
+      transform-origin: left center;
+      animation: feedProgress 650ms cubic-bezier(.4, 0, .2, 1) forwards;
+      z-index: 3; pointer-events: none;
+      box-shadow: 0 0 8px rgba(var(--accent-rgb), .35);
     }
     @keyframes feedProgress {
-      0%   { background-position: -40% 0; }
-      100% { background-position: 140% 0; }
+      0%   { transform: scaleX(0);   opacity: 1; }
+      70%  { transform: scaleX(.9);  opacity: 1; }
+      100% { transform: scaleX(1);   opacity: 0; }
     }
-    /* Gentle fade on the stale list while refreshing — disabled if user prefers reduced motion */
-    .feed-list.is-refreshing { opacity: .85; transition: opacity .18s ease; }
+    /* Very subtle list opacity dip — avoid flashing the whole feed */
+    .feed-list.is-refreshing { opacity: .94; transition: opacity .25s ease; }
     @media (prefers-reduced-motion: reduce) {
-      .feed-panel.is-refreshing::before { animation: none; opacity: .5; }
+      .feed-panel.is-refreshing::before { animation: none; transform: scaleX(1); opacity: .5; }
       .feed-list.is-refreshing { opacity: 1; }
     }
     .feed-panel-head {
@@ -2464,12 +2746,15 @@ class DashboardServer {
 
     /* ── Responsive grid collapses ── */
     @media (max-width: 1280px) {
-      .dashboard-grid { grid-template-columns: 210px 1fr; }
-      .dashboard-grid > .right-panel { display: none; }
+      .dashboard-grid { grid-template-columns: var(--col-left) 6px 1fr; }
+      .dashboard-grid > .right-panel,
+      .dashboard-grid > .right-panel-sticky,
+      .dashboard-grid > .col-resizer-right { display: none; }
     }
     @media (max-width: 960px) {
       .dashboard-grid { grid-template-columns: 1fr; padding: 10px; }
-      .dashboard-grid > .sidebar { display: none; }
+      .dashboard-grid > .sidebar,
+      .dashboard-grid > .col-resizer { display: none; }
     }
 
     /* ── Bottom status bar ── */
@@ -2641,6 +2926,7 @@ const I18N = {
     'app.loading': 'Loading…',
     'app.please_wait': 'Hold up…',
     'app.back': '← Back',
+    'app.reset': 'Reset',
     'app.cancel': '← Cancel',
     'app.esc_close': '✕ Esc',
 
@@ -2660,6 +2946,7 @@ const I18N = {
     'nav.stats': 'Stats',
     'nav.settings': 'Settings',
     'nav.feed': 'Feed',
+    'nav.account': 'Account',
 
     // Time
     'time.just_now': 'just now',
@@ -2719,6 +3006,7 @@ const I18N = {
 
     // Sidebar
     'sidebar.sources': 'Sources',
+    'sidebar.phase': 'Phase',
     'sidebar.filters': 'Filters',
     'sidebar.show_all': 'Show all',
     'sidebar.reset': 'Reset',
@@ -2815,6 +3103,10 @@ const I18N = {
     'settings.animations_desc': 'Turn off to reduce load on slower devices.',
     'settings.font_size': 'Font size',
     'settings.font_size_desc': 'Base text size across the dashboard.',
+    'settings.col_left':  'Left column width',
+    'settings.col_left_desc':  'Sidebar width — sources, phase, filters. Currently {px}px.',
+    'settings.col_right': 'Right column width',
+    'settings.col_right_desc': 'Insights / stats panel width. Currently {px}px.',
 
     'settings.behavior': '🔄 Behavior',
     'settings.behavior_desc': 'Auto-refresh and source visibility in the feed.',
@@ -2838,6 +3130,10 @@ const I18N = {
     'settings.tg_chatid': 'chat id: {id}',
     'settings.plan': 'Plan',
     'settings.plan_desc': 'Weights your likes/dislikes and unlocks premium features.',
+    'account.subscription': 'Subscription',
+    'account.subscription_desc': 'Your plan is active until this date.',
+    'account.threshold': 'Alert threshold',
+    'account.threshold_desc': 'Minimum score to trigger a bot alert. Change via /threshold in the Telegram bot.',
     'settings.logout': 'Log out',
     'settings.logout_desc': "Unlink this browser. You'll need a fresh bot code to sign back in.",
     'settings.logout_confirm': "Log out? You'll need to verify a fresh bot code to sign back in.",
@@ -2884,6 +3180,7 @@ const I18N = {
     'app.loading': 'Загрузка…',
     'app.please_wait': 'Подождите…',
     'app.back': '← Назад',
+    'app.reset': 'Сброс',
     'app.cancel': '← Отменить',
     'app.esc_close': '✕ Esc',
 
@@ -2903,6 +3200,7 @@ const I18N = {
     'nav.stats': 'Статистика',
     'nav.settings': 'Настройки',
     'nav.feed': 'Фид',
+    'nav.account': 'Аккаунт',
 
     // Time
     'time.just_now': 'только что',
@@ -2962,6 +3260,7 @@ const I18N = {
 
     // Sidebar
     'sidebar.sources': 'Источники',
+    'sidebar.phase': 'Фаза',
     'sidebar.filters': 'Фильтры',
     'sidebar.show_all': 'Показать все',
     'sidebar.reset': 'Сбросить',
@@ -3058,6 +3357,10 @@ const I18N = {
     'settings.animations_desc': 'Отключи для снижения нагрузки на слабых устройствах.',
     'settings.font_size': 'Размер шрифта',
     'settings.font_size_desc': 'Базовый размер текста на дашборде.',
+    'settings.col_left':  'Ширина левой колонки',
+    'settings.col_left_desc':  'Сайдбар — источники, фаза, фильтры. Сейчас {px}px.',
+    'settings.col_right': 'Ширина правой колонки',
+    'settings.col_right_desc': 'Панель инсайтов и статистики. Сейчас {px}px.',
 
     'settings.behavior': '🔄 Поведение',
     'settings.behavior_desc': 'Автообновление и видимость источников в фиде.',
@@ -3081,6 +3384,10 @@ const I18N = {
     'settings.tg_chatid': 'chat id: {id}',
     'settings.plan': 'Тариф',
     'settings.plan_desc': 'Влияет на вес твоих лайков/дизлайков и доступ к премиум-функциям.',
+    'account.subscription': 'Подписка',
+    'account.subscription_desc': 'Тариф активен до этой даты.',
+    'account.threshold': 'Порог алертов',
+    'account.threshold_desc': 'Минимальный скор для алерта от бота. Меняется командой /threshold в Telegram-боте.',
     'settings.logout': 'Выйти',
     'settings.logout_desc': 'Отвязать этот браузер. Для повторного входа потребуется новый код из бота.',
     'settings.logout_confirm': 'Выйти из аккаунта? Нужно будет снова подтвердить код в Telegram.',
@@ -4074,6 +4381,8 @@ const DEFAULT_PREFS = {
   animations:    true,
   refreshSec:    90,   // 0 = off
   fontSize:      14,   // 12..16
+  colLeft:       240,  // left sidebar width in px (180..360)
+  colRight:      300,  // right panel width in px (240..420)
 };
 function loadPrefs() {
   try {
@@ -4094,11 +4403,72 @@ function applyPrefsToDOM(p) {
   b.classList.toggle('prefs-no-images', !p.showImages);
   b.classList.toggle('prefs-no-anim',  !p.animations);
   try { b.style.setProperty('--user-font-size', p.fontSize + 'px'); } catch (e) {}
+  try {
+    const root = document.documentElement;
+    const left  = Math.max(180, Math.min(540, Number(p.colLeft)  || 240));
+    const right = Math.max(240, Math.min(630, Number(p.colRight) || 300));
+    root.style.setProperty('--col-left',  left  + 'px');
+    root.style.setProperty('--col-right', right + 'px');
+  } catch (e) {}
 }
 // apply on first script eval (before React mounts)
 try { applyPrefsToDOM(loadPrefs()); } catch (e) {}
 
-function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user, onLogout }) {
+// Modal sheet — centered card with blurred backdrop. Used by Settings,
+// Account and Stats views. Close via Esc, backdrop click, or the ✕ button.
+function Sheet({ title, icon, onClose, children }) {
+  useEffect(() => {
+    const fn = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', fn);
+    return () => document.removeEventListener('keydown', fn);
+  }, [onClose]);
+  // Lock body scroll while sheet is open
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+  return h('div', {
+    className: 'sheet-overlay',
+    onMouseDown: (e) => { if (e.target === e.currentTarget) onClose(); },
+  },
+    h('div', { className: 'sheet', role: 'dialog', 'aria-modal': 'true' },
+      h('div', { className: 'sheet-head' },
+        icon ? h('span', { className: 'sheet-title-ico' }, icon) : null,
+        h('span', { className: 'sheet-title' }, title),
+        h('button', {
+          type: 'button',
+          className: 'sheet-close',
+          onClick: onClose,
+          'aria-label': 'Close',
+          title: 'Esc',
+        }, '✕')
+      ),
+      h('div', { className: 'sheet-body' }, children)
+    )
+  );
+}
+
+// Shared primitives used by SettingsPanel and AccountPanel (keep module-level
+// so any settings-like panel can pick them up).
+const Toggle = ({ on, onChange }) =>
+  h('button', {
+    className: 'pref-toggle' + (on ? ' on' : ''),
+    onClick: () => onChange(!on),
+    role: 'switch',
+    'aria-checked': on,
+  }, h('span', { className: 'pref-toggle-knob' }));
+
+const Row = ({ icon, title, desc, control }) =>
+  h('div', { className: 'setting-row' },
+    h('div', { className: 'setting-label' },
+      h('span', { className: 'setting-name' }, icon ? (icon + ' ') : '', title),
+      desc ? h('span', { className: 'setting-hint' }, desc) : null
+    ),
+    h('div', { className: 'setting-control' }, control)
+  );
+
+function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
   const lang = useLang();
   const theme = useTheme();
   const [prefs, setPrefs] = useState(loadPrefs);
@@ -4112,13 +4482,6 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
 
   const flashMsg = (m) => { setFlash(m); setTimeout(() => setFlash(''), 2000); };
 
-  const planLabels = { free: t('plan.free'), test: t('plan.test'), pro: t('plan.pro'), admin: t('plan.admin') };
-  const doLogout = async () => {
-    if (!confirm(t('settings.logout_confirm'))) return;
-    try { await api('/auth/logout', { method: 'POST' }); } catch (e) { /* token already invalid */ }
-    if (onLogout) onLogout();
-  };
-
   const resetAllPrefs = () => {
     if (!confirm(t('settings.reset_all_confirm'))) return;
     const next = { ...DEFAULT_PREFS };
@@ -4127,22 +4490,6 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
     flashMsg(t('settings.flash_reset'));
   };
 
-  const Toggle = ({ on, onChange }) =>
-    h('button', {
-      className: 'pref-toggle' + (on ? ' on' : ''),
-      onClick: () => onChange(!on),
-      role: 'switch',
-      'aria-checked': on
-    }, h('span', { className: 'pref-toggle-knob' }));
-
-  const Row = ({ icon, title, desc, control }) =>
-    h('div', { className: 'setting-row' },
-      h('div', { className: 'setting-label' },
-        h('span', { className: 'setting-name' }, icon ? (icon + ' ') : '', title),
-        desc ? h('span', { className: 'setting-hint' }, desc) : null
-      ),
-      h('div', { className: 'setting-control' }, control)
-    );
 
   return h('div', { className: 'settings-panel' },
     h('div', { className: 'settings-header' },
@@ -4235,6 +4582,44 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
             }, o.l)
           )
         )
+      }),
+      h(Row, {
+        icon: '◧', title: t('settings.col_left'),
+        desc: t('settings.col_left_desc', { px: prefs.colLeft }),
+        control: h('div', { className: 'slider-wrap' },
+          h('input', {
+            type: 'range', min: 180, max: 540, step: 10,
+            value: prefs.colLeft,
+            onChange: e => update({ colLeft: Number(e.target.value) }),
+            className: 'range-slider'
+          }),
+          h('span', { className: 'slider-val' }, prefs.colLeft + 'px'),
+          h('button', {
+            type: 'button',
+            className: 'slider-reset',
+            onClick: () => update({ colLeft: 240 }),
+            title: t('app.reset')
+          }, '↺')
+        )
+      }),
+      h(Row, {
+        icon: '◨', title: t('settings.col_right'),
+        desc: t('settings.col_right_desc', { px: prefs.colRight }),
+        control: h('div', { className: 'slider-wrap' },
+          h('input', {
+            type: 'range', min: 240, max: 630, step: 10,
+            value: prefs.colRight,
+            onChange: e => update({ colRight: Number(e.target.value) }),
+            className: 'range-slider'
+          }),
+          h('span', { className: 'slider-val' }, prefs.colRight + 'px'),
+          h('button', {
+            type: 'button',
+            className: 'slider-reset',
+            onClick: () => update({ colRight: 300 }),
+            title: t('app.reset')
+          }, '↺')
+        )
       })
     ),
 
@@ -4272,7 +4657,66 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
       })
     ),
 
-    // ── Account ──
+    // ── Reset ──
+    h('div', { className: 'settings-actions' },
+      h('button', { className: 'btn btn-ghost', onClick: resetAllPrefs }, t('settings.reset_all'))
+    )
+  );
+}
+
+// ── AccountPanel — profile / plan / logout (extracted from SettingsPanel) ─────
+function AccountPanel({ onBack, user, onLogout }) {
+  useLang();
+  const planLabels = { free: t('plan.free'), test: t('plan.test'), pro: t('plan.pro'), admin: t('plan.admin') };
+  const doLogout = async () => {
+    if (!confirm(t('settings.logout_confirm'))) return;
+    try { await api('/auth/logout', { method: 'POST' }); } catch (e) { /* token already invalid */ }
+    if (onLogout) onLogout();
+  };
+
+  const avatarLetter = (user && user.username)
+    ? user.username.charAt(0).toUpperCase()
+    : '👤';
+
+  const subExpiry = user?.subscriptionExpiresAt
+    ? new Date(user.subscriptionExpiresAt).toLocaleDateString(localeTag(), { day: '2-digit', month: 'short', year: 'numeric' })
+    : null;
+
+  return h('div', { className: 'settings-panel' },
+    h('div', { className: 'settings-header' },
+      h('button', { className: 'btn btn-ghost', onClick: onBack }, t('app.back')),
+      h('span', { className: 'settings-title' }, t('nav.account'))
+    ),
+
+    // Profile hero
+    h('div', { className: 'settings-card account-hero' },
+      h('div', { className: 'account-avatar-big' }, avatarLetter),
+      h('div', { className: 'account-hero-main' },
+        h('div', { className: 'account-hero-name' },
+          user?.username ? '@' + user.username : t('settings.tg_chatid', { id: user?.chatId || '—' })
+        ),
+        h('div', { className: 'account-hero-sub' },
+          h('span', { className: 'account-hero-chip' },
+            h('span', { className: 'account-hero-chip-k' }, 'ID'),
+            h('span', { className: 'account-hero-chip-v' }, user?.chatId || '—')
+          ),
+          h('span', { className: 'account-hero-chip' },
+            h('span', { className: 'account-hero-chip-k' }, '💎'),
+            h('span', { className: 'account-hero-chip-v' }, planLabels[user?.plan] || user?.plan || '—')
+          ),
+          user?.status
+            ? h('span', { className: 'account-hero-chip' },
+                h('span', {
+                  className: 'account-hero-chip-k',
+                  style: { color: user.status === 'active' ? 'var(--green2)' : 'var(--red2)' }
+                }, user.status === 'active' ? '● ' + t('status.live') : '● ' + t('status.offline'))
+              )
+            : null
+        )
+      )
+    ),
+
+    // Account details
     h('div', { className: 'settings-card' },
       h('div', { className: 'settings-card-title' }, t('settings.account')),
       h('div', { className: 'settings-card-desc' }, t('settings.account_desc')),
@@ -4286,16 +4730,25 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user,
         desc: t('settings.plan_desc'),
         control: h('span', { className: 'pref-value' }, planLabels[user?.plan] || user?.plan || '—')
       }),
+      subExpiry
+        ? h(Row, {
+            icon: '📅', title: t('account.subscription'),
+            desc: t('account.subscription_desc'),
+            control: h('span', { className: 'pref-value' }, subExpiry)
+          })
+        : null,
+      user?.threshold != null
+        ? h(Row, {
+            icon: '🎯', title: t('account.threshold'),
+            desc: t('account.threshold_desc'),
+            control: h('span', { className: 'pref-value' }, user.threshold + '%')
+          })
+        : null,
       h(Row, {
         icon: '🚪', title: t('settings.logout'),
         desc: t('settings.logout_desc'),
         control: h('button', { className: 'btn btn-ghost', onClick: doLogout }, t('settings.logout'))
       })
-    ),
-
-    // ── Reset ──
-    h('div', { className: 'settings-actions' },
-      h('button', { className: 'btn btn-ghost', onClick: resetAllPrefs }, t('settings.reset_all'))
     )
   );
 }
@@ -4468,14 +4921,77 @@ function LoginScreen({ onLoggedIn }) {
   );
 }
 
+// Draggable column resizer — live-updates a CSS var while dragging,
+// then persists the final width to ts_prefs_v1 on mouseup/touchend.
+// Uses raw DOM (no React re-renders per frame) for 60fps smoothness.
+function ColumnResizer({ side }) {
+  const varName = side === 'left' ? '--col-left' : '--col-right';
+  const prefKey = side === 'left' ? 'colLeft'    : 'colRight';
+  const min     = side === 'left' ? 180 : 240;
+  const max     = side === 'left' ? 540 : 630;
+
+  const start = (clientX) => {
+    const root = document.documentElement;
+    const raw = getComputedStyle(root).getPropertyValue(varName).trim();
+    const startWidth = parseInt(raw, 10) || (side === 'left' ? 240 : 300);
+    const startX = clientX;
+    document.body.classList.add('is-resizing');
+
+    let currentW = startWidth;
+    const move = (x) => {
+      const delta = side === 'left' ? (x - startX) : (startX - x);
+      currentW = Math.max(min, Math.min(max, startWidth + delta));
+      root.style.setProperty(varName, currentW + 'px');
+    };
+    const onMove       = (ev) => { move(ev.clientX); };
+    const onTouchMove  = (ev) => { if (ev.touches[0]) move(ev.touches[0].clientX); };
+    const end = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', end);
+      document.removeEventListener('touchmove', onTouchMove);
+      document.removeEventListener('touchend', end);
+      document.body.classList.remove('is-resizing');
+      try {
+        const current = loadPrefs();
+        savePrefs({ ...current, [prefKey]: currentW });
+      } catch (e) {}
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', end);
+    document.addEventListener('touchmove', onTouchMove, { passive: true });
+    document.addEventListener('touchend', end);
+  };
+
+  // Double-click → reset to default
+  const onDoubleClick = () => {
+    const def = side === 'left' ? 240 : 300;
+    document.documentElement.style.setProperty(varName, def + 'px');
+    try {
+      const current = loadPrefs();
+      savePrefs({ ...current, [prefKey]: def });
+    } catch (e) {}
+  };
+
+  return h('div', {
+    className: 'col-resizer col-resizer-' + side,
+    role: 'separator',
+    'aria-orientation': 'vertical',
+    'aria-label': 'Resize ' + side + ' column (double-click to reset)',
+    title: 'Drag to resize · double-click to reset',
+    onMouseDown: (e) => { e.preventDefault(); start(e.clientX); },
+    onTouchStart: (e) => { if (e.touches[0]) start(e.touches[0].clientX); },
+    onDoubleClick,
+  });
+}
+
 // Unified bottom nav — shown in both trends sidebar and settings/stats sidebar.
 // Single source of truth for "Feed / Stats / Settings" navigation.
 function BottomNav({ view, setView }) {
   useLang(); // re-render on language switch
+  // Settings/Account live in top-right of the nav bar — not duplicated here.
   const tabs = [
-    { id: 'trends',   icon: '🔥', label: t('nav.feed'),     hint: '1' },
-    { id: 'stats',    icon: '📊', label: t('nav.stats'),    hint: '2' },
-    { id: 'settings', icon: '⚙️', label: t('nav.settings'), hint: '3' },
+    { id: 'trends', icon: '🔥', label: t('nav.feed')  },
+    { id: 'stats',  icon: '📊', label: t('nav.stats') },
   ];
   return h('div', { className: 'sidebar-footer' },
     h('div', { className: 'sb-foot-nav', role: 'tablist' },
@@ -4486,11 +5002,10 @@ function BottomNav({ view, setView }) {
         'aria-selected': view === tab.id,
         className: 'sb-foot-btn' + (view === tab.id ? ' active' : ''),
         onClick: () => setView(tab.id),
-        title: tab.label + ' (' + tab.hint + ')',
+        title: tab.label,
       },
         h('span', { className: 'sb-foot-ico' }, tab.icon),
-        h('span', null, tab.label),
-        h('span', { className: 'sb-foot-kbd' }, tab.hint)
+        h('span', null, tab.label)
       ))
     )
   );
@@ -4519,6 +5034,9 @@ function App() {
   const [toasts,     setToasts]     = useState([]);
   const [search,     setSearch]     = useState('');
   const [refreshAt,  setRefreshAt]  = useState(Date.now() + 90000);
+  // Refresh pulse — stays on for at least MIN_PULSE_MS so the animation is visible
+  // even when fetchData resolves in <200ms.
+  const [refreshPulse, setRefreshPulse] = useState(false);
   const [hiddenSources, setHiddenSources] = useState(() => {
     try { return new Set(JSON.parse(localStorage.getItem('ts_hidden_sources') || '[]')); }
     catch (e) { return new Set(); }
@@ -4534,8 +5052,10 @@ function App() {
   }, []);
 
   const fetchData = useCallback(async () => {
+    const started = Date.now();
+    const MIN_PULSE_MS = 650; // minimum duration the refresh indicator stays visible
     setRefreshAt(Date.now() + 90000);
-    setLoading(true); setError('');
+    setLoading(true); setRefreshPulse(true); setError('');
     try {
       const q = '?hours=' + hours + '&limit=' + LIMIT + '&offset=' + offset +
         '&sort=' + sort +
@@ -4555,6 +5075,9 @@ function App() {
       setSources(sr.sources || []);
     } catch (ex) { setError(t('toast.error_prefix', { e: ex.message })); }
     setLoading(false);
+    const elapsed = Date.now() - started;
+    const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
+    setTimeout(() => setRefreshPulse(false), remaining);
   }, [hours, category, source, phase, minMeme, offset, sort]);
 
 
@@ -4643,7 +5166,7 @@ function App() {
     return () => window.removeEventListener('dashboard:navigate', handleNavigate);
   }, []);
 
-  // Keyboard shortcuts: R=refresh, Esc=close modal/return to feed, 1/2/3=nav tabs
+  // Keyboard shortcuts: R=refresh, Esc=close modal → else return to feed
   useEffect(() => {
     const fn = e => {
       const tag = document.activeElement?.tagName?.toLowerCase();
@@ -4655,9 +5178,6 @@ function App() {
         return;
       }
       if (e.key === 'r' || e.key === 'R') { fetchData(); addToast(t('toast.refreshing'), 'info'); return; }
-      if (e.key === '1') { setView('trends');   return; }
-      if (e.key === '2') { setView('stats');    return; }
-      if (e.key === '3') { setView('settings'); return; }
     };
     window.addEventListener('keydown', fn);
     return () => window.removeEventListener('keydown', fn);
@@ -4737,24 +5257,45 @@ function App() {
     // ── Nav ──
     h('nav', { className: 'nav' },
       h('div', { className: 'nav-logo' },
-        h('span', { className: 'nav-logo-icon' }, '🔥'),
+        h('span', { className: 'nav-logo-icon' }, '🐱'),
         h('span', { className: 'nav-logo-text' }, t('app.title'))
       ),
-      h('span', { className: 'nav-version' }, 'v3'),
-      h('div', { className: 'nav-sep' }),
       h('span', { className: 'nav-subtitle' }, t('app.subtitle')),
       h('div', { className: 'nav-right' },
-        h('div', { className: 'status-pill ' + (stats && stats.paused ? 'paused' : 'live') },
-          h('div', { className: 'status-dot' + (stats && stats.paused ? ' paused' : '') }),
-          stats && stats.paused ? t('nav.offline') : t('nav.live')
+        h('button', {
+          type: 'button',
+          className: 'nav-icon-btn nav-account' + (view === 'account' ? ' active' : ''),
+          onClick: () => setView(view === 'account' ? 'trends' : 'account'),
+          title: (me && me !== true && me.username)
+            ? '@' + me.username + ' · ' + t('nav.account')
+            : t('nav.account'),
+        },
+          h('span', { className: 'nav-account-avatar' },
+            (me && me !== true && me.username)
+              ? me.username.charAt(0).toUpperCase()
+              : '👤'
+          ),
+          h('span', { className: 'nav-account-name' },
+            (me && me !== true && me.username)
+              ? '@' + me.username
+              : t('nav.account')
+          )
         ),
-        h(NavClock, { refreshAt })
+        h('button', {
+          type: 'button',
+          className: 'nav-icon-btn' + (view === 'settings' ? ' active' : ''),
+          onClick: () => setView(view === 'settings' ? 'trends' : 'settings'),
+          title: t('nav.settings'),
+          'aria-label': t('nav.settings'),
+        },
+          h('span', { className: 'nav-icon-btn-ico' }, '⚙️')
+        )
       )
     ),
 
-    // ── Layout: trends view gets 3-col dashboard-grid, others get classic layout ──
-    view === 'trends'
-      ? h('div', { className: 'dashboard-grid' },
+    // ── Layout: always 3-col dashboard-grid. Settings / Account / Stats
+    //   open as centered modal sheets with blurred backdrop (see below). ──
+    h('div', { className: 'dashboard-grid' },
 
           // ── Sidebar ──
           h('aside', { className: 'sidebar' },
@@ -4780,6 +5321,37 @@ function App() {
                 h('span', { className: 'source-eye' }, visible ? '👁' : '🙈')
               );
             }),
+
+            h('div', { className: 'sidebar-divider' }),
+
+            // ── Phase filter chips (moved from feed header) ──
+            h('div', { className: 'sidebar-section' },
+              h('span', null, t('sidebar.phase')),
+              phase
+                ? h('span', { className: 'sidebar-section-link', onClick: () => { setPhase(''); setOffset(0); }, title: t('tooltip.reset') }, t('sidebar.reset'))
+                : null
+            ),
+            h('div', { className: 'sidebar-phase' },
+              h('button', {
+                type: 'button',
+                className: 'phase-chip' + (phase === '' ? ' active' : ''),
+                onClick: () => { setPhase(''); setOffset(0); }
+              }, h('span', { className: 'phase-chip-dot' }, '◆'),
+                 h('span', { className: 'phase-chip-label' }, t('feed.filter.all')),
+                 h('span', { className: 'phase-chip-count' }, total)
+              ),
+              ['early','forming','strong','saturated'].map(p =>
+                h('button', {
+                  key: p,
+                  type: 'button',
+                  className: 'phase-chip phase-chip-' + p + (phase === p ? ' active' : ''),
+                  onClick: () => { setPhase(phase === p ? '' : p); setOffset(0); }
+                },
+                  h('span', { className: 'phase-chip-dot' }, PHASE_DOT[p]),
+                  h('span', { className: 'phase-chip-label' }, PHASE_META[p].label)
+                )
+              )
+            ),
 
             h('div', { className: 'sidebar-divider' }),
 
@@ -4866,11 +5438,14 @@ function App() {
             h(BottomNav, { view, setView })
           ),
 
+          // Draggable divider between sidebar and main feed
+          h(ColumnResizer, { side: 'left' }),
+
           // ── Main feed ──
           h('main', { className: 'main-feed' },
             error ? h('div', { className: 'error-bar', style: { marginBottom: 12 } }, '⚠️ ', error) : null,
 
-            h('div', { className: 'feed-panel' + (loading && trends.length > 0 ? ' is-refreshing' : '') },
+            h('div', { className: 'feed-panel' + (refreshPulse && trends.length > 0 ? ' is-refreshing' : '') },
 
               // ── Feed panel header ──
               h('div', { className: 'feed-panel-head' },
@@ -4904,29 +5479,12 @@ function App() {
                       })
                     ),
                     h('button', {
-                      className: 'btn btn-ghost' + (loading ? ' is-spinning' : ''),
+                      className: 'btn btn-ghost' + (refreshPulse ? ' is-spinning' : ''),
                       onClick: () => { if (!loading) { fetchData(); addToast(t('toast.refreshing'), 'info'); } },
                       disabled: loading,
                       style: { fontSize: 11, padding: '6px 10px' },
                       title: t('feed.refresh_tip')
                     }, h('span', { className: 'btn-refresh-ico' }, '↻'))
-                  )
-                ),
-
-                // ── Phase filter chips ──
-                h('div', { className: 'feed-filters-bar' },
-                  h('button', {
-                    className: 'feed-chip' + (phase === '' ? ' active' : ''),
-                    onClick: () => { setPhase(''); setOffset(0); }
-                  }, t('feed.filter.all') + ' ', h('span', { className: 'chip-count' }, total)),
-                  ['early','forming','strong','saturated'].map(p =>
-                    h('button', {
-                      key: p,
-                      className: 'feed-chip' + (phase === p ? ' active' : ''),
-                      onClick: () => { setPhase(phase === p ? '' : p); setOffset(0); }
-                    },
-                      PHASE_DOT[p], ' ', PHASE_META[p].label
-                    )
                   )
                 )
               ),
@@ -4950,7 +5508,7 @@ function App() {
                       ),
                       h('div', { className: 'empty-feed-sub' }, t('feed.empty.hint'))
                     )
-                  : h('div', { className: 'feed-list' + (loading ? ' is-refreshing' : '') },
+                  : h('div', { className: 'feed-list' + (refreshPulse ? ' is-refreshing' : '') },
                       visibleTrends.map(t => h(FeedCard, { key: t.id, trend: t, onOpen: setModalTrend, onCopy: copyToClipboard }))
                     ),
 
@@ -4963,6 +5521,9 @@ function App() {
             )
           ),
 
+          // Draggable divider between main feed and right panel
+          h(ColumnResizer, { side: 'right' }),
+
           // ── Right panel ──
           h(RightPanel, {
             stats,
@@ -4973,48 +5534,44 @@ function App() {
             onOpenTrend: setModalTrend,
             onToggleSource: toggle,
           })
-        )
-      : h('div', { className: 'layout' },
-          // Classic 2-col layout for settings / stats views
-          h('aside', { className: 'sidebar' },
-            h('div', { className: 'sidebar-section' },
-              h('span', null, t('sidebar.sources')),
-              hiddenSources.size
-                ? h('span', { className: 'sidebar-section-link', onClick: showAllSources }, t('sidebar.show_all'))
-                : null
-            ),
-            ...sources.map(s => {
-              const visible = !hiddenSources.has(s.source);
-              const cnt = s.last24h || 0;
-              return h('div', {
-                key: s.source,
-                'data-src': s.source,
-                className: 'source-item ' + (visible ? 'on' : 'off'),
-                onClick: () => toggle(s.source),
-                title: visible ? t('tooltip.hide_source') : t('tooltip.show_source')
-              },
-                h('span', { className: 'source-icon' }, SOURCE_ICONS[s.source] || '📡'),
-                h('span', { className: 'source-name' }, SOURCE_LABELS[s.source] || s.source),
-                h('span', { className: 'source-count' + (cnt >= 50 ? ' hot' : '') }, cnt),
-                h('span', { className: 'source-eye' }, visible ? '👁' : '🙈')
-              );
-            }),
-            h('div', { className: 'sidebar-divider' }),
-            h('div', { style: { flex: 1 } }),
-            h(BottomNav, { view, setView })
-          ),
-          h('main', { className: 'main' },
-            view === 'settings'
-              ? h(SettingsPanel, {
-                  onBack: () => setView('trends'),
-                  onResetHiddenSources: showAllSources,
-                  hiddenSourcesCount: hiddenSources.size,
-                  user: me,
-                  onLogout: handleLogout
-                })
-              : h(StatsPanel, { stats, hours, onBack: () => setView('trends'), onOpenTrend: setModalTrend })
-          )
-        )
+    ),
+
+    // ── Modal sheets (Settings / Account / Stats) ──
+    view === 'settings' ? h(Sheet, {
+      title: t('settings.title'),
+      icon: '⚙️',
+      onClose: () => setView('trends'),
+    },
+      h(SettingsPanel, {
+        onBack: () => setView('trends'),
+        onResetHiddenSources: showAllSources,
+        hiddenSourcesCount: hiddenSources.size,
+      })
+    ) : null,
+
+    view === 'account' ? h(Sheet, {
+      title: t('nav.account'),
+      icon: '👤',
+      onClose: () => setView('trends'),
+    },
+      h(AccountPanel, {
+        onBack: () => setView('trends'),
+        user: me,
+        onLogout: handleLogout,
+      })
+    ) : null,
+
+    view === 'stats' ? h(Sheet, {
+      title: t('nav.stats'),
+      icon: '📊',
+      onClose: () => setView('trends'),
+    },
+      h(StatsPanel, {
+        stats, hours,
+        onBack: () => setView('trends'),
+        onOpenTrend: setModalTrend,
+      })
+    ) : null
   );
 }
 
