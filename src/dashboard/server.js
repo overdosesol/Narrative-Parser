@@ -85,6 +85,18 @@ class DashboardServer {
     this.scanFn   = scanFn;   // callback to trigger manual scan
     this.server   = null;
     this.started  = Date.now();
+    this.sseClients = new Set();  // active Server-Sent Event subscribers
+    this._sseKeepAlive = null;
+  }
+
+  /** Broadcast an event to all connected SSE clients. */
+  broadcast(event, data) {
+    if (!this.sseClients || this.sseClients.size === 0) return;
+    const payload = 'event: ' + String(event || 'message') + '\n' +
+                    'data: ' + JSON.stringify(data ?? {}) + '\n\n';
+    for (const res of this.sseClients) {
+      try { res.write(payload); } catch (e) { /* drop */ }
+    }
   }
 
   start() {
@@ -129,12 +141,34 @@ class DashboardServer {
       return json(res, 200, { ok: true, uptime: Math.floor((Date.now() - this.started) / 1000), paused: this.appState?.paused ?? false });
     }
 
-    // Auth check for all other /api routes
-    if (path.startsWith('/api/')) {
+    // ── Auth policy ────────────────────────────────────────────────────────────
+    // The dashboard is designed to be **publicly readable** — anyone can view
+    // trends, stats, sources, previews, config, and submit like/dislike feedback
+    // without a key. Only mutating/operational endpoints still require the
+    // dashboard API key (these are not used by the public SPA anymore; they
+    // remain for backwards compatibility / tooling).
+    const PROTECTED_ROUTES = new Set([
+      'POST /api/scan',
+      'GET /api/settings',
+      'POST /api/settings',
+    ]);
+    const routeKey = method + ' ' + path;
+    const isProtected =
+      PROTECTED_ROUTES.has(routeKey) ||
+      (method === 'POST' && /^\/api\/collectors\/[\w_]+\/toggle$/.test(path));
+
+    if (isProtected) {
       const apiKey = this.config.apiKey;
       if (!apiKey) return json(res, 503, { error: 'Dashboard API key is not configured' });
-      const provided = req.headers['x-api-key'] || '';
+      const headerKey = req.headers['x-api-key'] || '';
+      const queryKey  = url.searchParams.get('key') || '';
+      const provided  = headerKey || queryKey;
       if (!safeEqual(provided, apiKey)) return json(res, 401, { error: 'Unauthorized — provide X-API-Key header' });
+    }
+
+    // SSE stream — pushed updates from server (new scans, etc.)
+    if (path === '/api/stream' && method === 'GET') {
+      return this._handleStream(req, res);
     }
 
     try {
@@ -395,6 +429,40 @@ class DashboardServer {
     });
   }
 
+  _handleStream(req, res) {
+    res.writeHead(200, {
+      'Content-Type':        'text/event-stream',
+      'Cache-Control':       'no-cache, no-transform',
+      'Connection':          'keep-alive',
+      'X-Accel-Buffering':   'no',           // disable proxy buffering
+      'Access-Control-Allow-Origin': '*',
+    });
+    // Handshake event so the client knows the stream is live
+    res.write('retry: 3000\n');
+    res.write('event: hello\ndata: ' + JSON.stringify({ t: Date.now() }) + '\n\n');
+
+    this.sseClients.add(res);
+
+    // Start keep-alive heartbeat once we have subscribers
+    if (!this._sseKeepAlive) {
+      this._sseKeepAlive = setInterval(() => {
+        for (const r of this.sseClients) {
+          try { r.write(': ping\n\n'); } catch (e) { /* drop */ }
+        }
+      }, 25_000);
+    }
+
+    const cleanup = () => {
+      this.sseClients.delete(res);
+      if (this.sseClients.size === 0 && this._sseKeepAlive) {
+        clearInterval(this._sseKeepAlive);
+        this._sseKeepAlive = null;
+      }
+    };
+    req.on('close', cleanup);
+    req.on('error', cleanup);
+  }
+
   async _handleScan(req, res) {
     if (this.appState?.paused) {
       return json(res, 409, { error: 'Scanner is paused. Resume it first.' });
@@ -631,48 +699,80 @@ class DashboardServer {
     /* ── Nav ── */
     .nav {
       position: sticky; top: 0; z-index: 200;
-      background: rgba(8,8,15,.93);
-      backdrop-filter: blur(16px) saturate(1.2);
-      -webkit-backdrop-filter: blur(16px) saturate(1.2);
+      background: linear-gradient(180deg, rgba(12,12,22,.96) 0%, rgba(8,8,15,.92) 100%);
+      backdrop-filter: blur(18px) saturate(1.3);
+      -webkit-backdrop-filter: blur(18px) saturate(1.3);
       border-bottom: 1px solid var(--border);
       padding: 0 18px;
       height: 50px;
       display: flex; align-items: center; gap: 14px;
+      box-shadow: 0 1px 0 rgba(98,114,255,.04), 0 6px 16px rgba(0,0,0,.25);
+    }
+    .nav::after {
+      content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+      background: linear-gradient(90deg, transparent 0%, rgba(98,114,255,.22) 20%, rgba(98,114,255,.22) 80%, transparent 100%);
+      pointer-events: none;
     }
     .nav-logo {
-      display: flex; align-items: center; gap: 8px;
+      display: flex; align-items: center; gap: 9px;
       font-size: 15px; font-weight: 800; letter-spacing: -0.5px;
       color: var(--text);
       white-space: nowrap;
     }
-    .nav-logo-icon { font-size: 17px; }
+    .nav-logo-icon {
+      font-size: 18px; line-height: 1;
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 28px; height: 28px; border-radius: 8px;
+      background: linear-gradient(135deg, rgba(98,114,255,.22), rgba(98,114,255,.05));
+      border: 1px solid rgba(98,114,255,.28);
+      box-shadow: 0 2px 10px rgba(98,114,255,.18), inset 0 1px 0 rgba(255,255,255,.05);
+    }
+    .nav-logo-text {
+      background: linear-gradient(180deg, #fff 0%, #cfd4ff 100%);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
     .nav-version {
       font-size: 9px; font-weight: 700; letter-spacing: .4px;
       color: var(--accent2); background: var(--accent-glow);
-      border: 1px solid rgba(98,114,255,.22); border-radius: 5px;
-      padding: 2px 6px; font-family: 'JetBrains Mono', monospace;
+      border: 1px solid rgba(98,114,255,.22); border-radius: 6px;
+      padding: 2px 7px; font-family: 'JetBrains Mono', monospace;
+      text-transform: uppercase;
     }
-    .nav-sep { width: 1px; height: 16px; background: var(--border2); }
-    .nav-subtitle { font-size: 9px; color: var(--dim); letter-spacing: 1.4px; text-transform: uppercase; font-weight: 600; }
-    .nav-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+    .nav-sep {
+      width: 1px; height: 18px;
+      background: linear-gradient(180deg, transparent, var(--border2), transparent);
+    }
+    .nav-subtitle { font-size: 9px; color: var(--dim); letter-spacing: 1.6px; text-transform: uppercase; font-weight: 700; }
+    .nav-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
     .status-pill {
-      display: flex; align-items: center; gap: 6px;
-      background: rgba(255,255,255,.025); border: 1px solid var(--border);
-      border-radius: 7px; padding: 4px 10px;
-      font-size: 10px; color: var(--text2); font-weight: 600;
-      letter-spacing: .2px;
+      display: flex; align-items: center; gap: 7px;
+      background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015));
+      border: 1px solid var(--border2);
+      border-radius: 999px; padding: 4px 11px 4px 9px;
+      font-size: 10px; color: var(--text2); font-weight: 700;
+      letter-spacing: .4px; text-transform: uppercase;
+      transition: border-color .2s, background .2s;
     }
+    .status-pill:hover { border-color: rgba(98,114,255,.3); }
+    .status-pill.live  { color: var(--green2); }
+    .status-pill.live:hover { border-color: rgba(34,197,94,.35); }
+    .status-pill.paused { color: var(--red2); }
     .status-dot {
-      width: 6px; height: 6px; border-radius: 50%;
+      width: 7px; height: 7px; border-radius: 50%;
       background: var(--green2);
-      box-shadow: 0 0 6px var(--green);
+      box-shadow: 0 0 8px var(--green), 0 0 0 2px rgba(34,197,94,.12);
       animation: pulse 2.5s ease-in-out infinite;
     }
     .status-dot.paused { background: var(--red2); box-shadow: 0 0 6px var(--red); animation: none; }
-    .nav-time { font-size: 10px; color: var(--dim); font-family: 'JetBrains Mono', monospace; font-weight: 400; }
+    .nav-time {
+      font-size: 10px; color: var(--dim); font-family: 'JetBrains Mono', monospace; font-weight: 500;
+      padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
+      background: rgba(255,255,255,.015); letter-spacing: .3px;
+    }
 
     /* ── Layout (classic 2-col for settings/stats) ── */
-    .layout { display: flex; min-height: calc(100vh - 50px); }
+    .layout { display: flex; min-height: calc(100vh - 50px - 28px); }
 
     /* ── Sidebar ── */
     .sidebar {
@@ -681,8 +781,8 @@ class DashboardServer {
       border-right: 1px solid var(--border);
       padding: 14px 10px 10px;
       display: flex; flex-direction: column; gap: 2px;
-      /* classic layout: sticky scroll */
-      position: sticky; top: 50px; height: calc(100vh - 50px); overflow-y: auto;
+      /* classic layout: sticky scroll, subtract nav(50) + statusbar(28) */
+      position: sticky; top: 50px; height: calc(100vh - 50px - 28px); overflow-y: auto;
     }
     /* In dashboard-grid the sidebar is app-shell (overrides above) */
     .sidebar-section {
@@ -814,7 +914,11 @@ class DashboardServer {
     .sb-foot-btn.active { color: var(--accent2); background: var(--accent-glow); border-color: rgba(98,114,255,.25); }
 
     /* ── Main content ── */
-    .main { flex: 1; min-width: 0; padding: 18px 20px 24px; }
+    .main {
+      flex: 1; min-width: 0; padding: 18px 20px 24px;
+      height: calc(100vh - 50px - 28px); overflow-y: auto;
+    }
+    .settings-panel { padding-bottom: 40px; }
 
     /* ── Session bar (compact hero replacement) ── */
     .session-bar {
@@ -1210,7 +1314,42 @@ class DashboardServer {
     .setting-control { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
     .setting-control input[type=range] { width: 130px; accent-color: var(--accent); height: 3px; cursor: pointer; }
     .setting-val { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 700; color: var(--accent2); min-width: 30px; text-align: right; }
-    .settings-actions { display: flex; gap: 10px; margin-top: 10px; }
+    .settings-actions { display: flex; gap: 10px; margin-top: 10px; justify-content: flex-end; }
+    .settings-flash {
+      margin-left: auto; font-size: 11px; font-weight: 600; color: var(--accent2);
+      background: var(--accent-glow); border: 1px solid rgba(98,114,255,.22);
+      padding: 4px 10px; border-radius: 999px; letter-spacing: .2px;
+      animation: fadeIn .2s ease;
+    }
+    .settings-info { border-style: dashed; background: linear-gradient(180deg, rgba(98,114,255,.05), transparent); }
+
+    /* ── Preference toggle switch ── */
+    .pref-toggle {
+      position: relative; width: 42px; height: 22px; flex-shrink: 0;
+      border-radius: 999px; border: 1px solid var(--border);
+      background: var(--card2); cursor: pointer; padding: 0;
+      transition: background .15s, border-color .15s;
+    }
+    .pref-toggle.on { background: var(--accent); border-color: var(--accent); }
+    .pref-toggle-knob {
+      position: absolute; top: 2px; left: 2px;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.3);
+      transition: transform .15s ease;
+    }
+    .pref-toggle.on .pref-toggle-knob { transform: translateX(20px); }
+
+    /* ── Body preference classes (applied by applyPrefsToDOM) ── */
+    body.prefs-no-anim *, body.prefs-no-anim *:before, body.prefs-no-anim *:after {
+      animation-duration: .001s !important; animation-delay: 0s !important;
+      transition-duration: .001s !important;
+    }
+    body.prefs-no-images .feed-card-media,
+    body.prefs-no-images .card-media,
+    body.prefs-no-images .trend-modal-media { display: none !important; }
+    body.prefs-compact .feed-card { padding: 10px 12px; }
+    body.prefs-compact .feed-card + .feed-card { margin-top: 6px; }
+    body.prefs-compact .feed-list { gap: 6px; }
 
     /* ── Preset grid ── */
     .preset-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 6px; }
@@ -1867,15 +2006,49 @@ class DashboardServer {
     /* ── Bottom status bar ── */
     .statusbar {
       position: fixed; bottom: 0; left: 0; right: 0; z-index: 300;
-      height: 28px; background: rgba(8,8,15,.96); border-top: 1px solid var(--border);
-      backdrop-filter: blur(10px); display: flex; align-items: center; gap: 14px;
-      padding: 0 14px; font-size: 10px; font-family: 'JetBrains Mono', monospace; color: var(--dim);
+      height: 28px;
+      background: linear-gradient(180deg, rgba(10,10,18,.94) 0%, rgba(6,6,12,.98) 100%);
+      border-top: 1px solid var(--border);
+      backdrop-filter: blur(14px) saturate(1.15);
+      -webkit-backdrop-filter: blur(14px) saturate(1.15);
+      display: flex; align-items: center; gap: 10px;
+      padding: 0 14px; font-size: 10px; font-family: 'JetBrains Mono', monospace; color: var(--text2);
+      box-shadow: 0 -2px 16px rgba(0,0,0,.35);
     }
-    .statusbar-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green2); box-shadow: 0 0 5px var(--green); animation: pulse 2.5s ease-in-out infinite; flex-shrink: 0; }
-    .statusbar-dot.paused { background: var(--red2); box-shadow: none; animation: none; }
-    .statusbar-item { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
-    .statusbar-sep { width: 1px; height: 12px; background: var(--border2); }
-    .statusbar-hint { margin-left: auto; color: var(--dim); opacity: .5; }
+    .statusbar::before {
+      content: ''; position: absolute; left: 0; right: 0; top: -1px; height: 1px;
+      background: linear-gradient(90deg, transparent 0%, rgba(98,114,255,.2) 15%, rgba(98,114,255,.2) 85%, transparent 100%);
+      pointer-events: none;
+    }
+    .statusbar-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--green2); flex-shrink: 0;
+      box-shadow: 0 0 8px var(--green), 0 0 0 2px rgba(34,197,94,.12);
+      animation: pulse 2.5s ease-in-out infinite;
+    }
+    .statusbar-dot.paused { background: var(--red2); box-shadow: 0 0 6px var(--red); animation: none; }
+    .statusbar-item {
+      display: flex; align-items: center; gap: 5px; white-space: nowrap;
+      padding: 2px 8px; border-radius: 999px;
+      background: rgba(255,255,255,.02); border: 1px solid transparent;
+      transition: border-color .15s, background .15s;
+    }
+    .statusbar-item:hover { background: rgba(255,255,255,.04); border-color: var(--border); }
+    .statusbar-item b { color: var(--text); font-weight: 700; letter-spacing: .2px; }
+    .statusbar-item .sb-key { color: var(--dim); text-transform: uppercase; font-size: 9px; letter-spacing: .8px; }
+    .statusbar-sep {
+      width: 1px; height: 14px;
+      background: linear-gradient(180deg, transparent, var(--border2), transparent);
+      flex-shrink: 0;
+    }
+    .statusbar-hint { margin-left: auto; color: var(--dim); opacity: .7; display: flex; align-items: center; gap: 8px; }
+    .statusbar-kbd {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 1px 6px; border-radius: 4px;
+      background: rgba(255,255,255,.04); border: 1px solid var(--border);
+      font-size: 9px; color: var(--text2); letter-spacing: .3px;
+    }
+    .statusbar-kbd b { color: var(--accent2); font-weight: 700; margin-right: 1px; }
 
     /* ── Responsive ── */
     @media (max-width: 1100px) { .card-meta { flex-wrap: wrap; } }
@@ -1908,14 +2081,6 @@ const { useState, useEffect, useCallback, useRef } = React;
 const h = React.createElement;
 
 // ── API ──────────────────────────────────────────────────────────────────────
-let API_KEY = localStorage.getItem('ts_api_key') || '';
-if (!API_KEY) {
-  const entered = window.prompt('Введите DASHBOARD API key');
-  if (entered && entered.trim()) {
-    API_KEY = entered.trim();
-    localStorage.setItem('ts_api_key', API_KEY);
-  }
-}
 // Stable per-browser user id for feedback attribution.
 // Prefixed "dashboard:" so it can never collide with real Telegram chat_ids.
 let USER_ID = '';
@@ -1931,7 +2096,6 @@ try {
 const api = (path, opts = {}) =>
   fetch('/api' + path, {
     headers: {
-      'X-API-Key': API_KEY,
       'X-User-Id': USER_ID,
       'Content-Type': 'application/json'
     },
@@ -2080,7 +2244,7 @@ function ImageThumb({ trend, size = 80 }) {
   useEffect(() => {
     if (!tried && !imgUrl && trend.url) {
       setTried(true);
-      fetch('/api/preview?url=' + encodeURIComponent(trend.url), { headers: { 'X-API-Key': API_KEY } })
+      fetch('/api/preview?url=' + encodeURIComponent(trend.url))
         .then(r => r.json())
         .then(d => { if (d.imageUrl) setImgUrl(d.imageUrl); })
         .catch(() => {});
@@ -2108,7 +2272,7 @@ function FeedImage({ trend }) {
   useEffect(() => {
     if (!tried && !imgUrl && trend.url) {
       setTried(true);
-      fetch('/api/preview?url=' + encodeURIComponent(trend.url), { headers: { 'X-API-Key': API_KEY } })
+      fetch('/api/preview?url=' + encodeURIComponent(trend.url))
         .then(r => r.json())
         .then(d => { if (d.imageUrl) setImgUrl(d.imageUrl); else setFailed(true); })
         .catch(() => setFailed(true));
@@ -2447,7 +2611,7 @@ function TrendModal({ trend, onClose }) {
 
   useEffect(() => {
     if (!imgUrl && trend.url) {
-      fetch('/api/preview?url=' + encodeURIComponent(trend.url), { headers: { 'X-API-Key': API_KEY } })
+      fetch('/api/preview?url=' + encodeURIComponent(trend.url))
         .then(r => r.json())
         .then(d => { setImgUrl(d.imageUrl || null); setImgLoading(false); })
         .catch(() => setImgLoading(false));
@@ -2606,33 +2770,38 @@ function NavClock({ refreshAt }) {
 function StatusBar({ stats, scanning, sources }) {
   const active = (sources || []).filter(function(s) { return s.enabled; }).length;
   const total  = (sources || []).length;
+  const paused = !!(stats && stats.paused);
+  const srcOk  = active === total && total > 0;
   return h('div', { className: 'statusbar' },
-    h('div', { className: 'statusbar-dot' + (stats && stats.paused ? ' paused' : '') }),
     h('span', {
       className: 'statusbar-item',
-      style: { color: stats && stats.paused ? 'var(--red2)' : 'var(--green2)', fontWeight: 700 }
-    }, stats && stats.paused ? 'PAUSED' : 'LIVE'),
-    h('div', { className: 'statusbar-sep' }),
-    h('span', { className: 'statusbar-item' }, 'signals: ',
-      h('span', { style: { color: 'var(--text2)' } }, String(stats ? stats.total || 0 : 0))
+      style: { color: paused ? 'var(--red2)' : 'var(--green2)', fontWeight: 700 }
+    },
+      h('div', { className: 'statusbar-dot' + (paused ? ' paused' : '') }),
+      paused ? 'OFFLINE' : 'LIVE'
     ),
     h('div', { className: 'statusbar-sep' }),
-    h('span', { className: 'statusbar-item' }, 'alerts: ',
-      h('span', { style: { color: 'var(--text2)' } }, String(stats ? stats.alerts || 0 : 0))
+    h('span', { className: 'statusbar-item' },
+      h('span', { className: 'sb-key' }, 'signals'),
+      h('b', null, String(stats ? stats.total || 0 : 0))
     ),
-    h('div', { className: 'statusbar-sep' }),
-    h('span', { className: 'statusbar-item' }, 'sources: ',
-      h('span', { style: { color: active === total && total > 0 ? 'var(--green2)' : 'var(--orange)' } },
-        active + '/' + total
-      )
+    h('span', { className: 'statusbar-item' },
+      h('span', { className: 'sb-key' }, 'alerts'),
+      h('b', null, String(stats ? stats.alerts || 0 : 0))
+    ),
+    h('span', { className: 'statusbar-item' },
+      h('span', { className: 'sb-key' }, 'sources'),
+      h('b', { style: { color: srcOk ? 'var(--green2)' : 'var(--orange)' } }, active + '/' + total)
     ),
     scanning
-      ? h(React.Fragment, null,
-          h('div', { className: 'statusbar-sep' }),
-          h('span', { className: 'statusbar-item', style: { color: 'var(--accent2)' } }, '\u23f3 scanning...')
+      ? h('span', { className: 'statusbar-item', style: { color: 'var(--accent2)' } },
+          h('span', { className: 'sb-key', style: { color: 'var(--accent2)' } }, '⏳ updating')
         )
       : null,
-    h('span', { className: 'statusbar-hint' }, 'R=refresh  S=scan  Esc=close')
+    h('span', { className: 'statusbar-hint' },
+      h('span', { className: 'statusbar-kbd' }, h('b', null, 'R'), 'refresh'),
+      h('span', { className: 'statusbar-kbd' }, h('b', null, 'Esc'), 'close')
+    )
   );
 }
 
@@ -2820,129 +2989,188 @@ function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
   );
 }
 
-function SettingsPanel({ onBack }) {
-  const [draft,   setDraft]   = useState(null);
-  const [saving,  setSaving]  = useState(false);
-  const [savedOk, setSavedOk] = useState(false);
-  const [err,     setErr]     = useState('');
+// ── User preferences helpers ─────────────────────────────────────────────────
+const PREFS_KEY = 'ts_prefs_v1';
+const DEFAULT_PREFS = {
+  density:       'comfortable', // 'compact' | 'comfortable'
+  showImages:    true,
+  animations:    true,
+  refreshSec:    90,   // 0 = off
+  fontSize:      14,   // 12..16
+};
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    if (!raw) return { ...DEFAULT_PREFS };
+    return { ...DEFAULT_PREFS, ...JSON.parse(raw) };
+  } catch (e) { return { ...DEFAULT_PREFS }; }
+}
+function savePrefs(p) {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch (e) {}
+  try { window.dispatchEvent(new CustomEvent('ts:prefs', { detail: p })); } catch (e) {}
+  applyPrefsToDOM(p);
+}
+function applyPrefsToDOM(p) {
+  const b = document.body;
+  if (!b) return;
+  b.classList.toggle('prefs-compact', p.density === 'compact');
+  b.classList.toggle('prefs-no-images', !p.showImages);
+  b.classList.toggle('prefs-no-anim',  !p.animations);
+  try { b.style.setProperty('--user-font-size', p.fontSize + 'px'); } catch (e) {}
+}
+// apply on first script eval (before React mounts)
+try { applyPrefsToDOM(loadPrefs()); } catch (e) {}
 
-  useEffect(() => {
-    api('/settings').then(s => setDraft(s)).catch(e => setErr(e.message));
-  }, []);
+function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
+  const [prefs, setPrefs] = useState(loadPrefs);
+  const [flash, setFlash] = useState('');
 
-  const set = (key, val) => setDraft(prev => ({ ...prev, [key]: val }));
-
-  const save = async () => {
-    setSaving(true); setSavedOk(false); setErr('');
-    try {
-      const res = await api('/settings', { method: 'POST', body: JSON.stringify(draft) });
-      if (res.error) { setErr(res.error); }
-      else { setSavedOk(true); setTimeout(() => setSavedOk(false), 3000); }
-    } catch (e) { setErr(e.message); }
-    setSaving(false);
+  const update = (patch) => {
+    const next = { ...prefs, ...patch };
+    setPrefs(next);
+    savePrefs(next);
   };
 
-  if (!draft) return h('div', { className: 'loading-wrap' },
-    h('div', { className: 'loading-spinner' }),
-    h('span', { className: 'loading-text' }, 'Загрузка настроек...')
-  );
+  const flashMsg = (m) => { setFlash(m); setTimeout(() => setFlash(''), 2000); };
 
-  const SliderRow = ({ label, hint, settingKey, min, max, step, valDisplay }) =>
+  const resetFeedbackProfile = () => {
+    if (!confirm('Сбросить профиль фидбэка? Лайки и дизлайки, которые ты оставлял, перестанут учитываться как твои.')) return;
+    try {
+      const rnd = Math.random().toString(36).slice(2, 10);
+      USER_ID = 'dashboard:' + rnd;
+      localStorage.setItem('ts_user_id', USER_ID);
+      flashMsg('✓ Профиль фидбэка сброшен');
+    } catch (e) { flashMsg('Ошибка: ' + e.message); }
+  };
+
+  const resetAllPrefs = () => {
+    if (!confirm('Сбросить все настройки дашборда к значениям по умолчанию?')) return;
+    const next = { ...DEFAULT_PREFS };
+    setPrefs(next);
+    savePrefs(next);
+    flashMsg('✓ Настройки сброшены');
+  };
+
+  const Toggle = ({ on, onChange }) =>
+    h('button', {
+      className: 'pref-toggle' + (on ? ' on' : ''),
+      onClick: () => onChange(!on),
+      role: 'switch',
+      'aria-checked': on
+    }, h('span', { className: 'pref-toggle-knob' }));
+
+  const Row = ({ icon, title, desc, control }) =>
     h('div', { className: 'setting-row' },
       h('div', { className: 'setting-label' },
-        h('span', { className: 'setting-name' }, label),
-        h('span', { className: 'setting-hint' }, hint)
+        h('span', { className: 'setting-name' }, icon ? (icon + ' ') : '', title),
+        desc ? h('span', { className: 'setting-hint' }, desc) : null
       ),
-      h('div', { className: 'setting-control' },
-        h('input', {
-          type: 'range', min, max, step,
-          value: draft[settingKey],
-          onChange: e => set(settingKey, +e.target.value)
-        }),
-        h('span', { className: 'setting-val' }, valDisplay !== undefined ? valDisplay : draft[settingKey])
-      )
+      h('div', { className: 'setting-control' }, control)
     );
-
-  const PRESETS = [
-    { id: 'general',     icon: '🌐', label: 'Общий',        hint: 'Любой вирусный контент — ультра-широкий поиск на всех языках' },
-    { id: 'animals',     icon: '🐾', label: 'Животные',     hint: 'Вирусные питомцы, смешные животные, милые создания' },
-    { id: 'culture',     icon: '🎭', label: 'Культура',     hint: 'Мемы, интернет-тренды, сленг, юмор, вирусный контент' },
-    { id: 'celebrities', icon: '⭐', label: 'Знаменитости', hint: 'Селебрити, поп-культура, музыка, кино, вирусные моменты' },
-    { id: 'events',      icon: '🌍', label: 'События',      hint: 'Мировые события, спорт, брейкинг, космос, AI-новости' },
-  ];
 
   return h('div', { className: 'settings-panel' },
     h('div', { className: 'settings-header' },
       h('button', { className: 'btn btn-ghost', onClick: onBack }, '← Назад'),
-      h('span', { className: 'settings-title' }, '⚙️ Настройки')
+      h('span', { className: 'settings-title' }, '⚙️ Настройки дашборда'),
+      flash ? h('span', { className: 'settings-flash' }, flash) : null
     ),
 
-    err ? h('div', { className: 'error-bar' }, '⚠️ ', err) : null,
-
-    // ── Presets ──
+    // ── Внешний вид ──
     h('div', { className: 'settings-card' },
-      h('div', { className: 'settings-card-title' }, '🎯 Пресет поиска'),
+      h('div', { className: 'settings-card-title' }, '🎨 Внешний вид'),
       h('div', { className: 'settings-card-desc' },
-        'Определяет темы для Twitter, Reddit и TikTok сразу. Применяется с ближайшего цикла.'
+        'Только визуальные предпочтения — применяются мгновенно и хранятся в этом браузере.'
       ),
-      h('div', { className: 'preset-grid' },
-        PRESETS.map(p =>
-          h('div', {
-            key: p.id,
-            className: 'preset-card' + (draft.activePreset === p.id ? ' active' : ''),
-            onClick: () => set('activePreset', p.id),
-          },
-            h('div', { className: 'preset-icon' }, p.icon),
-            h('div', { className: 'preset-label' }, p.label),
-            h('div', { className: 'preset-hint' }, p.hint)
+      h(Row, {
+        icon: '📐', title: 'Плотность фида',
+        desc: 'Compact уменьшает отступы и размер карточек для плотного просмотра.',
+        control: h('div', { className: 'seg-group seg-compact' },
+          [{ v: 'comfortable', l: 'Comfy' }, { v: 'compact', l: 'Compact' }].map(o =>
+            h('button', {
+              key: o.v,
+              className: 'seg-btn' + (prefs.density === o.v ? ' active' : ''),
+              onClick: () => update({ density: o.v })
+            }, o.l)
           )
         )
-      )
-    ),
-
-    // ── Alerts ──
-    h('div', { className: 'settings-card' },
-      h('div', { className: 'settings-card-title' }, '🔔 Алерты в Telegram / Discord'),
-      h('div', { className: 'settings-card-desc' },
-        'Нарратив проходит в уведомление только если проходит оба фильтра: Meme Potential и Virality.'
-      ),
-      h(SliderRow, {
-        label: '🔥 Глобальный Meme Potential (минимум для всех)',
-        hint:  'Текущее: ' + draft.alertThreshold + '/100. Это общий floor: пользовательский порог не может быть ниже.',
-        settingKey: 'alertThreshold', min: 0, max: 100, step: 5
       }),
-      h(SliderRow, {
-        label: '📈 Virality Score — глобальный порог',
-        hint:  'Текущее: ' + draft.viralityThreshold + '/100. Рекомендуемо 70-75 для снижения мусорных алертов.',
-        settingKey: 'viralityThreshold', min: 0, max: 100, step: 5
+      h(Row, {
+        icon: '🖼️', title: 'Показывать превью',
+        desc: 'Отключи чтобы экономить трафик и разгрузить фид.',
+        control: h(Toggle, { on: prefs.showImages, onChange: v => update({ showImages: v }) })
       }),
-      h(SliderRow, {
-        label: '📨 Максимум алертов за цикл',
-        hint:  '0 = без ограничений. Поставь 3-5 чтобы не получать пачки за раз.',
-        settingKey: 'maxAlertsPerCycle', min: 0, max: 20, step: 1,
-        valDisplay: draft.maxAlertsPerCycle === 0 ? '∞' : draft.maxAlertsPerCycle
+      h(Row, {
+        icon: '✨', title: 'Анимации интерфейса',
+        desc: 'Отключи для снижения нагрузки на слабых устройствах.',
+        control: h(Toggle, { on: prefs.animations, onChange: v => update({ animations: v }) })
+      }),
+      h(Row, {
+        icon: '🔠', title: 'Размер шрифта',
+        desc: 'Базовый размер текста на дашборде.',
+        control: h('div', { className: 'seg-group seg-compact' },
+          [{ v: 12, l: 'S' }, { v: 14, l: 'M' }, { v: 16, l: 'L' }].map(o =>
+            h('button', {
+              key: o.v,
+              className: 'seg-btn' + (prefs.fontSize === o.v ? ' active' : ''),
+              onClick: () => update({ fontSize: o.v })
+            }, o.l)
+          )
+        )
       })
     ),
 
-    // ── Storage ──
+    // ── Поведение ──
     h('div', { className: 'settings-card' },
-      h('div', { className: 'settings-card-title' }, '🗄️ Хранение данных'),
+      h('div', { className: 'settings-card-title' }, '🔄 Поведение'),
       h('div', { className: 'settings-card-desc' },
-        'Нарративы ниже порога сохраняются в БД но не алертят. Увеличь чтобы экономить место.'
+        'Автообновление и видимость источников в фиде.'
       ),
-      h(SliderRow, {
-        label: '📊 Базовый охват — мин. для сохранения',
-        hint:  'Нарративы с базовым охватом ниже этого значения не сохраняются вообще.',
-        settingKey: 'minScoreToSave', min: 0, max: 80, step: 5
+      h(Row, {
+        icon: '⏱', title: 'Автообновление',
+        desc: prefs.refreshSec === 0
+          ? 'Выключено — обновляй вручную клавишей R.'
+          : 'Каждые ' + prefs.refreshSec + ' секунд.',
+        control: h('div', { className: 'seg-group seg-compact' },
+          [{ v: 0, l: 'Off' }, { v: 30, l: '30s' }, { v: 60, l: '1m' }, { v: 90, l: '90s' }, { v: 300, l: '5m' }].map(o =>
+            h('button', {
+              key: o.v,
+              className: 'seg-btn' + (prefs.refreshSec === o.v ? ' active' : ''),
+              onClick: () => update({ refreshSec: o.v })
+            }, o.l)
+          )
+        )
+      }),
+      h(Row, {
+        icon: '👁', title: 'Скрытые источники',
+        desc: hiddenSourcesCount
+          ? 'Сейчас скрыто: ' + hiddenSourcesCount + '. Это только визуальная фильтрация в твоём браузере.'
+          : 'Ничего не скрыто — можешь скрывать источники кликом в сайдбаре.',
+        control: h('button', {
+          className: 'btn btn-ghost',
+          disabled: !hiddenSourcesCount,
+          onClick: () => {
+            if (onResetHiddenSources) { onResetHiddenSources(); flashMsg('✓ Все источники показаны'); }
+          }
+        }, 'Показать все')
       })
     ),
 
+    // ── Приватность ──
+    h('div', { className: 'settings-card' },
+      h('div', { className: 'settings-card-title' }, '🔒 Приватность'),
+      h('div', { className: 'settings-card-desc' },
+        'Твой анонимный профиль хранится только в этом браузере. Мы используем его, чтобы запомнить твои лайки и дизлайки.'
+      ),
+      h(Row, {
+        icon: '🪪', title: 'Профиль фидбэка',
+        desc: 'Анонимный ID этого браузера. Сбрось, чтобы начать с чистого листа.',
+        control: h('button', { className: 'btn btn-ghost', onClick: resetFeedbackProfile }, 'Сбросить')
+      })
+    ),
+
+    // ── Reset ──
     h('div', { className: 'settings-actions' },
-      h('button', {
-        className: 'btn btn-primary',
-        onClick: save,
-        disabled: saving
-      }, saving ? '⏳ Сохраняю...' : savedOk ? '✅ Сохранено!' : '💾 Сохранить настройки')
+      h('button', { className: 'btn btn-ghost', onClick: resetAllPrefs }, '↺ Сбросить все настройки')
     )
   );
 }
@@ -3006,18 +3234,66 @@ function App() {
     setLoading(false);
   }, [hours, category, source, phase, minMeme, offset, sort]);
 
-  const scan = useCallback(async () => {
-    setScanning(true);
-    try {
-      const res = await api('/scan', { method: 'POST' });
-      if (res.error) { addToast(res.error, 'error'); }
-      else { addToast('⚡ Сканирование запущено!', 'success'); setTimeout(fetchData, 8000); }
-    } catch (ex) { addToast(ex.message, 'error'); }
-    setTimeout(() => setScanning(false), 6000);
-  }, [addToast, fetchData]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
-  useEffect(() => { const t = setInterval(fetchData, 90000); return () => clearInterval(t); }, [fetchData]);
+  // Auto-refresh interval driven by user preference (0 = off)
+  const [refreshSec, setRefreshSec] = useState(() => {
+    try { return (loadPrefs().refreshSec | 0); } catch (e) { return 90; }
+  });
+  useEffect(() => {
+    const onPrefs = (ev) => { if (ev && ev.detail) setRefreshSec(ev.detail.refreshSec | 0); };
+    window.addEventListener('ts:prefs', onPrefs);
+    return () => window.removeEventListener('ts:prefs', onPrefs);
+  }, []);
+  useEffect(() => {
+    if (!refreshSec) return;
+    const t = setInterval(fetchData, refreshSec * 1000);
+    return () => clearInterval(t);
+  }, [fetchData, refreshSec]);
+
+  // ── Live stream (Server-Sent Events) — push-based real-time refresh ─────────
+  useEffect(() => {
+    if (typeof EventSource === 'undefined') return;
+
+    let es = null;
+    let refreshTimer = null;
+    let stopped = false;
+
+    const scheduleRefresh = (delay = 600) => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => { refreshTimer = null; fetchData(); }, delay);
+    };
+
+    const connect = () => {
+      if (stopped) return;
+      try {
+        es = new EventSource('/api/stream');
+      } catch (e) { return; }
+
+      es.addEventListener('hello', () => { /* connected */ });
+      es.addEventListener('scan-start', () => {
+        setScanning(true);
+        // safety reset in case the completion event is missed
+        setTimeout(() => setScanning(false), 90_000);
+      });
+      es.addEventListener('refresh', () => {
+        setScanning(false);
+        scheduleRefresh(400);
+      });
+      es.onerror = () => {
+        // EventSource auto-reconnects — browser uses the retry interval
+        // we send in the stream handshake.
+      };
+    };
+
+    connect();
+
+    return () => {
+      stopped = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      if (es) { try { es.close(); } catch (e) {} }
+    };
+  }, [fetchData]);
   useEffect(() => {
     const handleNavigate = (event) => {
       const nextView = event && event.detail ? event.detail.view : null;
@@ -3027,18 +3303,17 @@ function App() {
     return () => window.removeEventListener('dashboard:navigate', handleNavigate);
   }, []);
 
-  // Keyboard shortcuts: R=refresh, S=scan, Esc=close modal
+  // Keyboard shortcuts: R=refresh, Esc=close modal
   useEffect(() => {
     const fn = e => {
       const tag = document.activeElement?.tagName?.toLowerCase();
       if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
       if (e.key === 'Escape') { setModalTrend(null); return; }
       if (e.key === 'r' || e.key === 'R') { fetchData(); addToast('Обновляю...', 'info'); return; }
-      if ((e.key === 's' || e.key === 'S') && !scanning) { scan(); return; }
     };
     window.addEventListener('keydown', fn);
     return () => window.removeEventListener('keydown', fn);
-  }, [scanning, fetchData, addToast, scan]);
+  }, [fetchData, addToast]);
 
   // Visual-only source filter. Does NOT touch the collectors —
   // real enable/disable lives in the admin panel. This only hides
@@ -3108,15 +3383,15 @@ function App() {
     h('nav', { className: 'nav' },
       h('div', { className: 'nav-logo' },
         h('span', { className: 'nav-logo-icon' }, '🔥'),
-        'Catalyst'
+        h('span', { className: 'nav-logo-text' }, 'Catalyst')
       ),
       h('span', { className: 'nav-version' }, 'v3'),
       h('div', { className: 'nav-sep' }),
       h('span', { className: 'nav-subtitle' }, 'Narrative Terminal'),
       h('div', { className: 'nav-right' },
-        h('div', { className: 'status-pill' },
+        h('div', { className: 'status-pill ' + (stats && stats.paused ? 'paused' : 'live') },
           h('div', { className: 'status-dot' + (stats && stats.paused ? ' paused' : '') }),
-          stats && stats.paused ? 'Paused' : 'Live'
+          stats && stats.paused ? 'Offline' : 'Live'
         ),
         h(NavClock, { refreshAt })
       )
@@ -3292,14 +3567,7 @@ function App() {
                       disabled: loading,
                       style: { fontSize: 11, padding: '6px 10px' },
                       title: 'Refresh (R)'
-                    }, h('span', { className: 'btn-refresh-ico' }, '↻')),
-                    h('button', {
-                      className: 'btn btn-primary',
-                      onClick: scan,
-                      disabled: scanning,
-                      style: { fontSize: 11, padding: '6px 12px' },
-                      title: 'Scan now (S)'
-                    }, scanning ? '⏳ Scanning...' : '⚡ Scan')
+                    }, h('span', { className: 'btn-refresh-ico' }, '↻'))
                   )
                 ),
 
@@ -3336,7 +3604,7 @@ function App() {
                       h('div', { className: 'empty-feed-text' },
                         search.trim()
                           ? 'No matches for "' + search + '"'
-                          : 'No narratives found — try different filters or ⚡ Scan'
+                          : 'No narratives found — try different filters'
                       ),
                       h('div', { className: 'empty-feed-sub' }, 'Hint: widen the time window or clear filters')
                     )
@@ -3410,7 +3678,11 @@ function App() {
           ),
           h('main', { className: 'main' },
             view === 'settings'
-              ? h(SettingsPanel, { onBack: () => setView('trends') })
+              ? h(SettingsPanel, {
+                  onBack: () => setView('trends'),
+                  onResetHiddenSources: showAllSources,
+                  hiddenSourcesCount: hiddenSources.size
+                })
               : h(StatsPanel, { stats, hours, onBack: () => setView('trends'), onOpenTrend: setModalTrend })
           )
         )

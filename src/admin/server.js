@@ -52,12 +52,13 @@ function parseBody(req) {
 // ─── Admin Server ─────────────────────────────────────────────────────────────
 
 class AdminServer {
-  constructor(config, logger, db, bot, appState = null) {
+  constructor(config, logger, db, bot, appState = null, scanFn = null) {
     this.config = config;
     this.logger = logger;
     this.db = db;
     this.bot = bot;
     this.appState = appState || { paused: false, disabledCollectors: new Set() };
+    this.scanFn = scanFn; // optional callback to trigger manual scan
     this.port = parseInt(process.env.ADMIN_PORT || '8080');
     this.host = process.env.ADMIN_HOST || '127.0.0.1';
     this.adminKey = process.env.ADMIN_API_KEY || '';
@@ -196,6 +197,39 @@ class AdminServer {
     if (weightPro   !== undefined) this.db.setSetting('feedbackWeightPro',   String(parseFloat(weightPro)   || 1));
     if (weightTest  !== undefined) this.db.setSetting('feedbackWeightTest',  String(parseFloat(weightTest)  || 1));
     if (weightFree  !== undefined) this.db.setSetting('feedbackWeightFree',  String(parseFloat(weightFree)  || 1));
+  }
+
+  _getScannerConfig() {
+    const numDefaults = { alertThreshold: 60, viralityThreshold: 70, minScoreToSave: 0, maxAlertsPerCycle: 0 };
+    const merged = {};
+    for (const [k, v] of Object.entries(numDefaults)) {
+      const s = this.db.getSetting(k);
+      merged[k] = (s !== undefined && s !== null && s !== '') ? Number(s) : v;
+    }
+    merged.activePreset = this.db.getSetting('activePreset', 'general') || 'general';
+    return merged;
+  }
+
+  _setScannerConfig(body) {
+    const VALID_PRESETS = new Set(['general', 'animals', 'culture', 'celebrities', 'events']);
+    if ('activePreset' in body) {
+      if (!VALID_PRESETS.has(body.activePreset)) throw new Error('Invalid preset');
+      this.db.setSetting('activePreset', body.activePreset);
+    }
+    const allowed = {
+      alertThreshold:    { min: 0, max: 100 },
+      viralityThreshold: { min: 0, max: 100 },
+      minScoreToSave:    { min: 0, max: 100 },
+      maxAlertsPerCycle: { min: 0, max: 50  },
+    };
+    for (const [key, rules] of Object.entries(allowed)) {
+      if (!(key in body)) continue;
+      const val = Number(body[key]);
+      if (isNaN(val) || val < rules.min || val > rules.max) {
+        throw new Error(`${key}: must be ${rules.min}-${rules.max}`);
+      }
+      this.db.setSetting(key, Math.round(val));
+    }
   }
 
   _getAiConfig() {
@@ -631,6 +665,36 @@ class AdminServer {
         return json(res, 200, { ok: true, ...this._getAiConfig() });
       }
 
+      // ── Force scan trigger ──
+      if (path === '/api/scan' && method === 'POST') {
+        if (this.appState?.paused) {
+          return json(res, 409, { error: 'Scanner is paused. Resume it first.' });
+        }
+        if (this.appState?.scanRunning) {
+          return json(res, 409, { error: 'Scan is already running. Try again in a moment.' });
+        }
+        if (typeof this.scanFn !== 'function') {
+          return json(res, 503, { error: 'Scan function not available' });
+        }
+        this.logger.info('[Admin] Manual scan triggered');
+        this.scanFn().catch(e => this.logger.error(`Manual scan error: ${e.message}`));
+        return json(res, 202, { message: 'Scan triggered — check logs for progress' });
+      }
+
+      // ── Scanner Config (preset + alert thresholds + storage floor) ──
+      if (path === '/api/scanner-config' && method === 'GET') {
+        return json(res, 200, this._getScannerConfig());
+      }
+      if (path === '/api/scanner-config' && method === 'POST') {
+        try {
+          const body = await parseBody(req);
+          this._setScannerConfig(body);
+          return json(res, 200, { ok: true, ...this._getScannerConfig() });
+        } catch (e) {
+          return json(res, 400, { error: e.message });
+        }
+      }
+
       if (path === '/api/ai-models' && method === 'GET') {
         const provider = (url.searchParams.get('provider') || '').toLowerCase();
         if (provider) {
@@ -894,6 +958,25 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
 .sol-addr{font-family:monospace;font-size:11px;color:var(--text2)}
 .success-msg{color:var(--green);font-size:12px}
 .error-msg{color:var(--red);font-size:12px}
+/* Scanner config (preset + alert/storage thresholds) */
+.scfg-preset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:4px}
+.scfg-preset{padding:14px 14px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--border);cursor:pointer;transition:all .18s;display:flex;flex-direction:column;gap:4px;position:relative;overflow:hidden}
+.scfg-preset:hover{border-color:rgba(20,184,166,.35);transform:translateY(-1px)}
+.scfg-preset.active{border-color:var(--accent);background:linear-gradient(180deg,rgba(20,184,166,.14),rgba(20,184,166,.04));box-shadow:0 6px 20px rgba(20,184,166,.18)}
+.scfg-preset-icon{font-size:22px;line-height:1}
+.scfg-preset-label{font-size:13px;font-weight:600;color:var(--text)}
+.scfg-preset-hint{font-size:11px;color:var(--text2);line-height:1.35}
+.scfg-section{margin-top:22px;padding-top:18px;border-top:1px solid var(--border)}
+.scfg-h4{font-size:14px;font-weight:600;margin-bottom:4px}
+.scfg-desc{font-size:12px;color:var(--text2);margin-bottom:14px;line-height:1.45}
+.scfg-row{margin-bottom:14px}
+.scfg-row:last-child{margin-bottom:0}
+.scfg-row-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;font-size:12px}
+.scfg-label{color:var(--text);font-weight:500}
+.scfg-val{color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums}
+.scfg-slider{width:100%;-webkit-appearance:none;appearance:none;height:6px;border-radius:3px;background:var(--bg3);outline:none;cursor:pointer}
+.scfg-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 6px rgba(20,184,166,.4)}
+.scfg-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 6px rgba(20,184,166,.4)}
 @media (max-width: 980px){
   .layout{flex-direction:column}
   .sidebar{width:100%;border-right:none;border-bottom:1px solid var(--border)}
@@ -1245,6 +1328,17 @@ function ScannersPage() {
     } catch(e) { flash('Ошибка: ' + e.message); }
   };
 
+  const [scanning, setScanning] = React.useState(false);
+  const forceScan = async () => {
+    if (scanning) return;
+    setScanning(true);
+    try {
+      await api('/api/scan', 'POST');
+      flash('⚡ Сканирование запущено');
+    } catch(e) { flash('Ошибка: ' + e.message); }
+    setTimeout(() => setScanning(false), 8000);
+  };
+
   const toggleCollector = async (name) => {
     try {
       await api('/api/scanners/' + name + '/toggle', 'POST');
@@ -1297,11 +1391,20 @@ function ScannersPage() {
           ? 'Сбор данных приостановлен. Данные не собираются, алерты не отправляются.'
           : 'Данные собираются по расписанию. Алерты отправляются активным пользователям.')
       ),
-      React.createElement('button', {
-        className: 'btn ' + (paused ? 'btn-success' : 'btn-danger'),
-        style: { padding: '10px 22px', fontSize: 14 },
-        onClick: toggleGlobal
-      }, paused ? '▶ Запустить' : '⏸ Остановить'),
+      React.createElement('div', { style: { display: 'flex', gap: 10 } },
+        React.createElement('button', {
+          className: 'btn btn-primary',
+          style: { padding: '10px 22px', fontSize: 14 },
+          onClick: forceScan,
+          disabled: scanning || paused,
+          title: paused ? 'Сначала запусти сканер' : 'Принудительно запустить цикл сканирования'
+        }, scanning ? '⏳ Сканирую...' : '⚡ Сканировать сейчас'),
+        React.createElement('button', {
+          className: 'btn ' + (paused ? 'btn-success' : 'btn-danger'),
+          style: { padding: '10px 22px', fontSize: 14 },
+          onClick: toggleGlobal
+        }, paused ? '▶ Запустить' : '⏸ Остановить'),
+      ),
     ),
 
     msg && React.createElement('div', {
@@ -1309,6 +1412,9 @@ function ScannersPage() {
         background: msg.includes('Ошибка') ? 'rgba(239,68,68,.1)' : 'rgba(16,185,129,.1)',
         color: msg.includes('Ошибка') ? 'var(--red)' : 'var(--green)', fontSize: 13 }
     }, msg),
+
+    // Scanner tuning config (presets, thresholds, storage floor)
+    React.createElement(ScannerConfigSection, null),
 
     // Per-platform collector cards
     React.createElement('div', { className: 'broadcast-box' },
@@ -1339,6 +1445,109 @@ function ScannersPage() {
           )
         )
       )
+    )
+  );
+}
+
+// ── Scanner tuning: search preset + alert/storage thresholds ─────────────────
+function ScannerConfigSection() {
+  const h = React.createElement;
+  const [cfg, setCfg] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  useEffect(() => {
+    api('/api/scanner-config').then(c => setCfg(c)).catch(e => setMsg('Ошибка: ' + e.message));
+  }, []);
+
+  const flash = (m) => { setMsg(m); setTimeout(() => setMsg(''), 2500); };
+  const set = (k, v) => setCfg(prev => ({ ...prev, [k]: v }));
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const res = await api('/api/scanner-config', 'POST', cfg);
+      setCfg(res);
+      flash('✓ Конфиг сохранён');
+    } catch (e) { flash('Ошибка: ' + e.message); }
+    setSaving(false);
+  };
+
+  if (!cfg) return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
+    h('div', { className: 'loading' }, 'Загрузка конфига сканера...')
+  );
+
+  const PRESETS = [
+    { id: 'general',     icon: '🌐', label: 'Общий',        hint: 'Ультра-широкий поиск на всех языках' },
+    { id: 'animals',     icon: '🐾', label: 'Животные',     hint: 'Вирусные питомцы, милые создания' },
+    { id: 'culture',     icon: '🎭', label: 'Культура',     hint: 'Мемы, интернет-тренды, сленг' },
+    { id: 'celebrities', icon: '⭐', label: 'Знаменитости', hint: 'Селебрити, музыка, кино' },
+    { id: 'events',      icon: '🌍', label: 'События',      hint: 'Мировые события, спорт, AI-новости' },
+  ];
+
+  const row = (label, key, min, max, step, disp) => h('div', { className: 'scfg-row' },
+    h('div', { className: 'scfg-row-top' },
+      h('span', { className: 'scfg-label' }, label),
+      h('span', { className: 'scfg-val' }, disp !== undefined ? disp : cfg[key])
+    ),
+    h('input', {
+      type: 'range', min, max, step,
+      value: cfg[key],
+      onChange: e => set(key, +e.target.value),
+      className: 'scfg-slider'
+    })
+  );
+
+  return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
+    h('h3', { style: { marginBottom: 6 } }, '🎯 Конфиг сканера'),
+    h('p', { style: { color: 'var(--muted)', fontSize: 13, marginBottom: 18 } },
+      'Пресет поиска + пороги для алертов/хранения. Применяется со следующего цикла сканера.'),
+
+    // Preset grid
+    h('div', { className: 'scfg-label', style: { marginBottom: 10 } }, 'Пресет поиска'),
+    h('div', { className: 'scfg-preset-grid' },
+      PRESETS.map(p => h('div', {
+        key: p.id,
+        className: 'scfg-preset' + (cfg.activePreset === p.id ? ' active' : ''),
+        onClick: () => set('activePreset', p.id)
+      },
+        h('div', { className: 'scfg-preset-icon' }, p.icon),
+        h('div', { className: 'scfg-preset-label' }, p.label),
+        h('div', { className: 'scfg-preset-hint' }, p.hint)
+      ))
+    ),
+
+    // Alerts section
+    h('div', { className: 'scfg-section' },
+      h('h4', { className: 'scfg-h4' }, '🔔 Алерты'),
+      h('p', { className: 'scfg-desc' },
+        'Нарратив алертит только если проходит оба порога — Meme Potential и Virality.'),
+      row('🔥 Meme Potential — минимум', 'alertThreshold', 0, 100, 5),
+      row('📈 Virality Score — порог',   'viralityThreshold', 0, 100, 5),
+      row('📨 Максимум алертов за цикл', 'maxAlertsPerCycle', 0, 20, 1,
+          cfg.maxAlertsPerCycle === 0 ? '∞' : cfg.maxAlertsPerCycle),
+    ),
+
+    // Storage section
+    h('div', { className: 'scfg-section' },
+      h('h4', { className: 'scfg-h4' }, '🗄️ Хранение'),
+      h('p', { className: 'scfg-desc' },
+        'Нарративы с базовым охватом ниже этого значения не сохраняются в БД вообще.'),
+      row('📊 Базовый охват — floor для сохранения', 'minScoreToSave', 0, 80, 5),
+    ),
+
+    msg && h('div', {
+      style: { marginTop: 14, padding: '10px 14px', borderRadius: 8,
+        background: msg.includes('Ошибка') ? 'rgba(239,68,68,.1)' : 'rgba(16,185,129,.1)',
+        color: msg.includes('Ошибка') ? 'var(--red)' : 'var(--green)', fontSize: 13 }
+    }, msg),
+
+    h('div', { style: { marginTop: 16, display: 'flex', justifyContent: 'flex-end' } },
+      h('button', {
+        className: 'btn btn-primary',
+        onClick: save, disabled: saving,
+        style: { padding: '10px 20px' }
+      }, saving ? '⏳ Сохраняю...' : '💾 Сохранить конфиг')
     )
   );
 }

@@ -133,7 +133,7 @@ const dashboard = new DashboardServer(config, logger, db, appState, () => runSca
 dashboard.start();
 
 // ── Initialize admin panel ──────────────────────────────────────────────────
-const admin = new AdminServer(config, logger, db, telegram.bot, appState);
+const admin = new AdminServer(config, logger, db, telegram.bot, appState, () => runScanCycle());
 admin.start();
 
 // ── Start Solana Pay monitor ────────────────────────────────────────────────
@@ -153,6 +153,7 @@ async function runScanCycle() {
   }
 
   appState.scanRunning = true;
+  try { dashboard.broadcast('scan-start', { at: Date.now() }); } catch (e) {}
 
   const cycleStart = Date.now();
   logger.info('────── Starting scan cycle ──────');
@@ -351,6 +352,8 @@ async function runScanCycle() {
     logger.error(`Scan cycle failed: ${error.message}`, { stack: error.stack });
   } finally {
     appState.scanRunning = false;
+    // Notify all connected dashboard clients that fresh data is available
+    try { dashboard.broadcast('refresh', { at: Date.now() }); } catch (e) {}
   }
 }
 
