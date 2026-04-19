@@ -75,12 +75,41 @@ class TelegramNotifier {
   // ── Command handlers ──────────────────────────────────────────────────────
 
   _setupCommands() {
-    // /start — register user & show welcome
-    this.bot.onText(/^\/start/, (msg) => {
+    // /start — register user & show welcome (optional auth deep-link payload)
+    this.bot.onText(/^\/start(?:\s+(.+))?/, (msg, match) => {
       const chatId = msg.chat.id;
       const username = msg.from?.username || null;
       const user = this.db.getOrCreateUser(chatId, username);
       const t = getTranslations(user.language);
+      const payload = (match && match[1] || '').trim();
+
+      // ── Dashboard login deep-link: /start auth_<sessionId> ───────────
+      const authMatch = payload.match(/^auth_([a-f0-9]{32})$/i);
+      if (authMatch) {
+        const sessionId = authMatch[1].toLowerCase();
+        const result = this.db.attachAuthCode(sessionId, chatId);
+        if (!result) {
+          const txt = user.language === 'ru'
+            ? '\u274C Ссылка для входа недействительна или устарела. Вернитесь на сайт и попробуйте снова.'
+            : '\u274C Login link is invalid or expired. Go back to the site and try again.';
+          this.bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+          return;
+        }
+        if (result.alreadyVerified) {
+          const txt = user.language === 'ru'
+            ? '\u2705 Эта сессия уже подтверждена.'
+            : '\u2705 This session is already verified.';
+          this.bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+          return;
+        }
+        const mins = Math.max(1, Math.round((result.expiresAt - Date.now()) / 60000));
+        const title = user.language === 'ru' ? '\u{1F510} Код для входа на сайт' : '\u{1F510} Website login code';
+        const prompt = user.language === 'ru'
+          ? `Введите этот код на сайте, чтобы войти:\n\n<code>${result.code}</code>\n\n\u23F1 Код действителен ${mins} мин.\nЕсли вы не запрашивали вход — просто проигнорируйте это сообщение.`
+          : `Enter this code on the site to sign in:\n\n<code>${result.code}</code>\n\n\u23F1 Code expires in ${mins} min.\nIf you didn't request a login, you can ignore this message.`;
+        this.bot.sendMessage(chatId, `<b>${title}</b>\n\n${prompt}`, { parse_mode: 'HTML' });
+        return;
+      }
 
       if (user.created_at === user.last_seen_at) {
         // New user
@@ -990,6 +1019,26 @@ class TelegramNotifier {
       if (err.code === 'EFATAL') return;
       this.logger.error(`Telegram polling error: ${err.message}`);
     });
+  }
+
+  /**
+   * Resolve the bot's @username (without leading @).
+   * Prefers config.telegram.botUsername, falls back to bot.getMe() and caches.
+   * Returns '' if the bot is disabled or getMe() fails.
+   */
+  async getBotUsername() {
+    const configured = (this.config?.telegram?.botUsername || '').replace(/^@/, '');
+    if (configured) return configured;
+    if (this._cachedBotUsername) return this._cachedBotUsername;
+    if (!this.bot) return '';
+    try {
+      const me = await this.bot.getMe();
+      this._cachedBotUsername = (me?.username || '').replace(/^@/, '');
+      return this._cachedBotUsername;
+    } catch (e) {
+      this.logger.warn(`getBotUsername: bot.getMe() failed: ${e.message}`);
+      return '';
+    }
   }
 
   async stop() {

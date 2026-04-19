@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -80,6 +81,39 @@ class TrendDatabase {
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_feedback_votes_trend ON feedback_votes(trend_id)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_feedback_votes_chat  ON feedback_votes(chat_id)`);
+
+    // Auth sessions (Telegram-bot-verified login for the dashboard)
+    // ── Flow ───────────────────────────────────────────────────────────────────
+    //   1) Browser calls /api/auth/initiate     → row with session_id only
+    //   2) Bot receives /start auth_<session_id>→ row gets chat_id + 6-digit code
+    //   3) Browser calls /api/auth/verify       → row gets long-lived token,
+    //                                             code is cleared
+    //   4) Browser sends Authorization: Bearer <token> on all requests;
+    //      middleware looks up chat_id via the token row
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS auth_sessions (
+        session_id       TEXT PRIMARY KEY,
+        chat_id          TEXT,
+        code             TEXT,
+        code_expires_at  DATETIME,
+        token            TEXT,
+        token_expires_at DATETIME,
+        user_agent       TEXT,
+        created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+        verified_at      DATETIME
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_auth_token   ON auth_sessions(token)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_auth_chat    ON auth_sessions(chat_id)`);
+
+    // Housekeeping — prune anything that's fully expired and has no token
+    try {
+      this.db.prepare(
+        `DELETE FROM auth_sessions
+         WHERE token IS NULL
+           AND created_at < datetime('now', '-1 day')`
+      ).run();
+    } catch (e) { /* best-effort */ }
 
     // Plan normalization (v3 pricing/policy)
     const normalizePlans = this.db.transaction(() => {
@@ -215,6 +249,116 @@ class TrendDatabase {
    */
   incrementAlertCount(userId) {
     this.db.prepare(`UPDATE users SET alert_count_today = alert_count_today + 1 WHERE id = ?`).run(userId);
+  }
+
+  // ── Auth (Telegram-bot login) ─────────────────────────────────────────────
+
+  /**
+   * Step 1 — browser starts a new auth session. Returns the short public id
+   * embedded in the Telegram deep-link (t.me/<bot>?start=auth_<sessionId>).
+   * Session stays empty until the bot attaches a code.
+   */
+  createAuthSession(userAgent = null) {
+    // 16 bytes = 32 hex chars — enough entropy, short enough for deep-links
+    const sessionId = crypto.randomBytes(16).toString('hex');
+    this.db.prepare(`
+      INSERT INTO auth_sessions (session_id, user_agent) VALUES (?, ?)
+    `).run(sessionId, userAgent);
+    return sessionId;
+  }
+
+  /**
+   * Step 2 — bot confirms the user and stores a 6-digit code tied to the
+   * session + the chat_id that scanned the deep-link. Subsequent requests
+   * overwrite the code (e.g. user reopens the link).
+   */
+  attachAuthCode(sessionId, chatId, ttlMs = 5 * 60 * 1000) {
+    const session = this.db.prepare(
+      `SELECT * FROM auth_sessions WHERE session_id = ?`
+    ).get(sessionId);
+    if (!session) return null;
+    // Already verified — refuse (security)
+    if (session.token) return { alreadyVerified: true };
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const expires = new Date(Date.now() + ttlMs).toISOString();
+    this.db.prepare(`
+      UPDATE auth_sessions
+         SET chat_id = ?, code = ?, code_expires_at = ?
+       WHERE session_id = ?
+    `).run(String(chatId), code, expires, sessionId);
+    return { code, expiresAt: Date.now() + ttlMs };
+  }
+
+  /**
+   * Non-sensitive status check — returns only whether a code is waiting,
+   * never the code itself.
+   */
+  getAuthSessionStatus(sessionId) {
+    const s = this.db.prepare(
+      `SELECT chat_id, code, code_expires_at, token
+         FROM auth_sessions WHERE session_id = ?`
+    ).get(sessionId);
+    if (!s) return { exists: false };
+    if (s.token) return { exists: true, verified: true };
+    const hasCode = !!(s.chat_id && s.code &&
+      s.code_expires_at && new Date(s.code_expires_at).getTime() > Date.now());
+    return { exists: true, verified: false, codeReady: hasCode };
+  }
+
+  /**
+   * Step 3 — browser posts the code. On success: issues a long-lived token,
+   * clears the code, returns { token, user }. Constant-time code compare to
+   * resist timing attacks. Rate-limiting is the caller's responsibility.
+   */
+  verifyAuthCode(sessionId, code, ttlDays = 30) {
+    const s = this.db.prepare(
+      `SELECT * FROM auth_sessions WHERE session_id = ?`
+    ).get(sessionId);
+    if (!s || !s.chat_id || !s.code) return null;
+    if (!s.code_expires_at || new Date(s.code_expires_at).getTime() < Date.now()) return null;
+
+    const a = Buffer.from(String(s.code));
+    const b = Buffer.from(String(code || ''));
+    if (a.length !== b.length) return null;
+    try { if (!crypto.timingSafeEqual(a, b)) return null; } catch { return null; }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expires = new Date(Date.now() + ttlDays * 24 * 3600_000).toISOString();
+
+    this.db.prepare(`
+      UPDATE auth_sessions
+         SET token = ?, token_expires_at = ?, verified_at = CURRENT_TIMESTAMP,
+             code = NULL, code_expires_at = NULL
+       WHERE session_id = ?
+    `).run(token, expires, sessionId);
+
+    const user = this.getUserByChatId(s.chat_id);
+    return { token, tokenExpiresAt: expires, chatId: s.chat_id, user };
+  }
+
+  /**
+   * Middleware helper — resolve a bearer token to its owning user row.
+   * Returns null for missing/expired/unknown tokens.
+   */
+  getUserByAuthToken(token) {
+    if (!token || typeof token !== 'string') return null;
+    const row = this.db.prepare(
+      `SELECT chat_id, token_expires_at
+         FROM auth_sessions
+        WHERE token = ?`
+    ).get(token);
+    if (!row) return null;
+    if (row.token_expires_at && new Date(row.token_expires_at).getTime() < Date.now()) return null;
+    return this.getUserByChatId(row.chat_id);
+  }
+
+  /**
+   * Logout — invalidate a single token.
+   */
+  revokeAuthToken(token) {
+    if (!token) return 0;
+    return this.db.prepare(`DELETE FROM auth_sessions WHERE token = ?`).run(token).changes;
   }
 
   /**

@@ -129,7 +129,7 @@ try {
 }
 
 // ── Initialize dashboard ────────────────────────────────────────────────────
-const dashboard = new DashboardServer(config, logger, db, appState, () => runScanCycle());
+const dashboard = new DashboardServer(config, logger, db, appState, () => runScanCycle(), telegram);
 dashboard.start();
 
 // ── Initialize admin panel ──────────────────────────────────────────────────

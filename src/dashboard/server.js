@@ -77,15 +77,17 @@ function html(res, content) {
 // ─── Dashboard class ──────────────────────────────────────────────────────────
 
 class DashboardServer {
-  constructor(config, logger, db, appState, scanFn) {
-    this.config   = config.dashboard;
-    this.logger   = logger;
-    this.db       = db;
-    this.appState = appState;
-    this.scanFn   = scanFn;   // callback to trigger manual scan
-    this.server   = null;
-    this.started  = Date.now();
-    this.sseClients = new Set();  // active Server-Sent Event subscribers
+  constructor(config, logger, db, appState, scanFn, telegram = null) {
+    this.config       = config.dashboard;
+    this.fullConfig   = config;   // keep reference for telegram.botUsername, etc.
+    this.logger       = logger;
+    this.db           = db;
+    this.appState     = appState;
+    this.scanFn       = scanFn;   // callback to trigger manual scan
+    this.telegram     = telegram; // TelegramNotifier for bot-username lookup
+    this.server       = null;
+    this.started      = Date.now();
+    this.sseClients   = new Set();  // active Server-Sent Event subscribers
     this._sseKeepAlive = null;
   }
 
@@ -136,35 +138,44 @@ class DashboardServer {
       return res.end();
     }
 
-    // Health — no auth
+    // ── Public routes (no auth) ────────────────────────────────────────────
+    // Health
     if (path === '/api/health' && method === 'GET') {
       return json(res, 200, { ok: true, uptime: Math.floor((Date.now() - this.started) / 1000), paused: this.appState?.paused ?? false });
     }
 
-    // ── Auth policy ────────────────────────────────────────────────────────────
-    // The dashboard is designed to be **publicly readable** — anyone can view
-    // trends, stats, sources, previews, config, and submit like/dislike feedback
-    // without a key. Only mutating/operational endpoints still require the
-    // dashboard API key (these are not used by the public SPA anymore; they
-    // remain for backwards compatibility / tooling).
-    const PROTECTED_ROUTES = new Set([
-      'POST /api/scan',
-      'GET /api/settings',
-      'POST /api/settings',
-    ]);
-    const routeKey = method + ' ' + path;
-    const isProtected =
-      PROTECTED_ROUTES.has(routeKey) ||
-      (method === 'POST' && /^\/api\/collectors\/[\w_]+\/toggle$/.test(path));
+    // Auth endpoints — public (they create/verify sessions)
+    if (path === '/api/auth/initiate' && method === 'POST') return this._handleAuthInitiate(req, res);
+    if (path === '/api/auth/verify'   && method === 'POST') return this._handleAuthVerify(req, res);
+    if (path === '/api/auth/status'   && method === 'GET')  return this._handleAuthStatus(req, res, url);
 
-    if (isProtected) {
-      const apiKey = this.config.apiKey;
-      if (!apiKey) return json(res, 503, { error: 'Dashboard API key is not configured' });
-      const headerKey = req.headers['x-api-key'] || '';
-      const queryKey  = url.searchParams.get('key') || '';
-      const provided  = headerKey || queryKey;
-      if (!safeEqual(provided, apiKey)) return json(res, 401, { error: 'Unauthorized — provide X-API-Key header' });
+    // ── Bearer-token auth ──────────────────────────────────────────────────
+    // Every /api/* route below this point requires a valid session token
+    // issued by the Telegram bot login flow. The token is passed as either:
+    //   • Authorization: Bearer <token>   (preferred)
+    //   • ?token=<token>                  (for EventSource — no custom headers)
+    const authHeader = String(req.headers['authorization'] || '');
+    const bearerMatch = authHeader.match(/^Bearer\s+([a-f0-9]{64})$/i);
+    const token = bearerMatch ? bearerMatch[1] : (url.searchParams.get('token') || '');
+    const authUser = token ? this.db.getUserByAuthToken(token) : null;
+
+    if (path.startsWith('/api/')) {
+      if (!authUser) {
+        res.writeHead(401, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-cache',
+          'WWW-Authenticate': 'Bearer realm="dashboard"',
+        });
+        return res.end(JSON.stringify({ error: 'Unauthorized — please sign in via Telegram' }));
+      }
+      req.user = authUser;
+      req.authToken = token;
     }
+
+    // Auth routes requiring a session
+    if (path === '/api/auth/me'     && method === 'GET')  return this._handleAuthMe(req, res);
+    if (path === '/api/auth/logout' && method === 'POST') return this._handleAuthLogout(req, res);
 
     // SSE stream — pushed updates from server (new scans, etc.)
     if (path === '/api/stream' && method === 'GET') {
@@ -192,6 +203,80 @@ class DashboardServer {
       this.logger.error(`Dashboard handler error: ${err.message}`);
       return json(res, 500, { error: err.message });
     }
+  }
+
+  // ── Auth handlers ───────────────────────────────────────────────────────────
+
+  async _handleAuthInitiate(req, res) {
+    try {
+      const userAgent = String(req.headers['user-agent'] || '').slice(0, 500);
+      const sessionId = this.db.createAuthSession(userAgent);
+      let botUsername = '';
+      try {
+        if (this.telegram && typeof this.telegram.getBotUsername === 'function') {
+          botUsername = await this.telegram.getBotUsername();
+        } else {
+          botUsername = (this.fullConfig?.telegram?.botUsername || '').replace(/^@/, '');
+        }
+      } catch (e) { /* ignore */ }
+      const botUrl = botUsername
+        ? `https://t.me/${botUsername}?start=auth_${sessionId}`
+        : null;
+      return json(res, 200, { sessionId, botUrl, botUsername: botUsername || null });
+    } catch (err) {
+      this.logger.error(`auth/initiate failed: ${err.message}`);
+      return json(res, 500, { error: 'Failed to start login' });
+    }
+  }
+
+  async _handleAuthVerify(req, res) {
+    let body;
+    try { body = await parseBody(req); }
+    catch (e) { return json(res, 400, { error: e.message }); }
+
+    const sessionId = String(body?.sessionId || '').trim();
+    const code      = String(body?.code || '').trim();
+    if (!/^[a-f0-9]{32}$/i.test(sessionId)) return json(res, 400, { error: 'Invalid session' });
+    if (!/^\d{6}$/.test(code))              return json(res, 400, { error: 'Code must be 6 digits' });
+
+    const result = this.db.verifyAuthCode(sessionId, code);
+    if (!result) return json(res, 401, { error: 'Invalid or expired code' });
+
+    return json(res, 200, {
+      token: result.token,
+      expiresAt: result.tokenExpiresAt,
+      user: this._publicUser(result.user),
+    });
+  }
+
+  _handleAuthStatus(req, res, url) {
+    const sessionId = String(url.searchParams.get('sessionId') || '').trim();
+    if (!/^[a-f0-9]{32}$/i.test(sessionId)) return json(res, 400, { error: 'Invalid session' });
+    const status = this.db.getAuthSessionStatus(sessionId);
+    return json(res, 200, status || { exists: false, verified: false, codeReady: false });
+  }
+
+  _handleAuthMe(req, res) {
+    return json(res, 200, { user: this._publicUser(req.user) });
+  }
+
+  _handleAuthLogout(req, res) {
+    try { this.db.revokeAuthToken(req.authToken); } catch (e) { /* ignore */ }
+    return json(res, 200, { ok: true });
+  }
+
+  /** Strip private fields from a user row for client consumption. */
+  _publicUser(user) {
+    if (!user) return null;
+    return {
+      chatId:     String(user.telegram_chat_id || user.chat_id || ''),
+      username:   user.username || null,
+      language:   user.language || 'en',
+      plan:       user.plan_name || 'free',
+      status:     user.status || 'active',
+      threshold:  user.alert_threshold ?? null,
+      subscriptionExpiresAt: user.subscription_expires_at || null,
+    };
   }
 
   // ── Handlers ────────────────────────────────────────────────────────────────
@@ -236,7 +321,7 @@ class DashboardServer {
     const countQuery = query.replace(/ORDER BY.*$/, '').replace(/^SELECT \*/, 'SELECT COUNT(*) as c');
     const total = this.db.db.prepare(countQuery).get(...countParams)?.c ?? 0;
 
-    const userId = String(req.headers['x-user-id'] || '').trim() || null;
+    const userId = String(req.user?.telegram_chat_id || '').trim() || null;
     const trends = rows.map(row => this._formatTrend(row, userId));
 
     return json(res, 200, { trends, total, limit, offset });
@@ -246,7 +331,7 @@ class DashboardServer {
     const id  = parseInt(path.split('/').pop(), 10);
     const row = this.db.db.prepare(`SELECT * FROM trends WHERE id = ?`).get(id);
     if (!row) return json(res, 404, { error: 'Trend not found' });
-    const userId = String(req.headers['x-user-id'] || '').trim() || null;
+    const userId = String(req.user?.telegram_chat_id || '').trim() || null;
     return json(res, 200, this._formatTrend(row, userId));
   }
 
@@ -264,7 +349,7 @@ class DashboardServer {
       `SELECT category, COUNT(*) as count FROM trends WHERE first_seen_at > ? GROUP BY category ORDER BY count DESC`
     ).all(cutoff);
 
-    const statsUserId = String(req.headers['x-user-id'] || '').trim() || null;
+    const statsUserId = String(req.user?.telegram_chat_id || '').trim() || null;
     const topTrends = this.db.db.prepare(
       `SELECT * FROM trends WHERE first_seen_at > ? ORDER BY CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC LIMIT 5`
     ).all(cutoff).map(r => this._formatTrend(r, statsUserId));
@@ -389,24 +474,16 @@ class DashboardServer {
     if (!m) return json(res, 400, { error: 'Invalid path' });
     const trendId = parseInt(m[1], 10);
 
-    const userId = String(req.headers['x-user-id'] || '').trim();
-    if (!userId) return json(res, 400, { error: 'X-User-Id header required' });
+    // Authenticated user's Telegram chat_id — unifies votes between bot & web
+    const userId = String(req.user?.telegram_chat_id || '').trim();
+    if (!userId) return json(res, 401, { error: 'Authenticated user has no chat_id' });
+    const planName = req.user?.plan_name || 'free';
 
-    // Read body
-    let body = '';
-    await new Promise((resolve, reject) => {
-      req.on('data', chunk => { body += chunk; if (body.length > 4096) reject(new Error('Body too large')); });
-      req.on('end', resolve);
-      req.on('error', reject);
-    }).catch(() => {});
+    let body;
+    try { body = await parseBody(req); }
+    catch (e) { return json(res, 400, { error: e.message }); }
 
-    let vote;
-    try {
-      const parsed = body ? JSON.parse(body) : {};
-      vote = parseInt(parsed.vote, 10);
-    } catch (e) {
-      return json(res, 400, { error: 'Invalid JSON body' });
-    }
+    const vote = parseInt(body?.vote, 10);
     if (![1, -1, 0].includes(vote)) return json(res, 400, { error: 'vote must be 1, -1 or 0' });
 
     const trend = this.db.getTrendById ? this.db.getTrendById(trendId) : null;
@@ -416,9 +493,16 @@ class DashboardServer {
     const prev = this.db.getUserVote ? this.db.getUserVote(trendId, userId) : null;
     const finalVote = (vote !== 0 && prev === vote) ? 0 : vote;
 
-    // Dashboard voters use plan='dashboard' with weight=1 by default.
-    const weight = parseFloat(this.db?.getSetting?.('feedbackWeightDashboard', '1') || '1');
-    this.db.recordFeedback(trendId, userId, finalVote, weight, 'dashboard');
+    // Weight follows the authenticated user's plan (same as TG bot reactions).
+    const weightingEnabled = this.db?.getSetting?.('feedbackWeightingEnabled', '1') !== '0';
+    let weight = 1;
+    if (weightingEnabled) {
+      const key = 'feedbackWeight' + planName.charAt(0).toUpperCase() + planName.slice(1);
+      weight = parseFloat(this.db?.getSetting?.(key, planName === 'admin' ? '3' : planName === 'pro' ? '2' : '1') || '1');
+    } else {
+      weight = planName === 'admin' ? 1 : 0;
+    }
+    this.db.recordFeedback(trendId, userId, finalVote, weight, planName);
 
     const stats = this.db.getFeedbackStats(trendId);
     return json(res, 200, {
@@ -2080,28 +2164,40 @@ class DashboardServer {
 const { useState, useEffect, useCallback, useRef } = React;
 const h = React.createElement;
 
-// ── API ──────────────────────────────────────────────────────────────────────
-// Stable per-browser user id for feedback attribution.
-// Prefixed "dashboard:" so it can never collide with real Telegram chat_ids.
-let USER_ID = '';
-try {
-  USER_ID = localStorage.getItem('ts_user_id') || '';
-  if (!USER_ID) {
-    const rnd = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-    USER_ID = 'dashboard:' + rnd;
-    localStorage.setItem('ts_user_id', USER_ID);
-  }
-} catch (e) { USER_ID = 'dashboard:anon'; }
+// ── Auth token ────────────────────────────────────────────────────────────
+// Login is Telegram-bot-only. The bot issues a 6-digit code bound to a session;
+// verifying the code returns a 64-hex bearer token that is attached to every
+// /api/* request. On 401 we clear the token and show the login screen.
+const AUTH_TOKEN_KEY = 'ts_auth_token';
+let AUTH_TOKEN = '';
+try { AUTH_TOKEN = localStorage.getItem(AUTH_TOKEN_KEY) || ''; } catch (e) {}
+const authListeners = new Set();
+function setAuthToken(tok) {
+  AUTH_TOKEN = tok || '';
+  try {
+    if (AUTH_TOKEN) localStorage.setItem(AUTH_TOKEN_KEY, AUTH_TOKEN);
+    else            localStorage.removeItem(AUTH_TOKEN_KEY);
+  } catch (e) {}
+  authListeners.forEach(fn => { try { fn(AUTH_TOKEN); } catch (e) {} });
+}
+function onAuthChange(fn) { authListeners.add(fn); return () => authListeners.delete(fn); }
 
-const api = (path, opts = {}) =>
-  fetch('/api' + path, {
-    headers: {
-      'X-User-Id': USER_ID,
-      'Content-Type': 'application/json'
-    },
-    ...opts
-  })
-    .then(r => r.json().then(data => { if (!r.ok) throw new Error(data && data.error ? data.error : ('HTTP ' + r.status)); return data; }));
+const api = (path, opts = {}) => {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  if (AUTH_TOKEN) headers['Authorization'] = 'Bearer ' + AUTH_TOKEN;
+  return fetch('/api' + path, { ...opts, headers })
+    .then(r => r.json().then(data => {
+      if (r.status === 401) {
+        // Token rejected — nuke it and re-show the login screen
+        if (AUTH_TOKEN) setAuthToken('');
+        const err = new Error(data?.error || 'Unauthorized');
+        err.status = 401;
+        throw err;
+      }
+      if (!r.ok) throw new Error(data && data.error ? data.error : ('HTTP ' + r.status));
+      return data;
+    }));
+};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const SOURCE_ICONS  = { reddit: '🟠', google_trends: '🔍', twitter: '𝕏', tiktok: '🎵' };
@@ -3021,7 +3117,7 @@ function applyPrefsToDOM(p) {
 // apply on first script eval (before React mounts)
 try { applyPrefsToDOM(loadPrefs()); } catch (e) {}
 
-function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
+function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount, user, onLogout }) {
   const [prefs, setPrefs] = useState(loadPrefs);
   const [flash, setFlash] = useState('');
 
@@ -3033,14 +3129,11 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
 
   const flashMsg = (m) => { setFlash(m); setTimeout(() => setFlash(''), 2000); };
 
-  const resetFeedbackProfile = () => {
-    if (!confirm('Сбросить профиль фидбэка? Лайки и дизлайки, которые ты оставлял, перестанут учитываться как твои.')) return;
-    try {
-      const rnd = Math.random().toString(36).slice(2, 10);
-      USER_ID = 'dashboard:' + rnd;
-      localStorage.setItem('ts_user_id', USER_ID);
-      flashMsg('✓ Профиль фидбэка сброшен');
-    } catch (e) { flashMsg('Ошибка: ' + e.message); }
+  const planLabels = { free: 'Free', test: 'Test', pro: 'Pro', admin: 'Admin' };
+  const doLogout = async () => {
+    if (!confirm('Выйти из аккаунта? Нужно будет снова подтвердить код в Telegram.')) return;
+    try { await api('/auth/logout', { method: 'POST' }); } catch (e) { /* token already invalid */ }
+    if (onLogout) onLogout();
   };
 
   const resetAllPrefs = () => {
@@ -3155,16 +3248,26 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
       })
     ),
 
-    // ── Приватность ──
+    // ── Аккаунт ──
     h('div', { className: 'settings-card' },
-      h('div', { className: 'settings-card-title' }, '🔒 Приватность'),
+      h('div', { className: 'settings-card-title' }, '👤 Аккаунт'),
       h('div', { className: 'settings-card-desc' },
-        'Твой анонимный профиль хранится только в этом браузере. Мы используем его, чтобы запомнить твои лайки и дизлайки.'
+        'Вход выполняется через Telegram-бота. Твой план и настройки привязаны к этому аккаунту.'
       ),
       h(Row, {
-        icon: '🪪', title: 'Профиль фидбэка',
-        desc: 'Анонимный ID этого браузера. Сбрось, чтобы начать с чистого листа.',
-        control: h('button', { className: 'btn btn-ghost', onClick: resetFeedbackProfile }, 'Сбросить')
+        icon: '💬', title: 'Telegram',
+        desc: user?.username ? ('@' + user.username) : ('chat id: ' + (user?.chatId || '—')),
+        control: h('span', { className: 'pref-value' }, user?.chatId || '—')
+      }),
+      h(Row, {
+        icon: '💎', title: 'Тариф',
+        desc: 'Влияет на вес твоих лайков/дизлайков и доступ к премиум-функциям.',
+        control: h('span', { className: 'pref-value' }, planLabels[user?.plan] || user?.plan || '—')
+      }),
+      h(Row, {
+        icon: '🚪', title: 'Выйти',
+        desc: 'Отвязать этот браузер. Для повторного входа потребуется новый код из бота.',
+        control: h('button', { className: 'btn btn-ghost', onClick: doLogout }, 'Выйти')
       })
     ),
 
@@ -3176,7 +3279,153 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
 }
 
 // ── App ──────────────────────────────────────────────────────────────────────
+// ── LoginScreen ──────────────────────────────────────────────────────────────
+// Telegram-bot-only login. Flow:
+//   1. POST /api/auth/initiate → { sessionId, botUrl }
+//   2. User clicks "Войти через Telegram" → bot issues a 6-digit code
+//   3. User enters code → POST /api/auth/verify → { token, user }
+function LoginScreen({ onLoggedIn }) {
+  const [phase, setPhase]       = useState('idle');        // idle | linking | code | verifying
+  const [session, setSession]   = useState(null);          // { sessionId, botUrl }
+  const [code, setCode]         = useState('');
+  const [error, setError]       = useState('');
+  const [loading, setLoading]   = useState(false);
+
+  const startLogin = async () => {
+    setLoading(true); setError('');
+    try {
+      const r = await fetch('/api/auth/initiate', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'HTTP ' + r.status);
+      if (!data.botUrl) throw new Error('Бот временно недоступен. Попробуйте позже.');
+      setSession(data);
+      setPhase('code');
+      try { window.open(data.botUrl, '_blank', 'noopener'); } catch (e) {}
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const submitCode = async () => {
+    const clean = String(code || '').replace(/\D/g, '').slice(0, 6);
+    if (clean.length !== 6) { setError('Введите 6 цифр из сообщения бота'); return; }
+    setLoading(true); setError('');
+    try {
+      const r = await fetch('/api/auth/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: session.sessionId, code: clean })
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'HTTP ' + r.status);
+      setAuthToken(data.token);
+      onLoggedIn && onLoggedIn(data.user);
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  return h('div', {
+    style: {
+      minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      padding: '20px', background: 'var(--bg, #0a0a0f)'
+    }
+  },
+    h('div', {
+      style: {
+        maxWidth: '420px', width: '100%',
+        background: 'var(--card, #14141c)',
+        border: '1px solid var(--border, #22222e)',
+        borderRadius: '16px',
+        padding: '32px 28px',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.45)'
+      }
+    },
+      h('div', { style: { textAlign: 'center', marginBottom: '20px' } },
+        h('div', { style: { fontSize: '44px', lineHeight: '1' } }, '🔥'),
+        h('div', { style: { fontSize: '22px', fontWeight: '700', marginTop: '8px' } }, 'Catalyst'),
+        h('div', { style: { fontSize: '13px', opacity: '0.65', marginTop: '4px' } }, 'Вход через Telegram')
+      ),
+
+      phase === 'idle' && h('div', null,
+        h('p', { style: { fontSize: '14px', lineHeight: '1.5', opacity: '0.85', marginBottom: '16px' } },
+          'Мы не храним пароли. Авторизация — через нашего Telegram-бота: ты получишь одноразовый код и введёшь его здесь.'
+        ),
+        h('button', {
+          className: 'btn',
+          style: {
+            width: '100%', padding: '12px 16px', fontSize: '15px', fontWeight: '600',
+            background: '#229ED9', color: '#fff', border: 'none', borderRadius: '10px',
+            cursor: 'pointer', opacity: loading ? 0.6 : 1
+          },
+          disabled: loading,
+          onClick: startLogin
+        }, loading ? 'Подождите…' : '💬 Войти через Telegram')
+      ),
+
+      phase === 'code' && h('div', null,
+        h('p', { style: { fontSize: '14px', lineHeight: '1.5', opacity: '0.85', marginBottom: '12px' } },
+          'Открой чат с ботом и нажми Start — он пришлёт шестизначный код. Введи его ниже:'
+        ),
+        session?.botUrl && h('a', {
+          href: session.botUrl, target: '_blank', rel: 'noopener',
+          style: {
+            display: 'block', textAlign: 'center', padding: '10px 14px',
+            background: 'rgba(34,158,217,0.15)', color: '#5bb8e0',
+            border: '1px solid rgba(34,158,217,0.35)', borderRadius: '8px',
+            textDecoration: 'none', fontSize: '13px', marginBottom: '16px'
+          }
+        }, '↗ Открыть бота снова'),
+        h('input', {
+          type: 'text', inputMode: 'numeric', pattern: '[0-9]*', autoFocus: true,
+          maxLength: 6, value: code,
+          onChange: e => {
+            const v = e.target.value.replace(/\D/g, '').slice(0, 6);
+            setCode(v);
+            if (error) setError('');
+          },
+          onKeyDown: e => {
+            if (e.key === 'Enter' && code.length === 6 && !loading) submitCode();
+          },
+          placeholder: '• • • • • •',
+          style: {
+            width: '100%', padding: '14px', fontSize: '22px', letterSpacing: '0.4em',
+            textAlign: 'center', background: '#0b0b12', color: 'var(--text, #e8e8ef)',
+            border: '1px solid var(--border, #22222e)', borderRadius: '10px',
+            fontFamily: 'ui-monospace, monospace', marginBottom: '12px', boxSizing: 'border-box'
+          }
+        }),
+        h('button', {
+          style: {
+            width: '100%', padding: '12px 16px', fontSize: '15px', fontWeight: '600',
+            background: 'var(--accent, #ff6b35)', color: '#fff', border: 'none',
+            borderRadius: '10px', cursor: 'pointer', opacity: loading ? 0.6 : 1
+          },
+          disabled: loading || code.length !== 6,
+          onClick: submitCode
+        }, loading ? 'Проверяем…' : 'Войти'),
+        h('button', {
+          style: {
+            width: '100%', marginTop: '10px', padding: '8px', fontSize: '12px',
+            background: 'transparent', color: 'var(--muted, #888)', border: 'none',
+            cursor: 'pointer'
+          },
+          onClick: () => { setPhase('idle'); setSession(null); setCode(''); setError(''); }
+        }, '← Отменить')
+      ),
+
+      error && h('div', {
+        style: {
+          marginTop: '14px', padding: '10px 12px', fontSize: '13px',
+          background: 'rgba(239,68,68,0.1)', color: '#f87171',
+          border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px'
+        }
+      }, error)
+    )
+  );
+}
+
 function App() {
+  // Auth: null = checking, false = logged out, object = logged in
+  const [me,         setMe]         = useState(AUTH_TOKEN ? null : false);
   const [stats,      setStats]      = useState(null);
   const [trends,     setTrends]     = useState([]);
   const [sources,    setSources]    = useState([]);
@@ -3235,7 +3484,22 @@ function App() {
   }, [hours, category, source, phase, minMeme, offset, sort]);
 
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  // Resolve the authenticated user on load / whenever the token changes.
+  useEffect(() => {
+    const sync = (tok) => {
+      if (!tok) { setMe(false); return; }
+      setMe(prev => (prev && prev !== true) ? prev : null);
+      api('/auth/me').then(d => setMe(d.user || false)).catch(() => setMe(false));
+    };
+    sync(AUTH_TOKEN);
+    return onAuthChange(sync);
+  }, []);
+
+  const handleLoggedIn = useCallback((user) => { setMe(user || null); }, []);
+  const handleLogout   = useCallback(() => { setAuthToken(''); setMe(false); }, []);
+
+  // Only fetch trends/stats/sources after we have a valid session.
+  useEffect(() => { if (me && me !== true) fetchData(); }, [fetchData, me]);
   // Auto-refresh interval driven by user preference (0 = off)
   const [refreshSec, setRefreshSec] = useState(() => {
     try { return (loadPrefs().refreshSec | 0); } catch (e) { return 90; }
@@ -3266,8 +3530,10 @@ function App() {
 
     const connect = () => {
       if (stopped) return;
+      if (!AUTH_TOKEN) return; // skip stream until user is signed in
       try {
-        es = new EventSource('/api/stream');
+        // EventSource can't set custom headers — pass token as query param
+        es = new EventSource('/api/stream?token=' + encodeURIComponent(AUTH_TOKEN));
       } catch (e) { return; }
 
       es.addEventListener('hello', () => { /* connected */ });
@@ -3368,6 +3634,12 @@ function App() {
   const visibleTrends = hiddenSources.size
     ? searchFiltered.filter(t => !hiddenSources.has(t.source))
     : searchFiltered;
+
+  // ── Auth gate ───────────────────────────────────────────────────────────
+  if (me === false) return h(LoginScreen, { onLoggedIn: handleLoggedIn });
+  if (me === null)  return h('div', {
+    style: { minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.7 }
+  }, 'Загрузка…');
 
   return h('div', null,
     // Toast notifications (fixed top-right)
@@ -3681,7 +3953,9 @@ function App() {
               ? h(SettingsPanel, {
                   onBack: () => setView('trends'),
                   onResetHiddenSources: showAllSources,
-                  hiddenSourcesCount: hiddenSources.size
+                  hiddenSourcesCount: hiddenSources.size,
+                  user: me,
+                  onLogout: handleLogout
                 })
               : h(StatsPanel, { stats, hours, onBack: () => setView('trends'), onOpenTrend: setModalTrend })
           )
