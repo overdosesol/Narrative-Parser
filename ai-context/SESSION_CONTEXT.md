@@ -127,6 +127,7 @@
 - **БД**: `users.avatar_file_id`, `users.avatar_file_unique_id`, `users.avatar_checked_at` (миграция через PRAGMA-guarded ALTER); метод `db.setUserAvatar(userId, fileId, fileUniqueId)`
 - **Бот** (`notifications/telegram.js`):
   - `refreshUserAvatar(chatId, userId, {force})` — `getUserProfilePhotos` → max size → save to DB; throttle 6ч; тихий fail на privacy-locked юзерах
+  - Auto-delete старого файла в `data/avatars/<old>.jpg` при смене `file_unique_id` (с path-traversal guard)
   - `getFileUrl(fileId)` — `bot.getFile` → `api.telegram.org/file/bot<TOKEN>/...` (токен остаётся на сервере)
   - Hook в `/start` (включая deep-link `auth_<sessionId>`) — fire-and-forget
 - **Dashboard**:
@@ -135,4 +136,55 @@
   - `_publicUser` отдаёт `hasAvatar: boolean`, `avatarKey: string|null` (= fileUniqueId)
   - UI (hero card + top-right): `<img src="/api/auth/avatar?token=...&k=<avatarKey>">`; onError → fallback на букву / 👤
   - `.gitignore`: `data/avatars/`
-- **Смена фото в TG**: `fileUniqueId` меняется → `avatarKey` в ответе `/me` меняется → браузер перекачивает (cache-bust через query param); диск-кэш хранит обе версии (старую можно периодически чистить)
+- **Смена фото в TG**: `fileUniqueId` меняется → `avatarKey` в ответе `/me` меняется → браузер перекачивает (cache-bust через query param); старый файл автоматически удаляется
+
+## Media pipeline — видео со звуком (2026-04-20)
+
+- **Dockerfile**: `ffmpeg` установлен в runtime-stage Alpine-образа (`apk add --no-cache ffmpeg`). Без него mux молча падал и видео были silent
+- **Reddit video collector** (`src/collectors/reddit.js`): `_bestVideo(post)` — резолвит MP4 URL в приоритете `reddit_video.fallback_url` → `preview.reddit_video_preview` → direct `.mp4/.webm` → imgur `.gifv→.mp4`; результат в `metrics.videoUrl`
+- **Twitter video collector**: достаёт best-bitrate MP4 из `video_info.variants`
+- **Clusterer** (`src/analysis/clusterer.js`): агрегирует `videoUrl` на представителя кластера после image gallery
+- **Reddit audio discovery**: `_findRedditAudioUrl(videoUrl)` — HEAD-probe кандидатов в порядке **CMAF_AUDIO_128 → CMAF_AUDIO_64 → CMAF_audio → DASH_AUDIO_128 → DASH_AUDIO_64 → DASH_audio → audio**. Reddit в 2025 мигрировал с `DASH_*` на `CMAF_*` в именовании сегментов
+- **Mux flow** (`_muxRedditVideo`): `ffmpeg -c copy -movflags +faststart` (stream-copy, без reencode) → кэш в `data/video-cache/<id>.mp4`; `cleanupVideoCache(maxAgeDays=7)` вызывается при старте из `index.js`
+- **Telegram alert**: multi-tier fallback — `sendVideo` (с `supports_streaming`) → `sendMediaGroup` → `sendPhoto` → text; для Reddit — попытка mux'нуть перед отправкой
+- **Dashboard video player**:
+  - Public route (до auth middleware) `GET /api/video/reddit/<id>.mp4?src=<encoded v.redd.it url>` с Range-support (206 Partial Content); regex-валидация `src` против `v.redd.it/<alphanum>/` шаблона; cache-first; на cache miss → `_muxRedditVideo`; если аудио нет → 302 на оригинал
+  - `<video>` элементы не могут слать `Authorization: Bearer` headers — поэтому только этот маршрут public (контент и так публичный на Reddit CDN)
+  - HTML5 `<video controls preload="none" poster={imageUrl}>` в `FeedImage` и `TrendModal`
+- **Volume persistence**: `videoVolumeRef` ref-callback сохраняет `catalyst_video_volume` + `catalyst_video_muted` в localStorage; общий для всех плееров страницы
+
+## "Why now" — триггер события (2026-04-20)
+
+- **БД**: колонка `trends.why_now TEXT NOT NULL DEFAULT ''` (миграция через `addIfMissing`)
+- **AI stage-1 prompt**: поле `"whyNow"` — строгая инструкция «ТОЛЬКО явный конкретный триггер (кто что сделал / что произошло); если нет — пустая строка; не спекулировать, не перефразировать заголовок»
+- **Scorer**: `whyNow: (a.whyNow || '').trim().slice(0, 280)` → сохраняется в `saveTrend`
+- **Dashboard**: `_formatTrend` отдаёт поле; `TrendModal` рендерит секцию `🔥 Trigger / Триггер` с красно-оранжевым стилем (`.modal-section-content.why-now`); только при непустой строке
+- **Telegram alert**: строка `🔥 <b>{whyNow}</b>` над обычным AI-блоком в `formatter.js`
+- **Стоимость**: +20-40 токенов на ответ, <$0.50/мес
+
+## Персонализированный ранг (2026-04-20)
+
+- **Модель данных**:
+  - `feedback_votes` — источник правды для голосов (уже существовал): `(trend_id, chat_id, vote±1, weight, plan_name)`
+  - `trends.user_feedback` — глобальный агрегат (уже существовал), не используется для ранжирования
+  - Новое: `users.personalization_enabled INTEGER NOT NULL DEFAULT 1` — per-user toggle
+- **DB helpers** (`database.js`):
+  - `getCategoryPreferences(chatId, days=30)` → `{ category: net }` (JOIN feedback_votes × trends, SUM(vote × weight), GROUP BY category)
+  - `getPersonalizationEnabled(chatId)` / `setPersonalizationEnabled(chatId, enabled)`
+- **Ранжирование** (`_handleTrends`): при `sort=rank` + auth + toggle=ON + prefs≠{} — `ORDER BY (CAST(JSON_EXTRACT(raw_metrics, '$.rankScore') AS INT) + CASE category WHEN 'X' THEN +3 ... ELSE 0 END) DESC`; каждый boost clamp'ится к ±15; SQL-эскейп category names
+- **API**: `GET/POST /api/personalization` — управление toggle и чтение prefs map (list, sorted desc)
+- **UI**: `PersonalizationCard` в `SettingsPanel` — независимый компонент, фетчит `/api/personalization`; toggle (🎯) + грид чипов `.pref-chip.up` (зелёные `+N`) / `.down` (красные `−N`); empty-state «проголосуй за несколько трендов»
+- **Переводы EN+RU**: `settings.personalization*`
+- **Важно**: feedback и персонализация — два read-пути на одних и тех же голосах. Глобальный `trends.user_feedback` продолжает отражать общую реакцию; per-user boost — дополнительный слой поверх `rankScore`, работает только для авторизованных и только в дефолтной сортировке `rank`
+- **Окно**: последние 30 дней (старые голоса не учитываются, но остаются в глобальном счётчике)
+
+## Dashboard UX polish (2026-04-20)
+
+- Infinite scroll вместо пагинации: `IntersectionObserver` на `sentinelRef`; `refreshAllRef` для стабильности SSE при смене offset
+- Multi-image Telegram alerts через `sendMediaGroup` (до 10 фото, caption только на первой из-за TG 1024-char лимита)
+- Top Narratives: 5 → 10 (SQL LIMIT + client .slice)
+- Удалены: «Source Pulse» дубль в правой колонке, 📋 copy-title button в карточках
+
+## Ловушка server.js — backticks в комментариях
+
+`src/dashboard/server.js` — единый огромный inline React SPA внутри одного template literal. **Любой бэктик в `//` комментарии ломает outer literal** с `SyntaxError: Unexpected identifier '<token>'`. Уже трижды ловили (id, videoUrl, ref). Правило: в этом файле **никогда** не писать `` `token` `` в комментариях. Всегда `node -c src/dashboard/server.js` перед деплоем.

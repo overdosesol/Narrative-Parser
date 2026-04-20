@@ -139,6 +139,7 @@ For EACH trend, return a JSON object with these exact fields:
 - "sentiment"         : one of [positive, negative, neutral, mixed]
 - "explanation"       : 1-2 sentences WHY this is (or isn't) a great memecoin narrative — IN ENGLISH
 - "whyItWillPump"     : one punchy degen pitch line (e.g. "Elon retweeted a frog — $FROG launches at 3am") — IN ENGLISH. Empty string if memePotential < 30.
+- "whyNow"            : ONE short sentence naming the specific, concrete EVENT driving this trend RIGHT NOW (who did what, or what just happened). Only fill this if the data clearly points to a real triggering event — a tweet by a named person, a news story, a launch, a scandal, a viral clip, etc. If there is NO obvious trigger, or you would have to guess, return an empty string "". Do NOT speculate. Do NOT restate the title. IN ENGLISH.
 - "predictedLifespan" : one of [flash (hours), short (1-2 days), medium (3-7 days), long (weeks+)]
 
 Respond ONLY with a JSON array. No markdown fences, no extra text.

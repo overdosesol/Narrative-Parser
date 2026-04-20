@@ -50,12 +50,21 @@ class TrendDatabase {
     addIfMissing('users', 'telegram_username', 'TEXT');
     addIfMissing('users', 'pinned_broadcast_message_id', 'INTEGER');
 
+    // Personalized ranking toggle — when 1, dashboard rank-sort applies a
+    // per-category boost derived from the user's 👍/👎 history.
+    addIfMissing('users', 'personalization_enabled', 'INTEGER NOT NULL DEFAULT 1');
+
     // Notifications user_id migration
     addIfMissing('notifications', 'user_id', 'INTEGER');
 
     // Pipeline status — tracks how far a trend got through the analysis pipeline
     // 'save_only' = clusterer skipped AI scoring; 'scored' = went through stage 1 AI
     addIfMissing('trends', 'pipeline_status', "TEXT NOT NULL DEFAULT 'save_only'");
+
+    // Trigger event — stage-1 AI fills this only when there is an explicit,
+    // concrete event driving the narrative right now. Empty string otherwise
+    // (we instruct the model to NOT guess). Rendered separately in UI/alerts.
+    addIfMissing('trends', 'why_now', "TEXT NOT NULL DEFAULT ''");
 
     // Settings key-value store
     this.db.exec(`
@@ -680,6 +689,7 @@ class TrendDatabase {
         UPDATE trends SET
           score = ?, category = ?, sentiment = ?, ai_explanation = ?,
           predicted_lifespan = ?, raw_metrics = ?, pipeline_status = ?,
+          why_now = ?,
           last_seen_at = CURRENT_TIMESTAMP, times_seen = times_seen + 1
         WHERE id = ?
       `).run(
@@ -690,6 +700,7 @@ class TrendDatabase {
         trend.predictedLifespan || null,
         rawMetrics,
         pipelineStatus,
+        trend.whyNow || '',
         existingId
       );
       return existingId;
@@ -697,8 +708,8 @@ class TrendDatabase {
 
     // New trend — INSERT
     const result = this.db.prepare(`
-      INSERT INTO trends (external_id, source, title, original_title, description, url, score, category, sentiment, ai_explanation, predicted_lifespan, raw_metrics, pipeline_status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO trends (external_id, source, title, original_title, description, url, score, category, sentiment, ai_explanation, predicted_lifespan, raw_metrics, pipeline_status, why_now)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       trend.externalId || null,
       trend.source,
@@ -712,7 +723,8 @@ class TrendDatabase {
       trend.aiExplanation || null,
       trend.predictedLifespan || null,
       rawMetrics,
-      pipelineStatus
+      pipelineStatus,
+      trend.whyNow || ''
     );
 
     return result.lastInsertRowid;
@@ -888,6 +900,57 @@ class TrendDatabase {
       WHERE user_feedback < 0 AND first_seen_at > ?
       ORDER BY user_feedback ASC LIMIT ?
     `).all(cutoff, limit);
+  }
+
+  /**
+   * Compute a per-user category preference map from their 👍/👎 history over
+   * the last `days` days. Returns `{ "AI/Tech": +3, "Politics": -2, ... }`.
+   *
+   * Each like on a trend in category C contributes `+vote.weight` (default 1),
+   * each dislike contributes `-vote.weight`. Categories with zero net score
+   * are included too (so the UI can show them as "neutral") but callers
+   * usually drop zeros for display.
+   *
+   * Used by the dashboard rank-sort boost and by the settings UI.
+   */
+  getCategoryPreferences(chatId, days = 30) {
+    if (!chatId) return {};
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const rows = this.db.prepare(`
+      SELECT t.category AS category,
+             SUM(fv.vote * fv.weight) AS net
+      FROM feedback_votes fv
+      JOIN trends t ON t.id = fv.trend_id
+      WHERE fv.chat_id = ?
+        AND fv.created_at > ?
+        AND t.category IS NOT NULL
+        AND t.category <> ''
+      GROUP BY t.category
+    `).all(String(chatId), cutoff);
+    const map = {};
+    for (const r of rows) {
+      if (r.category) map[r.category] = Math.round(r.net || 0);
+    }
+    return map;
+  }
+
+  /**
+   * Read/write the per-user personalization toggle stored on the users row.
+   * Missing user → default to enabled (true). `set` accepts any truthy value.
+   */
+  getPersonalizationEnabled(chatId) {
+    if (!chatId) return true;
+    const row = this.db.prepare(
+      `SELECT personalization_enabled AS v FROM users WHERE telegram_chat_id = ?`
+    ).get(String(chatId));
+    return row ? !!row.v : true;
+  }
+
+  setPersonalizationEnabled(chatId, enabled) {
+    if (!chatId) return;
+    this.db.prepare(
+      `UPDATE users SET personalization_enabled = ? WHERE telegram_chat_id = ?`
+    ).run(enabled ? 1 : 0, String(chatId));
   }
 
   close() {

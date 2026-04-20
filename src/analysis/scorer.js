@@ -333,6 +333,9 @@ class Scorer {
         sentiment:        a.sentiment         || 'neutral',
         aiExplanation:    a.explanation       || '',
         whyItWillPump:    a.whyItWillPump     || '',
+        // Trigger event — only populated when the model found an explicit cause.
+        // We trim and cap to keep it one line; empty string means "no trigger".
+        whyNow:           (a.whyNow || '').trim().slice(0, 280),
         predictedLifespan:a.predictedLifespan || 'unknown',
         isGenuinelyInteresting: a.isGenuinelyInteresting ?? true,
       };

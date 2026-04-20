@@ -223,6 +223,8 @@ class DashboardServer {
       if (path === '/api/config'    && method === 'GET')  return this._handleConfig(req, res);
       if (path === '/api/settings'  && method === 'GET')  return this._handleSettingsGet(req, res);
       if (path === '/api/settings'  && method === 'POST') return this._handleSettingsPost(req, res);
+      if (path === '/api/personalization' && method === 'GET')  return this._handlePersonalizationGet(req, res);
+      if (path === '/api/personalization' && method === 'POST') return this._handlePersonalizationPost(req, res);
       if (path.match(/^\/api\/collectors\/[\w_]+\/toggle$/) && method === 'POST') return this._handleCollectorToggle(req, res, path);
       if (path.match(/^\/api\/trends\/\d+\/feedback$/) && method === 'POST') return this._handleTrendFeedback(req, res, path);
 
@@ -441,12 +443,38 @@ class DashboardServer {
     const minPlatforms = parseInt(url.searchParams.get('minPlatforms') || '0', 10);
 
     const sortParam = url.searchParams.get('sort') || 'rank';
+
+    // ── Personalized rank-sort ─────────────────────────────────────────────
+    // Only for authenticated users who left personalization enabled and have
+    // actually voted on something. Bakes a per-category boost into the SQL
+    // ORDER BY so pagination stays correct; untouched for other sort modes.
+    const authedChatId = String(req.user?.telegram_chat_id || '').trim() || null;
+    let personalBoostSql = '';
+    let activePrefs = null;
+    if (sortParam === 'rank' && authedChatId && this.db.getPersonalizationEnabled(authedChatId)) {
+      const prefs = this.db.getCategoryPreferences(authedChatId, 30);
+      const entries = Object.entries(prefs).filter(([, v]) => v !== 0);
+      if (entries.length) {
+        // Clamp each boost to ±15 so a single heavy category can't dominate.
+        const cases = entries
+          .map(([cat, v]) => {
+            const boost = Math.max(-15, Math.min(15, v));
+            // SQL-escape the category name (single quotes doubled).
+            const safe = String(cat).replace(/'/g, "''");
+            return `WHEN '${safe}' THEN ${boost}`;
+          })
+          .join(' ');
+        personalBoostSql = ` + (CASE category ${cases} ELSE 0 END)`;
+        activePrefs = prefs;
+      }
+    }
+
     let orderBy;
     if      (sortParam === 'time')      orderBy = 'first_seen_at DESC';
     else if (sortParam === 'virality')  orderBy = 'score DESC';
     else if (sortParam === 'meme')      orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC";
     else if (sortParam === 'emergence') orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) DESC";
-    else                                orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.rankScore') AS INT) DESC";
+    else                                orderBy = `(CAST(JSON_EXTRACT(raw_metrics, '$.rankScore') AS INT)${personalBoostSql}) DESC`;
 
     const cutoff = new Date(Date.now() - hours * 3_600_000).toISOString();
     let query = `SELECT * FROM trends WHERE first_seen_at > ?`;
@@ -472,7 +500,12 @@ class DashboardServer {
     const userId = String(req.user?.telegram_chat_id || '').trim() || null;
     const trends = rows.map(row => this._formatTrend(row, userId));
 
-    return json(res, 200, { trends, total, limit, offset });
+    // When personalization was applied, echo a tiny summary so the client
+    // can show an indicator on the settings screen (active prefs map).
+    const payload = { trends, total, limit, offset };
+    if (activePrefs) payload.personalization = { active: true, prefs: activePrefs };
+
+    return json(res, 200, payload);
   }
 
   _handleTrend(req, res, path) {
@@ -595,6 +628,38 @@ class DashboardServer {
 
     this.logger.info(`[Dashboard] Settings updated: ${JSON.stringify(saved)}`);
     return json(res, 200, { ok: true, saved });
+  }
+
+  /**
+   * GET /api/personalization — returns the current user's preference map
+   * (net 👍/👎 score per category over the last 30 days) plus the on/off
+   * toggle. Used by the settings UI to show "we're boosting X, damping Y".
+   */
+  _handlePersonalizationGet(req, res) {
+    const chatId = String(req.user?.telegram_chat_id || '').trim() || null;
+    if (!chatId) return json(res, 401, { error: 'Not authenticated' });
+    const enabled = this.db.getPersonalizationEnabled(chatId);
+    const prefs   = this.db.getCategoryPreferences(chatId, 30);
+    // Convert to a sorted array for stable UI rendering.
+    const list = Object.entries(prefs)
+      .map(([category, net]) => ({ category, net }))
+      .sort((a, b) => b.net - a.net);
+    return json(res, 200, { enabled, prefs: list });
+  }
+
+  /**
+   * POST /api/personalization — accepts `{ enabled: boolean }` and persists
+   * the toggle on the user row. No-op if already in that state.
+   */
+  async _handlePersonalizationPost(req, res) {
+    const chatId = String(req.user?.telegram_chat_id || '').trim() || null;
+    if (!chatId) return json(res, 401, { error: 'Not authenticated' });
+    let body;
+    try { body = await parseBody(req); }
+    catch { return json(res, 400, { error: 'Invalid JSON' }); }
+    const enabled = !!body?.enabled;
+    this.db.setPersonalizationEnabled(chatId, enabled);
+    return json(res, 200, { ok: true, enabled });
   }
 
   _handleCollectorToggle(req, res, path) {
@@ -757,6 +822,9 @@ class DashboardServer {
       uniquePlatforms: metrics.uniquePlatforms ?? 1,
       aiExplanation:   row.ai_explanation,
       whyItWillPump:   metrics.whyItWillPump || '',
+      // Trigger event — empty string when the AI found no explicit cause.
+      // UI only renders the row when non-empty.
+      whyNow:          row.why_now || '',
       predictedLifespan: row.predicted_lifespan,
       url:             row.url,
       tgMessageUrl:    metrics.tgMessageUrl || null,
@@ -2430,6 +2498,15 @@ class DashboardServer {
     .modal-section-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); font-weight: 700; }
     .modal-section-content { font-size: 12px; color: var(--text2); line-height: 1.55; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 11px 13px; }
     .modal-section-content.pump { color: var(--orange); border-color: rgba(var(--orange-rgb), .15); background: rgba(var(--orange-rgb), .05); }
+    .modal-section-content.why-now { color: #ff6b6b; border-color: rgba(255, 107, 107, .18); background: rgba(255, 107, 107, .06); font-weight: 500; }
+    .pref-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    .pref-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 999px; font-size: 11px; font-weight: 500; border: 1px solid var(--border); background: var(--card); }
+    .pref-chip-name { color: var(--text2); text-transform: capitalize; }
+    .pref-chip-val  { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .pref-chip.up   { border-color: rgba(34, 197, 94, .25); background: rgba(34, 197, 94, .06); }
+    .pref-chip.up .pref-chip-val   { color: #22c55e; }
+    .pref-chip.down { border-color: rgba(255, 107, 107, .22); background: rgba(255, 107, 107, .05); }
+    .pref-chip.down .pref-chip-val { color: #ff6b6b; }
     .modal-stats-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }
     .modal-stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; }
     .modal-stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: .7px; color: var(--dim); font-weight: 600; }
@@ -3324,6 +3401,7 @@ const I18N = {
 
     // Trend modal
     'modal.why_pump': "⚡ Why it'll moon",
+    'modal.why_now': '🔥 Trigger',
     'modal.ai_explanation': '🤖 AI alpha',
     'modal.market_stage': '💹 Market Stage',
     'modal.phase': '🧭 Narrative phase',
@@ -3383,6 +3461,12 @@ const I18N = {
     'settings.col_left_desc':  'Sidebar width — sources, phase, filters. Currently {px}px.',
     'settings.col_right': 'Right column width',
     'settings.col_right_desc': 'Insights / stats panel width. Currently {px}px.',
+
+    'settings.personalization': '🎯 Personalization',
+    'settings.personalization_desc': 'Your 👍 / 👎 votes re-rank the feed. Categories you liked get a boost, ones you disliked get damped. Only affects the default "Rank" sort.',
+    'settings.personalization_toggle': 'Personalized ranking',
+    'settings.personalization_toggle_desc': 'Turn off to see the raw global ranking.',
+    'settings.personalization_empty': 'No votes yet — react to a few trends with 👍 or 👎 to train the feed.',
 
     'settings.behavior': '🔄 Behavior',
     'settings.behavior_desc': 'Source visibility in the feed. New data arrives live — no auto-refresh timer needed.',
@@ -3575,6 +3659,7 @@ const I18N = {
 
     // Trend modal
     'modal.why_pump': '⚡ Почему запампит',
+    'modal.why_now': '🔥 Триггер',
     'modal.ai_explanation': '🤖 AI-объяснение',
     'modal.market_stage': '💹 Стадия рынка',
     'modal.phase': '🧭 Фаза нарратива',
@@ -3634,6 +3719,12 @@ const I18N = {
     'settings.col_left_desc':  'Сайдбар — источники, фаза, фильтры. Сейчас {px}px.',
     'settings.col_right': 'Ширина правой колонки',
     'settings.col_right_desc': 'Панель инсайтов и статистики. Сейчас {px}px.',
+
+    'settings.personalization': '🎯 Персонализация',
+    'settings.personalization_desc': 'Твои голоса 👍 / 👎 подстраивают ленту. Категории, которые ты лайкал, получают буст, дизлайкнутые — штраф. Работает только в дефолтной сортировке «Rank».',
+    'settings.personalization_toggle': 'Персональный ранг',
+    'settings.personalization_toggle_desc': 'Выключи, чтобы видеть обычный глобальный ранг.',
+    'settings.personalization_empty': 'Голосов ещё нет — оцени несколько трендов через 👍/👎, и лента начнёт подстраиваться.',
 
     'settings.behavior': '🔄 Поведение',
     'settings.behavior_desc': 'Видимость источников в фиде. Новые данные приходят в реальном времени — таймер автообновления не нужен.',
@@ -4338,6 +4429,13 @@ function TrendModal({ trend, onClose }) {
           h('div', { className: 'modal-section-content pump' }, trend.whyItWillPump)
         ) : null,
 
+        // Why now — concrete triggering event. Rendered only when the AI
+        // found an explicit cause; empty string means "no visible trigger".
+        trend.whyNow ? h('div', { className: 'modal-section' },
+          h('div', { className: 'modal-section-label' }, t('modal.why_now')),
+          h('div', { className: 'modal-section-content why-now' }, trend.whyNow)
+        ) : null,
+
         // AI explanation
         trend.aiExplanation ? h('div', { className: 'modal-section' },
           h('div', { className: 'modal-section-label' }, t('modal.ai_explanation')),
@@ -4761,6 +4859,63 @@ const Row = ({ icon, title, desc, control }) =>
     h('div', { className: 'setting-control' }, control)
   );
 
+// ── PersonalizationCard ───────────────────────────────────────────────────────
+// Fetches the current user's category preference map plus the on/off toggle.
+// Shows the user a transparent view of "the feed boosts these categories and
+// damps those" so they can trust or disable it. No per-trend badges on cards.
+function PersonalizationCard() {
+  const [loading, setLoading] = useState(true);
+  const [enabled, setEnabled] = useState(true);
+  const [prefs,   setPrefs]   = useState([]);     // [{ category, net }]
+  const [err,     setErr]     = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api('/personalization')
+      .then(d => {
+        if (cancelled) return;
+        setEnabled(!!d.enabled);
+        setPrefs(Array.isArray(d.prefs) ? d.prefs : []);
+      })
+      .catch(e => { if (!cancelled) setErr(e.message || 'load failed'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const toggle = async (v) => {
+    setEnabled(v);
+    try { await api('/personalization', { method: 'POST', body: JSON.stringify({ enabled: v }) }); }
+    catch (e) { setEnabled(!v); setErr(e.message || 'save failed'); }
+  };
+
+  return h('div', { className: 'settings-card' },
+    h('div', { className: 'settings-card-title' }, t('settings.personalization')),
+    h('div', { className: 'settings-card-desc' }, t('settings.personalization_desc')),
+    h(Row, {
+      icon: '🎯', title: t('settings.personalization_toggle'),
+      desc: t('settings.personalization_toggle_desc'),
+      control: h(Toggle, { on: enabled, onChange: toggle }),
+    }),
+    loading
+      ? h('div', { className: 'settings-card-desc' }, '…')
+      : err
+        ? h('div', { className: 'settings-card-desc', style: { color: 'var(--red, #ff6b6b)' } }, err)
+        : prefs.length === 0
+          ? h('div', { className: 'settings-card-desc' }, t('settings.personalization_empty'))
+          : h('div', { className: 'pref-chips' },
+              prefs.map(p => {
+                const up = p.net > 0;
+                const cls = 'pref-chip ' + (up ? 'up' : 'down');
+                const sign = up ? '+' : '';
+                return h('span', { key: p.category, className: cls },
+                  h('span', { className: 'pref-chip-name' }, p.category),
+                  h('span', { className: 'pref-chip-val'  }, sign + p.net)
+                );
+              })
+            )
+  );
+}
+
 function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
   const lang = useLang();
   const theme = useTheme();
@@ -4915,6 +5070,9 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
         )
       })
     ),
+
+    // ── Personalization (per-category boost from 👍/👎 history) ──
+    h(PersonalizationCard),
 
     // ── Behavior ──
     h('div', { className: 'settings-card' },

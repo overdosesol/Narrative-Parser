@@ -34,6 +34,12 @@ export function formatTelegramAlert(trend, lang = 'en') {
     msg += `\u{1F4CC} <b>${escHtml(enTitle)}</b>\n\n`;
   }
 
+  // Trigger event — rendered only when the model found a concrete cause.
+  // Shown above the longer AI explanation as a one-liner with a 🔥 marker.
+  if (trend.whyNow) {
+    msg += `\u{1F525} <b>${escHtml(trend.whyNow)}</b>\n\n`;
+  }
+
   if (trend.aiExplanation) {
     msg += `\u{1F916} ${escHtml(trend.aiExplanation)}\n\n`;
   }

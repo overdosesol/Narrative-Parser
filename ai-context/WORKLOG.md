@@ -792,3 +792,71 @@
   - `fileUniqueId` стабилен per-photo: при смене юзером фото в TG → следующий `getUserProfilePhotos` вернёт новый unique id → `avatarKey` в `/me` ответе меняется → браузер перекачивает картинку (HTTP cache busting через query-параметр)
   - Существующие юзеры не получат аватарку пока не пингнут `/start` в боте (или не пройдёт 6ч и дашборд сам триггернёт re-check через `/api/auth/me`)
   - better-sqlite3 bindings требуют recompile под текущий node (`v22.22.2`) — в диагностических скриптах пришлось fallback'ить на sqlite3 CLI
+
+## 2026-04-20 (media pipeline overhaul + UX polish + feedback-driven rank)
+
+- Model/session: Claude Sonnet 4.6 + Opus 4.7
+- Цель: сделать медиа в алертах и дашборде живыми (видео+звук), отполировать UX, добавить двухступенчатый product value — «Why now» триггер и персонализация ленты
+- Изменения (`src/notifications/telegram.js`, `src/notifications/formatter.js`, `src/dashboard/server.js`, `src/collectors/reddit.js`, `src/collectors/twitter.js`, `src/analysis/clusterer.js`, `src/analysis/scorer.js`, `src/analysis/prompts.js`, `src/db/database.js`, `src/db/schema.sql`, `src/index.js`, `Dockerfile`):
+  - **Multi-image Telegram alerts**: `sendMediaGroup` для карусели до 10 изображений; fallback на `sendPhoto` если 1 элемент; в алерте — длинный caption только на первой картинке (TG лимит 1024 char)
+  - **Telegram avatar auto-replace**: при изменении `file_unique_id` старый файл в `data/avatars/<old>.jpg` удаляется (path-traversal guard); реализовано в `_deleteAvatarFile()` внутри `refreshUserAvatar`
+  - **Видео в алертах вместо первого кадра**:
+    - Reddit collector: `_bestVideo(post)` — `reddit_video.fallback_url` → `preview.reddit_video_preview` → direct `.mp4/.webm` → imgur `.gifv → .mp4`
+    - Twitter collector: достаёт best-bitrate MP4 из `video_info.variants`
+    - Clusterer: агрегирует `videoUrl` на представителя кластера если его ещё нет
+    - Telegram: `sendVideo` с `supports_streaming: true`; multi-tier fallback — video → mediaGroup → photo → text
+  - **Reddit DASH/CMAF audio muxing** (раньше выдавался silent stream):
+    - `_findRedditAudioUrl(videoUrl)`: HEAD-probe кандидатов — **CMAF_AUDIO_128.mp4 → CMAF_AUDIO_64.mp4 → CMAF_audio.mp4 → DASH_AUDIO_128.mp4 → DASH_AUDIO_64.mp4 → DASH_audio.mp4 → audio**
+    - `_muxRedditVideo(videoUrl)`: `ffmpeg -c copy -movflags +faststart` → кэш в `data/video-cache/<id>.mp4`; stream-copy, никакого reencode
+    - `cleanupVideoCache(maxAgeDays=7)` вызывается из `index.js` на старте
+    - Reddit в 2025 переехал с `DASH_*` на `CMAF_*` в video segment names — оба формата поддерживаются для совместимости
+    - Лог-уровень: `no audio track` = warn (было debug, не видно в проде); при неудаче — перечисление попытанных URL со статусами
+  - **Dockerfile**: в runtime-stage (Alpine) добавлен `ffmpeg` через `apk add --no-cache`; без него mux молча не работал и контейнер отдавал silent stream
+  - **Dashboard video player** (вместо статичного первого кадра):
+    - `FeedImage`: при наличии `trend.videoUrl` рендерит HTML5 `<video controls preload="none" poster={imgUrl}>`; `onClick` на wrap-элементе — `stopPropagation` чтобы play не открывал модалку
+    - `TrendModal`: аналогично в modal-body
+    - Публичный route (до auth middleware) `GET /api/video/reddit/<id>.mp4?src=<encoded v.redd.it url>`:
+      - Regex-валидация `src`: должен быть `v.redd.it/<alphanumeric>/` (не общий proxy)
+      - Cache-first: если `data/video-cache/<id>.mp4` есть — отдаём с Range support (206 Partial Content)
+      - Cache miss: `_muxRedditVideo` → если успех, отдаём; если нет аудио — 302 на оригинал
+      - `<video>` элементы не могут слать `Authorization: Bearer`, поэтому этот маршрут единственный public (контент и так паблик с Reddit)
+  - **Video volume persistence** across videos: `videoVolumeRef` ref-callback, читает/пишет `catalyst_video_volume` + `catalyst_video_muted` в localStorage; `addEventListener('volumechange')`; подключён и в FeedImage, и в TrendModal
+  - **Dashboard UX polish**:
+    - Убрана секция «Source Pulse» из правой колонки — дублировала сайдбар; удалены `sources`, `allSourceStats`, `hiddenSources`, `onToggleSource` props
+    - Top Narratives: 5 → 10 (и SQL LIMIT, и client .slice)
+    - Замена пагинации на **infinite scroll**: `IntersectionObserver` + `sentinelRef` в конце ленты; `loadingMore` state; SSE-стабильность через `refreshAllRef` (иначе reconnect на каждой смене offset)
+    - Убран 📋 copy-title button у карточек (бесполезный)
+- **Feature 1 — «Why now» (триггер события)**:
+  - `src/db/database.js`: миграция `trends.why_now TEXT NOT NULL DEFAULT ''` через `addIfMissing`; INSERT/UPDATE в `saveTrend` пишут `trend.whyNow`
+  - `src/analysis/prompts.js`: новое поле `"whyNow"` в stage-1 JSON schema с строгой инструкцией — «fill only when data clearly points to a real triggering event; no speculation, no title restatement; empty string otherwise»
+  - `src/analysis/scorer.js`: `whyNow: (a.whyNow || '').trim().slice(0, 280)` в результате batch
+  - Dashboard: `_formatTrend` отдаёт `whyNow` → TrendModal рендерит `🔥 Trigger / Триггер` секцию с красно-оранжевым акцентом (`.modal-section-content.why-now`), только если не пустая строка
+  - Telegram alert (`formatter.js`): над AI-explanation выводится `🔥 <b>{whyNow}</b>` при непустом значении
+  - Стоимость: +20-40 токенов на ответ — на текущих объёмах <$0.50/месяц
+- **Feature 2 — Персонализированный ранг**:
+  - `src/db/database.js`:
+    - `users.personalization_enabled INTEGER NOT NULL DEFAULT 1` — миграция
+    - `getCategoryPreferences(chatId, days=30)` — JOIN `feedback_votes` × `trends`, GROUP BY category, SUM(vote × weight), возвращает `{ category: net }` map
+    - `getPersonalizationEnabled(chatId)` / `setPersonalizationEnabled(chatId, enabled)` — per-user toggle на users row
+  - `src/dashboard/server.js`:
+    - `_handleTrends`: при `sort=rank` + аутентифицированный юзер + toggle ON + непустая prefs map — строится SQL `ORDER BY (CAST(JSON_EXTRACT(raw_metrics, '$.rankScore') AS INT) + CASE category WHEN 'X' THEN +3 WHEN 'Y' THEN -5 ELSE 0 END) DESC`; каждый boost clamp'ится к ±15 для защиты от перекоса; SQL-эскейп category names
+    - Ответ содержит `payload.personalization = { active: true, prefs }` если boost применён
+    - Новые endpoints: `GET /api/personalization` (возвращает `{ enabled, prefs: [{ category, net }] }`, sorted desc), `POST /api/personalization` (body `{ enabled: boolean }`)
+  - UI: новый компонент `PersonalizationCard` в `SettingsPanel` — независимо фетчит `/api/personalization`, рендерит toggle + грид чипов (`.pref-chip.up` зелёные `+N`, `.down` красные `−N`); empty-state «проголосуй за несколько трендов, чтобы обучить ленту»
+  - Переводы: `settings.personalization`, `settings.personalization_desc`, `settings.personalization_toggle`, `settings.personalization_toggle_desc`, `settings.personalization_empty` — EN + RU
+  - Взаимодействие с существующим feedback: `feedback_votes` — источник данных и для глобального `trends.user_feedback`, и для персональной карты предпочтений; это два разных read-пути на одних и тех же голосах
+- Баг-фиксы / технический долг:
+  - **3× SyntaxError «Unexpected identifier 'id' / 'videoUrl' / 'ref'»**: backticks в комментариях внутри огромного template literal в `src/dashboard/server.js` — любой `` `token` `` внутри `//` коммента ломает outer literal. Правило: в этом файле **никогда** не использовать бэктики в комментариях. После каждого исправления — `node -c src/dashboard/server.js` перед деплоем
+  - `/api/video/reddit/*` был за auth middleware → `<video>` получал 401; вынесен в public-блок перед auth check
+  - `<video>` сначала грузил raw `v.redd.it/...CMAF_720.mp4` из браузерного кэша после обновления кода — hard-refresh (Ctrl+Shift+R) обязателен для тестирования video features
+  - `ffmpeg` был установлен на хост, но не в Docker-образе (Alpine) — контейнер собирается из своего Dockerfile, пакеты хоста не попадают; фикс через `apk add ffmpeg`
+- Проверка:
+  - `node --check` на всех изменённых файлах → OK
+  - Вручную проверены: Reddit видео со звуком в дашборде (CMAF), Reddit видео со звуком в Telegram (mux работает), volume persistence при переключении видео, feedback → smaller sample персонализации (требует десятка голосов для видимого эффекта)
+  - Миграции `why_now` и `personalization_enabled` накатились без ошибок
+- Риски/заметки:
+  - Если Reddit снова переименует audio segments — увидим в логах `[Video] no reddit audio found — tried [CMAF_AUDIO_128.mp4=404, ...]`, по списку добавим новый кандидат
+  - Кэш `data/video-cache/` растёт при активном использовании; auto-cleanup 7 дней
+  - На свежей БД `why_now` пустой у всех старых записей — заполняется постепенно по мере того, как новые тренды проходят AI scoring
+  - Клиент кэширует бандл JS агрессивно — при выкатке UI-фич нужно просить ctrl+shift+R или добавить cache-busting (TODO при росте аудитории)
+  - Персонализация требует минимум ~5-10 голосов per category чтобы быть заметной; для нового юзера ранжирование идентично глобальному
