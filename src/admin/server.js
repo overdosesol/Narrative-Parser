@@ -214,6 +214,9 @@ class AdminServer {
       alertStaleDecayPerHour: 2,
       alertStaleDecayGrace:   24,
       alertStaleDecayCap:     30,
+      // AI Stage 2 gates — tune in UI to balance x_search cost vs coverage
+      stage2Threshold: 60,
+      stage2MaxCalls:  6,
     };
     const merged = {};
     for (const [k, v] of Object.entries(numDefaults)) {
@@ -263,6 +266,8 @@ class AdminServer {
       alertStaleDecayPerHour: { min: 0, max: 20 },
       alertStaleDecayGrace:   { min: 0, max: 168 },
       alertStaleDecayCap:     { min: 0, max: 100 },
+      stage2Threshold:        { min: 0, max: 100 },
+      stage2MaxCalls:         { min: 0, max: 20  },
     };
     for (const [key, rules] of Object.entries(allowedInt)) {
       if (!(key in body)) continue;
@@ -1781,6 +1786,24 @@ function ScannerConfigSection() {
       row('📉 Баллов штрафа за каждый час после grace', 'alertStaleDecayPerHour', 0, 10, 1),
       row('🛡️ Grace-период (часов без штрафа)',          'alertStaleDecayGrace',   0, 72, 1),
       row('🧢 Максимум штрафа (cap)',                    'alertStaleDecayCap',     0, 80, 5),
+    ),
+
+    // AI Stage 2 — deep-dive via x_search (Grok)
+    h('div', { className: 'scfg-section' },
+      h('h4', { className: 'scfg-h4' }, '🧪 AI Stage 2 · x_search deep-dive'),
+      h('p', { className: 'scfg-desc' },
+        'Stage 2 = Grok + живой поиск по X. Запускается на топ-N трендов с memePotential ≥ порога. ' +
+        'Результат: свежая оценка buzz + штраф за weak xBuzz (×0.5) и saturated coins 3+ (×0.7). ' +
+        'Каждый вызов стоит денег (x_search) — держи cap разумным и следи за счётом xAI.'),
+      row('🎯 Порог входа (memePotential ≥)', 'stage2Threshold', 0, 100, 5),
+      row('⚡ Макс. вызовов за цикл (cap)',    'stage2MaxCalls',  0, 20, 1,
+          cfg.stage2MaxCalls === 0 ? '0 (off)' : cfg.stage2MaxCalls),
+      h('div', { style: { marginTop: 8, fontSize: 11, color: 'var(--muted)', lineHeight: 1.4 } },
+        '💡 Порог 78 / cap 3 — консервативно (старый дефолт). ' +
+        'Порог 60 / cap 6 — рекомендовано: Stage 2 срабатывает ~70% циклов. ' +
+        'Порог 50 / cap 10 — агрессивно: Stage 2 как основной скорер. ' +
+        'Cap = 0 полностью выключает Stage 2 (дешевле через тумблер aiStage2Enabled в AI-секции).'
+      ),
     ),
 
     // Storage section

@@ -197,10 +197,12 @@ class Scorer {
 
     this.current = this._getRuntimeAiConfig();
 
-    // Stage 2 threshold — only trends scoring >= this get x_search deep-dive
-    this.stage2Threshold = 78;
+    // Stage 2 gates — default values; can be overridden in admin UI via
+    // `stage2Threshold` and `stage2MaxCalls` settings. Runtime read per cycle
+    // inside scoreTrends() so changes apply without restart.
+    this.stage2Threshold = 60;   // memePotential >= this → Stage 2 candidate
     this.stage2Model = 'grok-4-1-fast-non-reasoning';
-    this.stage2MaxCalls = 3; // cap per cycle to limit cost
+    this.stage2MaxCalls = 6;     // cap x_search calls per cycle (cost control)
 
     if (!this.current.enabled) {
       this.logger.warn('AI API key not set for selected provider — AI scoring disabled, using heuristics');
@@ -322,15 +324,26 @@ class Scorer {
     const stage2EnabledRaw = this.db?.getSetting?.('aiStage2Enabled', '1');
     const stage2Enabled = String(stage2EnabledRaw) !== '0';
 
+    // Runtime-tunable gates — read fresh from DB each cycle so admin edits
+    // take effect immediately (no restart). Falls back to constructor defaults.
+    const readNum = (key, fallback) => {
+      const v = this.db?.getSetting?.(key);
+      if (v === undefined || v === null || v === '') return fallback;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : fallback;
+    };
+    const stage2Threshold = readNum('stage2Threshold', this.stage2Threshold);
+    const stage2MaxCalls  = readNum('stage2MaxCalls',  this.stage2MaxCalls);
+
     // ── Stage 2: x_search deep-dive for high-potential trends ──
-    // Gates: threshold=78, max=3, skip google_trends, novelty gate
+    // Gates: threshold (default 60), max (default 6), skip google_trends, novelty gate
     const stage2Candidates = stage1Results
       .filter(t =>
-        t.memePotential >= this.stage2Threshold &&
+        t.memePotential >= stage2Threshold &&
         t.source?.toLowerCase() !== 'google_trends' &&
         t.clusterMetrics?.isNovel !== false
       )
-      .slice(0, this.stage2MaxCalls);
+      .slice(0, stage2MaxCalls);
 
     metrics.stage2Candidates = stage2Candidates.length;
 
@@ -351,7 +364,7 @@ class Scorer {
       }
 
       this.logger.info(
-        `Stage 2: ${stage2Candidates.length} trends scored >= ${this.stage2Threshold} (cap=${this.stage2MaxCalls}), running x_search with ${stage2Cfg.model}`
+        `Stage 2: ${stage2Candidates.length} trends scored >= ${stage2Threshold} (cap=${stage2MaxCalls}), running x_search with ${stage2Cfg.model}`
       );
 
       for (const trend of stage2Candidates) {
@@ -512,13 +525,58 @@ class Scorer {
       trend.whyItWillPump = result.whyItWillPump;
     }
 
-    // Store Stage 2 metadata
+    // Store Stage 2 metadata (narrative-focused — no coin search)
     trend.xSearchData = {
-      xBuzz:         result.xBuzz         || 'unknown',
-      existingCoins: result.existingCoins  || [],
-      xSentiment:    result.xSentiment     || 'unknown',
-      adjustment:    result.adjustment     || '',
+      xBuzz:              result.xBuzz              || 'unknown',
+      narrativeMomentum:  result.narrativeMomentum  || 'unknown',
+      organicity:         result.organicity         || 'unknown',
+      xSentiment:         result.xSentiment         || 'unknown',
+      adjustment:         result.adjustment         || '',
     };
+
+    // ── Stage 2 authority: apply penalties based on live X narrative signals ──
+    // Stage 1 judges from a headline; Stage 2 saw the actual X feed. If Grok
+    // reports weak buzz, fading momentum, or astroturf amplification, we TRUST
+    // it over Stage 1 and penalize memePotential/score. Multiplicative so
+    // strong signals still pass through — just capped.
+    const xBuzz       = String(trend.xSearchData.xBuzz              || '').toLowerCase();
+    const momentum    = String(trend.xSearchData.narrativeMomentum  || '').toLowerCase();
+    const organicity  = String(trend.xSearchData.organicity         || '').toLowerCase();
+
+    let penaltyMult = 1.0;
+    const penaltyReasons = [];
+
+    if (xBuzz === 'low' || xBuzz === 'none') {
+      penaltyMult *= 0.5;          // no real buzz on X → half credit
+      penaltyReasons.push('weak-xBuzz');
+    }
+    if (momentum === 'fading') {
+      penaltyMult *= 0.7;          // narrative is dying
+      penaltyReasons.push('fading-momentum');
+    }
+    if (organicity === 'astroturf') {
+      penaltyMult *= 0.6;          // bot / spam amplification, not organic
+      penaltyReasons.push('astroturf');
+    }
+
+    if (penaltyMult < 1.0) {
+      const beforeMeme  = trend.memePotential;
+      const beforeViral = trend.score;
+      trend.memePotential = Math.round(trend.memePotential * penaltyMult);
+      trend.score         = Math.round(trend.score         * penaltyMult);
+      trend.stage2Penalty = {
+        multiplier: +penaltyMult.toFixed(2),
+        reasons: penaltyReasons,
+        memeBefore:  beforeMeme,
+        memeAfter:   trend.memePotential,
+        viralBefore: beforeViral,
+        viralAfter:  trend.score,
+      };
+      this.logger.info(
+        `Stage 2 penalty "${trend.title}": ×${penaltyMult.toFixed(2)} ` +
+        `[${penaltyReasons.join(', ')}] meme ${beforeMeme}→${trend.memePotential}`
+      );
+    }
 
     // Recalculate adoption + phase after Stage 2 adjustments
     trend.adoptionScore  = trend.memePotential;
@@ -737,10 +795,8 @@ class Scorer {
     if (m.plays > 10_000_000) score += 15;
     else if (m.plays > 1_000_000) score += 10;
 
-    // Multi-source bonus
-    if (trend.multiSourceBonus > 0) {
-      score += Math.min(trend.multiSourceBonus, 20);
-    }
+    // (Multi-source bonus removed — news/politics dominated every platform
+    //  and drowned out single-source meme content.)
 
     return Math.min(score, 85); // Cap at 85 — AI needed for 85+
   }
@@ -759,8 +815,7 @@ class Scorer {
     // Engagement rate signal
     if (trend.metrics?.engagementRate > 5) bonus += 8;
 
-    // Multi-source signal
-    if (trend.sources?.length > 1) bonus += (trend.sources.length - 1) * 5;
+    // (Multi-source bonus removed — see _heuristicScore.)
 
     const raw = Math.floor(this._heuristicScore(trend) * 0.8) + bonus;
     return Math.min(raw, 70); // Cap at 70 — AI needed for confident high scores

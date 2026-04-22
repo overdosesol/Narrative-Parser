@@ -33,7 +33,11 @@ class NarrativeClusterer {
 
     // ── Clustering params ────────────────────────────────────────────────
     this.JACCARD_THRESHOLD = 0.40; // word-set overlap to merge into one cluster
-    this.MIN_WORDS         = 3;    // titles with fewer meaningful words → singleton
+    this.MIN_WORDS         = 1;    // allow short meme titles ("capybara", "$PEPE") to
+                                   //   cluster with longer variants. Jaccard 0.40 is
+                                   //   strict enough on its own: two single-word titles
+                                   //   only merge if the word is identical, which is
+                                   //   exactly the meme-overlap case we want.
 
     // ── DB lookback ──────────────────────────────────────────────────────
     this.DB_WINDOW_HOURS = 48;
@@ -305,12 +309,31 @@ class NarrativeClusterer {
         try { overrides = JSON.parse(rawOverrides); }
         catch (_) { /* malformed blob — ignore, fall back to defaults */ }
       }
-      const { junkPenalty, junkReasons } = calculateJunkPenalty(items, base, activePreset, overrides);
-      base.junkPenalty  = junkPenalty;
-      base.junkReasons  = junkReasons;
+      const { junkPenalty, junkReasons, memeShapeBoost, memeShapeSignals } =
+        calculateJunkPenalty(items, base, activePreset, overrides);
+      base.junkPenalty       = junkPenalty;
+      base.junkReasons       = junkReasons;
+      base.memeShapeBoost    = memeShapeBoost    || 0;
+      base.memeShapeSignals  = memeShapeSignals  || [];
+
+      // Apply meme-shape boost to emergenceScore so that meme-looking clusters
+      // pass the DROP_EMERGENCE_MAX gate and reach LLM. Affects ROUTING only —
+      // LLM still assigns the real memePotential based on actual content.
+      if (base.memeShapeBoost > 0) {
+        const before = base.emergenceScore;
+        base.emergenceScore = Math.min(100, base.emergenceScore + base.memeShapeBoost);
+        if (base.emergenceScore !== before) {
+          this.logger.debug(
+            `[Clusterer] meme-shape boost +${base.memeShapeBoost} ` +
+            `[${base.memeShapeSignals.join(',')}] emergence ${before}→${base.emergenceScore}`
+          );
+        }
+      }
     } catch (_) {
-      base.junkPenalty = 0;
-      base.junkReasons = [];
+      base.junkPenalty      = 0;
+      base.junkReasons      = [];
+      base.memeShapeBoost   = 0;
+      base.memeShapeSignals = [];
     }
 
     return base;

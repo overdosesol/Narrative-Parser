@@ -56,9 +56,15 @@ const RE_HEARTWARMING = /\b(rescue|rescued|saves?\s+\w+|adopted|adoption|donated
  *                                  penalty profile. Unknown/missing → `general`.
  * @param {object} [overrides]    — admin-UI overrides blob (shape defined in
  *                                  filter-profiles.js). Passed to resolveProfile.
- * @returns {{ junkPenalty: number, junkReasons: string[] }}
- *   junkPenalty  0–100 (0 = clean, 100 = pure junk)
- *   junkReasons  list of triggered rules (for logging/debugging)
+ * @returns {{ junkPenalty: number, junkReasons: string[], memeShapeBoost: number, memeShapeSignals: string[] }}
+ *   junkPenalty       0–100 (0 = clean, 100 = pure junk)
+ *   junkReasons       list of triggered rules (for logging/debugging)
+ *   memeShapeBoost    positive bonus meant to be added to emergenceScore when
+ *                     the cluster looks meme-shaped (animal / absurd / meme /
+ *                     heartwarming). Rescues short single-source meme titles
+ *                     from DROP_EMERGENCE_MAX so LLM gets a chance to evaluate.
+ *                     2+ signals → ×1.5 (capped).
+ *   memeShapeSignals  which meme signals fired (for logs)
  */
 export function calculateJunkPenalty(items, clusterMetrics = {}, preset = null, overrides = null) {
   const profile = preset || overrides ? resolveProfile(preset, overrides) : DEFAULT_PROFILE;
@@ -102,21 +108,36 @@ export function calculateJunkPenalty(items, clusterMetrics = {}, preset = null, 
     reasons.push('no-meme-shape');
   }
 
-  if (raw === 0) return { junkPenalty: 0, junkReasons: [] };
+  // ── Meme-shape boost (applied regardless of penalty state) ─────────
+  // Even a "clean" cluster (no penalties at all) benefits from the boost —
+  // this is what gives lonely single-source meme titles a chance to reach
+  // LLM via the emergenceScore gate.
+  const memeShapeSignals = [];
+  if (hasAnimal)       memeShapeSignals.push('animal');
+  if (hasAbsurd)       memeShapeSignals.push('absurd');
+  if (hasMeme)         memeShapeSignals.push('meme');
+  if (hasHeartwarming) memeShapeSignals.push('heartwarming');
+
+  const perSignalBoost = profile.memeShapeBoost || 0;
+  const signalCount    = memeShapeSignals.length;
+  const memeShapeBoost = perSignalBoost > 0 && signalCount > 0
+    ? Math.round(perSignalBoost * (signalCount >= 2 ? 1.5 : 1))
+    : 0;
 
   // ── Safe-signal override ───────────────────────────────────────────
   // Strong meme signals heavily offset the junk penalty.
   // E.g. "weird goat at government event" → politics penalty but animal overrides.
-  if (hasMemeShape) {
-    const safeCount = [hasAnimal, hasAbsurd, hasMeme, hasHeartwarming].filter(Boolean).length;
-    const baseDiv   = profile.safeOverrideDivisor || 3;
-    const divisor   = safeCount >= 2 ? baseDiv + 1 : baseDiv;
+  if (raw > 0 && hasMemeShape) {
+    const baseDiv = profile.safeOverrideDivisor || 3;
+    const divisor = signalCount >= 2 ? baseDiv + 1 : baseDiv;
     raw = Math.round(raw / divisor);
     reasons.push(`safe-override(÷${divisor})`);
   }
 
   return {
-    junkPenalty: Math.min(raw, 100),
-    junkReasons: reasons,
+    junkPenalty:      Math.min(raw, 100),
+    junkReasons:      reasons,
+    memeShapeBoost,
+    memeShapeSignals,
   };
 }

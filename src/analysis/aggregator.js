@@ -45,8 +45,8 @@ class Aggregator {
         if (!existing.sources.includes(trend.source)) {
           existing.sources.push(trend.source);
         }
-        // Boost score for multi-source trends
-        existing.multiSourceBonus = (existing.multiSourceBonus || 0) + 10;
+        // Multi-source bonus disabled — in practice it rewards news/politics
+        // (which tend to hit every platform) and starves single-platform memes.
       } else {
         groups.set(key, { ...trend, sources: [trend.source] });
       }
