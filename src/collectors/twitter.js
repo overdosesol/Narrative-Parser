@@ -266,6 +266,11 @@ class TwitterCollector extends BaseCollector {
       ? (Date.now() - new Date(createdAt).getTime()) / 3_600_000
       : 0;
 
+    // Drop stale tweets — default 72h, admin-configurable via 'twitterMaxAgeHours'.
+    // 0 disables the filter. Only applies when the tweet has a createdAt.
+    const maxAgeHours = Number(this.db?.getSetting('twitterMaxAgeHours', 72) ?? 72) || 0;
+    if (createdAt && maxAgeHours > 0 && ageHours > maxAgeHours) return null;
+
     const title = this._buildTitle(text, hashtags, tickers);
 
     // Media — works for both photos and videos (preview frame)
@@ -292,28 +297,74 @@ class TwitterCollector extends BaseCollector {
         return url.toString();
       } catch (_) { return u; }
     };
+    // Helper: extract image URLs from a given media array into `imageUrls`.
+    // Dedupes against existing entries; caps the final list at 10.
+    const pushImagesFrom = (list) => {
+      if (!Array.isArray(list)) return;
+      for (const m of list) {
+        const raw = pickUrl(m);
+        const url = upgrade(raw);
+        if (url && !imageUrls.includes(url)) imageUrls.push(url);
+        if (imageUrls.length >= 10) break;
+      }
+    };
+
+    // Helper: extract the best MP4 video URL from a media array.
+    const pickVideoFrom = (list) => {
+      if (!Array.isArray(list)) return null;
+      for (const m of list) {
+        const type = m?.type;
+        if (type !== 'video' && type !== 'animated_gif') continue;
+        const variants = m.video_info?.variants || m.variants || [];
+        const mp4s = variants
+          .filter(v => (v.content_type || v.contentType || '').includes('mp4') || /\.mp4(\?|$)/i.test(v.url || ''))
+          .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        const best = mp4s[0]?.url;
+        if (best) return best;
+      }
+      return null;
+    };
+
     // All photo URLs (preserve order, dedupe); cap 10 for Telegram media group.
+    // Order: (1) main tweet images, (2) quoted tweet images, (3) reply-parent
+    // images. This keeps the tweet's own content primary while still surfacing
+    // the referenced media — crucial for quote tweets where the "story" lives
+    // entirely in the embedded card.
     const imageUrls = [];
-    for (const m of mediaList) {
-      const raw = pickUrl(m);
-      const url = upgrade(raw);
-      if (url && !imageUrls.includes(url)) imageUrls.push(url);
-      if (imageUrls.length >= 10) break;
+    pushImagesFrom(mediaList);
+
+    // Quoted tweet — multiple Apify/X API shapes. fxtwitter uses `quote`,
+    // apidojo/kaitoeasy usually `quoted_tweet` / `quotedStatus`.
+    const quoted = tweet.quote || tweet.quoted_tweet || tweet.quotedStatus
+                 || tweet.quoted_status || tweet.retweeted_tweet || null;
+    if (quoted) {
+      const qMedia = quoted.media?.length ? quoted.media
+                   : (quoted.entities?.media || quoted.media?.all || []);
+      pushImagesFrom(qMedia);
     }
+
+    // Reply-parent tweet — when the current tweet is itself a reply and the
+    // parent carries the original content (e.g. a thread starter with the
+    // screenshot). Less common in Apify payloads; fetched when exposed.
+    const replyParent = tweet.in_reply_to_tweet || tweet.in_reply_to_status
+                      || tweet.replying_to || null;
+    if (replyParent) {
+      const rMedia = replyParent.media?.length ? replyParent.media
+                   : (replyParent.entities?.media || []);
+      pushImagesFrom(rMedia);
+    }
+
     const thumbnailUrl = imageUrls[0] || null;
 
-    // Best video URL — scan media for type=video/animated_gif and pick the
-    // highest-bitrate MP4 variant. Twitter videos carry audio in the variant.
-    let videoUrl = null;
-    for (const m of mediaList) {
-      const type = m?.type;
-      if (type !== 'video' && type !== 'animated_gif') continue;
-      const variants = m.video_info?.variants || m.variants || [];
-      const mp4s = variants
-        .filter(v => (v.content_type || v.contentType || '').includes('mp4') || /\.mp4(\?|$)/i.test(v.url || ''))
-        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      const best = mp4s[0]?.url;
-      if (best) { videoUrl = best; break; }
+    // Best video URL — main tweet first, then quoted/reply-parent as fallback.
+    let videoUrl = pickVideoFrom(mediaList);
+    if (!videoUrl && quoted) {
+      const qMedia = quoted.media?.length ? quoted.media : (quoted.entities?.media || []);
+      videoUrl = pickVideoFrom(qMedia);
+    }
+    if (!videoUrl && replyParent) {
+      const rMedia = replyParent.media?.length ? replyParent.media : (replyParent.entities?.media || []);
+      videoUrl = pickVideoFrom(rMedia);
     }
 
     return {
@@ -381,11 +432,20 @@ class TwitterCollector extends BaseCollector {
       const keys = [...tickers, ...hashtags].slice(0, 3);
       const clusterKey = keys.length > 0 ? keys[0] : tweet.title.substring(0, 30);
 
+      // Per-tweet engagement velocity (likes/hour). Reused both for the
+      // initial cluster seed and every merged tweet — we accumulate the sum
+      // of rates so the cluster velocity reflects real-time traction across
+      // all tweets, not just cluster size.
+      const tweetEngagement = (tweet.metrics.likes || 0) + (tweet.metrics.retweets || 0) * 2;
+      const tweetAge = Math.max(tweet.metrics.ageHours || 0, 0.25); // floor at 15min
+      const tweetVelocity = tweetEngagement / tweetAge;
+
       if (!clusters.has(clusterKey)) {
-        clusters.set(clusterKey, { ...tweet, _count: 1 });
+        clusters.set(clusterKey, { ...tweet, _count: 1, _velocitySum: tweetVelocity });
       } else {
         const c = clusters.get(clusterKey);
         c._count++;
+        c._velocitySum = (c._velocitySum || 0) + tweetVelocity;
         c.metrics.views    = (c.metrics.views    || 0) + (tweet.metrics.views    || 0);
         c.metrics.likes    = (c.metrics.likes    || 0) + (tweet.metrics.likes    || 0);
         c.metrics.retweets = (c.metrics.retweets || 0) + (tweet.metrics.retweets || 0);
@@ -410,7 +470,8 @@ class TwitterCollector extends BaseCollector {
           tweetCount: cluster._count,
           // upvotes-equivalent for scorer
           upvotes: (cluster.metrics.likes || 0) + (cluster.metrics.retweets || 0) * 2,
-          velocity: cluster._count,
+          // Likes/hour — sum of per-tweet rates, mirrors Reddit's velocity
+          velocity: Math.round(cluster._velocitySum || 0),
         },
       }));
   }

@@ -3,15 +3,22 @@
  */
 export default {
   // ── Bot welcome & commands ─────────────────────────────────────────────
-  welcome: `\u{1F680} <b>Welcome to Catalyst!</b>
+  welcome: `\u{1F431} <b>Hey! Meet Catalyst</b>
 
-24/7 AI-powered trend monitoring for memecoin narratives.
+\u{1F916} It scans Twitter, TikTok, Reddit and Google Trends - the moment something starts going viral, you get an alert.
 
-I analyze Reddit, Google Trends, Twitter/X, and TikTok to find viral trends that could spawn Solana memecoins.
+\u{1F3AF} <b>What's in the alert:</b>
+\u2022 How hot the trend is (0\u2013100)
+\u2022 The catalyst behind the hype
+\u2022 What exactly happened
+\u2022 A plain-English explanation
+\u2022 View/like numbers
 
-Use the menu below to configure your preferences.`,
+Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
 
-  welcomeBack: (plan) => `\u{1F44B} <b>Welcome back!</b>\nYour plan: <b>${plan}</b>\nUse /menu to manage settings.`,
+\u{1D54F} <a href="https://x.com/Catalystparser">Follow us on X</a>`,
+
+  welcomeBack: (plan) => `\u{1F44B} <b>Welcome back!</b>\n\nYour plan: <b>${plan}</b>\nUse /menu any time to tweak settings.`,
 
   // ── Main menu ──────────────────────────────────────────────────────────
   menuTitle: '\u{2699}\u{FE0F} <b>Settings</b>\n\nManage your Catalyst preferences:',
@@ -21,6 +28,8 @@ Use the menu below to configure your preferences.`,
   btnSubscription: '\u{1F4B3} Subscription',
   btnTop: '\u{1F525} Top Trends',
   btnStartStop: (paused) => paused ? '\u{25B6}\u{FE0F} Resume Alerts' : '\u{23F8}\u{FE0F} Pause Alerts',
+  btnFollowX: '\u{1D54F} Follow @Catalystparser',
+  btnAskQuestion: '\u{1F4AC} Ask a question',
   btnOpenMenu: '\u2699\uFE0F Open Menu',
   btnBack: '\u{25C0}\u{FE0F} Back',
   btnClose: '\u{274C} Close',
@@ -80,17 +89,22 @@ Use the menu below to configure your preferences.`,
   paymentPending: '\u{23F3} Waiting for payment confirmation...',
 
   // ── Alerts ─────────────────────────────────────────────────────────────
-  alertHeader: (score) => `${scoreEmoji(score)} <b>TREND ALERT</b> [Meme Potential: ${score}/100]`,
+  alertHeader: (score) => `${scoreEmoji(score)} <b>${score}/100</b> \u00B7 TREND ALERT`,
+  alertTrigger: 'Trigger',
+  alertAI: 'AI',
   alertCategory: 'Category',
   alertViralityScore: 'Virality',
   alertSentiment: 'Sentiment',
   alertForecast: 'Forecast',
   alertSources: 'Sources',
-  alertUpvotes: (count, velocity) => `\u{1F4C8} Upvotes: ${count} (${velocity}/hr)`,
-  alertComments: (count) => `\u{1F4AC} Comments: ${count}`,
-  alertGoogleTraffic: (traffic) => `\u{1F4CA} Google Traffic: ${traffic}`,
-  alertTwitterHeader: (hours) => `\u{1F426} <b>Twitter in ${hours}h:</b>`,
-  alertOpen: 'Open',
+  alertUpvotes:    (count, velocity) => `\u{1F4C8} <b>${count}</b> upvotes (\u2191${velocity}/hr)`,
+  alertLikes:      (count, velocity) => `\u{2764}\u{FE0F} <b>${count}</b> likes (\u2191${velocity}/hr)`,
+  alertPlays:      (count, velocity) => `\u{25B6}\u{FE0F} <b>${count}</b> plays (\u2191${velocity}/hr)`,
+  alertGoogleHits: (count)           => `\u{1F4CA} Search interest: <b>${count}</b>`,
+  alertComments: (count) => `\u{1F4AC} <b>${count}</b> comments`,
+  alertGoogleTraffic: (traffic) => `\u{1F4CA} Google traffic: <b>${traffic}</b>`,
+  alertTwitterHeader: (hours) => `\u{1F426} <b>Twitter \u00B7 ${hours}h</b>`,
+  alertOpen: 'Open link',
 
   // ── Top command ────────────────────────────────────────────────────────
   topSelectorTitle: '\u{1F525} <b>Top Narratives</b>\n\nHow many trends to show?',
@@ -115,6 +129,7 @@ Use the menu below to configure your preferences.`,
 
   // ── X Analysis ─────────────────────────────────────────────────────────
   xAnalysisBtn: '\u{1F426} X Analysis',
+  btnAskGrok:   '\u{1F9E0} Ask Grok',
   xAnalysisLockedBtn: '\u{1F512} X Analysis (Locked)',
   xAnalysisLocked: '\u{1F512} X Analysis is not available on Test plan. Upgrade to Pro.',
   xAnalysisLoading: '\u{23F3} Loading...',

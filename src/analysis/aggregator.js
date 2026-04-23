@@ -9,18 +9,17 @@ class Aggregator {
 
   /**
    * Process raw collected trends:
-   * 1. Deduplicate within the batch
-   * 2. Filter out already-seen trends (from DB)
-   * 3. Merge multi-source trends
+   * 1. Deduplicate within the batch by identity (externalId / URL) only —
+   *    titles are NOT used, so posts with similar wording survive and get
+   *    grouped semantically by the clusterer downstream.
+   * 2. Filter out trends already seen in DB.
    */
   process(allTrends) {
     this.logger.info(`Aggregator: processing ${allTrends.length} raw trends`);
 
-    // Step 1: Deduplicate within batch by title similarity
-    const deduped = this._deduplicateByTitle(allTrends);
-    this.logger.info(`After dedup: ${deduped.length} unique trends`);
+    const deduped = this._deduplicateByIdentity(allTrends);
+    this.logger.info(`After identity dedup: ${deduped.length} unique trends`);
 
-    // Step 2: Filter out trends already seen in DB by URL or ID (avoid matching English vs Russian titles)
     const newTrends = deduped.filter(trend => {
       const seen = this.db.isTrendSeen(trend.externalId, trend.title, trend.url, 12);
       if (seen) {
@@ -33,36 +32,25 @@ class Aggregator {
     return newTrends;
   }
 
-  _deduplicateByTitle(trends) {
-    const groups = new Map();
+  _deduplicateByIdentity(trends) {
+    const seenIds = new Set();
+    const seenUrls = new Set();
+    const out = [];
 
     for (const trend of trends) {
-      const key = this._normalizeTitle(trend.title);
-      if (groups.has(key)) {
-        // Merge: keep the one with higher engagement
-        const existing = groups.get(key);
-        existing.sources = existing.sources || [existing.source];
-        if (!existing.sources.includes(trend.source)) {
-          existing.sources.push(trend.source);
-        }
-        // Multi-source bonus disabled — in practice it rewards news/politics
-        // (which tend to hit every platform) and starves single-platform memes.
-      } else {
-        groups.set(key, { ...trend, sources: [trend.source] });
-      }
+      const idKey  = trend.externalId ? `${trend.source}:${trend.externalId}` : null;
+      const urlKey = trend.url || null;
+
+      if (idKey && seenIds.has(idKey))   continue;
+      if (urlKey && seenUrls.has(urlKey)) continue;
+
+      if (idKey)  seenIds.add(idKey);
+      if (urlKey) seenUrls.add(urlKey);
+
+      out.push({ ...trend, sources: [trend.source] });
     }
 
-    return Array.from(groups.values());
-  }
-
-  _normalizeTitle(title) {
-    return title
-      .toLowerCase()
-      // Keep all Unicode letters/digits (Latin, Cyrillic, CJK, Arabic, etc.)
-      .replace(/[^\p{L}\p{N}\s]/gu, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .substring(0, 80);
+    return out;
   }
 }
 

@@ -162,6 +162,40 @@ ADJUSTMENT RULES:
 • No meaningful X discussion found → slight reduction (5-15) for lack of buzz
 • Genuine cultural moment, shareable, meme-shaped → lean toward the upper end of the range
 
+━━━ STORY / NARRATIVE DEPTH (storyScore) ━━━
+Judge the STICKINESS of the story itself, separate from raw virality. A rich story-hook is what turns a generic cute animal into a legendary coin (Moo Deng, Peanut the Squirrel, Punch the monkey bullied by her troop in a Japanese zoo whose only possession is her toy — THAT is a story, not just "monkey pic").
+
+storyScore rubric (0-100):
+• 85-100: Named character + clear conflict + emotional stakes + shareable backstory (the Punch monkey, Peanut the squirrel seized by the government, Moo Deng's personality arc, a dog saving its owner, an underdog human interest story with a face and a name).
+• 60-84: Strong character or situation with a concrete, memorable hook — named subject, unusual circumstance, or a clear "what happened and why it matters" narrative.
+• 30-59: Mild hook — specific moment or character but without deep stakes or arc (e.g. "this cat reacted funny to vacuum").
+• 0-29: No character, no story, no stakes — generic cute pet, random meme format, news headline without a human/animal anchor.
+
+IMPORTANT: storyScore is ADDITIVE to memePotential downstream — high storyScore BOOSTS, low storyScore does NOT penalize. So do not lower memePotential just because a post lacks a story; simply reflect the story depth honestly in storyScore.
+
+━━━ SUBJECT NAME / TICKER CANDIDATE (subjectName + nameStrength) ━━━
+From the same X search results, identify whether the narrative has a SPECIFIC PROPER NAME that degens could turn into a ticker. This is separate from storyScore — you can have a great story without a tickerable name, and a mediocre story with a killer name. Both bonuses stack.
+
+What counts as a subjectName:
+• Named animal / character: "Peanut", "Moo Deng", "Punch", "Fumo", "Doug the Pug"
+• Named person tied to the narrative: "Elon", "Trump", "Hawk Tuah girl"
+• Short branded phrase / catchphrase: "Hawk Tuah", "Skibidi", "Fanum Tax"
+• Existing ticker mentioned on X: "$BONK", "$WIF", "$CHILLGUY"
+
+What does NOT count (return "" for subjectName):
+• Generic descriptors: "the cat", "this dog", "a frog"
+• Long phrases (>3 words) that won't fit a ticker
+• Topic labels without a character: "AI art", "election drama"
+• Politicians / news figures where the narrative is the event, not the person
+
+nameStrength rubric (0-100) — how tickerable the name is:
+• 85-100: Short (1-2 syllables), phonetic, unique, already memed on X, natural ticker ($PEANUT, $MOODENG, $PUNCH). Degens will use this exact string.
+• 60-84: Solid name — 1-3 words, memorable, clearly attached to the narrative, easily shortened to a ticker.
+• 30-59: Name exists but is long, generic, or competes with existing tokens (e.g. "Brian the Dog" — fine but forgettable).
+• 0-29: Weak or no name — only generic descriptors available, or a name so long/bland it won't stick.
+
+IMPORTANT: nameStrength is ADDITIVE, booster-only, NEVER penalizes. If there is no clean name, return subjectName: "" and nameStrength: 0 — the trend simply gets no bonus, not a penalty.
+
 Always respond with ONLY valid JSON. No markdown, no preamble.`;
 
 export function buildStage2Prompt(trend) {
@@ -182,6 +216,10 @@ Search X/Twitter for discussions about this trend (the NARRATIVE, not coins). Th
 - "narrativeMomentum" : one of [fading, flat, building, exploding] — is the conversation growing or dying?
 - "organicity"        : one of [organic, mixed, astroturf] — does the buzz look like real people or bots/spam?
 - "xSentiment"        : one of [positive, negative, neutral, mixed]
+- "storyScore"        : 0-100 — narrative depth / story-hook strength (see rubric in system prompt). Booster-only, never penalizes generic content.
+- "storyHook"         : ONE short sentence naming the actual story (character, conflict, stakes). Empty string if storyScore < 30. — IN ENGLISH
+- "subjectName"       : the specific proper name/ticker candidate attached to the narrative (e.g. "Peanut", "Moo Deng", "Hawk Tuah", "$BONK"), or "" if none. See rubric in system prompt. Booster-only.
+- "nameStrength"      : 0-100 — how tickerable that name is (see rubric). Return 0 if subjectName is "". Booster-only, never penalizes.
 - "adjustment"        : brief explanation of what you found on X and why you adjusted scores — IN ENGLISH
 - "whyItWillPump"     : updated degen pitch focused on the NARRATIVE — IN ENGLISH (empty string if memePotential < 30)
 

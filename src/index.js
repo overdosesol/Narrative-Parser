@@ -31,7 +31,7 @@ const scorer     = new Scorer(config, logger, db);
 // ── Initialize Telegram Bot ─────────────────────────────────────────────────
 const telegram = new TelegramNotifier(config, logger, db); // solanaMonitor injected below
 // Prune muxed video cache on startup (files older than 7 days)
-try { telegram.cleanupVideoCache(7); } catch {}
+try { telegram.cleanupVideoCache(5); } catch {}
 
 // ── Initialize Solana Pay Monitor ───────────────────────────────────────────
 const solanaMonitor = new SolanaPayMonitor(
@@ -69,7 +69,6 @@ if (config.tiktok.enabled)       collectors.push(new TikTokCollector(config, log
 
 logger.info(`Active collectors: ${collectors.map(c => c.name).join(', ') || 'none'}`);
 logger.info(`Alert threshold (global default): ${config.alertThreshold}/100`);
-logger.info(`Virality threshold (global default): ${config.viralityThreshold}/100`);
 logger.info(`Scan interval: ${config.scanIntervalMinutes} minutes`);
 
 function normalizeThreshold(value, fallback) {
@@ -90,11 +89,23 @@ const appState = {
   scanRunning: false,
   disabledCollectors: new Set(),
   lastStorageCheckAt: 0,
+  // Pipeline observability — drives the admin flow-diagram animation.
+  // currentStage: idle|collect|dedupe|cluster|ai|save|alerts|done
+  currentStage: 'idle',
+  stageStartedAt: null,
+  cycleStartedAt: null,
+  cycleInProgress: null,   // live per-stage counters for the active cycle
+  lastCycle: null,         // snapshot of the previous completed cycle
   // Ring buffer of per-trend alert-gate decisions (last N). Mirrored to the
   // admin UI so you can see exactly why a trend was or wasn't alerted.
   alertDecisions: [],
   alertDecisionsCap: 500,
 };
+
+function setPipelineStage(stage) {
+  appState.currentStage = stage;
+  appState.stageStartedAt = Date.now();
+}
 
 function recordAlertDecision(rec) {
   appState.alertDecisions.push({ ts: new Date().toISOString(), ...rec });
@@ -150,7 +161,10 @@ const dashboard = new DashboardServer(config, logger, db, appState, () => runSca
 dashboard.start();
 
 // ── Initialize admin panel ──────────────────────────────────────────────────
-const admin = new AdminServer(config, logger, db, telegram.bot, appState, () => runScanCycle());
+const admin = new AdminServer(config, logger, db, telegram.bot, appState, () => runScanCycle(), {
+  scorer,
+  telegram,       // full wrapper — needed for sendAlertToUser + attachXButton
+});
 admin.start();
 
 // ── Start Solana Pay monitor ────────────────────────────────────────────────
@@ -173,6 +187,11 @@ async function runScanCycle() {
   try { dashboard.broadcast('scan-start', { at: Date.now() }); } catch (e) {}
 
   const cycleStart = Date.now();
+  appState.cycleStartedAt = cycleStart;
+  appState.cycleInProgress = {
+    collect: 0, dedupe: 0, cluster: 0, ai: 0, save: 0, alerts: 0,
+  };
+  setPipelineStage('collect');
   logger.info('────── Starting scan cycle ──────');
 
   try {
@@ -188,6 +207,7 @@ async function runScanCycle() {
       const items = await collector.safeCollect();
       allRawTrends.push(...items);
     }
+    appState.cycleInProgress.collect = allRawTrends.length;
 
     if (allRawTrends.length === 0) {
       logger.info('No trends collected this cycle');
@@ -196,14 +216,18 @@ async function runScanCycle() {
     logger.info(`Total raw trends collected: ${allRawTrends.length}`);
 
     // Step 2: Aggregate & deduplicate
+    setPipelineStage('dedupe');
     const newTrends = aggregator.process(allRawTrends);
+    appState.cycleInProgress.dedupe = newTrends.length;
     if (newTrends.length === 0) {
       logger.info('No new trends after deduplication');
       return;
     }
 
     // Step 2.5: Pre-AI cluster routing — signal quality layer
+    setPipelineStage('cluster');
     const { priority, toScore, toSave, droppedCount } = clusterer.route(newTrends);
+    appState.cycleInProgress.cluster = (priority?.length || 0) + (toScore?.length || 0);
 
     // Save "save_only" items directly (no AI cost, no alerts)
     for (const trend of toSave) {
@@ -229,10 +253,13 @@ async function runScanCycle() {
     }
 
     // Step 3: AI scoring
+    setPipelineStage('ai');
     logger.info(`Running AI scoring on ${toScoreAll.length} trends (${priority.length} priority)...`);
     const scoredTrends = await scorer.scoreTrends(toScoreAll);
+    appState.cycleInProgress.ai = scoredTrends.length;
 
     // Step 4: Filter — drop politics/spam
+    setPipelineStage('save');
     const validTrends = scoredTrends.filter(t =>
       t.category !== 'politics' && t.isGenuinelyInteresting !== false
     );
@@ -247,6 +274,7 @@ async function runScanCycle() {
       const trendId = db.saveTrend({ ...trend, pipelineStatus: 'scored' });
       trend._dbId = trendId;
     }
+    appState.cycleInProgress.save = allToSave.length;
 
     logger.info(`Scored ${scoredTrends.length} trends, saved ${allToSave.length}`);
 
@@ -292,6 +320,7 @@ async function runScanCycle() {
       `emerge=${alertWeights.weightEmergence}, x=${alertWeights.weightTwitter}, ` +
       `junk×${alertWeights.weightJunk}, hardJunk>=${alertWeights.hardJunkStop})`
     );
+    setPipelineStage('alerts');
     logger.info(`Sending alerts to ${activeUsers.length} active user(s)`);
 
     // Sort by alertScore descending (fallback chain for legacy rows)
@@ -413,7 +442,7 @@ async function runScanCycle() {
 
           // Attach X Analysis button (only for the first user's message — use their chat as anchor)
           if (sent.messageId) {
-            await telegram.attachXButton(sent.chatId, sent.messageId, trend._dbId, user);
+            await telegram.attachXButton(sent.chatId, sent.messageId, trend._dbId, user, trend);
 
             // Save tg_message_id to trend for reaction tracking (use first message sent)
             const existing = db.getTrendById(trend._dbId);
@@ -431,6 +460,7 @@ async function runScanCycle() {
       }
 
       if (alertsSentThisCycle > 0) {
+        appState.cycleInProgress.alerts += alertsSentThisCycle;
         logger.info(`Sent ${alertsSentThisCycle} alert(s) to user ${user.telegram_chat_id}`);
       }
     }
@@ -441,6 +471,19 @@ async function runScanCycle() {
   } catch (error) {
     logger.error(`Scan cycle failed: ${error.message}`, { stack: error.stack });
   } finally {
+    // Snapshot the cycle as "last completed" so the admin flow diagram keeps
+    // showing meaningful numbers between scans instead of dashes.
+    if (appState.cycleInProgress) {
+      appState.lastCycle = {
+        ...appState.cycleInProgress,
+        startedAt:   appState.cycleStartedAt,
+        completedAt: Date.now(),
+        durationMs:  Date.now() - (appState.cycleStartedAt || Date.now()),
+      };
+    }
+    appState.cycleInProgress = null;
+    appState.cycleStartedAt = null;
+    setPipelineStage('idle');
     appState.scanRunning = false;
     // Notify all connected dashboard clients that fresh data is available
     try { dashboard.broadcast('refresh', { at: Date.now() }); } catch (e) {}

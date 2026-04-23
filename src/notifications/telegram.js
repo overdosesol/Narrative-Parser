@@ -9,6 +9,25 @@ import TwitterChecker from '../collectors/twitter-check.js';
 import { UserRateLimiter } from '../utils/rate-limiter.js';
 
 /**
+ * Build a deep-link to grok.com with a pre-filled prompt asking Grok to
+ * assess the narrative's current virality. Returns null when the trend is
+ * missing the bits needed to form a useful prompt.
+ * grok.com accepts `?q=<url-encoded-text>` and auto-sends it as the first message.
+ */
+function buildGrokUrl(trend, lang = 'en') {
+  if (!trend) return null;
+  const title = trend.titleEn || trend.title_en || trend.original_title || trend.originalTitle || trend.title || '';
+  const url   = trend.url || '';
+  if (!title && !url) return null;
+
+  const prompt = lang === 'ru'
+    ? `\u041D\u0430\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0432\u0438\u0440\u0443\u0441\u0438\u0442\u0441\u044F \u044D\u0442\u043E\u0442 \u043D\u0430\u0440\u0440\u0430\u0442\u0438\u0432 \u043F\u0440\u044F\u043C\u043E \u0441\u0435\u0439\u0447\u0430\u0441? ${title}${url ? ' \u2014 ' + url : ''}`
+    : `How viral is this narrative right now? ${title}${url ? ' \u2014 ' + url : ''}`;
+
+  return `https://grok.com/?q=${encodeURIComponent(prompt)}`;
+}
+
+/**
  * Multi-user Telegram bot with inline keyboard management.
  * Each user has their own language, sources, threshold, and subscription.
  */
@@ -117,18 +136,10 @@ class TelegramNotifier {
         return;
       }
 
-      if (user.created_at === user.last_seen_at) {
-        // New user
-        this.bot.sendMessage(chatId, t.welcome, {
-          parse_mode: 'HTML',
-          reply_markup: this._startKeyboard(user),
-        });
-      } else {
-        this.bot.sendMessage(chatId, t.welcomeBack(user.plan_name), {
-          parse_mode: 'HTML',
-          reply_markup: this._startKeyboard(user),
-        });
-      }
+      this.bot.sendMessage(chatId, t.welcome, {
+        parse_mode: 'HTML',
+        reply_markup: this._startKeyboard(user),
+      });
     });
 
     // /menu — show settings menu
@@ -425,6 +436,8 @@ class TelegramNotifier {
     return {
       inline_keyboard: [
         [{ text: t.btnOpenMenu || '⚙️ Open Menu', callback_data: 'menu' }],
+        [{ text: t.btnFollowX || '𝕏 Follow @Catalystparser', url: 'https://x.com/Catalystparser' }],
+        [{ text: t.btnAskQuestion || '💬 Ask a question', url: 'https://t.me/support-bot' }],
       ],
     };
   }
@@ -437,6 +450,7 @@ class TelegramNotifier {
         [{ text: t.btnLanguage, callback_data: 'language' }, { text: t.btnSubscription, callback_data: 'subscription' }],
         [{ text: t.btnTop, callback_data: 'top' }],
         [{ text: t.btnStartStop(user.status === 'paused'), callback_data: 'toggle_pause' }],
+        [{ text: t.btnAskQuestion || '💬 Ask a question', url: 'https://t.me/support-bot' }],
         [{ text: t.btnClose, callback_data: 'close' }],
       ]
     };
@@ -764,12 +778,24 @@ class TelegramNotifier {
 
   // ── Send alert to a specific user ─────────────────────────────────────────
 
-  async sendAlertToUser(trend, user) {
+  async sendAlertToUser(trend, user, opts = {}) {
     if (!this.enabled || !this.bot) return false;
 
     try {
       const t = getTranslations(user.language);
-      const message = formatTelegramAlert(trend, user.language);
+      let message = formatTelegramAlert(trend, user.language);
+      // Optional admin comment prepended to the alert body. Used by the
+      // "📨 Отправить алерт" button on SubmitPage — lets the operator add
+      // context (e.g. "смотрите реплаи под этим постом") without editing
+      // the formatter. HTML-escaped to match parse_mode: 'HTML'.
+      const rawComment = typeof opts.comment === 'string' ? opts.comment.trim() : '';
+      if (rawComment) {
+        const esc = rawComment
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+        message = `💬 <b>${esc}</b>\n\n` + message;
+      }
       const chatId = user.telegram_chat_id;
 
       // Collect all available images (deduped). Prefer the array collected by
@@ -854,21 +880,22 @@ class TelegramNotifier {
         }
       } else if (imageUrls.length >= 2) {
         try {
-          const media = imageUrls.map((u, i) => ({
-            type: 'photo',
-            media: u,
-            ...(i === 0 && fitsInCaption ? { caption: message, parse_mode: 'HTML' } : {}),
-          }));
-          const group = await this.bot.sendMediaGroup(chatId, media);
-          sentMsg = Array.isArray(group) ? group[0] : group;
-          if (!fitsInCaption) {
-            // Follow-up text (replied to the first media item) for the full body
-            await this.bot.sendMessage(chatId, message, {
-              parse_mode: 'HTML',
-              disable_web_page_preview: true,
-              reply_to_message_id: sentMsg?.message_id,
-            });
-          }
+          // Media groups (albums) do NOT support inline_keyboard on their
+          // items — Telegram Bot API limitation. So we send the album WITHOUT
+          // a caption and post the full body as a follow-up text message that
+          // CAN host buttons. We return the follow-up's message_id as the
+          // anchor so attachAlertButtons wires X Analysis / Ask Grok / 👍👎
+          // to a message that accepts them.
+          const media = imageUrls.map((u) => ({ type: 'photo', media: u }));
+          // Send the album silently — the follow-up text message is what
+          // triggers the single notification ping (with buttons attached).
+          const group = await this.bot.sendMediaGroup(chatId, media, { disable_notification: true });
+          const albumAnchor = Array.isArray(group) ? group[0] : group;
+          sentMsg = await this.bot.sendMessage(chatId, message, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            reply_to_message_id: albumAnchor?.message_id,
+          });
         } catch (err) {
           this.logger.warn(`sendMediaGroup failed (${err.message}) — falling back to sendPhoto`);
           try {
@@ -932,10 +959,12 @@ class TelegramNotifier {
   }
 
   /**
-   * Attach all alert buttons: X Analysis + 👍/👎 feedback.
+   * Attach all alert buttons: X Analysis + Ask Grok + 👍/👎 feedback.
+   * `trend` is optional — when provided, we add a deep-link button that opens
+   * grok.com with a pre-filled prompt asking about the narrative's virality.
    * Replaces the old attachXButton (kept as alias for compatibility).
    */
-  async attachAlertButtons(chatId, messageId, dbId, userOrLang = 'en') {
+  async attachAlertButtons(chatId, messageId, dbId, userOrLang = 'en', trend = null) {
     if (!this.bot || !messageId || !dbId) return;
     const lang = typeof userOrLang === 'string' ? userOrLang : (userOrLang?.language || 'en');
     const plan = typeof userOrLang === 'object' ? userOrLang?.plan_name : null;
@@ -943,11 +972,18 @@ class TelegramNotifier {
     const isLocked = plan === 'test';
     const xText = isLocked ? (t.xAnalysisLockedBtn || '\u{1F512} X Analysis') : t.xAnalysisBtn;
     const xData = isLocked ? 'x_locked' : `x_analysis:${dbId}`;
+
+    const topRow = [{ text: xText, callback_data: xData }];
+    const grokUrl = buildGrokUrl(trend, lang);
+    if (grokUrl) {
+      topRow.push({ text: t.btnAskGrok, url: grokUrl });
+    }
+
     try {
       await this.bot.editMessageReplyMarkup(
         {
           inline_keyboard: [
-            [{ text: xText, callback_data: xData }],
+            topRow,
             [
               { text: '\u{1F44D}', callback_data: `feedback:1:${dbId}` },
               { text: '\u{1F44E}', callback_data: `feedback:-1:${dbId}` },
@@ -961,9 +997,9 @@ class TelegramNotifier {
     }
   }
 
-  /** Backward-compat alias */
-  async attachXButton(chatId, messageId, dbId, userOrLang = 'en') {
-    return this.attachAlertButtons(chatId, messageId, dbId, userOrLang);
+  /** Backward-compat alias — forwards trend so the Grok button appears. */
+  async attachXButton(chatId, messageId, dbId, userOrLang = 'en', trend = null) {
+    return this.attachAlertButtons(chatId, messageId, dbId, userOrLang, trend);
   }
 
   // ── X Analysis ────────────────────────────────────────────────────────────

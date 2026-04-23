@@ -19,11 +19,10 @@ export function formatTelegramAlert(trend, lang = 'en') {
   const t = getTranslations(lang);
   const memePotential = trend.memePotential || 0;
 
-  let msg = t.alertHeader(memePotential) + '\n\n';
+  const DIV = '\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501';
+  let msg = t.alertHeader(memePotential) + '\n';
+  msg += DIV + '\n';
 
-  // Title display:
-  // EN users: original English source title (or AI English title)
-  // RU users: show EN source title + RU translated title
   const enTitle = trend.titleEn || trend.originalTitle || trend.original_title || trend.title;
   const ruTitle = (trend.title !== enTitle) ? trend.title : null;
 
@@ -34,14 +33,12 @@ export function formatTelegramAlert(trend, lang = 'en') {
     msg += `\u{1F4CC} <b>${escHtml(enTitle)}</b>\n\n`;
   }
 
-  // Trigger event — rendered only when the model found a concrete cause.
-  // Shown above the longer AI explanation as a one-liner with a 🔥 marker.
   if (trend.whyNow) {
-    msg += `\u{1F525} <b>${escHtml(trend.whyNow)}</b>\n\n`;
+    msg += `\u{1F525} <b>${t.alertTrigger}:</b> ${escHtml(trend.whyNow)}\n\n`;
   }
 
   if (trend.aiExplanation) {
-    msg += `\u{1F916} ${escHtml(trend.aiExplanation)}\n\n`;
+    msg += `\u{1F916} <b>${t.alertAI}:</b> ${escHtml(trend.aiExplanation)}\n\n`;
   }
 
   const sources = trend.sources ? trend.sources.join(', ') : trend.source;
@@ -49,33 +46,43 @@ export function formatTelegramAlert(trend, lang = 'en') {
   const sentiment = t.sentiments[trend.sentiment] || trend.sentiment || t.sentiments.neutral;
   const lifespan = t.lifespans[trend.predictedLifespan] || trend.predictedLifespan || t.lifespans.unknown;
 
-  msg += `\u{1F4C2} ${t.alertCategory}: ${escHtml(category)}\n`;
-  msg += `\u{1F525} ${t.alertViralityScore}: ${trend.score}/100\n`;
-  msg += `\u{1F3AD} ${t.alertSentiment}: ${escHtml(sentiment)}\n`;
-  msg += `\u{23F1} ${t.alertForecast}: ${escHtml(lifespan)}\n`;
-  msg += `\u{1F30D} ${t.alertSources}: ${escHtml(sources)}\n`;
+  msg += DIV + '\n';
+  msg += `${escHtml(category)}  \u00B7  ${escHtml(sentiment)}  \u00B7  ${escHtml(lifespan)}\n`;
+  msg += `\u{1F30D} ${escHtml(sources)}\n`;
 
   if (trend.metrics) {
     const m = trend.metrics;
-    if (m.upvotes) msg += t.alertUpvotes(formatNumber(m.upvotes), formatNumber(m.velocity || 0)) + '\n';
+    const hasEngagement = m.upvotes || m.comments || m.formattedTraffic;
+    if (hasEngagement) msg += DIV + '\n';
+    if (m.upvotes) {
+      const src = (trend.source || '').toLowerCase();
+      const count = formatNumber(m.upvotes);
+      const vel   = formatNumber(m.velocity || 0);
+      if (src === 'twitter')      msg += t.alertLikes(count, vel) + '\n';
+      else if (src === 'tiktok')  msg += t.alertPlays(count, vel) + '\n';
+      else                        msg += t.alertUpvotes(count, vel) + '\n';
+    }
     if (m.comments) msg += t.alertComments(formatNumber(m.comments)) + '\n';
     if (m.formattedTraffic) msg += t.alertGoogleTraffic(escHtml(m.formattedTraffic)) + '\n';
 
     if (m.twitter && m.twitter.tweetCount > 0) {
       const tw = m.twitter;
-      msg += '\n' + t.alertTwitterHeader(tw.windowHours) + '\n';
-      msg += `   Tweets: ${tw.tweetCount}`;
-      if (tw.totalViews > 0)   msg += ` | \u{1F441} ${formatNumber(tw.totalViews)}`;
-      if (tw.totalLikes > 0)   msg += ` | \u{2764}\u{FE0F} ${formatNumber(tw.totalLikes)}`;
-      if (tw.totalRetweets > 0) msg += ` | \u{1F501} ${formatNumber(tw.totalRetweets)}`;
-      msg += '\n';
-      if (tw.viralityScore >= 60) msg += `   \u{1F4E1} Virality: ${tw.viralityScore}/100 \u{1F525}\n`;
-      else msg += `   \u{1F4E1} Virality: ${tw.viralityScore}/100\n`;
+      msg += DIV + '\n';
+      msg += t.alertTwitterHeader(tw.windowHours) + '\n';
+      const parts = [];
+      if (tw.totalViews > 0)    parts.push(`\u{1F441} <b>${formatNumber(tw.totalViews)}</b>`);
+      if (tw.totalLikes > 0)    parts.push(`\u{2764}\u{FE0F} <b>${formatNumber(tw.totalLikes)}</b>`);
+      if (tw.totalRetweets > 0) parts.push(`\u{1F501} <b>${formatNumber(tw.totalRetweets)}</b>`);
+      if (parts.length) msg += parts.join('  ') + `  \u00B7  ${tw.tweetCount} tweets\n`;
+      else              msg += `${tw.tweetCount} tweets\n`;
+      const flame = tw.viralityScore >= 60 ? ' \u{1F525}' : '';
+      msg += `\u{1F4E1} ${t.alertViralityScore} <b>${tw.viralityScore}/100</b>${flame}\n`;
     }
   }
 
   if (trend.url) {
-    msg += `\n\u{1F517} <a href="${trend.url}">${t.alertOpen}</a>`;
+    msg += DIV + '\n';
+    msg += `\u{1F517} <a href="${trend.url}">${t.alertOpen}</a>`;
   }
 
   return msg;

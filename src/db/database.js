@@ -610,30 +610,48 @@ class TrendDatabase {
 
   isTrendSeen(externalId, title, url) {
     // Logic:
-    //   scored    → block forever (AI already analysed, no point repeating)
-    //   save_only → always allow through with fresh collector metrics so the
-    //               clusterer can re-evaluate based on current engagement.
-    //               The collector itself acts as a natural "freshness gate":
-    //               if a post fell off the feed it won't appear at all.
+    //   save_only → always allow through with fresh collector metrics.
+    //   scored    → re-analysis window. Block if EITHER already alerted to any
+    //               user (no point paying AI again) OR re-scored within the
+    //               cooldown (default 3h — admin-tunable via rescoreCooldownHours).
+    //               Otherwise let it through so AI can re-evaluate with fresh
+    //               engagement and maybe clear the alert gate this time.
+    const cooldownHours = Number(this.getSetting('rescoreCooldownHours', 3)) || 3;
+    const cooldownMs = cooldownHours * 3_600_000;
+
     const _check = (row) => {
       if (!row) return false;
-      if (row.pipeline_status === 'scored') {
+      if (row.pipeline_status !== 'scored') return false; // save_only → pass
+
+      // Already alerted to someone? Don't waste AI re-scoring it.
+      const alerted = this.db.prepare(
+        `SELECT 1 FROM notifications WHERE trend_id = ? LIMIT 1`
+      ).get(row.id);
+      if (alerted) {
         this._touchTrend(row.id);
         return true;
       }
-      // save_only — let it through every scan
+
+      // Inside cooldown window? Skip this scan.
+      const lastSeenMs = row.last_seen_at ? new Date(row.last_seen_at).getTime() : 0;
+      if (lastSeenMs && Date.now() - lastSeenMs < cooldownMs) {
+        this._touchTrend(row.id);
+        return true;
+      }
+
+      // Cooldown expired + never alerted → re-analyse.
       return false;
     };
 
     if (externalId) {
       const row = this.db.prepare(
-        `SELECT id, pipeline_status FROM trends WHERE external_id = ?`
+        `SELECT id, pipeline_status, last_seen_at FROM trends WHERE external_id = ?`
       ).get(externalId);
       if (_check(row)) return true;
     }
     if (url) {
       const row = this.db.prepare(
-        `SELECT id, pipeline_status FROM trends WHERE url = ?`
+        `SELECT id, pipeline_status, last_seen_at FROM trends WHERE url = ?`
       ).get(url);
       if (_check(row)) return true;
     }
@@ -672,6 +690,8 @@ class TrendDatabase {
       junkReasons:    trend.clusterMetrics?.junkReasons ?? [],                           // [JUNK_FILTER]
       alertScore:     trend.alertScore      ?? null,
       alertBreakdown: trend.alertBreakdown  ?? null,
+      storyScore:     trend.xSearchData?.storyScore ?? 0,
+      storyHook:      trend.xSearchData?.storyHook  ?? '',
     });
 
     // UPSERT: if the trend already exists in DB (re-analysis after window expiry),

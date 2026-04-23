@@ -4,22 +4,54 @@ import BaseCollector from './base-collector.js';
  * Reddit collector — uses Reddit JSON API (no auth needed with proper User-Agent)
  *
  * Strategy:
- *  - Fetches r/all and r/popular hot listings (actual upvote counts)
- *  - Filters by minimum upvotes and engagement to surface truly viral content
- *  - 94 upvotes is NOT viral — minimum bar is 5 000 upvotes for r/all
+ *  - Per active preset (see PRESET_SUBREDDITS below) fetches hot listings from
+ *    a curated list of meme-shape-friendly subreddits
+ *  - Filters by minimum upvotes (5 000) to surface truly viral content
+ *  - NICHE_SUBS (crypto) get a lowered bar (1 000) — only triggers when a user
+ *    manually overrides subreddits via env, since crypto subs are no longer in
+ *    any default preset
  */
 
 const MIN_UPVOTES       = 5_000;
 const NICHE_MIN_UPVOTES = 1_000;
 const NICHE_SUBS = new Set(['cryptocurrency', 'cryptomoonshots', 'solana', 'memecoins', 'defi', 'wallstreetbets', 'dogecoin', 'pepecoin', 'shib', 'AICoins']);
 
-// Subreddits per preset — tailored to the active meta
+// Subreddits per preset — tailored to the active meta.
+// Keys MUST match filter-profiles.js PRESET_KEYS (general/animals/culture/celebrities/events).
+// Picked for MEME-SHAPE signal (viral, visual, absurd, wholesome) rather than
+// crypto-native chat. Crypto subs are intentionally NOT here — they're mostly
+// price-chat / shill noise; we want the original meme energy that degens then
+// latch onto. You can still force crypto subs via env override (config.reddit.subreddits).
 const PRESET_SUBREDDITS = {
-  general:  ['all', 'popular', 'cryptocurrency', 'memecoins', 'cryptomoonshots'],
-  animals:  ['dogecoin', 'shib', 'pepecoin', 'memecoins', 'cryptocurrency', 'all'],
-  ai:       ['artificial', 'MachineLearning', 'cryptocurrency', 'memecoins', 'all'],
-  elon:     ['dogecoin', 'elonmusk', 'cryptocurrency', 'wallstreetbets', 'all'],
-  sports:   ['sportsbook', 'nfl', 'nba', 'cryptocurrency', 'memecoins', 'all'],
+  // 🌐 General — broad viral net: aggregators + "interesting" subs
+  general: [
+    'all', 'popular', 'interestingasfuck', 'Damnthatsinteresting',
+    'nextfuckinglevel', 'BeAmazed',
+  ],
+
+  // 🐾 Animals — viral pets, wildlife, cute/funny creatures
+  animals: [
+    'aww', 'AnimalsBeingDerps', 'AnimalsBeingBros', 'AnimalsBeingJerks',
+    'NatureIsFuckingLit', 'Eyebleach', 'rarepuppers', 'capybara',
+  ],
+
+  // 🎭 Culture — memes, internet humor, viral moments
+  culture: [
+    'memes', 'dankmemes', 'Unexpected', 'facepalm', 'TikTokCringe',
+    'OutOfTheLoop', 'KnowYourMeme', 'therewasanattempt',
+  ],
+
+  // ⭐ Celebrities — pop culture, celeb drama, entertainment
+  celebrities: [
+    'popculturechat', 'Fauxmoi', 'entertainment', 'movies', 'television',
+    'popheads', 'hiphopheads',
+  ],
+
+  // 🌍 Events — world events, tech, space, uplifting news
+  events: [
+    'worldnews', 'news', 'UpliftingNews', 'technology', 'space',
+    'Futurology', 'science',
+  ],
 };
 
 class RedditCollector extends BaseCollector {

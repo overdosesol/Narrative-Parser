@@ -526,11 +526,21 @@ class Scorer {
     }
 
     // Store Stage 2 metadata (narrative-focused — no coin search)
+    const storyScore = Math.max(0, Math.min(100, Number(result.storyScore) || 0));
+    const rawSubjectName = typeof result.subjectName === 'string' ? result.subjectName.trim() : '';
+    const subjectName = rawSubjectName.length > 64 ? rawSubjectName.slice(0, 64) : rawSubjectName;
+    const nameStrength = subjectName
+      ? Math.max(0, Math.min(100, Number(result.nameStrength) || 0))
+      : 0;
     trend.xSearchData = {
       xBuzz:              result.xBuzz              || 'unknown',
       narrativeMomentum:  result.narrativeMomentum  || 'unknown',
       organicity:         result.organicity         || 'unknown',
       xSentiment:         result.xSentiment         || 'unknown',
+      storyScore,
+      storyHook:          typeof result.storyHook === 'string' ? result.storyHook : '',
+      subjectName,
+      nameStrength,
       adjustment:         result.adjustment         || '',
     };
 
@@ -578,6 +588,53 @@ class Scorer {
       );
     }
 
+    // Story-hook booster — additive only, never penalizes.
+    // Generic cute-pet posts (low storyScore) stay where they are; narratives
+    // with real character + conflict + stakes (Punch monkey, Peanut squirrel)
+    // get a bump that lets them clear the alert bar on softer raw virality.
+    if (storyScore >= 60) {
+      const storyBonus = Math.min(15, Math.round((storyScore - 60) * 0.4));
+      if (storyBonus > 0) {
+        const beforeMeme = trend.memePotential;
+        trend.memePotential = Math.min(100, trend.memePotential + storyBonus);
+        trend.stage2StoryBonus = {
+          storyScore,
+          bonus: storyBonus,
+          memeBefore: beforeMeme,
+          memeAfter:  trend.memePotential,
+        };
+        this.logger.info(
+          `Stage 2 story bonus "${trend.title}": +${storyBonus} ` +
+          `(storyScore=${storyScore}) meme ${beforeMeme}→${trend.memePotential}`
+        );
+      }
+    }
+
+    // Subject-name / ticker-candidate booster — additive only, never penalizes.
+    // If Grok spotted a clean proper name attached to the narrative (Peanut,
+    // Moo Deng, Hawk Tuah, $BONK) and rated it tickerable, we bump memePotential
+    // a little. Trends without a name get subjectName="" and nameStrength=0 —
+    // they simply don't receive the bonus. No penalty path.
+    // Formula mirrors stage2StoryBonus: threshold 60, max +10, slope 0.25.
+    if (subjectName && nameStrength >= 60) {
+      const nameBonus = Math.min(10, Math.round((nameStrength - 60) * 0.25));
+      if (nameBonus > 0) {
+        const beforeMeme = trend.memePotential;
+        trend.memePotential = Math.min(100, trend.memePotential + nameBonus);
+        trend.stage2NameBonus = {
+          subjectName,
+          nameStrength,
+          bonus: nameBonus,
+          memeBefore: beforeMeme,
+          memeAfter:  trend.memePotential,
+        };
+        this.logger.info(
+          `Stage 2 name bonus "${trend.title}": +${nameBonus} ` +
+          `(subject="${subjectName}", strength=${nameStrength}) meme ${beforeMeme}→${trend.memePotential}`
+        );
+      }
+    }
+
     // Recalculate adoption + phase after Stage 2 adjustments
     trend.adoptionScore  = trend.memePotential;
     trend.narrativePhase = narrativePhase(trend.emergenceScore ?? 0, trend.adoptionScore);
@@ -592,7 +649,7 @@ class Scorer {
     this.logger.info(
       `Stage 2 "${trend.title}": meme ${oldMeme}→${trend.memePotential}, ` +
       `viral ${oldViral}→${trend.score}, buzz: ${trend.xSearchData.xBuzz}, ` +
-      `phase: ${trend.narrativePhase}`
+      `story: ${storyScore}, phase: ${trend.narrativePhase}`
     );
 
     return { inputTokens, outputTokens };

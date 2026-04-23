@@ -88,7 +88,6 @@ const config = {
 
   // System settings
   alertThreshold:      parseInt(process.env.ALERT_THRESHOLD       || '60', 10),
-  viralityThreshold:   parseInt(process.env.VIRALITY_THRESHOLD    || '70', 10),
   scanIntervalMinutes: parseInt(process.env.SCAN_INTERVAL_MINUTES || '15', 10),
   logLevel:            process.env.LOG_LEVEL || 'info',
 

@@ -59,13 +59,17 @@ function parseBody(req) {
 // ─── Admin Server ─────────────────────────────────────────────────────────────
 
 class AdminServer {
-  constructor(config, logger, db, bot, appState = null, scanFn = null) {
+  constructor(config, logger, db, bot, appState = null, scanFn = null, extras = {}) {
     this.config = config;
     this.logger = logger;
     this.db = db;
     this.bot = bot;
     this.appState = appState || { paused: false, disabledCollectors: new Set() };
     this.scanFn = scanFn; // optional callback to trigger manual scan
+    // Injected components for the manual-submit feature (POST /api/submit-narrative).
+    // Both are optional — if absent the endpoint returns 503.
+    this.scorer = extras.scorer || null;
+    this.telegram = extras.telegram || null;
     this.port = parseInt(process.env.ADMIN_PORT || '8080');
     this.host = process.env.ADMIN_HOST || '127.0.0.1';
     this.adminKey = process.env.ADMIN_API_KEY || '';
@@ -207,13 +211,21 @@ class AdminServer {
   }
 
   _getScannerConfig() {
-    // Int settings — thresholds + legacy gates (kept for back-compat)
+    // Int settings — thresholds + scan-side gates
     const numDefaults = {
-      alertThreshold: 60, viralityThreshold: 70, minScoreToSave: 0, maxAlertsPerCycle: 0,
+      alertThreshold: 60, minScoreToSave: 0, maxAlertsPerCycle: 0,
       alertHardJunkStop: 70,
       alertStaleDecayPerHour: 2,
       alertStaleDecayGrace:   24,
       alertStaleDecayCap:     30,
+      // Drop Twitter tweets older than this many hours before they enter the pipeline.
+      // 0 disables the filter.
+      twitterMaxAgeHours: 72,
+      // Cooldown for re-scoring already-scored items. If the same URL shows
+      // up again AND was never alerted AND last_seen_at > this many hours ago,
+      // the aggregator lets it through to AI again. 0 = disables re-analysis
+      // (classic "block forever" behaviour).
+      rescoreCooldownHours: 3,
       // AI Stage 2 gates — tune in UI to balance x_search cost vs coverage
       stage2Threshold: 60,
       stage2MaxCalls:  6,
@@ -259,13 +271,14 @@ class AdminServer {
     }
     const allowedInt = {
       alertThreshold:    { min: 0, max: 100 },
-      viralityThreshold: { min: 0, max: 100 },
       minScoreToSave:    { min: 0, max: 100 },
       maxAlertsPerCycle: { min: 0, max: 50  },
       alertHardJunkStop: { min: 0, max: 100 },
       alertStaleDecayPerHour: { min: 0, max: 20 },
       alertStaleDecayGrace:   { min: 0, max: 168 },
       alertStaleDecayCap:     { min: 0, max: 100 },
+      twitterMaxAgeHours:     { min: 0, max: 720 },
+      rescoreCooldownHours:   { min: 0, max: 168 },
       stage2Threshold:        { min: 0, max: 100 },
       stage2MaxCalls:         { min: 0, max: 20  },
     };
@@ -331,6 +344,64 @@ class AdminServer {
       overrides,                       // what's actually stored (sparse)
       fields:    PROFILE_FIELD_RANGES, // { field: {min,max,step,label,desc} }
       presets:   PRESET_KEYS,
+    };
+  }
+
+  // ── Junk-reason stats over the last N hours ─────────────────────────────────
+  // Reads raw_metrics from trends table, aggregates junkReasons occurrences.
+  // Used by the admin UI to answer "что у нас чаще всего режет junk-filter?".
+  _getJunkStats(hours = 24) {
+    const rows = this.db.db.prepare(
+      "SELECT raw_metrics, source FROM trends WHERE first_seen_at > datetime('now', ?)"
+    ).all('-' + Math.max(1, Math.min(720, hours | 0)) + ' hours');
+
+    const reasonCounts = {};   // { politics: 12, 'no-meme-shape': 30, ... }
+    const sourceCounts = {};   // { reddit: 50, twitter: 20, ... }
+    let totalTrends       = 0;
+    let trendsWithPenalty = 0;
+    let sumPenalty        = 0;
+    let maxPenalty        = 0;
+    let memeShapeHits     = 0;
+
+    for (const r of rows) {
+      totalTrends++;
+      sourceCounts[r.source] = (sourceCounts[r.source] || 0) + 1;
+      if (!r.raw_metrics) continue;
+      let m;
+      try { m = JSON.parse(r.raw_metrics); } catch (_) { continue; }
+      const p = Number(m.junkPenalty || 0);
+      if (p > 0) {
+        trendsWithPenalty++;
+        sumPenalty += p;
+        if (p > maxPenalty) maxPenalty = p;
+      }
+      if (Array.isArray(m.junkReasons)) {
+        for (const reason of m.junkReasons) {
+          // Strip "safe-override(÷N)" variance so they all aggregate together
+          const key = String(reason).startsWith('safe-override') ? 'safe-override' : String(reason);
+          reasonCounts[key] = (reasonCounts[key] || 0) + 1;
+        }
+      }
+      if (Array.isArray(m.memeShapeSignals) && m.memeShapeSignals.length > 0) {
+        memeShapeHits++;
+      }
+    }
+
+    // Sort reasons by count desc for stable rendering
+    const topReasons = Object.entries(reasonCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([reason, count]) => ({ reason, count, pctOfTotal: totalTrends ? Math.round(count * 100 / totalTrends) : 0 }));
+
+    return {
+      windowHours:       hours,
+      totalTrends,
+      trendsWithPenalty,
+      avgPenalty:        trendsWithPenalty ? Math.round(sumPenalty / trendsWithPenalty) : 0,
+      maxPenalty,
+      memeShapeHits,
+      memeShapePct:      totalTrends ? Math.round(memeShapeHits * 100 / totalTrends) : 0,
+      topReasons,
+      sourceCounts,
     };
   }
 
@@ -821,6 +892,16 @@ class AdminServer {
         }
       }
 
+      // ── Junk-reason stats over last N hours (for observation panel) ──
+      if (path === '/api/junk-stats' && method === 'GET') {
+        const hours = parseInt(url.searchParams.get('hours') || '24', 10) || 24;
+        try {
+          return json(res, 200, this._getJunkStats(hours));
+        } catch (e) {
+          return json(res, 500, { error: e.message });
+        }
+      }
+
       // Alert decisions — per-trend verdicts from the last N cycles. In-memory
       // ring buffer on appState.alertDecisions, populated by index.js on every
       // alert-gate evaluation. Useful to answer "почему нет алертов".
@@ -895,6 +976,86 @@ class AdminServer {
         const result = await this._manageBroadcastMessages(action, message, plan);
         this.logger.info('Admin broadcast manage action', result);
         return json(res, 200, result);
+      }
+
+      // ── Manual submit: analyse an arbitrary URL on demand ──────────────────
+      // POST /api/submit-narrative { url, sendToTelegram? }
+      // Resolves the URL → synthetic trend → runs scorer → saves to DB with
+      // raw_metrics.manualSubmitted=true. If sendToTelegram is set, pushes the
+      // alert to every active user (bypasses threshold/dedup gates — the whole
+      // point of a manual submit is to force distribution).
+      if (path === '/api/submit-narrative' && method === 'POST') {
+        if (!this.scorer || !this.telegram) {
+          return json(res, 503, { error: 'Scorer/Telegram not wired into admin server' });
+        }
+        let body;
+        try { body = await parseBody(req); }
+        catch (e) { return json(res, 400, { error: e.message }); }
+        const rawUrl = String(body?.url || '').trim();
+        const sendToTelegram = !!body?.sendToTelegram;
+        const rawComment = typeof body?.comment === 'string' ? body.comment.trim() : '';
+        const comment = rawComment.length > 500 ? rawComment.slice(0, 500) : rawComment;
+        if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+          return json(res, 400, { error: 'Valid URL is required' });
+        }
+        try {
+          const result = await this._submitNarrative(rawUrl, sendToTelegram, { comment });
+          return json(res, 200, result);
+        } catch (e) {
+          this.logger.error(`[ManualSubmit] failed: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+      }
+
+      // ── Manual send-alert: broadcast an alert for an ALREADY saved trend ──
+      // POST /api/send-alert { trendId }
+      // Used by the "📨 Отправить алерт" button on SubmitPage — works on any
+      // trend_id in the DB, not just manual submits. Rehydrates the trend row
+      // from raw_metrics and fans out to every active user.
+      if (path === '/api/send-alert' && method === 'POST') {
+        if (!this.telegram) {
+          return json(res, 503, { error: 'Telegram not wired into admin server' });
+        }
+        let body;
+        try { body = await parseBody(req); }
+        catch (e) { return json(res, 400, { error: e.message }); }
+        const trendId = parseInt(body?.trendId, 10);
+        if (!Number.isFinite(trendId) || trendId <= 0) {
+          return json(res, 400, { error: 'trendId is required' });
+        }
+        // Optional admin comment — prepended to the TG alert body. Cap at
+        // 500 chars so the caption still fits Telegram's 1024 limit after
+        // concat with the formatter output.
+        const rawComment = typeof body?.comment === 'string' ? body.comment.trim() : '';
+        const comment = rawComment.length > 500 ? rawComment.slice(0, 500) : rawComment;
+        try {
+          const row = this.db.getTrendById?.(trendId);
+          if (!row) return json(res, 404, { error: 'Trend not found' });
+          const trend = this._hydrateTrendFromDb(row);
+          const started = Date.now();
+          this.logger.info(`[SendAlert] broadcasting trend #${trendId}${comment ? ' (with comment)' : ''}`);
+          const alerts = await this._broadcastTrendAlert(trend, trendId, { comment });
+          const elapsedMs = Date.now() - started;
+          const ok = alerts.filter(a => a.ok).length;
+          this.logger.info(`[SendAlert] done in ${elapsedMs}ms — ${ok}/${alerts.length} delivered`);
+          return json(res, 200, { ok: true, elapsedMs, alerts, trendId });
+        } catch (e) {
+          this.logger.error(`[SendAlert] failed: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+      }
+
+      // ── Pipeline flow (live stage + counters for the flow diagram) ──
+      if (path === '/api/pipeline' && method === 'GET') {
+        return json(res, 200, {
+          paused:         !!this.appState?.paused,
+          running:        !!this.appState?.scanRunning,
+          currentStage:   this.appState?.currentStage   || 'idle',
+          stageStartedAt: this.appState?.stageStartedAt || null,
+          cycleStartedAt: this.appState?.cycleStartedAt || null,
+          cycleInProgress: this.appState?.cycleInProgress || null,
+          lastCycle:       this.appState?.lastCycle       || null,
+        });
       }
 
       // ── Scanners ──
@@ -1088,6 +1249,32 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
 .collector-status{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
 .collector-status.on{color:var(--green)}
 .collector-status.off{color:var(--red)}
+/* Pipeline flow diagram */
+.pflow-wrap{background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01));border:1px solid var(--border);border-radius:16px;padding:20px 22px;margin-bottom:20px;box-shadow:0 12px 32px rgba(0,0,0,.12)}
+.pflow-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:18px;flex-wrap:wrap;gap:10px}
+.pflow-head h3{font-size:15px;font-weight:600}
+.pflow-sub{font-size:12px;color:var(--text2)}
+.pflow-sub .pflow-live{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-right:6px;vertical-align:middle;box-shadow:0 0 8px var(--accent);animation:pflow-blink 1.2s ease-in-out infinite}
+.pflow{display:flex;align-items:stretch;gap:0;overflow:visible;padding:18px 6px 20px}
+.pflow-node{flex:0 0 auto;min-width:112px;text-align:center;padding:14px 14px 12px;border:1px solid var(--border);border-radius:14px;background:rgba(255,255,255,.015);transition:all .35s ease;position:relative}
+.pflow-node.done{border-color:rgba(20,184,166,.35);background:rgba(20,184,166,.05)}
+.pflow-node.active{border-color:var(--accent);background:rgba(20,184,166,.12);box-shadow:0 0 0 1px rgba(20,184,166,.35),0 0 28px rgba(20,184,166,.35);animation:pflow-pulse 1.6s ease-in-out infinite}
+.pflow-ico{font-size:22px;line-height:1;margin-bottom:6px;filter:grayscale(.3);transition:filter .3s}
+.pflow-node.active .pflow-ico,.pflow-node.done .pflow-ico{filter:none}
+.pflow-lbl{font-size:10.5px;color:var(--text2);text-transform:uppercase;letter-spacing:.7px;font-weight:700}
+.pflow-node.active .pflow-lbl,.pflow-node.done .pflow-lbl{color:var(--text)}
+.pflow-cnt{font-size:19px;font-weight:700;margin-top:6px;color:var(--text);font-variant-numeric:tabular-nums;line-height:1}
+.pflow-node:not(.done):not(.active) .pflow-cnt{color:var(--text2);font-weight:500}
+.pflow-wire{flex:1 1 34px;min-width:28px;height:2px;align-self:center;background:rgba(255,255,255,.06);border-radius:2px;position:relative;margin:0 -1px}
+.pflow-wire.done{background:rgba(20,184,166,.45)}
+.pflow-wire.active{background:rgba(20,184,166,.12);overflow:hidden}
+.pflow-wire.active::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent 0%,var(--accent) 45%,var(--accent) 55%,transparent 100%);background-size:50% 100%;background-repeat:no-repeat;animation:pflow-flow 1.25s linear infinite}
+.pflow-foot{margin-top:12px;display:flex;justify-content:space-between;font-size:11px;color:var(--text2);letter-spacing:.3px}
+.pflow-foot b{color:var(--text);font-weight:600}
+@keyframes pflow-pulse{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+@keyframes pflow-flow{0%{background-position:-50% 0}100%{background-position:150% 0}}
+@keyframes pflow-blink{0%,100%{opacity:.4}50%{opacity:1}}
+@media (max-width:780px){.pflow{flex-wrap:wrap;gap:8px}.pflow-wire{display:none}.pflow-node{flex:1 1 calc(33% - 8px)}}
 /* Global scanner status */
 .scanner-status-bar{background:linear-gradient(135deg,rgba(20,184,166,.07),rgba(56,189,248,.04));border:1px solid rgba(20,184,166,.16);border-radius:16px;padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:20px;box-shadow:0 12px 32px rgba(0,0,0,.12)}
 .scanner-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0}
@@ -1451,6 +1638,103 @@ function PaymentsPage() {
   );
 }
 
+// ── Pipeline flow diagram (Apify → Dedupe → Cluster → AI → Save → Alerts) ──
+// Polls /api/pipeline on a short interval so active stages light up in near
+// real time while the scan is running. Between cycles it shows numbers from
+// the last completed cycle so the panel is never a dead ghost.
+const PIPELINE_STAGES = [
+  { id: 'collect', icon: '📡', label: 'Collect',  hint: 'Apify scrapers'   },
+  { id: 'dedupe',  icon: '🧩', label: 'Dedupe',   hint: 'Aggregator'        },
+  { id: 'cluster', icon: '🗂',  label: 'Cluster',  hint: 'Junk filter'       },
+  { id: 'ai',      icon: '🧠', label: 'AI',       hint: 'Stage 1 + Grok'    },
+  { id: 'save',    icon: '💾', label: 'Save',     hint: 'Persist to DB'     },
+  { id: 'alerts',  icon: '📣', label: 'Alerts',   hint: 'Telegram push'     },
+];
+
+function PipelineFlow() {
+  const h = React.createElement;
+  const [state, setState] = React.useState(null);
+
+  React.useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      api('/api/pipeline')
+        .then(s => { if (alive) setState(s); })
+        .catch(() => {});
+    };
+    tick();
+    // 2.5s feels snappy without hammering the backend; pulse still reads well.
+    const id = setInterval(tick, 2500);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  if (!state) return null;
+
+  const live     = state.running && state.cycleInProgress;
+  const counts   = live ? state.cycleInProgress : (state.lastCycle || {});
+  const curStage = state.currentStage || 'idle';
+  const curIdx   = PIPELINE_STAGES.findIndex(s => s.id === curStage);
+
+  let subtitle;
+  if (state.running) {
+    subtitle = h('span', null,
+      h('span', { className: 'pflow-live' }),
+      'Live — ' + (PIPELINE_STAGES[curIdx]?.label || 'работает') + '...'
+    );
+  } else if (state.lastCycle) {
+    const ago = Math.max(0, Math.round((Date.now() - (state.lastCycle.completedAt || 0)) / 1000));
+    const agoStr = ago < 60 ? ago + 'с назад' : Math.round(ago / 60) + 'м назад';
+    const dur = state.lastCycle.durationMs ? (state.lastCycle.durationMs / 1000).toFixed(1) + 'с' : '—';
+    subtitle = 'Последний цикл завершён ' + agoStr + ' (за ' + dur + ')';
+  } else {
+    subtitle = 'Ожидание первого цикла...';
+  }
+
+  const fmt = (v) => (v === undefined || v === null ? '—' : String(v));
+
+  const nodes = [];
+  PIPELINE_STAGES.forEach((s, i) => {
+    const isActive = live && curStage === s.id;
+    const isDone   = live ? (curIdx > i) : !!state.lastCycle;
+    nodes.push(
+      h('div', {
+        key: s.id,
+        className: 'pflow-node' + (isActive ? ' active' : '') + (!isActive && isDone ? ' done' : ''),
+        title: s.hint,
+      },
+        h('div', { className: 'pflow-ico' }, s.icon),
+        h('div', { className: 'pflow-lbl' }, s.label),
+        h('div', { className: 'pflow-cnt' }, fmt(counts[s.id])),
+      )
+    );
+    if (i < PIPELINE_STAGES.length - 1) {
+      const wireActive = live && curIdx === i + 1;
+      const wireDone   = live ? curIdx > i + 1 : !!state.lastCycle;
+      nodes.push(h('div', {
+        key: 'w' + i,
+        className: 'pflow-wire' + (wireActive ? ' active' : '') + (!wireActive && wireDone ? ' done' : ''),
+      }));
+    }
+  });
+
+  return h('div', { className: 'pflow-wrap' },
+    h('div', { className: 'pflow-head' },
+      h('h3', null, '🔄 Пайплайн'),
+      h('span', { className: 'pflow-sub' }, subtitle)
+    ),
+    h('div', { className: 'pflow' }, nodes),
+    state.lastCycle && !state.running
+      ? h('div', { className: 'pflow-foot' },
+          h('span', null, 'Собрано → ', h('b', null, fmt(state.lastCycle.collect)),
+            ' • После dedupe → ', h('b', null, fmt(state.lastCycle.dedupe)),
+            ' • AI → ', h('b', null, fmt(state.lastCycle.ai)),
+            ' • Алертов отправлено → ', h('b', null, fmt(state.lastCycle.alerts))
+          )
+        )
+      : null
+  );
+}
+
 function ScannersPage() {
   const [state, setState] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
@@ -1560,11 +1844,17 @@ function ScannersPage() {
         color: msg.includes('Ошибка') ? 'var(--red)' : 'var(--green)', fontSize: 13 }
     }, msg),
 
+    // Live pipeline flow animation — Apify → ... → Alerts
+    React.createElement(PipelineFlow, null),
+
     // Scanner tuning config (presets, thresholds, storage floor)
     React.createElement(ScannerConfigSection, null),
 
     // Per-preset junk-filter weights (politics/kpop/celeb/meme-shape/safe-override)
     React.createElement(FilterProfilesSection, null),
+
+    // Rolling stats on what junk-filter is actually filtering out
+    React.createElement(JunkStatsSection, null),
 
     // Per-platform collector cards
     React.createElement('div', { className: 'broadcast-box' },
@@ -1778,6 +2068,27 @@ function ScannerConfigSection() {
     })(),
 
     // Stale decay — age-based penalty
+    h('div', { className: 'scfg-section' },
+      h('h4', { className: 'scfg-h4' }, '🐦 Twitter — фильтр по возрасту'),
+      h('p', { className: 'scfg-desc' },
+        'Твиты старше указанного числа часов отбрасываются на входе. ' +
+        '0 = фильтр выключен. Рекомендуется 72 — ловим ре-игниты последних 3 суток, ' +
+        'не засоряем пайплайн старьём.'),
+      row('⏳ Макс. возраст твита (часов)', 'twitterMaxAgeHours', 0, 720, 12,
+          cfg.twitterMaxAgeHours === 0 ? '0 (off)' : cfg.twitterMaxAgeHours + 'h'),
+    ),
+
+    h('div', { className: 'scfg-section' },
+      h('h4', { className: 'scfg-h4' }, '🔁 Ре-анализ уже обработанных постов'),
+      h('p', { className: 'scfg-desc' },
+        'Если тот же URL возвращается в фид, пост прогоняется через AI заново — ' +
+        'если engagement вырос, он может пройти алерт-фильтр. Ре-анализ делается ' +
+        'только если: (1) пост ещё никому не уходил алертом и (2) прошло ≥ N часов ' +
+        'с прошлого ре-скора. 0 = выключено (посты блокируются навсегда после первого скоринга).'),
+      row('🕒 Cooldown между ре-анализами (часов)', 'rescoreCooldownHours', 0, 168, 1,
+          cfg.rescoreCooldownHours === 0 ? '0 (off)' : cfg.rescoreCooldownHours + 'h'),
+    ),
+
     h('div', { className: 'scfg-section' },
       h('h4', { className: 'scfg-h4' }, '⏳ Stale decay (штраф за возраст)'),
       h('p', { className: 'scfg-desc' },
@@ -2066,6 +2377,139 @@ function FilterProfilesSection() {
         fontSize: 13,
       },
     }, msg)
+  );
+}
+
+// ── Junk-filter observation panel ────────────────────────────────────────────
+// "What is junk-filter actually filtering out?" Shows top reasons over last N
+// hours plus basic counts. Auto-refreshes so you can watch behaviour live.
+const JUNK_REASON_LABELS = {
+  'politics':          { color: '#ef4444', label: 'Политика' },
+  'kpop/fandom':       { color: '#a855f7', label: 'K-pop / фандом' },
+  'celeb-noise':       { color: '#f59e0b', label: 'Celeb-noise' },
+  'no-meme-shape':     { color: '#64748b', label: 'Нет meme-shape' },
+  'safe-override':     { color: '#14b8a6', label: 'Safe-override (регулятор)' },
+};
+
+function JunkStatsSection() {
+  const h = React.createElement;
+  const [hours, setHours]   = useState(24);
+  const [data, setData]     = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = () => {
+    setLoading(true);
+    api('/api/junk-stats?hours=' + hours)
+      .then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  };
+  useEffect(load, [hours]);
+  useEffect(() => {
+    const iv = setInterval(load, 30_000); // refresh every 30s
+    return () => clearInterval(iv);
+    // eslint-disable-next-line
+  }, [hours]);
+
+  return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
+    h('div', {
+      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 8 }
+    },
+      h('h3', { style: { margin: 0 } }, '📊 Junk-filter наблюдение'),
+      h('div', { style: { display: 'flex', gap: 4 } },
+        [6, 24, 72, 168].map(hrs =>
+          h('button', {
+            key: hrs,
+            onClick: () => setHours(hrs),
+            style: {
+              padding: '6px 10px', borderRadius: 6, fontSize: 12,
+              background: hours === hrs ? 'var(--accent)' : 'transparent',
+              color:      hours === hrs ? '#fff' : 'var(--text)',
+              border: '1px solid ' + (hours === hrs ? 'var(--accent)' : 'var(--border)'),
+              cursor: 'pointer', fontWeight: hours === hrs ? 700 : 500,
+            },
+          }, hrs < 24 ? hrs + 'ч' : hrs === 24 ? '24ч' : hrs === 72 ? '3д' : '7д')
+        )
+      )
+    ),
+    h('p', { style: { color: 'var(--muted)', fontSize: 13, marginBottom: 16 } },
+      'Что чаще всего помечает junk-filter за выбранное окно. Обновляется каждые 30с.'
+    ),
+
+    loading && !data ? h('div', { className: 'loading' }, 'Загрузка статистики...') :
+    !data ? h('div', { className: 'empty' }, 'Нет данных') :
+    h('div', null,
+      // ── Summary tiles ──
+      h('div', {
+        style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10, marginBottom: 18 }
+      },
+        [
+          { label: 'Трендов за окно', value: data.totalTrends, color: 'var(--text)' },
+          { label: 'Со штрафом', value: data.trendsWithPenalty + ' (' + (data.totalTrends ? Math.round(data.trendsWithPenalty * 100 / data.totalTrends) : 0) + '%)', color: 'var(--red)' },
+          { label: 'Ø штраф', value: data.avgPenalty, color: 'var(--accent)' },
+          { label: 'Max штраф', value: data.maxPenalty, color: '#f59e0b' },
+          { label: 'Meme-shape signals', value: data.memeShapeHits + ' (' + data.memeShapePct + '%)', color: 'var(--green)' },
+        ].map((tile, i) => h('div', {
+          key: i,
+          style: {
+            padding: '10px 12px', borderRadius: 8,
+            background: 'var(--bg2)', border: '1px solid var(--border)',
+          },
+        },
+          h('div', { style: { fontSize: 11, color: 'var(--muted)', marginBottom: 4 } }, tile.label),
+          h('div', { style: { fontSize: 18, fontWeight: 700, color: tile.color } }, String(tile.value))
+        ))
+      ),
+
+      // ── Reason breakdown bars ──
+      h('h4', { style: { marginTop: 8, marginBottom: 10, fontSize: 14 } }, 'Топ причин'),
+      data.topReasons.length === 0
+        ? h('div', { className: 'empty', style: { padding: 12 } }, 'За это окно ничего не отфильтровано 🎉')
+        : h('div', null,
+            data.topReasons.map(r => {
+              const meta = JUNK_REASON_LABELS[r.reason] || { color: '#94a3b8', label: r.reason };
+              const pct  = Math.max(2, Math.min(100, r.pctOfTotal));
+              return h('div', { key: r.reason, style: { marginBottom: 8 } },
+                h('div', {
+                  style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 3 }
+                },
+                  h('span', { style: { color: meta.color, fontWeight: 600 } }, meta.label),
+                  h('span', { style: { color: 'var(--muted)' } },
+                    r.count + ' (' + r.pctOfTotal + '% всех)'
+                  )
+                ),
+                h('div', {
+                  style: {
+                    height: 6, borderRadius: 3, background: 'var(--bg2)',
+                    border: '1px solid var(--border)', overflow: 'hidden',
+                  },
+                },
+                  h('div', {
+                    style: {
+                      height: '100%', width: pct + '%',
+                      background: meta.color, transition: 'width .3s',
+                    }
+                  })
+                )
+              );
+            })
+          ),
+
+      // ── Source mix ──
+      Object.keys(data.sourceCounts).length > 0 && h('div', { style: { marginTop: 18 } },
+        h('h4', { style: { marginBottom: 8, fontSize: 14 } }, 'Разбивка по источникам'),
+        h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+          Object.entries(data.sourceCounts)
+            .sort((a, b) => b[1] - a[1])
+            .map(([src, cnt]) => h('span', {
+              key: src,
+              style: {
+                padding: '4px 10px', borderRadius: 14, fontSize: 12,
+                background: 'var(--bg2)', border: '1px solid var(--border)',
+              },
+            }, src + ': ' + cnt))
+        )
+      )
+    )
   );
 }
 
@@ -2803,6 +3247,222 @@ function BotPage() {
   );
 }
 
+// ── SubmitPage — manual URL / narrative analysis ─────────────────────────────
+function SubmitPage() {
+  const [url, setUrl] = useState('');
+  const [sendTg, setSendTg] = useState(false);
+  // Optional admin comment — prepended to the TG alert body (bold, on its own
+  // line). Shared between the initial submit (when "send to TG" is ticked)
+  // and the standalone "📨 Отправить алерт" button after analysis.
+  const [comment, setComment] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  // Separate state for the standalone "send alert" button on an already-
+  // analysed trend (so the main submit button's loading state isn't confused
+  // with the follow-up broadcast).
+  const [alertLoading, setAlertLoading] = useState(false);
+  const [alertError, setAlertError] = useState('');
+
+  const COMMENT_MAX = 500;
+
+  const submit = async () => {
+    const clean = url.trim();
+    if (!clean) { setError('Вставь URL'); return; }
+    if (!/^https?:\\/\\//i.test(clean)) { setError('URL должен начинаться с http(s)://'); return; }
+    setError(''); setAlertError(''); setLoading(true); setResult(null);
+    try {
+      const res = await api('/api/submit-narrative', 'POST', {
+        url: clean,
+        sendToTelegram: sendTg,
+        comment: sendTg ? comment.trim() : '',
+      });
+      setResult(res);
+    } catch (e) {
+      setError(e.message || 'Ошибка анализа');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Broadcast a TG alert for a trend that was already analysed (result.trend.id).
+  // Confirms first — blasting a message to every active subscriber is loud.
+  const sendAlertNow = async () => {
+    if (!result?.trend?.id) return;
+    const trimmed = comment.trim();
+    const confirmMsg = trimmed
+      ? ('Отправить нарратив в Telegram с комментарием:\\n\\n«' + trimmed + '»\\n\\nВсем активным подписчикам?')
+      : 'Отправить этот нарратив в Telegram всем активным подписчикам?';
+    if (!window.confirm(confirmMsg)) return;
+    setAlertError(''); setAlertLoading(true);
+    try {
+      const res = await api('/api/send-alert', 'POST', {
+        trendId: result.trend.id,
+        comment: trimmed,
+      });
+      // Merge/replace alerts array on the existing result so the UI updates
+      // inline (status panel re-renders with delivery stats).
+      setResult(prev => prev ? ({ ...prev, alerts: res.alerts || [] }) : prev);
+    } catch (e) {
+      setAlertError(e.message || 'Не удалось отправить алерт');
+    } finally {
+      setAlertLoading(false);
+    }
+  };
+
+  const t = result?.trend;
+  const srcIco = t && (t.source === 'twitter' ? '🐦' : t.source === 'reddit' ? '🟠' : t.source === 'tiktok' ? '🎵' : '🌐');
+  const memeCls = t && (t.memePotential >= 80 ? 'score-hot' : t.memePotential >= 60 ? 'score-warm' : 'score-cold');
+
+  return React.createElement('div',{className:'page'},
+    React.createElement('div',{className:'page-head'},
+      React.createElement('h2',null,'🧪 Ручной анализ нарратива'),
+      React.createElement('p',{style:{color:'var(--text2)',fontSize:13,marginTop:6}},
+        'Закинь URL поста (Twitter / Reddit / TikTok / любой сайт с og:image) — прогоним через полный пайплайн анализа (Stage 1 + Stage 2 Grok), сохраним в БД и опционально отправим в Telegram всем активным подписчикам.'
+      )
+    ),
+
+    React.createElement('div',{className:'card',style:{padding:20,marginBottom:20}},
+      React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:12}},
+        React.createElement('div',null,
+          React.createElement('label',{style:{fontSize:12,fontWeight:600,color:'var(--text2)',display:'block',marginBottom:6}},'URL поста'),
+          React.createElement('input',{
+            type:'url',
+            value:url,
+            onChange:e=>setUrl(e.target.value),
+            onKeyDown:e=>{ if(e.key==='Enter' && !loading) submit(); },
+            placeholder:'https://twitter.com/user/status/12345  или  https://reddit.com/r/xyz/comments/...',
+            disabled:loading,
+            style:{width:'100%',padding:'10px 12px',background:'var(--bg2)',border:'1px solid var(--border)',borderRadius:8,color:'var(--text)',fontSize:13,fontFamily:'inherit'}
+          })
+        ),
+        React.createElement('label',{style:{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:13}},
+          React.createElement('input',{type:'checkbox',checked:sendTg,onChange:e=>setSendTg(e.target.checked),disabled:loading}),
+          React.createElement('span',null,'📨 Отправить в Telegram всем активным подписчикам после анализа')
+        ),
+        // Optional comment — applies both to the initial send (if the checkbox
+        // above is ticked) and to the standalone "📨 Отправить алерт" button
+        // after analysis.
+        React.createElement('div',null,
+          React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}},
+            React.createElement('label',{style:{fontSize:12,fontWeight:600,color:'var(--text2)'}},'💬 Комментарий к алерту (необязательно)'),
+            React.createElement('span',{style:{fontSize:11,color:comment.length>COMMENT_MAX?'#f87171':'var(--text3)'}}, comment.length + '/' + COMMENT_MAX)
+          ),
+          React.createElement('textarea',{
+            value:comment,
+            onChange:e=>setComment(e.target.value.slice(0, COMMENT_MAX + 50)),
+            placeholder:'Например: смотрите реплаи под этим постом — там эпичный слив / мета новой мемной волны',
+            disabled:loading,
+            rows:2,
+            style:{width:'100%',padding:'10px 12px',background:'var(--bg2)',border:'1px solid var(--border)',borderRadius:8,color:'var(--text)',fontSize:13,fontFamily:'inherit',resize:'vertical',minHeight:60}
+          }),
+          React.createElement('div',{style:{fontSize:11,color:'var(--text3)',marginTop:4}},
+            'Комментарий прикрепится жирной строкой в начале алерта. Пусто — алерт уйдёт без него.'
+          )
+        ),
+        React.createElement('div',{style:{display:'flex',gap:10,alignItems:'center'}},
+          React.createElement('button',{className:'btn btn-primary',onClick:submit,disabled:loading||!url.trim()},
+            loading ? '⏳ Анализ идёт...' : '🚀 Проанализировать'
+          ),
+          error && React.createElement('span',{style:{color:'#ff6b6b',fontSize:12}},'⚠ ' + error)
+        )
+      )
+    ),
+
+    loading && React.createElement('div',{className:'card',style:{padding:28,textAlign:'center',color:'var(--text2)'}},
+      React.createElement('div',{style:{fontSize:24,marginBottom:8}},'⚙️'),
+      React.createElement('div',{style:{fontSize:13}},'Тянем метаданные → Stage 1 (батч-скоринг) → Stage 2 (Grok x_search deep-dive)...'),
+      React.createElement('div',{style:{fontSize:11,marginTop:6,color:'var(--text3)'}},'Обычно 10-30 секунд')
+    ),
+
+    result && React.createElement('div',{className:'card',style:{padding:20}},
+      // Header bar
+      React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16,paddingBottom:14,borderBottom:'1px solid var(--border)'}},
+        React.createElement('div',{style:{display:'flex',alignItems:'center',gap:10}},
+          React.createElement('span',{style:{fontSize:24}},srcIco),
+          React.createElement('div',null,
+            React.createElement('div',{style:{fontSize:15,fontWeight:700}},t.title),
+            React.createElement('div',{style:{fontSize:11,color:'var(--text3)'}}, '#' + t.id + '  ·  ' + t.source + '  ·  ' + (result.elapsedMs/1000).toFixed(1) + 's')
+          )
+        ),
+        React.createElement('div',{style:{display:'flex',gap:6,alignItems:'center'}},
+          t.url && React.createElement('a',{href:t.url,target:'_blank',className:'btn btn-ghost btn-sm'},'🔗 Источник'),
+          React.createElement('button',{
+            className:'btn btn-primary btn-sm',
+            onClick:sendAlertNow,
+            disabled:alertLoading,
+            title:'Разослать этот нарратив в Telegram всем активным подписчикам',
+            style:{background:'#5bc0eb',borderColor:'#5bc0eb',color:'#041018',fontWeight:700}
+          }, alertLoading ? '⏳ Отправка...' : '📨 Отправить алерт'),
+          React.createElement('span',{className:'chip chip-manual',style:{background:'rgba(180,140,255,.15)',color:'#b48cff',border:'1px solid rgba(180,140,255,.35)',padding:'3px 10px',borderRadius:12,fontSize:11,fontWeight:700}},'🧪 MANUAL')
+        )
+      ),
+      alertError && React.createElement('div',{style:{marginBottom:12,padding:10,background:'rgba(248,113,113,.08)',border:'1px solid rgba(248,113,113,.25)',borderRadius:8,fontSize:12,color:'#f87171'}},'⚠ ' + alertError),
+
+      // Metrics grid
+      React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))',gap:10,marginBottom:16}},
+        scoreBox('💎 Meme',  t.memePotential || 0, memeCls),
+        scoreBox('📈 Score', t.score         || 0),
+        scoreBox('🚀 Alert', t.alertScore    || 0),
+        scoreBox('✨ Emergence', t.emergenceScore || 0),
+        scoreBox('🔥 Adoption',  t.adoptionScore  || 0),
+        (t.storyScore || 0) > 0 && scoreBox('📖 Story', t.storyScore),
+        t.junkPenalty > 0 && scoreBox('🗑 Junk', t.junkPenalty, 'score-bad')
+      ),
+
+      // Narrative fields
+      t.whyItWillPump && narrativeBox('🔥 Почему залетит', t.whyItWillPump),
+      t.whyNow && narrativeBox('⚡ Триггер (Why Now)', t.whyNow),
+      t.aiExplanation && narrativeBox('🤖 AI объяснение', t.aiExplanation),
+      t.storyHook && narrativeBox('📖 Story Hook', '"' + t.storyHook + '"'),
+
+      // Meta strip
+      React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:8,marginTop:14,fontSize:11}},
+        t.category && React.createElement('span',{className:'chip'},'📁 ' + t.category),
+        t.sentiment && React.createElement('span',{className:'chip'},'💭 ' + t.sentiment),
+        t.predictedLifespan && React.createElement('span',{className:'chip'},'⏱ ' + t.predictedLifespan),
+        t.narrativePhase && React.createElement('span',{className:'chip'},'🌀 ' + t.narrativePhase),
+        t.marketStage && t.marketStage !== 'none' && React.createElement('span',{className:'chip'},'📊 ' + t.marketStage)
+      ),
+
+      // Telegram status
+      result.alerts && result.alerts.length > 0 && React.createElement('div',{style:{marginTop:18,padding:12,background:'rgba(91,192,235,.08)',border:'1px solid rgba(91,192,235,.25)',borderRadius:8}},
+        React.createElement('div',{style:{fontSize:12,fontWeight:700,color:'#5bc0eb',marginBottom:6}},'📨 Отправка в Telegram'),
+        React.createElement('div',{style:{fontSize:12,color:'var(--text2)'}},
+          '✅ Успешно: ' + result.alerts.filter(a=>a.ok).length + ' / ' + result.alerts.length,
+          result.alerts.some(a=>!a.ok) && React.createElement('div',{style:{color:'#ff9b6b',marginTop:4}},
+            '⚠ Ошибки: ' + result.alerts.filter(a=>!a.ok).map(a=>a.reason).join(', ')
+          )
+        )
+      ),
+
+      // Image preview
+      (t.imageUrls && t.imageUrls.length > 0) && React.createElement('div',{style:{marginTop:16}},
+        React.createElement('div',{style:{fontSize:11,fontWeight:700,color:'var(--text2)',marginBottom:6}},'🖼 Картинки (' + t.imageUrls.length + ')'),
+        React.createElement('div',{style:{display:'flex',gap:6,overflowX:'auto',paddingBottom:6}},
+          t.imageUrls.slice(0,6).map((u,i)=>React.createElement('img',{key:i,src:u,alt:'',style:{height:120,borderRadius:6,border:'1px solid var(--border)'}}))
+        )
+      )
+    )
+  );
+}
+
+function scoreBox(label, value, cls) {
+  if (!cls) cls = value >= 70 ? 'score-hot' : value >= 40 ? 'score-warm' : '';
+  const color = cls === 'score-hot' ? '#ff6b35' : cls === 'score-warm' ? '#ffa94d' : cls === 'score-bad' ? '#ff5252' : '#5bc0eb';
+  return React.createElement('div',{style:{padding:'10px 12px',background:'var(--bg2)',border:'1px solid var(--border)',borderRadius:8}},
+    React.createElement('div',{style:{fontSize:10,color:'var(--text3)',marginBottom:4,fontWeight:600,letterSpacing:'.3px'}},label),
+    React.createElement('div',{style:{fontSize:20,fontWeight:800,color,fontFamily:'JetBrains Mono, monospace'}},value + '/100')
+  );
+}
+
+function narrativeBox(label, content) {
+  return React.createElement('div',{style:{marginBottom:12}},
+    React.createElement('div',{style:{fontSize:10,color:'var(--text3)',marginBottom:4,fontWeight:600,letterSpacing:'.3px'}},label),
+    React.createElement('div',{style:{fontSize:13,lineHeight:1.5,color:'var(--text)',padding:'8px 12px',background:'rgba(255,255,255,.02)',borderLeft:'2px solid var(--accent)',borderRadius:'0 6px 6px 0'}},content)
+  );
+}
+
 // ── App Root ──────────────────────────────────────────────────────────────────
 function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('adminKey'));
@@ -2813,13 +3473,14 @@ function App() {
   const TABS = [
     {id:'stats',     icon:'📊', label:'Статистика'},
     {id:'scanners',  icon:'⚙️',  label:'Сканеры'},
+    {id:'submit',    icon:'🧪', label:'Ручной анализ'},
     {id:'decisions', icon:'🔔', label:'Алерты'},
     {id:'users',     icon:'👥', label:'Пользователи'},
     {id:'payments',  icon:'💳', label:'Платежи'},
     {id:'bot',       icon:'🤖', label:'Бот и планы'},
   ];
 
-  const PAGE = {stats:StatsPage, scanners:ScannersPage, decisions:DecisionsPage, users:UsersPage, payments:PaymentsPage, bot:BotPage};
+  const PAGE = {stats:StatsPage, scanners:ScannersPage, submit:SubmitPage, decisions:DecisionsPage, users:UsersPage, payments:PaymentsPage, bot:BotPage};
   const CurrentPage = PAGE[tab];
 
   return React.createElement('div',{className:'layout'},
@@ -2848,6 +3509,428 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
 </script>
 </body>
 </html>`;
+  }
+
+  // ── Manual narrative submit ──────────────────────────────────────────────────
+  // Resolves a user-supplied URL into a synthetic trend, runs it through the
+  // scorer, persists the row with a manual flag, and (optionally) pushes the
+  // alert to every active Telegram user. Bypasses scan-cycle gates on purpose.
+  async _submitNarrative(rawUrl, sendToTelegram, opts = {}) {
+    const startedAt = Date.now();
+    this.logger.info(`[ManualSubmit] ${rawUrl} (tg=${sendToTelegram ? 'yes' : 'no'})`);
+
+    const synthetic = await this._resolveUrlToTrend(rawUrl);
+    if (!synthetic) throw new Error('Could not resolve URL metadata');
+
+    // Run full scorer (Stage 1 batch + Stage 2 Grok if threshold met)
+    const scored = await this.scorer.scoreTrends([synthetic]);
+    const trend = scored[0] || synthetic;
+
+    // Persist with manual marker in raw_metrics
+    trend.metrics = trend.metrics || {};
+    trend.metrics.manualSubmitted = true;
+    trend.metrics.manualSubmittedAt = new Date().toISOString();
+    const dbId = this.db.saveTrend({ ...trend, pipelineStatus: 'scored' });
+    trend._dbId = dbId;
+
+    // Optional: broadcast to all active users right now
+    const alertResults = sendToTelegram
+      ? await this._broadcastTrendAlert(trend, dbId, { comment: opts.comment || '' })
+      : [];
+
+    const elapsedMs = Date.now() - startedAt;
+    this.logger.info(`[ManualSubmit] done in ${elapsedMs}ms — trend #${dbId}, score=${trend.score}, meme=${trend.memePotential}, alerts=${alertResults.filter(a => a.ok).length}/${alertResults.length}`);
+
+    return {
+      ok: true,
+      elapsedMs,
+      trend: {
+        id: dbId,
+        source: trend.source,
+        title: trend.title,
+        originalTitle: trend.originalTitle || trend.title,
+        url: trend.url,
+        score: trend.score,
+        memePotential: trend.memePotential,
+        emergenceScore: trend.emergenceScore,
+        adoptionScore: trend.adoptionScore,
+        storyScore: trend.xSearchData?.storyScore || 0,
+        storyHook: trend.xSearchData?.storyHook || '',
+        category: trend.category,
+        sentiment: trend.sentiment,
+        predictedLifespan: trend.predictedLifespan,
+        aiExplanation: trend.aiExplanation,
+        whyNow: trend.whyNow,
+        whyItWillPump: trend.whyItWillPump,
+        narrativePhase: trend.narrativePhase,
+        marketStage: trend.marketStage,
+        alertScore: trend.alertScore,
+        junkPenalty: trend.junkPenalty,
+        imageUrls: trend.metrics?.imageUrls || [],
+        videoUrl: trend.metrics?.videoUrl || null,
+        metrics: trend.metrics,
+      },
+      alerts: alertResults,
+    };
+  }
+
+  // Broadcast a TG alert for an already-analysed trend to every active user.
+  // Returns a per-user results array (same shape _submitNarrative used to emit).
+  // Used by both the inline submit-with-TG flow and the standalone
+  // POST /api/send-alert endpoint (button on an already-analysed narrative).
+  async _broadcastTrendAlert(trend, dbId, opts = {}) {
+    const alertResults = [];
+    const users = this.db.getActiveUsers();
+    const comment = typeof opts.comment === 'string' ? opts.comment : '';
+    for (const user of users) {
+      if (user.status === 'suspended') continue;
+      try {
+        const sent = await this.telegram.sendAlertToUser(trend, user, { comment });
+        if (sent) {
+          this.db.recordNotification(dbId, 'telegram', user.id);
+          this.db.incrementAlertCount(user.id);
+          if (sent.messageId && typeof this.telegram.attachXButton === 'function') {
+            try {
+              await this.telegram.attachXButton(sent.chatId, sent.messageId, dbId, user, trend);
+            } catch { /* best-effort — buttons aren't critical for manual push */ }
+            // Save tg_message_id so the dashboard can link to the TG alert
+            try {
+              const existing = this.db.getTrendById?.(dbId);
+              if (existing && !existing.tg_message_id) {
+                let msgUrl = '';
+                if (String(sent.chatId).startsWith('-100')) {
+                  msgUrl = `https://t.me/c/${String(sent.chatId).slice(4)}/${sent.messageId}`;
+                }
+                this.db.updateTgUrl?.(dbId, msgUrl, sent.messageId);
+              }
+            } catch { /* non-fatal */ }
+          }
+          alertResults.push({ userId: user.id, chatId: user.telegram_chat_id, ok: true });
+        } else {
+          alertResults.push({ userId: user.id, chatId: user.telegram_chat_id, ok: false, reason: 'send returned false' });
+        }
+        // Small spacing so we don't hammer Telegram rate-limit
+        await new Promise(r => setTimeout(r, 250));
+      } catch (e) {
+        alertResults.push({ userId: user.id, chatId: user.telegram_chat_id, ok: false, reason: e.message });
+      }
+    }
+    return alertResults;
+  }
+
+  // Rebuild a scorer-shaped trend object from a DB row (for re-sending an alert
+  // on a trend that was already saved). DB row is mostly flat — metrics live
+  // inside raw_metrics as JSON. We restore the same field names the
+  // Telegram notifier reads (metrics.imageUrls, whyItWillPump, storyHook, etc).
+  _hydrateTrendFromDb(row) {
+    if (!row) return null;
+    let metrics = {};
+    try { metrics = JSON.parse(row.raw_metrics || '{}'); } catch {}
+    return {
+      _dbId:           row.id,
+      id:              row.id,
+      source:          row.source,
+      title:           row.title,
+      originalTitle:   row.original_title || row.title,
+      url:             row.url,
+      category:        row.category,
+      sentiment:       row.sentiment,
+      score:           row.score,
+      memePotential:   metrics.memePotential || 0,
+      adoptionScore:   metrics.adoptionScore  ?? metrics.memePotential ?? 0,
+      emergenceScore:  metrics.emergenceScore ?? 0,
+      storyScore:      metrics.storyScore     ?? 0,
+      storyHook:       metrics.storyHook      ?? '',
+      narrativePhase:  metrics.narrativePhase  ?? null,
+      rankScore:       metrics.rankScore       ?? null,
+      alertScore:      metrics.alertScore      ?? null,
+      alertBreakdown:  metrics.alertBreakdown  ?? null,
+      marketStage:     metrics.marketStage     ?? null,
+      junkPenalty:     metrics.junkPenalty     ?? 0,
+      junkReasons:     metrics.junkReasons     ?? [],
+      velocity:        metrics.velocity        ?? 0,
+      uniquePlatforms: metrics.uniquePlatforms ?? 1,
+      aiExplanation:   row.ai_explanation,
+      whyItWillPump:   metrics.whyItWillPump || '',
+      whyNow:          row.why_now || '',
+      predictedLifespan: row.predicted_lifespan,
+      xSearchData:     metrics.xSearchData || { storyScore: metrics.storyScore || 0, storyHook: metrics.storyHook || '' },
+      metrics,
+    };
+  }
+
+  // Turn a raw URL into a synthetic trend with whatever metadata we can fetch.
+  // Supports twitter/x, reddit, tiktok, generic (og:image). Free APIs only.
+  async _resolveUrlToTrend(rawUrl) {
+    const url = rawUrl.trim();
+    const isTwitter = /^https?:\/\/(www\.|mobile\.)?(twitter|x)\.com\//i.test(url);
+    const isReddit  = /^https?:\/\/(www\.|old\.|new\.)?reddit\.com\//i.test(url);
+    const isTiktok  = /^https?:\/\/(www\.)?tiktok\.com\//i.test(url);
+
+    if (isTwitter) return this._resolveTwitterUrl(url);
+    if (isReddit)  return this._resolveRedditUrl(url);
+    if (isTiktok)  return this._resolveTiktokUrl(url);
+    return this._resolveGenericUrl(url);
+  }
+
+  async _resolveTwitterUrl(url) {
+    const m = url.match(/(?:twitter|x)\.com\/[^/?#]+\/status\/(\d+)/i);
+    if (!m) throw new Error('Not a valid tweet URL');
+    const [, tweetId] = m;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const r = await fetch(`https://api.fxtwitter.com/i/status/${tweetId}`, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Catalyst/3.0', 'Accept': 'application/json' },
+      });
+      clearTimeout(timer);
+      if (!r.ok) throw new Error(`fxtwitter ${r.status}`);
+      const data = await r.json();
+      const tw = data?.tweet;
+      if (!tw) throw new Error('Tweet not found');
+
+      const likes    = tw.likes    || 0;
+      const retweets = tw.retweets || 0;
+      const replies  = tw.replies  || 0;
+      const views    = tw.views    || 0;
+      const author   = tw.author?.screen_name || 'unknown';
+      const text     = tw.text || '';
+      const createdAt = tw.created_at ? new Date(tw.created_at) : null;
+      const ageHours  = createdAt ? Math.max(0.25, (Date.now() - createdAt.getTime()) / 3_600_000) : 1;
+      const engagement = likes + retweets * 2;
+      const velocity  = Math.round(engagement / ageHours);
+
+      // Pull media (main + quote + reply-parent) — mirrors /api/preview
+      const upgrade = (u) => {
+        if (!u || !/pbs\.twimg\.com\//.test(u)) return u;
+        try {
+          const x = new URL(u);
+          x.searchParams.set('name', 'orig');
+          if (!x.searchParams.get('format')) {
+            const ext = x.pathname.match(/\.(jpe?g|png|webp)$/i)?.[1] || 'jpg';
+            x.searchParams.set('format', ext.toLowerCase().replace('jpeg', 'jpg'));
+          }
+          return x.toString();
+        } catch { return u; }
+      };
+      const imageUrls = [];
+      const pushMedia = (list) => {
+        if (!Array.isArray(list)) return;
+        for (const m of list) {
+          const raw = m?.type === 'photo' ? (m.url || m.thumbnail_url) : (m?.thumbnail_url || m?.url);
+          const u = raw ? upgrade(raw) : null;
+          if (u && !imageUrls.includes(u)) imageUrls.push(u);
+        }
+      };
+      pushMedia(tw.media?.all);
+      pushMedia(tw.quote?.media?.all);
+      pushMedia(tw.replying_to?.media?.all);
+
+      // Video: pick from main, fallback quote/reply
+      const pickVideo = (list) => {
+        if (!Array.isArray(list)) return null;
+        for (const m of list) {
+          if (m?.type === 'video' || m?.type === 'gif') {
+            return m.url || m.thumbnail_url;
+          }
+        }
+        return null;
+      };
+      const videoUrl = pickVideo(tw.media?.all) || pickVideo(tw.quote?.media?.all) || null;
+
+      // Hashtags/tickers from text
+      const hashtags = [...new Set((text.match(/#\w+/g) || []).map(h => h.toLowerCase()))];
+      const tickers  = [...new Set(text.match(/\$[A-Z]{2,8}/g) || [])];
+
+      // Build title — prefer hashtags/tickers, fall back to cleaned text
+      const title = (hashtags[0] && tickers[0]) ? `${hashtags[0]} ${tickers[0]}`
+                  : hashtags[0] || tickers[0]
+                  || text.replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim().substring(0, 120);
+
+      return {
+        externalId: `manual_twitter_${tweetId}`,
+        source: 'twitter',
+        title: title || `Tweet by @${author}`,
+        originalTitle: title || `Tweet by @${author}`,
+        description: text.substring(0, 300),
+        url: `https://twitter.com/${author}/status/${tweetId}`,
+        metrics: {
+          views, likes, retweets, replies,
+          upvotes: engagement,
+          velocity,
+          ageHours: Math.round(ageHours * 10) / 10,
+          hashtags, tickers,
+          author: `@${author}`,
+          followers: tw.author?.followers || 0,
+          thumbnailUrl: imageUrls[0] || null,
+          imageUrls,
+          videoUrl,
+          searchQuery: '(manual)',
+        },
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _resolveRedditUrl(url) {
+    const jsonUrl = url.replace(/\/?(\?.*)?$/, '') + '.json?raw_json=1';
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const r = await fetch(jsonUrl, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Catalyst/3.0)', 'Accept': 'application/json' },
+      });
+      clearTimeout(timer);
+      if (!r.ok) throw new Error(`reddit ${r.status}`);
+      const data = await r.json();
+      const post = data?.[0]?.data?.children?.[0]?.data;
+      if (!post) throw new Error('Reddit post not found');
+
+      const score     = post.score || post.ups || 0;
+      const comments  = post.num_comments || 0;
+      const createdAt = post.created_utc ? new Date(post.created_utc * 1000) : null;
+      const ageHours  = createdAt ? Math.max(0.25, (Date.now() - createdAt.getTime()) / 3_600_000) : 1;
+      const velocity  = Math.round(score / ageHours);
+      const subreddit = post.subreddit || '';
+      const author    = post.author || '';
+
+      // Pull best-quality image
+      let imageUrl = null;
+      const directUrl = post.url_overridden_by_dest || post.url;
+      if (directUrl && /\.(jpe?g|png|gif|webp)(\?|$)/i.test(directUrl)) imageUrl = directUrl;
+      else if (post.preview?.images?.[0]?.source?.url) imageUrl = post.preview.images[0].source.url;
+      else if (post.is_gallery && post.media_metadata) {
+        const firstId = post.gallery_data?.items?.[0]?.media_id;
+        const item = firstId && post.media_metadata[firstId];
+        imageUrl = item?.s?.u || item?.s?.gif || null;
+      }
+      // Gallery: collect all images
+      const imageUrls = [];
+      if (imageUrl) imageUrls.push(imageUrl);
+      if (post.is_gallery && post.media_metadata && post.gallery_data?.items) {
+        for (const it of post.gallery_data.items) {
+          const m = post.media_metadata[it.media_id];
+          const u = m?.s?.u || m?.s?.gif;
+          if (u && !imageUrls.includes(u)) imageUrls.push(u);
+        }
+      }
+
+      const videoUrl = post.preview?.reddit_video_preview?.fallback_url
+                    || post.media?.reddit_video?.fallback_url
+                    || null;
+
+      return {
+        externalId: `manual_reddit_${post.id}`,
+        source: 'reddit',
+        title: post.title || '(untitled Reddit post)',
+        originalTitle: post.title || '(untitled Reddit post)',
+        description: (post.selftext || '').substring(0, 400),
+        url: 'https://reddit.com' + (post.permalink || ''),
+        metrics: {
+          upvotes: score,
+          comments,
+          velocity,
+          ageHours: Math.round(ageHours * 10) / 10,
+          subreddit,
+          author: `u/${author}`,
+          thumbnailUrl: imageUrls[0] || null,
+          imageUrls,
+          videoUrl,
+          searchQuery: '(manual)',
+        },
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _resolveTiktokUrl(url) {
+    const videoIdMatch = url.match(/\/video\/(\d+)/);
+    if (!videoIdMatch) throw new Error('Not a valid TikTok URL');
+    const videoId = videoIdMatch[1];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const r = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Catalyst/3.0', 'Accept': 'application/json' },
+      });
+      clearTimeout(timer);
+      if (!r.ok) throw new Error(`tiktok ${r.status}`);
+      const data = await r.json();
+      const title  = (data.title || '').substring(0, 200);
+      const author = data.author_name || '';
+      const thumb  = data.thumbnail_url || null;
+      return {
+        externalId: `manual_tiktok_${videoId}`,
+        source: 'tiktok',
+        title: title || '(TikTok video)',
+        originalTitle: title || '(TikTok video)',
+        description: title,
+        url,
+        metrics: {
+          upvotes: 0, // oembed doesn't expose play counts
+          comments: 0,
+          velocity: 0,
+          ageHours: 1,
+          author: `@${author}`,
+          thumbnailUrl: thumb,
+          imageUrls: thumb ? [thumb] : [],
+          videoUrl: null,
+          searchQuery: '(manual)',
+        },
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _resolveGenericUrl(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const r = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Catalyst/3.0)' },
+      });
+      clearTimeout(timer);
+      if (!r.ok) throw new Error(`fetch ${r.status}`);
+      const ct = (r.headers.get('content-type') || '').toLowerCase();
+      if (!ct.includes('text/html')) throw new Error('Not an HTML page');
+      const html = await r.text();
+      const pick = (re) => { const m = html.match(re); return m ? m[1] : ''; };
+      const title = pick(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)
+                 || pick(/<title[^>]*>([^<]+)<\/title>/i);
+      const desc  = pick(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']+)["']/i)
+                 || pick(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i);
+      const image = pick(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i);
+      const cleanTitle = (title || '').replace(/\s+/g, ' ').trim().substring(0, 200);
+      const cleanDesc  = (desc  || '').replace(/\s+/g, ' ').trim().substring(0, 400);
+      if (!cleanTitle) throw new Error('No title or og:title found on page');
+      return {
+        externalId: `manual_web_${Buffer.from(url).toString('base64').substring(0, 16)}`,
+        source: 'web',
+        title: cleanTitle,
+        originalTitle: cleanTitle,
+        description: cleanDesc,
+        url,
+        metrics: {
+          upvotes: 0,
+          comments: 0,
+          velocity: 0,
+          ageHours: 1,
+          thumbnailUrl: image || null,
+          imageUrls: image ? [image] : [],
+          videoUrl: null,
+          searchQuery: '(manual)',
+        },
+      };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // ── Start ────────────────────────────────────────────────────────────────────

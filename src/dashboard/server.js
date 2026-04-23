@@ -15,7 +15,7 @@ import http from 'http';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { timingSafeEqual } from 'crypto';
+import { timingSafeEqual, createHash } from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -176,6 +176,13 @@ class DashboardServer {
     // as a generic proxy.
     if (path.match(/^\/api\/video\/reddit\/[a-z0-9]+\.mp4$/i) && method === 'GET') {
       return this._handleRedditVideo(req, res, path);
+    }
+
+    // Twitter video proxy — public. video.twimg.com returns 403 on cross-origin
+    // hotlinked <video> plays, so we fetch server-side with a Twitter Referer,
+    // cache on disk, and stream with Range support.
+    if (path.match(/^\/api\/video\/twitter\/[a-f0-9]{16}\.mp4$/i) && method === 'GET') {
+      return this._handleTwitterVideo(req, res, path);
     }
 
     // ── Bearer-token auth ──────────────────────────────────────────────────
@@ -578,7 +585,7 @@ class DashboardServer {
   }
 
   _handleSettingsGet(req, res) {
-    const numDefaults = { alertThreshold: 60, viralityThreshold: 70, minScoreToSave: 0, maxAlertsPerCycle: 0 };
+    const numDefaults = { alertThreshold: 60, minScoreToSave: 0, maxAlertsPerCycle: 0 };
     const stored = this.db.getAllSettings();
     const merged = {};
     for (const [k, v] of Object.entries(numDefaults)) {
@@ -608,7 +615,6 @@ class DashboardServer {
 
     const allowed = {
       alertThreshold:    { min: 0,  max: 100, type: 'int' },
-      viralityThreshold: { min: 0,  max: 100, type: 'int' },
       minScoreToSave:    { min: 0,  max: 100, type: 'int' },
       maxAlertsPerCycle: { min: 0,  max: 50,  type: 'int' },
     };
@@ -835,6 +841,8 @@ class DashboardServer {
       memePotential:   metrics.memePotential || 0,
       adoptionScore:   metrics.adoptionScore  ?? metrics.memePotential ?? 0,
       emergenceScore:  metrics.emergenceScore ?? 0,
+      storyScore:      metrics.storyScore     ?? 0,
+      storyHook:       metrics.storyHook      ?? '',
       narrativePhase:  metrics.narrativePhase  ?? null,
       rankScore:       metrics.rankScore       ?? null,
       alertScore:      metrics.alertScore      ?? null,
@@ -844,6 +852,7 @@ class DashboardServer {
       junkReasons:     metrics.junkReasons     ?? [],  // [JUNK_FILTER]
       velocity:        metrics.velocity        ?? 0,
       uniquePlatforms: metrics.uniquePlatforms ?? 1,
+      manualSubmitted: metrics.manualSubmitted === true,
       aiExplanation:   row.ai_explanation,
       whyItWillPump:   metrics.whyItWillPump || '',
       // Trigger event — empty string when the AI found no explicit cause.
@@ -877,6 +886,11 @@ class DashboardServer {
         // exact stream Reddit indexed for this post.
         const m = /^https:\/\/v\.redd\.it\/([a-z0-9]+)\//i.exec(v);
         if (m) return `/api/video/reddit/${m[1]}.mp4?src=${encodeURIComponent(v)}`;
+        // Twitter — video.twimg.com 403s on hotlink. Route through our proxy.
+        if (/^https:\/\/video\.twimg\.com\//i.test(v) && /\.mp4(\?|$)/i.test(v)) {
+          const id = createHash('sha1').update(v).digest('hex').slice(0, 16);
+          return `/api/video/twitter/${id}.mp4?src=${encodeURIComponent(v)}`;
+        }
         return v;
       })(),
       feedback,
@@ -912,15 +926,26 @@ class DashboardServer {
             return json(res, 200, { imageUrl: null });
           }
           const data = await r.json();
-          // media.all[0]: photo → .url (full-res), video → .thumbnail_url (frame)
-          const media = data?.tweet?.media?.all?.[0];
-          const rawUrl = media?.type === 'photo'
-            ? (media.url || media.thumbnail_url)
-            : (media?.thumbnail_url || media?.url) || null;
-          // Force pbs.twimg.com to original resolution
-          const imageUrl = rawUrl ? upgradeTwimgUrl(rawUrl) : null;
-          this.logger.info(`[Preview] tweet ${tweetId} → ${imageUrl ? 'has image' : 'no media'}`);
-          return json(res, 200, { imageUrl });
+          // Collect media from main tweet AND quoted/reply-parent tweet. For
+          // each media entry: photo → .url (full-res), video → .thumbnail_url
+          // (frame). Force pbs.twimg.com to original resolution via upgrade.
+          const collectFrom = (list, bucket) => {
+            if (!Array.isArray(list)) return;
+            for (const m of list) {
+              const raw = m?.type === 'photo'
+                ? (m.url || m.thumbnail_url)
+                : (m?.thumbnail_url || m?.url);
+              const u = raw ? upgradeTwimgUrl(raw) : null;
+              if (u && !bucket.includes(u)) bucket.push(u);
+            }
+          };
+          const urls = [];
+          collectFrom(data?.tweet?.media?.all, urls);
+          collectFrom(data?.tweet?.quote?.media?.all, urls);
+          collectFrom(data?.tweet?.replying_to?.media?.all, urls);
+          const imageUrl = urls[0] || null;
+          this.logger.info(`[Preview] tweet ${tweetId} → ${urls.length} image(s) (main + quote)`);
+          return json(res, 200, { imageUrl, imageUrls: urls });
         } catch (err) {
           clearTimeout(timer);
           this.logger.info(`[Preview] fxtwitter fetch error for tweet ${tweetId}: ${err.message}`);
@@ -1074,6 +1099,106 @@ class DashboardServer {
       fs.createReadStream(filePath, { start, end }).pipe(res);
     } catch (err) {
       this.logger?.warn?.(`[Video] proxy error: ${err.message}`);
+      try { res.writeHead(500).end('video proxy error'); } catch {}
+    }
+  }
+
+  // Twitter video proxy. video.twimg.com hotlink-protects and returns 403 when
+  // a <video> element plays it cross-origin (no Referer). We fetch server-side
+  // with a Twitter Referer + browser UA, cache to disk, then stream with Range.
+  async _handleTwitterVideo(req, res, reqPath) {
+    try {
+      const id = reqPath.match(/\/api\/video\/twitter\/([a-f0-9]{16})\.mp4$/i)?.[1];
+      if (!id) { res.writeHead(400).end('bad id'); return; }
+
+      const u = new URL(req.url, 'http://localhost');
+      const srcRaw = u.searchParams.get('src') || '';
+      // Strict allow-list — only genuine video.twimg.com MP4s, no open proxy.
+      if (!/^https:\/\/video\.twimg\.com\/[^\s]+\.mp4(\?|$)/i.test(srcRaw)) {
+        res.writeHead(400).end('bad src');
+        return;
+      }
+
+      const cacheDir = path.join(process.cwd(), 'data', 'video-cache');
+      const filePath = path.join(cacheDir, `tw_${id}.mp4`);
+
+      if (!fs.existsSync(filePath)) {
+        try { fs.mkdirSync(cacheDir, { recursive: true }); } catch {}
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15000);
+        try {
+          const upstream = await fetch(srcRaw, {
+            signal: controller.signal,
+            headers: {
+              'Referer': 'https://x.com/',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+              'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.5',
+            },
+          });
+          if (!upstream.ok || !upstream.body) {
+            throw new Error(`upstream ${upstream.status}`);
+          }
+          const partPath = filePath + '.part';
+          const fileStream = fs.createWriteStream(partPath);
+          await new Promise((resolve, reject) => {
+            const reader = upstream.body.getReader();
+            const pump = async () => {
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  fileStream.write(value);
+                }
+                fileStream.end();
+                fileStream.on('finish', resolve);
+                fileStream.on('error', reject);
+              } catch (e) { reject(e); }
+            };
+            pump();
+          });
+          fs.renameSync(partPath, filePath);
+        } catch (err) {
+          this.logger?.warn?.(`[Video] twitter fetch failed (${err.message}) — 302 fallback`);
+          try { fs.unlinkSync(filePath + '.part'); } catch {}
+          res.writeHead(302, { Location: srcRaw });
+          res.end();
+          return;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      const stat = fs.statSync(filePath);
+      const total = stat.size;
+      const range = req.headers.range;
+
+      const baseHeaders = {
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'public, max-age=86400, immutable',
+      };
+
+      if (!range) {
+        res.writeHead(200, { ...baseHeaders, 'Content-Length': total });
+        fs.createReadStream(filePath).pipe(res);
+        return;
+      }
+
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      const start = m && m[1] ? parseInt(m[1], 10) : 0;
+      const end   = m && m[2] ? parseInt(m[2], 10) : total - 1;
+      if (isNaN(start) || isNaN(end) || start > end || end >= total) {
+        res.writeHead(416, { 'Content-Range': `bytes */${total}` }).end();
+        return;
+      }
+      res.writeHead(206, {
+        ...baseHeaders,
+        'Content-Range':  `bytes ${start}-${end}/${total}`,
+        'Content-Length': end - start + 1,
+      });
+      fs.createReadStream(filePath, { start, end }).pipe(res);
+    } catch (err) {
+      this.logger?.warn?.(`[Video] twitter proxy error: ${err.message}`);
       try { res.writeHead(500).end('video proxy error'); } catch {}
     }
   }
@@ -2026,6 +2151,7 @@ class DashboardServer {
     .cat-ai_drama    { background: rgba(129,236,236,.1); color: #81ecec; border: 1px solid rgba(129,236,236,.18); }
     .cat-boring      { background: rgba(255,255,255,.04); color: var(--dim); border: 1px solid var(--border); }
     .cat-other       { background: rgba(255,255,255,.04); color: var(--dim); border: 1px solid var(--border); }
+    .badge-manual    { background: rgba(180,140,255,.12); color: #b48cff; border: 1px solid rgba(180,140,255,.3); }
 
     /* ── Source chip ── */
     .source-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--dim); white-space: nowrap; padding: 2px 7px; border-radius: 5px; background: rgba(255,255,255,.04); }
@@ -2057,6 +2183,8 @@ class DashboardServer {
     .trend-link-twitter:hover { background: rgba(29,161,242,.1); border-color: rgba(29,161,242,.4); color: #fff; }
     .trend-link-tiktok { color: #ee1d52; border-color: rgba(238,29,82,.2); }
     .trend-link-tiktok:hover { background: rgba(238,29,82,.1); border-color: rgba(238,29,82,.4); color: #fff; }
+    .trend-link-grok { color: #b48cff; border-color: rgba(180,140,255,.25); }
+    .trend-link-grok:hover { background: rgba(180,140,255,.1); border-color: rgba(180,140,255,.5); color: #fff; }
 
     /* ── Table wrap & header ── */
     .table-wrap { background: transparent; border: none; border-radius: var(--radius); overflow: hidden; }
@@ -2903,6 +3031,70 @@ class DashboardServer {
       background: linear-gradient(135deg, var(--card2), var(--card3));
     }
 
+    /* Multi-image gallery (2+ photos) — horizontal carousel with arrows */
+    .img-carousel {
+      position: relative; width: 100%;
+      border-radius: 14px; overflow: hidden;
+      margin: 8px 0 10px;
+      background: #0a0a12;
+      border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      max-height: 380px;
+    }
+    .img-carousel img {
+      display: block; width: 100%; height: auto;
+      max-height: 380px;
+      object-fit: contain;
+    }
+    body.prefs-compact .img-carousel,
+    body.prefs-compact .img-carousel img { max-height: 280px; }
+    .img-carousel.in-modal { max-height: 440px; border-radius: 8px; }
+    .img-carousel.in-modal img { max-height: 440px; }
+    .img-carousel-nav {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      width: 38px; height: 38px; border-radius: 50%;
+      background: rgba(0,0,0,.55);
+      border: 1px solid rgba(255,255,255,.18);
+      color: #fff; font-size: 22px; line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; z-index: 2;
+      transition: all .15s;
+      padding: 0;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+    }
+    .img-carousel-nav:hover {
+      background: rgba(0,0,0,.8);
+      border-color: rgba(255,255,255,.35);
+      transform: translateY(-50%) scale(1.08);
+    }
+    .img-carousel-nav:active { transform: translateY(-50%) scale(.95); }
+    .img-carousel-nav-prev { left: 10px; }
+    .img-carousel-nav-next { right: 10px; }
+    .img-carousel-counter {
+      position: absolute; top: 10px; right: 10px;
+      background: rgba(0,0,0,.6);
+      color: #fff; font-size: 11px; font-weight: 700;
+      padding: 4px 10px; border-radius: 12px;
+      z-index: 2;
+      font-family: 'JetBrains Mono', monospace;
+      letter-spacing: .3px;
+    }
+    .img-carousel-dots {
+      position: absolute; bottom: 10px; left: 50%;
+      transform: translateX(-50%);
+      display: flex; gap: 5px; z-index: 2;
+    }
+    .img-carousel-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: rgba(255,255,255,.35);
+      transition: all .15s;
+    }
+    .img-carousel-dot.active {
+      background: #fff;
+      width: 18px; border-radius: 3px;
+    }
+
     /* ── Feed score strip ── */
     .feed-scores {
       display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
@@ -3353,12 +3545,15 @@ const I18N = {
     // Bars / scores
     'bar.emergence': '🌊 Emergence',
     'bar.adoption': '💊 Adoption',
+    'bar.story': '📖 Story',
+    'story.hook_label': 'Hook',
 
     // Feed card
     'feed.details': '📖 Details',
     'feed.open_source': 'Open',
     'feed.copy_title': 'Copy title',
     'feed.category_tip': 'Category',
+    'feed.manual_tip': 'Manually submitted via admin panel',
     'feedback.like': 'Smash that like',
     'feedback.unlike': 'Undo like',
     'feedback.dislike': 'Dislike',
@@ -3385,6 +3580,7 @@ const I18N = {
     'sidebar.sources': 'Sources',
     'sidebar.phase': 'Phase',
     'sidebar.filters': 'Filters',
+    'sidebar.manual_only': 'Manual only',
     'sidebar.show_all': 'Show all',
     'sidebar.reset': 'Reset',
     'sidebar.window': '⏱ Window',
@@ -3401,6 +3597,8 @@ const I18N = {
     'tooltip.show_source': 'Show in feed',
     'tooltip.show_all': 'Show all',
     'tooltip.reset': 'Reset',
+    'tooltip.manual_on': 'Show only manually-submitted trends',
+    'tooltip.manual_off': 'Show all trends',
 
     // Hero bar (session/trends summary header)
     'hero.window': 'Window',
@@ -3426,6 +3624,7 @@ const I18N = {
     // Trend modal
     'modal.why_pump': "⚡ Why it'll moon",
     'modal.why_now': '🔥 Trigger',
+    'modal.why_now_empty': 'No clear trigger — organic slow-burn',
     'modal.ai_explanation': '🤖 AI alpha',
     'modal.market_stage': '💹 Market Stage',
     'modal.phase': '🧭 Narrative phase',
@@ -3440,6 +3639,7 @@ const I18N = {
     'modal.links': '🔗 Links',
     'modal.source_link': '{ico} Source →',
     'modal.tg_link': '📨 Telegram',
+    'modal.ask_grok': '🧠 Ask Grok',
 
     // Control panel
     'control.title': '⚙️ Controls',
@@ -3551,6 +3751,8 @@ const I18N = {
     'toast.hidden_from_feed': '🙈 Hidden from feed: {name}',
     'toast.shown_in_feed': '👁 Shown: {name}',
     'toast.filters_reset': '♻️ Filters reset',
+    'toast.manual_only_on': '🧪 Showing manual submissions only',
+    'toast.manual_only_off': '🧪 Showing all trends',
     'toast.error_prefix': 'Error: {e}',
   },
 
@@ -3611,12 +3813,15 @@ const I18N = {
     // Bars / scores
     'bar.emergence': '🌊 Emergence',
     'bar.adoption': '💊 Adoption',
+    'bar.story': '📖 Story',
+    'story.hook_label': 'Хук',
 
     // Feed card
     'feed.details': '📖 Подробнее',
     'feed.open_source': 'Открыть',
     'feed.copy_title': 'Скопировать заголовок',
     'feed.category_tip': 'Категория',
+    'feed.manual_tip': 'Ручная отправка через админку',
     'feedback.like': 'Лайк',
     'feedback.unlike': 'Убрать лайк',
     'feedback.dislike': 'Дизлайк',
@@ -3643,6 +3848,7 @@ const I18N = {
     'sidebar.sources': 'Источники',
     'sidebar.phase': 'Фаза',
     'sidebar.filters': 'Фильтры',
+    'sidebar.manual_only': 'Только ручные',
     'sidebar.show_all': 'Показать все',
     'sidebar.reset': 'Сбросить',
     'sidebar.window': '⏱ Окно',
@@ -3659,6 +3865,8 @@ const I18N = {
     'tooltip.show_source': 'Показать в фиде',
     'tooltip.show_all': 'Показать все',
     'tooltip.reset': 'Сбросить',
+    'tooltip.manual_on': 'Показать только ручные сабмиты',
+    'tooltip.manual_off': 'Показать все тренды',
 
     // Hero bar
     'hero.window': 'Окно',
@@ -3684,6 +3892,7 @@ const I18N = {
     // Trend modal
     'modal.why_pump': '⚡ Почему запампит',
     'modal.why_now': '🔥 Триггер',
+    'modal.why_now_empty': 'Нет явного триггера — органический рост',
     'modal.ai_explanation': '🤖 AI-объяснение',
     'modal.market_stage': '💹 Стадия рынка',
     'modal.phase': '🧭 Фаза нарратива',
@@ -3698,6 +3907,7 @@ const I18N = {
     'modal.links': '🔗 Ссылки',
     'modal.source_link': '{ico} Источник →',
     'modal.tg_link': '📨 Telegram',
+    'modal.ask_grok': '🧠 Спросить Grok',
 
     // Control panel
     'control.title': '⚙️ Управление',
@@ -3809,6 +4019,8 @@ const I18N = {
     'toast.hidden_from_feed': '🙈 Скрыт в фиде: {name}',
     'toast.shown_in_feed': '👁 Показан: {name}',
     'toast.filters_reset': '♻️ Фильтры сброшены',
+    'toast.manual_only_on': '🧪 Только ручные сабмиты',
+    'toast.manual_only_off': '🧪 Показываю все тренды',
     'toast.error_prefix': 'Ошибка: {e}',
   },
 };
@@ -3830,6 +4042,16 @@ function useLang() {
   return lang;
 }
 function localeTag() { return CURRENT_LANG === 'ru' ? 'ru-RU' : 'en-US'; }
+// Russian plural for the "seen" counter: 1 раз, 2 раза, 5 раз, 11 раз, 21 раз…
+function pluralSeen(n) {
+  const num = Number(n) || 0;
+  if (CURRENT_LANG !== 'ru') return num + 'x';
+  const mod10  = num % 10;
+  const mod100 = num % 100;
+  if (mod10 === 1 && mod100 !== 11) return num + ' раз';
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return num + ' раза';
+  return num + ' раз';
+}
 function useTheme() {
   const [theme, setThemeState] = useState(CURRENT_THEME);
   useEffect(() => onThemeChange(setThemeState), []);
@@ -4046,14 +4268,68 @@ function videoVolumeRef(el) {
   });
 }
 
+// ── ImageCarousel — horizontal slider for 2+ photos ─────────────────────────
+// One image at a time, full width, aspect preserved. Prev/next arrow buttons,
+// a small "N/M" counter, and dot pagination. Arrow clicks stop propagation so
+// feed cards don't open their modal when the user just wants to flip photos.
+function ImageCarousel({ urls, variant = 'in-feed' }) {
+  const filtered = (urls || []).filter(Boolean);
+  const [idx, setIdx] = useState(0);
+  if (filtered.length === 0) return null;
+  const stop = (e) => { if (e) { e.stopPropagation(); e.preventDefault(); } };
+  const go = (delta) => (e) => {
+    stop(e);
+    setIdx((i) => (i + delta + filtered.length) % filtered.length);
+  };
+  const children = [
+    h('img', {
+      key: 'img:' + idx,
+      src: filtered[idx], alt: '', loading: 'lazy',
+      onError: (e) => { try { e.target.style.opacity = 0; } catch {} },
+    }),
+  ];
+  if (filtered.length > 1) {
+    children.push(
+      h('button', {
+        key: 'prev',
+        className: 'img-carousel-nav img-carousel-nav-prev',
+        onClick: go(-1),
+        'aria-label': 'Previous image',
+        type: 'button',
+      }, '\u2039'),
+      h('button', {
+        key: 'next',
+        className: 'img-carousel-nav img-carousel-nav-next',
+        onClick: go(1),
+        'aria-label': 'Next image',
+        type: 'button',
+      }, '\u203A'),
+      h('div', { key: 'counter', className: 'img-carousel-counter' },
+        (idx + 1) + ' / ' + filtered.length
+      ),
+      h('div', { key: 'dots', className: 'img-carousel-dots' },
+        filtered.map((_, i) =>
+          h('div', {
+            key: 'dot' + i,
+            className: 'img-carousel-dot' + (i === idx ? ' active' : ''),
+          })
+        )
+      )
+    );
+  }
+  return h('div', { className: 'img-carousel ' + variant }, children);
+}
+
 // ── FeedImage — inline image / video for feed cards ──────────────────────────
 // When the trend has a videoUrl we render an HTML5 <video> player with the
 // image as its poster (so the card still looks the same until the user clicks
 // play). Click/drag on the player doesn't bubble up to the card's onClick —
 // otherwise pressing play would open the trend modal.
 function FeedImage({ trend }) {
-  const [imgUrl, setImgUrl] = useState(trend.imageUrl || null);
-  const [tried,  setTried]  = useState(!!trend.imageUrl);
+  const galleryUrls = Array.isArray(trend.imageUrls) ? trend.imageUrls.filter(Boolean) : [];
+  const hasGallery  = galleryUrls.length >= 2;
+  const [imgUrl, setImgUrl] = useState(trend.imageUrl || (hasGallery ? galleryUrls[0] : null));
+  const [tried,  setTried]  = useState(!!trend.imageUrl || hasGallery);
   const [failed, setFailed] = useState(false);
   const [videoFailed, setVideoFailed] = useState(false);
 
@@ -4068,6 +4344,11 @@ function FeedImage({ trend }) {
   }, [trend.url]);
 
   const hasVideo = !!trend.videoUrl && !videoFailed;
+
+  // Multi-image gallery (no video) → TG-style tile grid
+  if (!hasVideo && hasGallery) {
+    return h(ImageCarousel, { urls: galleryUrls, variant: 'in-feed' });
+  }
 
   if (!hasVideo) {
     if (failed || (!imgUrl && tried)) return null;
@@ -4225,6 +4506,7 @@ function FeedCard({ trend, onOpen }) {
           h('span', { className: 'feed-dot' }),
           h('span', { className: 'feed-time' }, fmtTime(trend.firstSeen)),
           h('div', { className: 'feed-badges' },
+            trend.manualSubmitted ? h('span', { className: 'badge badge-manual', title: t('feed.manual_tip') }, '🧪 MANUAL') : null,
             phase ? h(PhaseBadge, { phase }) : null,
             h(MarketStageBadge, { stage: trend.marketStage }),
             h('span', { className: 'badge ' + catCls, title: t('feed.category_tip') }, catIco + ' ' + (trend.category || 'other'))
@@ -4375,9 +4657,13 @@ function RightPanel({ stats, hours, onOpenTrend }) {
 
 // ── TrendModal (side drawer) ───────────────────────────────────────────────────
 function TrendModal({ trend, onClose }) {
-  useLang();
+  const lang = useLang();
   const [imgUrl, setImgUrl] = useState(trend.imageUrl || null);
   const [imgLoading, setImgLoading] = useState(!trend.imageUrl && !!trend.url);
+  // Extra images pulled lazily from /api/preview (typically quote-tweet media
+  // for Twitter trends saved before the quote-media fix). Merged with
+  // trend.imageUrls below so the carousel surfaces them even for old rows.
+  const [extraUrls, setExtraUrls] = useState([]);
   const catCls = CAT_CLS[trend.category] || 'cat-other';
   const catIco = CAT_ICONS[trend.category] || '📌';
   const srcIco = SOURCE_ICONS[trend.source] || '📡';
@@ -4387,11 +4673,31 @@ function TrendModal({ trend, onClose }) {
     : trend.source === 'tiktok' ? ' trend-link-tiktok' : '';
 
   useEffect(() => {
+    // Missing main image → fetch preview for the og:image / fxtwitter media.
     if (!imgUrl && trend.url) {
       fetch('/api/preview?url=' + encodeURIComponent(trend.url))
         .then(r => r.json())
-        .then(d => { setImgUrl(d.imageUrl || null); setImgLoading(false); })
+        .then(d => {
+          setImgUrl(d.imageUrl || null);
+          if (Array.isArray(d.imageUrls) && d.imageUrls.length) setExtraUrls(d.imageUrls);
+          setImgLoading(false);
+        })
         .catch(() => setImgLoading(false));
+      return;
+    }
+    // Twitter trend WITH main image → still probe preview to pick up
+    // quote-tweet / reply-parent media that the collector didn't capture
+    // (old DB rows). Cheap: a single fxtwitter call per modal open.
+    if (trend.source === 'twitter' && trend.url) {
+      const existing = Array.isArray(trend.imageUrls) ? trend.imageUrls.filter(Boolean) : [];
+      if (existing.length < 2) {
+        fetch('/api/preview?url=' + encodeURIComponent(trend.url))
+          .then(r => r.json())
+          .then(d => {
+            if (Array.isArray(d.imageUrls) && d.imageUrls.length) setExtraUrls(d.imageUrls);
+          })
+          .catch(() => {});
+      }
     }
   }, []);
 
@@ -4413,6 +4719,7 @@ function TrendModal({ trend, onClose }) {
       // Head
       h('div', { className: 'modal-head' },
         h('span', { className: 'badge ' + catCls }, catIco + ' ' + (trend.category || 'other')),
+        trend.manualSubmitted ? h('span', { className: 'badge badge-manual', title: t('feed.manual_tip') }, '🧪 MANUAL') : null,
         h('div', { className: 'source-chip' }, srcIco, ' ', srcLbl),
         h('span', { className: 'time-cell', style: { fontSize: 11 } }, fmtTime(trend.firstSeen)),
         h('button', { className: 'modal-close', onClick: onClose }, t('app.esc_close'))
@@ -4422,22 +4729,37 @@ function TrendModal({ trend, onClose }) {
       h('div', { className: 'modal-body' },
 
         // Media — video with image poster if available, otherwise just image
-        imgLoading
-          ? h('div', { className: 'modal-image-loading' })
-          : trend.videoUrl
-            ? h('video', {
-                ref: videoVolumeRef,
-                className: 'modal-image',
-                style: { height: 'auto', maxHeight: 420, objectFit: 'contain', background: '#000' },
-                src: trend.videoUrl,
-                poster: imgUrl || undefined,
-                controls: true,
-                preload: 'metadata',
-                playsInline: true,
-              })
-            : imgUrl
-              ? h('img', { className: 'modal-image', src: imgUrl, alt: '', onError: () => setImgUrl(null), loading: 'lazy' })
-              : null,
+        // (or a TG-style tile grid when the trend has 2+ photos and no video)
+        (() => {
+          if (imgLoading) return h('div', { className: 'modal-image-loading' });
+          if (trend.videoUrl) {
+            return h('video', {
+              ref: videoVolumeRef,
+              className: 'modal-image',
+              style: { height: 'auto', maxHeight: 420, objectFit: 'contain', background: '#000' },
+              src: trend.videoUrl,
+              poster: imgUrl || undefined,
+              controls: true,
+              preload: 'metadata',
+              playsInline: true,
+            });
+          }
+          // Merge DB imageUrls + preview-sourced extras (quote-tweet media for
+          // Twitter), dedupe preserving order. Seed with singular imgUrl too
+          // in case DB only stored the scalar field.
+          const gallery = [];
+          const pushUnique = (u) => { if (u && !gallery.includes(u)) gallery.push(u); };
+          if (imgUrl) pushUnique(imgUrl);
+          if (Array.isArray(trend.imageUrls)) trend.imageUrls.forEach(pushUnique);
+          extraUrls.forEach(pushUnique);
+          if (gallery.length >= 2) {
+            return h(ImageCarousel, { urls: gallery, variant: 'in-modal' });
+          }
+          if (gallery.length === 1) {
+            return h('img', { className: 'modal-image', src: gallery[0], alt: '', onError: () => setImgUrl(null), loading: 'lazy' });
+          }
+          return null;
+        })(),
 
         // Title
         h('div', { className: 'modal-title' }, trend.title),
@@ -4453,18 +4775,48 @@ function TrendModal({ trend, onClose }) {
           h('div', { className: 'modal-section-content pump' }, trend.whyItWillPump)
         ) : null,
 
-        // Why now — concrete triggering event. Rendered only when the AI
-        // found an explicit cause; empty string means "no visible trigger".
-        trend.whyNow ? h('div', { className: 'modal-section' },
+        // Why now — concrete triggering event. Always rendered; when the AI
+        // didn't find an explicit cause we show a dim fallback so the user
+        // knows the system ran and intentionally chose not to speculate.
+        h('div', { className: 'modal-section' },
           h('div', { className: 'modal-section-label' }, t('modal.why_now')),
-          h('div', { className: 'modal-section-content why-now' }, trend.whyNow)
-        ) : null,
+          trend.whyNow
+            ? h('div', { className: 'modal-section-content why-now' }, trend.whyNow)
+            : h('div', {
+                className: 'modal-section-content why-now why-now-empty',
+                style: { color: 'var(--dim)', fontStyle: 'italic', opacity: 0.75 }
+              }, t('modal.why_now_empty'))
+        ),
 
         // AI explanation
         trend.aiExplanation ? h('div', { className: 'modal-section' },
           h('div', { className: 'modal-section-label' }, t('modal.ai_explanation')),
           h('div', { className: 'modal-section-content' }, trend.aiExplanation)
         ) : null,
+
+        // Actions — moved up for quick access to source/TG/Grok
+        h('div', { className: 'modal-section' },
+          h('div', { className: 'modal-section-label' }, t('modal.links')),
+          h('div', { className: 'modal-actions' },
+            trend.url ? h('a', { className: 'trend-link' + srcLinkCls, href: trend.url, target: '_blank', rel: 'noopener' }, t('modal.source_link', { ico: srcIco })) : null,
+            trend.tgMessageUrl ? h('a', { className: 'trend-link trend-link-tg', href: trend.tgMessageUrl, target: '_blank', rel: 'noopener' }, t('modal.tg_link')) : null,
+            (() => {
+              const title = trend.titleEn || trend.original_title || trend.originalTitle || trend.title || '';
+              if (!title && !trend.url) return null;
+              const prompt = lang === 'ru'
+                ? 'Насколько вирусится этот нарратив прямо сейчас? ' + title + (trend.url ? ' — ' + trend.url : '')
+                : 'How viral is this narrative right now? ' + title + (trend.url ? ' — ' + trend.url : '');
+              const grokUrl = 'https://grok.com/?q=' + encodeURIComponent(prompt);
+              return h('a', { className: 'trend-link trend-link-grok', href: grokUrl, target: '_blank', rel: 'noopener' }, t('modal.ask_grok'));
+            })()
+          )
+        ),
+
+        // Feedback
+        h('div', { className: 'modal-section' },
+          h('div', { className: 'modal-section-label' }, t('modal.feedback')),
+          h(FeedbackBar, { trend, variant: 'modal' })
+        ),
 
         // [MARKET_STAGE] market stage line in modal — remove block to disable
         trend.marketStage && trend.marketStage !== 'none' ? h('div', { className: 'modal-section' },
@@ -4488,10 +4840,23 @@ function TrendModal({ trend, onClose }) {
           ),
           h(ScoreBar, { label: t('bar.emergence'), value: trend.emergenceScore || 0 }),
           h('div', { style: { height: 4 } }),
-          h(ScoreBar, { label: t('bar.adoption'),  value: trend.adoptionScore || trend.memePotential || 0 })
+          h(ScoreBar, { label: t('bar.adoption'),  value: trend.adoptionScore || trend.memePotential || 0 }),
+          (trend.storyScore || 0) > 0 ? h('div', { style: { height: 4 } }) : null,
+          (trend.storyScore || 0) > 0
+            ? h(ScoreBar, {
+                label: t('bar.story'),
+                value: trend.storyScore || 0,
+                sub: trend.storyHook
+                  ? h('span', null,
+                      h('span', { style: { color: 'var(--dim)', marginRight: 6 } }, t('story.hook_label') + ':'),
+                      h('span', { style: { color: 'var(--text)', fontStyle: 'italic' } }, '\u201C' + trend.storyHook + '\u201D')
+                    )
+                  : null,
+              })
+            : null
         ) : null,
 
-        // Stats grid
+        // Stats grid — metrics at the very bottom
         h('div', { className: 'modal-section' },
           h('div', { className: 'modal-section-label' }, t('modal.metrics')),
           h('div', { className: 'modal-stats-grid' },
@@ -4513,23 +4878,8 @@ function TrendModal({ trend, onClose }) {
             ),
             h('div', { className: 'modal-stat' },
               h('div', { className: 'modal-stat-label' }, t('modal.seen')),
-              h('span', { style: { fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700 } }, trend.timesSeen || 1, t('modal.seen_suffix'))
+              h('span', { style: { fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700 } }, pluralSeen(trend.timesSeen || 1))
             )
-          )
-        ),
-
-        // Feedback
-        h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.feedback')),
-          h(FeedbackBar, { trend, variant: 'modal' })
-        ),
-
-        // Actions
-        h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.links')),
-          h('div', { className: 'modal-actions' },
-            trend.url ? h('a', { className: 'trend-link' + srcLinkCls, href: trend.url, target: '_blank', rel: 'noopener' }, t('modal.source_link', { ico: srcIco })) : null,
-            trend.tgMessageUrl ? h('a', { className: 'trend-link trend-link-tg', href: trend.tgMessageUrl, target: '_blank', rel: 'noopener' }, t('modal.tg_link')) : null
           )
         )
       )
@@ -5547,6 +5897,12 @@ function App() {
     try { return new Set(JSON.parse(localStorage.getItem('ts_hidden_sources') || '[]')); }
     catch (e) { return new Set(); }
   });
+  // "Manual only" filter — when true, restricts the feed to manually-submitted
+  // trends (flagged via raw_metrics.manualSubmitted). Persisted in localStorage.
+  const [manualOnly, setManualOnly] = useState(() => {
+    try { return localStorage.getItem('ts_manual_only') === '1'; }
+    catch (e) { return false; }
+  });
   const toastId = useRef(0);
   const sentinelRef = useRef(null);
   const mainFeedRef = useRef(null);
@@ -5794,9 +6150,10 @@ function App() {
           || (t.category || '').toLowerCase().includes(q);
       })
     : trends;
-  const visibleTrends = hiddenSources.size
+  let visibleTrends = hiddenSources.size
     ? searchFiltered.filter(t => !hiddenSources.has(t.source))
     : searchFiltered;
+  if (manualOnly) visibleTrends = visibleTrends.filter(t => t.manualSubmitted);
 
   // ── Auth gate ───────────────────────────────────────────────────────────
   if (me === false) return h(LoginScreen, { onLoggedIn: handleLoggedIn });
@@ -5822,6 +6179,16 @@ function App() {
       ),
       h('span', { className: 'nav-subtitle' }, t('app.subtitle')),
       h('div', { className: 'nav-right' },
+        h('a', {
+          className: 'nav-icon-btn',
+          href: 'https://x.com/Catalystparser',
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          title: 'Follow @Catalystparser on X',
+          'aria-label': 'Follow on X',
+        },
+          h('span', { className: 'nav-icon-btn-ico' }, '𝕏')
+        ),
         h('button', {
           type: 'button',
           className: 'nav-icon-btn nav-account' + (view === 'account' ? ' active' : ''),
@@ -5887,6 +6254,26 @@ function App() {
                 h('span', { className: 'source-eye' }, visible ? '👁' : '🙈')
               );
             }),
+
+            // Manual-only toggle — reuses .source-item styling so it lives
+            // visually next to the source list. Click toggles the filter.
+            h('div', {
+              'data-src': 'manual',
+              className: 'source-item ' + (manualOnly ? 'on' : 'off'),
+              onClick: () => {
+                setManualOnly(prev => {
+                  const next = !prev;
+                  try { localStorage.setItem('ts_manual_only', next ? '1' : '0'); } catch (e) {}
+                  addToast(next ? t('toast.manual_only_on') : t('toast.manual_only_off'), 'info');
+                  return next;
+                });
+              },
+              title: manualOnly ? t('tooltip.manual_off') : t('tooltip.manual_on')
+            },
+              h('span', { className: 'source-icon' }, '🧪'),
+              h('span', { className: 'source-name' }, t('sidebar.manual_only')),
+              h('span', { className: 'source-eye' }, manualOnly ? '✓' : '')
+            ),
 
             h('div', { className: 'sidebar-divider' }),
 
