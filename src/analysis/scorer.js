@@ -439,10 +439,12 @@ class Scorer {
 
     return trends.map((trend, idx) => {
       const a = analyses[idx] || {};
-      // originalTitle = source English title, title = English (from AI), titleRu = Russian translation
+      // originalTitle = raw source text (any language), title/titleEn = AI's
+      // English rendering. We no longer produce a Russian translation — prompt
+      // is English-only. `titleRu` was removed end-to-end; do NOT bring it back
+      // without also reviving the dual-flag formatter branch.
       const originalEnTitle = trend.originalTitle || trend.title;
-      const aiEnTitle       = a.title    || originalEnTitle;
-      const aiRuTitle       = a.titleRu  || null;
+      const aiEnTitle       = a.title || originalEnTitle;
 
       const adoption  = Number(a.memePotential) || 0;
       const emergence = trend.clusterMetrics?.emergenceScore ?? 0;
@@ -462,7 +464,7 @@ class Scorer {
         // [MARKET_STAGE] carry through from clusterMetrics if present
         marketStage: trend.clusterMetrics?.marketStage ?? null,
         originalTitle:    originalEnTitle,
-        title:            aiRuTitle || aiEnTitle,
+        title:            aiEnTitle,
         titleEn:          aiEnTitle,
         score:            viralityForAlert,
         memePotential:    adoption,

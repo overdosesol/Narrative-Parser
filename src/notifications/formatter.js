@@ -23,15 +23,16 @@ export function formatTelegramAlert(trend, lang = 'en') {
   let msg = t.alertHeader(memePotential) + '\n';
   msg += DIV + '\n';
 
-  const enTitle = trend.titleEn || trend.originalTitle || trend.original_title || trend.title;
-  const ruTitle = (trend.title !== enTitle) ? trend.title : null;
-
-  if (lang === 'ru' && ruTitle) {
-    msg += `\u{1F1EC}\u{1F1E7} ${escHtml(enTitle)}\n`;
-    msg += `\u{1F1F7}\u{1F1FA} <b>${escHtml(ruTitle)}</b>\n\n`;
-  } else {
-    msg += `\u{1F4CC} <b>${escHtml(enTitle)}</b>\n\n`;
-  }
+  // Single-line title. Historical note: earlier prompts returned both `title`
+  // (English) and `titleRu` (Russian), so the formatter rendered a two-flag
+  // bilingual block. The current SYSTEM_PROMPT is English-only — there is no
+  // Russian translation anywhere in the pipeline, and `trend.titleEn` is not
+  // restored by `_hydrateTrendFromDb` either. The dual-flag path therefore
+  // produced "🇷🇺 <English text>" on manual resends, which confused users.
+  // If we ever reintroduce translations, bring back a guarded bilingual branch
+  // here — but gate it on a real `titleRu` field, not on inequality.
+  const displayTitle = trend.title || trend.titleEn || trend.originalTitle || trend.original_title || '';
+  msg += `\u{1F4CC} <b>${escHtml(displayTitle)}</b>\n\n`;
 
   if (trend.whyNow) {
     msg += `\u{1F525} <b>${t.alertTrigger}:</b> ${escHtml(trend.whyNow)}\n\n`;
