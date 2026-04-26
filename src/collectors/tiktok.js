@@ -159,7 +159,21 @@ class TikTokCollector extends BaseCollector {
     //   ≥ 1 000 likes    (people actively liked it)
     //   ≥ 200  shares    (the real virality signal on TikTok)
     //   viralScore ≥ 40  (composite — catches influencer posts with big follower counts)
-    const meetsBar = plays >= 50_000 || likes >= 1_000 || shares >= 200 || viralScore >= 40;
+    //
+    // CJK-script videos get a harder bar — Apify's TikTok firehose drags in
+    // regional virality that meets the default floor but never crosses into a
+    // global narrative.
+    //   • Chinese (zh): 4× — Douyin reposts dominate the mainland firehose
+    //   • Japanese (ja) / Korean (ko): 2× — noisier than EN, less than zh
+    // viralScore is on a 0–100 scale, so it's bumped additively rather than
+    // multiplicatively (50 for ja/ko, 60 for zh).
+    const cjkScript = _detectCjkScript(desc);
+    const cjkMult   = cjkScript === 'zh' ? 4 : cjkScript ? 2 : 1;
+    const playsBar  = 50_000 * cjkMult;
+    const likesBar  = 1_000  * cjkMult;
+    const sharesBar = 200    * cjkMult;
+    const viralBar  = cjkScript === 'zh' ? 60 : cjkScript ? 50 : 40;
+    const meetsBar  = plays >= playsBar || likes >= likesBar || shares >= sharesBar || viralScore >= viralBar;
     if (!meetsBar) return null;
 
     const createdAt = video.createTime ? new Date(video.createTime * 1000) : null;
@@ -274,6 +288,39 @@ class TikTokCollector extends BaseCollector {
   normalize(item) {
     return item; // already normalized in _normalize()
   }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Detect dominant CJK script in a description.
+ *
+ * Returns 'zh' (Han only), 'ja' (any kana), 'ko' (any hangul), or null.
+ * ≥30 % of Unicode letters must be CJK to register at all.
+ *
+ * Used by `_normalize` to scale the engagement floor by script:
+ * Chinese gets 4×, Japanese/Korean get 2×, everyone else 1×.
+ */
+function _detectCjkScript(text) {
+  if (!text) return null;
+  const kanaRe   = /[぀-ゟ゠-ヿ]/g;          // Hiragana + Katakana — Japanese
+  const hangulRe = /[가-힯]/g;                 // Hangul Syllables — Korean
+  const hanRe    = /[㐀-䶿一-鿿]/g;           // CJK Ext-A + Unified — shared
+
+  const kanaCount   = (text.match(kanaRe)   || []).length;
+  const hangulCount = (text.match(hangulRe) || []).length;
+  const hanCount    = (text.match(hanRe)    || []).length;
+  const cjkCount    = kanaCount + hangulCount + hanCount;
+  if (cjkCount === 0) return null;
+
+  const letterMatches = text.match(/\p{L}/gu);
+  const letters = letterMatches ? letterMatches.length : 0;
+  if (letters === 0) return null;
+  if ((cjkCount / letters) < 0.30) return null;
+
+  if (kanaCount > 0)   return 'ja';
+  if (hangulCount > 0) return 'ko';
+  return 'zh';
 }
 
 export default TikTokCollector;

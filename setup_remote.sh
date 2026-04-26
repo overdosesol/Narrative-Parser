@@ -80,6 +80,24 @@ $DC down || true
 $DC build
 $DC up -d
 
+# ── Auto-cleanup: prune stale Docker build cache ──────────────────────────────
+# Build cache piles up at ~70-100MB per deploy; left unchecked it filled the
+# disk to 85% (we hit this 2026-04-27 — needed manual `buildx prune`). We only
+# touch cache OLDER than 7 days, so recent layers stay around for incremental
+# rebuilds. The active image (`catalyst-catalyst:latest`) and the live
+# container are NEVER touched by this — buildx prune only operates on the
+# build cache namespace. Failure is non-fatal (deploy already succeeded by now).
+echo ""
+echo "=== Pruning build cache older than 7d ==="
+docker buildx prune -af --filter "until=168h" 2>&1 | tail -3 || true
+# Hard guard: if disk is still >80% after prune, run aggressive cleanup that
+# also removes dangling images. Active resources still safe.
+DISK_USE=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+if [ -n "$DISK_USE" ] && [ "$DISK_USE" -gt 80 ]; then
+  echo "Disk still ${DISK_USE}% used — running aggressive prune"
+  docker system prune -af 2>&1 | tail -3 || true
+fi
+
 echo ""
 echo "=== Status ==="
 $DC ps

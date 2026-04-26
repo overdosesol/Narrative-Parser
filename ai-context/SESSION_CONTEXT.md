@@ -82,9 +82,16 @@
   - `_callResponsesAPI` возвращает `{ text, inputTokens, outputTokens }` (реальные токены из `data.usage`)
   - Stage 1 batch size: 5 → 8
   - Stage 2 gate: threshold 78 → **60** (2026-04-22, больше пропускаем в deep-dive после narrative pivot), cap **6** на цикл (было 3), skip google_trends, novelty gate (`clusterMetrics.isNovel !== false`)
-  - Stage 2 output: `narrativeMomentum` + `organicity` (заменили `existingCoins` — coin-search логика убрана целиком)
+  - Stage 2 output: `narrativeMomentum` + `organicity` (заменили `existingCoins` — coin-search логика убрана целиком). 2026-04-27: убраны `xSentiment` и `adjustment` (никем не читались)
   - Prompt: description truncated 250 → 100; поля `titleRu` и `isGenuinelyInteresting` удалены из output spec
   - Логируется `total_in`/`total_out` (реальные токены) после каждого цикла
+- **Stage 2 cost knobs** (2026-04-27):
+  - `x_search` теперь вызывается с явными параметрами: `max_search_results: 10` (env `XAI_STAGE2_MAX_RESULTS`, default 10, был дефолт xAI ~25), `from_date` за 48h (env `XAI_STAGE2_LOOKBACK_HOURS`, default 48), `sources: [{type:'x'}]`, `return_citations: false`
+  - `max_tool_calls: 2` в body (env `XAI_STAGE2_MAX_TOOL_CALLS`, default 2) — Grok не может делать >2 последовательных x_search в одном ответе. Без этого fan-out в 3-4 вызова раздувал input квадратично
+  - STAGE2_SYSTEM_PROMPT сжат ~750 → ~330 токенов: убраны inline-примеры (Punch monkey/Moo Deng/Hawk Tuah — Grok их знает) и дублирующие IMPORTANT
+  - `storyHook` cap 80 chars при парсинге (был 100-150 prose)
+  - `market-stage.js applyStage2MarketPatch` теперь no-op stub (читал `adjustment` + `existingCoins`, оба удалены; вызов оставлен для будущего)
+  - Совокупный эффект: Stage 2 input -60…-70%, output -20…-25%
 
 ## AI модели (UI curated)
 
@@ -218,6 +225,21 @@
 - **Key rotation removed**: старая логика `_nextKey()` / `_keyIndex` вырезана — теперь каждый актёр работает со своим одним ключом, rotation не нужна (для rate-limit'а есть delay между запросами)
 - **Как добавить актёр**: (1) записать в `ACTORS` в `twitter.js` + `twitter-check.js`, (2) в `config.js` под `apify.twitterKeys`, (3) в `VALID_TWITTER_ACTORS` в admin `_setScannerConfig`, (4) карточку в `TWITTER_ACTORS` в `ScannerConfigSection`
 - **Security**: Apify `General resource access` должен быть **Restricted** (не Anonymous) — иначе runId/datasetId даёт анонимный доступ к твоим данным без токена
+
+## Apify per-script engagement thresholds (2026-04-27)
+
+Чтобы резать low-signal азиатский фуд из Apify firehose, входной порог в `_normalize` обоих коллекторов умножается на CJK-script:
+
+| Письменность | Twitter views (или fallback likes) | TikTok plays / likes / shares / viralScore |
+|---|---|---|
+| Дефолт (EN/RU/Romance/AR/...) | 500K / 10K | 50K / 1K / 200 / 40 |
+| Японский (`ja`), Корейский (`ko`) | 1M / 20K (×2) | 100K / 2K / 400 / 50 |
+| Китайский (`zh`) | 2M / 40K (×4) | 200K / 4K / 800 / 60 |
+
+- Хелпер `_detectCjkScript(text)` дублируется в `src/collectors/twitter.js` и `src/collectors/tiktok.js`. Считает доли символов по непересекающимся блокам — kana (Hiragana+Katakana, японский-эксклюзив), Hangul (корейский-эксклюзив), Han (общий). Требует ≥30% CJK-доли от всех `\p{L}` → иначе `null` и дефолтный порог
+- Возврат: `'ja'` если есть kana, `'ko'` если есть hangul, `'zh'` если только Han без каны/хангыля. `null` для всех нон-CJK языков
+- Применяется до всей остальной фильтрации (clusterer/junk/AI); посты, не пробившие порог, отбрасываются прямо в `_normalize` и в БД не попадают
+- Не путать с CJK-расширением запросов в `general` пресете (2026-04-24, добавляет 6-й слот с японскими/корейскими/китайскими частицами для увеличения coverage). Здесь — наоборот, **режем входящий поток** на стороне нормализации; query-расширение подгребает CJK твиты, а порог фильтрует низкосигнальные из них
 
 ## Env keys (2026-04-22)
 

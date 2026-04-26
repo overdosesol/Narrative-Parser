@@ -10,6 +10,7 @@ import TikTokCollector from './collectors/tiktok.js';
 import Aggregator from './analysis/aggregator.js';
 import Scorer, { loadAlertWeights, computeAlertScore, feedbackBoostFromStats } from './analysis/scorer.js';
 import NarrativeClusterer from './analysis/clusterer.js';
+import TriggerFinder from './analysis/trigger-finder.js';
 import TelegramNotifier from './notifications/telegram.js';
 import SolanaPayMonitor from './billing/solana-pay.js';
 import DashboardServer from './dashboard/server.js';
@@ -28,8 +29,13 @@ const aggregator = new Aggregator(db, logger);
 const clusterer  = new NarrativeClusterer(db, logger);
 const scorer     = new Scorer(config, logger, db);
 
+// On-demand trigger search (Pro-plan button in TG + dashboard).
+// Disabled gracefully when XAI_API_KEY is missing — `enabled` flag exposed
+// so handlers can show "trigger search unavailable" instead of failing.
+const triggerFinder = new TriggerFinder(config, logger);
+
 // ── Initialize Telegram Bot ─────────────────────────────────────────────────
-const telegram = new TelegramNotifier(config, logger, db); // solanaMonitor injected below
+const telegram = new TelegramNotifier(config, logger, db, null, triggerFinder); // solanaMonitor injected below
 // Prune muxed video cache on startup (files older than 7 days)
 try { telegram.cleanupVideoCache(5); } catch {}
 
@@ -136,6 +142,36 @@ function runStorageGuard() {
     logger.warn(`Low disk space: ${formatGb(freeBytes)} GB free. Running alert cleanup (${days}d)...`);
     const result = db.cleanupAlerts(days);
     logger.warn(`Storage cleanup done: trends=${result.trendsDeleted}, notifications=${result.notificationsDeleted}`);
+
+    // The DB cleanup above only frees a few MB on this project (DB ~10MB
+    // total). The real disk hog on this VPS is Docker build cache (we hit
+    // 85% disk on 2026-04-27 from accumulated layers, not from data).
+    // From inside the container we can't touch host docker — but we CAN
+    // truncate our own log files which DO grow unbounded between deploys.
+    try {
+      const logsDir = path.resolve(process.cwd(), 'logs');
+      if (fs.existsSync(logsDir)) {
+        const cutoffMs = Date.now() - 7 * 24 * 3600_000;
+        let purged = 0;
+        let bytesFreed = 0;
+        for (const file of fs.readdirSync(logsDir)) {
+          const full = path.join(logsDir, file);
+          try {
+            const s = fs.statSync(full);
+            if (s.isFile() && s.mtimeMs < cutoffMs) {
+              bytesFreed += s.size;
+              fs.unlinkSync(full);
+              purged++;
+            }
+          } catch (_) { /* skip locked file */ }
+        }
+        if (purged > 0) {
+          logger.warn(`Storage cleanup: removed ${purged} log file(s) older than 7d (${formatGb(bytesFreed)} GB)`);
+        }
+      }
+    } catch (e) {
+      logger.warn(`Log cleanup failed: ${e.message}`);
+    }
   } catch (e) {
     logger.warn(`Storage guard failed: ${e.message}`);
   }
@@ -157,7 +193,7 @@ try {
 }
 
 // ── Initialize dashboard ────────────────────────────────────────────────────
-const dashboard = new DashboardServer(config, logger, db, appState, () => runScanCycle(), telegram);
+const dashboard = new DashboardServer(config, logger, db, appState, () => runScanCycle(), telegram, triggerFinder);
 dashboard.start();
 
 // ── Initialize admin panel ──────────────────────────────────────────────────
@@ -189,7 +225,11 @@ async function runScanCycle() {
   const cycleStart = Date.now();
   appState.cycleStartedAt = cycleStart;
   appState.cycleInProgress = {
-    collect: 0, dedupe: 0, cluster: 0, ai: 0, save: 0, alerts: 0,
+    collect: 0, dedupe: 0, cluster: 0,
+    // `ai` kept for backwards compat (= total trends scored). New split:
+    // `stage1` = trends through base scoring, `stage2` = actual x_search calls.
+    ai: 0, stage1: 0, stage2: 0,
+    save: 0, alerts: 0,
   };
   setPipelineStage('collect');
   logger.info('────── Starting scan cycle ──────');
@@ -257,6 +297,16 @@ async function runScanCycle() {
     logger.info(`Running AI scoring on ${toScoreAll.length} trends (${priority.length} priority)...`);
     const scoredTrends = await scorer.scoreTrends(toScoreAll);
     appState.cycleInProgress.ai = scoredTrends.length;
+    // Split AI into Stage 1 / Stage 2 cards. scorer.lastMetrics is set by
+    // scoreTrends(); falls back to scoredTrends.length / 0 on heuristic path
+    // where lastMetrics is unset.
+    const aiMetrics = scorer.lastMetrics || null;
+    appState.cycleInProgress.stage1 = aiMetrics ? aiMetrics.stage1Trends : scoredTrends.length;
+    appState.cycleInProgress.stage2 = aiMetrics ? aiMetrics.stage2Calls   : 0;
+    appState.cycleInProgress.stage1Model = aiMetrics?.stage1Provider
+      ? `${aiMetrics.stage1Provider}:${aiMetrics.stage1Model}`
+      : null;
+    appState.cycleInProgress.stage2Model = aiMetrics?.stage2Model || null;
 
     // Step 4: Filter — drop politics/spam
     setPipelineStage('save');

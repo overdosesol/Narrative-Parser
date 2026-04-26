@@ -204,6 +204,16 @@ class Scorer {
     this.stage2Model = 'grok-4-1-fast-non-reasoning';
     this.stage2MaxCalls = 6;     // cap x_search calls per cycle (cost control)
 
+    // Stage 2 cost knobs (env-tunable, no restart needed if read per cycle).
+    // - XAI_STAGE2_MAX_RESULTS: tweets per x_search call (default 10, was ~25
+    //   from xAI's silent default). Biggest single lever on input tokens.
+    // - XAI_STAGE2_LOOKBACK_HOURS: how far back x_search looks (48h default).
+    // - XAI_STAGE2_MAX_TOOL_CALLS: hard cap on consecutive x_search calls in
+    //   one Grok response (default 2). Stops the model from over-fanning.
+    this.stage2MaxResults     = Math.max(1, Math.min(30, parseInt(process.env.XAI_STAGE2_MAX_RESULTS, 10)     || 10));
+    this.stage2LookbackHours  = Math.max(1, Math.min(168, parseInt(process.env.XAI_STAGE2_LOOKBACK_HOURS, 10) || 48));
+    this.stage2MaxToolCalls   = Math.max(1, Math.min(5, parseInt(process.env.XAI_STAGE2_MAX_TOOL_CALLS, 10)   || 2));
+
     if (!this.current.enabled) {
       this.logger.warn('AI API key not set for selected provider — AI scoring disabled, using heuristics');
     } else {
@@ -397,6 +407,20 @@ class Scorer {
       `total_in=${totalIn} total_out=${totalOut} (real tokens from API)`
     );
 
+    // Expose latest metrics so the pipeline observability layer (admin UI's
+    // /api/pipeline → cycleInProgress) can split Stage 1 vs Stage 2 counts.
+    // Includes the configured provider/model for both stages so the UI can
+    // label cards dynamically (Stage 1 may be GPT or Grok, Stage 2 is always
+    // Grok with x_search).
+    this.lastMetrics = {
+      ...metrics,
+      stage1Trends:    stage1Results.length,
+      stage1Provider:  this.current?.provider || 'unknown',
+      stage1Model:     this.current?.model    || 'unknown',
+      stage2Provider:  'xai',
+      stage2Model:     this.stage2Model,
+    };
+
     return stage1Results;
   }
 
@@ -477,7 +501,6 @@ class Scorer {
         category:         a.category         || 'other',
         sentiment:        a.sentiment         || 'neutral',
         aiExplanation:    a.explanation       || '',
-        whyItWillPump:    a.whyItWillPump     || '',
         // Trigger event — only populated when the model found an explicit cause.
         // We trim and cap to keep it one line; empty string means "no trigger".
         whyNow:           (a.whyNow || '').trim().slice(0, 280),
@@ -492,12 +515,28 @@ class Scorer {
   async _stage2DeepDive(trend, runtimeOverride) {
     const prompt = buildStage2Prompt(trend);
 
+    // x_search params — were unset before, so xAI defaulted to ~25 results /
+    // unbounded date range and Grok could fan out into 3-4 consecutive tool
+    // calls. Each tool call dumps its results into the model's context for
+    // the next reasoning step → quadratic input growth. Capping all three
+    // levers cuts Stage 2 input tokens by ~60%.
+    const fromDate = new Date(Date.now() - this.stage2LookbackHours * 3_600_000)
+      .toISOString().slice(0, 10); // YYYY-MM-DD per xAI x_search spec
+    const xSearchTool = {
+      type: 'x_search',
+      max_search_results: this.stage2MaxResults,
+      from_date: fromDate,
+      sources: [{ type: 'x' }],     // do not bleed into news / web sources
+      return_citations: false,       // we don't render citations downstream
+    };
+
     const { text: raw, inputTokens, outputTokens } = await this._callResponsesAPI({
       input: [
         { role: 'system', content: STAGE2_SYSTEM_PROMPT },
         { role: 'user',   content: prompt               },
       ],
-      tools: [{ type: 'x_search' }],
+      tools: [xSearchTool],
+      maxToolCalls: this.stage2MaxToolCalls,
       temperature: 0.3,
       runtimeOverride,
     });
@@ -523,27 +562,28 @@ class Scorer {
     if (typeof result.viralityScore === 'number') {
       trend.score = Math.max(0, Math.min(100, result.viralityScore));
     }
-    if (result.whyItWillPump) {
-      trend.whyItWillPump = result.whyItWillPump;
-    }
 
     // Store Stage 2 metadata (narrative-focused — no coin search)
+    // Removed 2026-04-27: `xSentiment` (never consumed downstream) and
+    // `adjustment` (only read by market-stage.js which is feature-flagged off
+    // and depended on the now-deleted existingCoins field). storyHook capped
+    // 80 chars — Grok was returning 100-150 char prose, output token waste.
     const storyScore = Math.max(0, Math.min(100, Number(result.storyScore) || 0));
     const rawSubjectName = typeof result.subjectName === 'string' ? result.subjectName.trim() : '';
     const subjectName = rawSubjectName.length > 64 ? rawSubjectName.slice(0, 64) : rawSubjectName;
     const nameStrength = subjectName
       ? Math.max(0, Math.min(100, Number(result.nameStrength) || 0))
       : 0;
+    const rawStoryHook = typeof result.storyHook === 'string' ? result.storyHook.trim() : '';
+    const storyHook = rawStoryHook.length > 80 ? rawStoryHook.slice(0, 80) : rawStoryHook;
     trend.xSearchData = {
       xBuzz:              result.xBuzz              || 'unknown',
       narrativeMomentum:  result.narrativeMomentum  || 'unknown',
       organicity:         result.organicity         || 'unknown',
-      xSentiment:         result.xSentiment         || 'unknown',
       storyScore,
-      storyHook:          typeof result.storyHook === 'string' ? result.storyHook : '',
+      storyHook,
       subjectName,
       nameStrength,
-      adjustment:         result.adjustment         || '',
     };
 
     // ── Stage 2 authority: apply penalties based on live X narrative signals ──
@@ -662,7 +702,7 @@ class Scorer {
   /**
    * Call the Responses API and return { text, inputTokens, outputTokens }.
    */
-  async _callResponsesAPI({ input, tools, temperature, runtimeOverride = null }) {
+  async _callResponsesAPI({ input, tools, temperature, runtimeOverride = null, maxToolCalls = null }) {
     const runtime = runtimeOverride || this.current;
     const body = {
       model: runtime.model,
@@ -671,6 +711,10 @@ class Scorer {
 
     if (temperature !== undefined) body.temperature = temperature;
     if (tools && tools.length > 0) body.tools = tools;
+    // Hard cap consecutive tool calls (e.g. x_search loops) — without this,
+    // Grok happily fans out 3-4 searches per response and quadruples input
+    // tokens via accumulated tool results in the reasoning context.
+    if (maxToolCalls && Number.isFinite(maxToolCalls)) body.max_tool_calls = maxToolCalls;
 
     const doRequest = async (requestBody) => {
       const response = await fetch(`${runtime.baseUrl}/responses`, {
@@ -775,7 +819,6 @@ class Scorer {
       category:         'other',
       sentiment:        'neutral',
       aiExplanation:    'AI scoring disabled — heuristic score applied',
-      whyItWillPump:    '',
       predictedLifespan:'unknown',
       isGenuinelyInteresting: true,
     };
@@ -805,7 +848,6 @@ class Scorer {
         category:         'other',
         sentiment:        'neutral',
         aiExplanation:    reason,
-        whyItWillPump:    '',
         predictedLifespan:'unknown',
         isGenuinelyInteresting: true,
       };

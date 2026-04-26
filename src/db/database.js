@@ -66,6 +66,30 @@ class TrendDatabase {
     // (we instruct the model to NOT guess). Rendered separately in UI/alerts.
     addIfMissing('trends', 'why_now', "TEXT NOT NULL DEFAULT ''");
 
+    // ── On-demand trigger search (replaces legacy whyItWillPump) ─────────────
+    // Filled only when a user clicks the "Search Trigger" button (TG or dashboard).
+    // First click triggers a Grok reasoning + x_search call; result is shared
+    // across all users (the next click reads from DB instantly).
+    //
+    // `trigger_in_flight` is a DB-level lock to prevent duplicate Grok calls
+    // when two users click simultaneously. Cleared on startup to recover from
+    // crashes that left the flag set (see _resetTriggerLocks below).
+    addIfMissing('trends', 'trigger_text',         'TEXT');
+    addIfMissing('trends', 'trigger_searched_at',  'DATETIME');
+    addIfMissing('trends', 'trigger_searched_by',  'TEXT');     // chat_id of the user who first triggered
+    addIfMissing('trends', 'trigger_sources',      'TEXT');     // JSON array of @handles
+    addIfMissing('trends', 'trigger_confidence',   'INTEGER NOT NULL DEFAULT 0');
+    addIfMissing('trends', 'trigger_in_flight',    'INTEGER NOT NULL DEFAULT 0');
+
+    // Crash recovery: clear any lock left over from a previous process. Safe
+    // because no in-flight Grok call could have survived the restart.
+    try {
+      const r = this.db.prepare(`UPDATE trends SET trigger_in_flight = 0 WHERE trigger_in_flight = 1`).run();
+      if (r.changes > 0) this.logger.info(`DB startup: cleared ${r.changes} stale trigger_in_flight locks`);
+    } catch (e) {
+      // Column may not exist on first migration pass — ignore.
+    }
+
     // Settings key-value store
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS settings (
@@ -897,6 +921,137 @@ class TrendDatabase {
       );
     } catch (e) {
       this.logger?.warn?.(`saveXAnalysis failed for trend #${trendId}: ${e.message}`);
+    }
+  }
+
+  // ── Trigger search ─────────────────────────────────────────────────────────
+
+  /**
+   * Atomically claim the right to run a Grok trigger search for this trend.
+   *
+   * Two users can click "Search Trigger" in the same second — we want only ONE
+   * Grok call to actually fire. The atomic UPDATE below succeeds only when the
+   * trend has no trigger yet AND no in-flight claim. The loser of the race
+   * gets `claimed: false` and inspects `state` to decide what to do:
+   *   - 'cached'    → another caller already filled the trigger; read & return
+   *   - 'in-flight' → another caller is currently calling Grok; show a toast,
+   *                   ask the user to retry shortly
+   *
+   * @param {number} trendId
+   * @param {string|number} userId  chat_id of the requesting user (audit)
+   * @returns {{ claimed: boolean, state?: 'cached'|'in-flight', trend?: Object }}
+   */
+  claimTriggerSearch(trendId, userId) {
+    if (!trendId) return { claimed: false, state: 'in-flight' };
+
+    const result = this.db.prepare(`
+      UPDATE trends
+      SET trigger_in_flight   = 1,
+          trigger_searched_by = ?
+      WHERE id = ?
+        AND trigger_in_flight = 0
+        AND (trigger_text IS NULL OR trigger_text = '')
+    `).run(String(userId || ''), trendId);
+
+    if (result.changes === 1) {
+      return { claimed: true };
+    }
+
+    // Lost the race — figure out why
+    const trend = this.getTrendById(trendId);
+    if (trend?.trigger_text && trend.trigger_text.length > 0) {
+      return { claimed: false, state: 'cached', trend };
+    }
+    return { claimed: false, state: 'in-flight', trend };
+  }
+
+  /**
+   * Persist a successful trigger search result and release the lock.
+   *
+   * @param {number} trendId
+   * @param {Object} data
+   * @param {string}   data.text         Trigger summary (2-3 sentences)
+   * @param {string[]} [data.sources]    Array of @handles
+   * @param {number}   [data.confidence] 0-100
+   */
+  saveTrendTrigger(trendId, data) {
+    if (!trendId || !data || typeof data.text !== 'string') return;
+    try {
+      const sourcesJson = JSON.stringify(Array.isArray(data.sources) ? data.sources.slice(0, 10) : []);
+      const confidence  = Math.max(0, Math.min(100, Number(data.confidence) || 0));
+      this.db.prepare(`
+        UPDATE trends SET
+          trigger_text         = ?,
+          trigger_sources      = ?,
+          trigger_confidence   = ?,
+          trigger_searched_at  = CURRENT_TIMESTAMP,
+          trigger_in_flight    = 0
+        WHERE id = ?
+      `).run(data.text, sourcesJson, confidence, trendId);
+    } catch (e) {
+      this.logger?.warn?.(`saveTrendTrigger failed for trend #${trendId}: ${e.message}`);
+    }
+  }
+
+  /**
+   * Release the in-flight lock without saving (call this on Grok failure).
+   * Leaves trigger_text NULL so a retry is possible.
+   */
+  releaseTriggerLock(trendId) {
+    if (!trendId) return;
+    try {
+      this.db.prepare(`UPDATE trends SET trigger_in_flight = 0 WHERE id = ?`).run(trendId);
+    } catch (e) {
+      this.logger?.warn?.(`releaseTriggerLock failed for trend #${trendId}: ${e.message}`);
+    }
+  }
+
+  /**
+   * Read the trigger payload for a trend, parsed into JS objects.
+   * Returns null when no search has been performed yet.
+   */
+  getTrendTrigger(trendId) {
+    if (!trendId) return null;
+    const row = this.db.prepare(`
+      SELECT trigger_text, trigger_sources, trigger_confidence,
+             trigger_searched_at, trigger_searched_by, trigger_in_flight
+      FROM trends WHERE id = ?
+    `).get(trendId);
+    if (!row || !row.trigger_text) return null;
+    let sources = [];
+    try { sources = JSON.parse(row.trigger_sources || '[]'); } catch { /* corrupt JSON, ignore */ }
+    return {
+      text:        row.trigger_text,
+      sources:     Array.isArray(sources) ? sources : [],
+      confidence:  row.trigger_confidence | 0,
+      searchedAt:  row.trigger_searched_at,
+      searchedBy:  row.trigger_searched_by,
+      inFlight:    row.trigger_in_flight === 1,
+    };
+  }
+
+  /**
+   * Find the most recent trigger search initiated by a given user.
+   * Used to enforce the 15-minute per-user cooldown on Grok calls. Cached
+   * reads (where another user did the actual Grok call) DO NOT count — they
+   * don't appear in this query because `trigger_searched_by` records only the
+   * user who initiated the live Grok call.
+   *
+   * @param {string|number} userId  chat_id
+   * @returns {string|null} ISO timestamp of last search, or null if none
+   */
+  getLastTriggerSearchByUser(userId) {
+    if (!userId) return null;
+    try {
+      const row = this.db.prepare(`
+        SELECT MAX(trigger_searched_at) AS last_at
+        FROM trends
+        WHERE trigger_searched_by = ?
+      `).get(String(userId));
+      return row?.last_at || null;
+    } catch (e) {
+      this.logger?.warn?.(`getLastTriggerSearchByUser failed: ${e.message}`);
+      return null;
     }
   }
 

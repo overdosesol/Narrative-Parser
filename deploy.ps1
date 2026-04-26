@@ -72,14 +72,12 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-ssh -o StrictHostKeyChecking=no $Server "mkdir -p '$RemoteDir'"
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: could not create remote directory." -ForegroundColor Red
-    exit 1
-}
-
+# Single SSH session for mkdir + setup — avoids hitting SSH MaxSessions/
+# MaxStartups when the previous deploy left lingering connections, and keeps
+# the auth handshake count down on small VPS where re-auth is expensive.
 $success = $false
-ssh -o StrictHostKeyChecking=no $Server "REMOTE_DIR='$RemoteDir' bash /tmp/catalyst_setup.sh 2>&1" | Tee-Object -Variable lines | ForEach-Object {
+$remoteCmd = "mkdir -p '$RemoteDir' && REMOTE_DIR='$RemoteDir' bash /tmp/catalyst_setup.sh 2>&1"
+ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 $Server $remoteCmd | Tee-Object -Variable lines | ForEach-Object {
     Write-Host $_
     if ($_ -match "DEPLOY_SUCCESS") { $success = $true }
 }
