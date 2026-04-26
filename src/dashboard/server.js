@@ -97,17 +97,18 @@ function html(res, content) {
 // ─── Dashboard class ──────────────────────────────────────────────────────────
 
 class DashboardServer {
-  constructor(config, logger, db, appState, scanFn, telegram = null) {
-    this.config       = config.dashboard;
-    this.fullConfig   = config;   // keep reference for telegram.botUsername, etc.
-    this.logger       = logger;
-    this.db           = db;
-    this.appState     = appState;
-    this.scanFn       = scanFn;   // callback to trigger manual scan
-    this.telegram     = telegram; // TelegramNotifier for bot-username lookup
-    this.server       = null;
-    this.started      = Date.now();
-    this.sseClients   = new Set();  // active Server-Sent Event subscribers
+  constructor(config, logger, db, appState, scanFn, telegram = null, triggerFinder = null) {
+    this.config        = config.dashboard;
+    this.fullConfig    = config;   // keep reference for telegram.botUsername, etc.
+    this.logger        = logger;
+    this.db            = db;
+    this.appState      = appState;
+    this.scanFn        = scanFn;   // callback to trigger manual scan
+    this.telegram      = telegram; // TelegramNotifier for bot-username lookup
+    this.triggerFinder = triggerFinder; // optional — pro-only Grok reasoning trigger search
+    this.server        = null;
+    this.started       = Date.now();
+    this.sseClients    = new Set();  // active Server-Sent Event subscribers
     this._sseKeepAlive = null;
   }
 
@@ -235,6 +236,7 @@ class DashboardServer {
       if (path === '/api/user/threshold'  && method === 'POST') return this._handleUserThresholdPost(req, res);
       if (path.match(/^\/api\/collectors\/[\w_]+\/toggle$/) && method === 'POST') return this._handleCollectorToggle(req, res, path);
       if (path.match(/^\/api\/trends\/\d+\/feedback$/) && method === 'POST') return this._handleTrendFeedback(req, res, path);
+      if (path.match(/^\/api\/trends\/\d+\/trigger$/)  && method === 'POST') return this._handleTrendTrigger(req, res, path);
 
       // SPA fallback — serve dashboard HTML for all non-API routes
       if (!path.startsWith('/api/')) return html(res, this._buildSPA());
@@ -754,6 +756,87 @@ class DashboardServer {
     });
   }
 
+  /**
+   * POST /api/trends/:id/trigger — on-demand "what's driving this trend RIGHT NOW"
+   * lookup via Grok reasoning + x_search.
+   *
+   * Response shape:
+   *   200 { text, sources, confidence, fromCache: boolean, searchedAt }
+   *   202 { state: 'in-flight' }                  another user is already searching
+   *   403 { error, reason: 'plan'|'cooldown', minLeft? }
+   *   503 { error, reason: 'disabled' }
+   *
+   * Behaviour mirrors the Telegram flow — see telegram.js _handleTriggerSearch.
+   */
+  async _handleTrendTrigger(req, res, path) {
+    const m = path.match(/^\/api\/trends\/(\d+)\/trigger$/);
+    if (!m) return json(res, 400, { error: 'Invalid path' });
+    const trendId = parseInt(m[1], 10);
+
+    if (!this.triggerFinder || !this.triggerFinder.enabled) {
+      return json(res, 503, { error: 'Trigger search disabled', reason: 'disabled' });
+    }
+
+    const userId = String(req.user?.telegram_chat_id || '').trim();
+    if (!userId) return json(res, 401, { error: 'Authenticated user has no chat_id' });
+    const planName = req.user?.plan_name || 'free';
+
+    // Plan gate — pro/admin only (mirrors TG button state)
+    if (planName !== 'pro' && planName !== 'admin') {
+      return json(res, 403, { error: 'Trigger search is a Pro-plan feature', reason: 'plan' });
+    }
+
+    const trend = this.db.getTrendById ? this.db.getTrendById(trendId) : null;
+    if (!trend) return json(res, 404, { error: 'Trend not found' });
+
+    // Cached fast-path
+    const existing = this.db.getTrendTrigger(trendId);
+    if (existing && existing.text) {
+      return json(res, 200, { ...existing, fromCache: true });
+    }
+
+    // Per-user 15min cooldown (admin bypass)
+    const COOLDOWN_MS = 15 * 60 * 1000;
+    if (planName !== 'admin') {
+      const lastAt = this.db.getLastTriggerSearchByUser(userId);
+      if (lastAt) {
+        const elapsedMs = Date.now() - new Date(lastAt + 'Z').getTime();
+        if (elapsedMs < COOLDOWN_MS) {
+          const minLeft = Math.max(1, Math.ceil((COOLDOWN_MS - elapsedMs) / 60000));
+          return json(res, 403, { error: 'Cooldown active', reason: 'cooldown', minLeft });
+        }
+      }
+    }
+
+    // DB-level claim — dedupe parallel clicks across TG and dashboard
+    const claim = this.db.claimTriggerSearch(trendId, userId);
+    if (!claim.claimed) {
+      if (claim.state === 'cached' && claim.trend?.trigger_text) {
+        let sources = [];
+        try { sources = JSON.parse(claim.trend.trigger_sources || '[]'); } catch { /* ignore */ }
+        return json(res, 200, {
+          text:        claim.trend.trigger_text,
+          sources,
+          confidence:  claim.trend.trigger_confidence | 0,
+          searchedAt:  claim.trend.trigger_searched_at,
+          fromCache:   true,
+        });
+      }
+      return json(res, 202, { state: 'in-flight' });
+    }
+
+    try {
+      const result = await this.triggerFinder.findTrigger(trend);
+      this.db.saveTrendTrigger(trendId, result);
+      const saved = this.db.getTrendTrigger(trendId); // re-read to pick up timestamp
+      return json(res, 200, { ...saved, fromCache: false });
+    } catch (err) {
+      this.db.releaseTriggerLock(trendId);
+      this.logger.error(`Trigger search failed for trend #${trendId}: ${err.message}`);
+      return json(res, 500, { error: err.message });
+    }
+  }
+
   _handleStream(req, res) {
     res.writeHead(200, {
       'Content-Type':        'text/event-stream',
@@ -854,10 +937,17 @@ class DashboardServer {
       uniquePlatforms: metrics.uniquePlatforms ?? 1,
       manualSubmitted: metrics.manualSubmitted === true,
       aiExplanation:   row.ai_explanation,
-      whyItWillPump:   metrics.whyItWillPump || '',
       // Trigger event — empty string when the AI found no explicit cause.
       // UI only renders the row when non-empty.
       whyNow:          row.why_now || '',
+      // On-demand trigger search (filled by Pro click). When null/empty, the
+      // dashboard renders a "Search Trigger" button instead.
+      trigger: row.trigger_text ? {
+        text:        row.trigger_text,
+        sources:     (() => { try { return JSON.parse(row.trigger_sources || '[]'); } catch { return []; } })(),
+        confidence:  row.trigger_confidence | 0,
+        searchedAt:  row.trigger_searched_at,
+      } : null,
       predictedLifespan: row.predicted_lifespan,
       url:             row.url,
       tgMessageUrl:    metrics.tgMessageUrl || null,
@@ -2637,11 +2727,36 @@ class DashboardServer {
     .modal-body { flex: 1; overflow-y: auto; padding: 16px 16px 36px; display: flex; flex-direction: column; gap: 14px; }
 
     /* ── Modal image ── */
-    .modal-image { width: 100%; height: 180px; border-radius: 8px; object-fit: cover; display: block; border: 1px solid var(--border); }
+    /* Matches .feed-image: bounded max-height + contain so portraits / GIFs
+       aren't cropped. The dark wrap supplies letterbox bg for narrower images. */
+    .modal-image-wrap {
+      position: relative;
+      width: 100%;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0a0a12;
+      border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      max-height: 440px;
+    }
+    .modal-image {
+      display: block;
+      width: 100%;
+      height: auto;
+      max-height: 440px;
+      object-fit: contain;
+    }
     .modal-image-loading {
-      height: 180px; border-radius: 8px;
+      height: 220px; border-radius: 8px;
       background: linear-gradient(90deg, var(--card2) 25%, var(--card3) 50%, var(--card2) 75%);
       background-size: 200% 100%; animation: shimmer 1.5s linear infinite; border: 1px solid var(--border);
+    }
+    /* Secondary carousel under a primary video — slimmer than .img-carousel.in-modal */
+    .modal-aux-gallery {
+      margin-top: 8px;
+    }
+    .modal-aux-gallery .img-carousel.in-modal {
+      height: 280px;
     }
 
     /* ── Modal sections ── */
@@ -3623,10 +3738,21 @@ const I18N = {
     'right.score.vrl': 'vrl',
 
     // Trend modal
-    'modal.why_pump': "⚡ Why it'll moon",
     'modal.why_now': '🔥 Trigger',
     'modal.why_now_empty': 'No clear trigger — organic slow-burn',
     'modal.ai_explanation': '🤖 AI alpha',
+    // Trigger search (on-demand Grok reasoning)
+    'trigger.label':         '🔥 Trigger',
+    'trigger.btn':           '🔍 Search Trigger',
+    'trigger.btn_pro_only':  '🔒 Search Trigger (Pro)',
+    'trigger.btn_loading':   '🔍 Searching… (~30-60s)',
+    'trigger.confidence':    'Confidence: {pct}%',
+    'trigger.sources':       '📡 Sources:',
+    'trigger.in_flight':     '🔍 Another user is already searching this trigger. Try again in ~30s.',
+    'trigger.cooldown':      '⏳ You can run another trigger search in {min} min',
+    'trigger.error':         '❌ Trigger search failed: {err}',
+    'trigger.disabled':      '❌ Trigger search is currently unavailable.',
+    'trigger.help_quick':    '↳ Quick stage-1 hint. Run a deep Grok search for the live catalyst.',
     'modal.market_stage': '💹 Market Stage',
     'modal.phase': '🧭 Narrative phase',
     'modal.metrics': '📊 Stats',
@@ -3891,10 +4017,21 @@ const I18N = {
     'right.score.vrl': 'vrl',
 
     // Trend modal
-    'modal.why_pump': '⚡ Почему запампит',
     'modal.why_now': '🔥 Триггер',
     'modal.why_now_empty': 'Нет явного триггера — органический рост',
     'modal.ai_explanation': '🤖 AI-объяснение',
+    // Trigger search (on-demand Grok reasoning)
+    'trigger.label':         '🔥 Триггер',
+    'trigger.btn':           '🔍 Найти триггер',
+    'trigger.btn_pro_only':  '🔒 Найти триггер (Pro)',
+    'trigger.btn_loading':   '🔍 Ищу… (~30-60с)',
+    'trigger.confidence':    'Уверенность: {pct}%',
+    'trigger.sources':       '📡 Источники:',
+    'trigger.in_flight':     '🔍 Другой юзер уже ищет триггер. Попробуй через ~30с.',
+    'trigger.cooldown':      '⏳ Следующий поиск через {min} мин',
+    'trigger.error':         '❌ Ошибка поиска триггера: {err}',
+    'trigger.disabled':      '❌ Поиск триггера недоступен.',
+    'trigger.help_quick':    '↳ Быстрая stage-1 подсказка. Запусти глубокий Grok-поиск катализатора.',
     'modal.market_stage': '💹 Стадия рынка',
     'modal.phase': '🧭 Фаза нарратива',
     'modal.metrics': '📊 Метрики',
@@ -4477,8 +4614,12 @@ function FeedCard({ trend, onOpen }) {
                     : trend.source === 'twitter' ? 'twitter_x'
                     : trend.source || 'source');
 
-  const descText = trend.whyItWillPump || trend.aiExplanation || '';
-  const isPump = !!trend.whyItWillPump;
+  // Feed-card description: prefer the deep trigger summary (cached Grok result)
+  // when a Pro user has searched it; otherwise fall back to the Stage-1
+  // AI explanation. The legacy whyItWillPump pitch field has been removed —
+  // see WORKLOG entry "Trigger search: replace whyItWillPump".
+  const descText = (trend.trigger?.text) || trend.aiExplanation || '';
+  const isPump = !!(trend.trigger?.text);
 
   const handleClick = (e) => {
     if (e.target.closest('a') || e.target.closest('button')) return;
@@ -4656,8 +4797,128 @@ function RightPanel({ stats, hours, onOpenTrend }) {
   );  // right-panel-sticky
 }
 
+// ── TriggerSection (TrendModal child) ──────────────────────────────────────
+//
+// Renders the "Trigger" block inside the trend modal. Three render states:
+//
+//   1. trend.trigger.text present
+//      → render the deep Grok-reasoning result: text + sources + confidence.
+//        This is the post-search state and is shared across all users.
+//
+//   2. trend.whyNow present (and no trigger.text yet)
+//      → render the stage-1 short hint as a fallback, with a small note
+//        suggesting a deep search. Pro users still see the search button.
+//
+//   3. neither
+//      → render an action: "🔍 Search Trigger" button (pro/admin only) or
+//        a locked-state hint for free/test plans.
+//
+// Local state holds the optimistic-update path: clicking the button sets
+// loading=true, fires POST /api/trends/:id/trigger, and on success replaces
+// the whole section with the returned payload without remounting the modal.
+function TriggerSection({ trend, lang, me }) {
+  const [data, setData] = useState(trend.trigger || null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const planName = (me && typeof me === 'object') ? (me.plan || me.plan_name || 'free') : 'free';
+  const isPro = planName === 'pro' || planName === 'admin';
+
+  const onSearch = async () => {
+    if (loading) return;
+    setLoading(true); setError(null);
+    try {
+      const res = await fetch('/api/trends/' + trend.id + '/trigger', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(AUTH_TOKEN ? { 'Authorization': 'Bearer ' + AUTH_TOKEN } : {}),
+        },
+      });
+      const body = await res.json().catch(() => ({}));
+
+      if (res.status === 200 && body && body.text) {
+        setData({ text: body.text, sources: body.sources || [], confidence: body.confidence | 0 });
+      } else if (res.status === 202) {
+        setError(t('trigger.in_flight'));
+      } else if (res.status === 403 && body.reason === 'cooldown') {
+        setError(t('trigger.cooldown', { min: body.minLeft || 1 }));
+      } else if (res.status === 503) {
+        setError(t('trigger.disabled'));
+      } else {
+        setError(t('trigger.error', { err: (body && body.error) || ('HTTP ' + res.status) }));
+      }
+    } catch (e) {
+      setError(t('trigger.error', { err: e.message }));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Render-state 1: we have a trigger payload (either pre-loaded from API or
+  // just fetched). Always wins over fallback.
+  if (data && data.text) {
+    return h('div', { className: 'modal-section' },
+      h('div', { className: 'modal-section-label' }, t('trigger.label')),
+      h('div', { className: 'modal-section-content why-now' }, data.text),
+      Array.isArray(data.sources) && data.sources.length > 0
+        ? h('div', { className: 'modal-section-content', style: { marginTop: 6, fontSize: 12 } },
+            h('span', { style: { color: 'var(--dim)' } }, t('trigger.sources') + ' '),
+            data.sources.map((s, i) => {
+              const handle = s.startsWith('@') ? s.slice(1) : s;
+              return h('a', {
+                key: 'src' + i,
+                href: 'https://x.com/' + encodeURIComponent(handle),
+                target: '_blank', rel: 'noopener',
+                style: { marginRight: 8 },
+              }, '@' + handle);
+            })
+          )
+        : null,
+      typeof data.confidence === 'number' && data.confidence > 0
+        ? h('div', { style: { marginTop: 4, fontSize: 11, color: 'var(--dim)', fontStyle: 'italic' } },
+            t('trigger.confidence', { pct: data.confidence }))
+        : null,
+    );
+  }
+
+  // Render-state 2/3: no deep trigger yet. Show whyNow as fallback if any,
+  // plus the action button (or locked state for non-pro).
+  return h('div', { className: 'modal-section' },
+    h('div', { className: 'modal-section-label' }, t('trigger.label')),
+    trend.whyNow
+      ? h('div', { className: 'modal-section-content why-now' }, trend.whyNow)
+      : h('div', {
+          className: 'modal-section-content why-now why-now-empty',
+          style: { color: 'var(--dim)', fontStyle: 'italic', opacity: 0.75 },
+        }, t('modal.why_now_empty')),
+
+    // Quick-hint helper text — only when whyNow is present and the user can dig deeper
+    (trend.whyNow && isPro)
+      ? h('div', { style: { marginTop: 4, fontSize: 11, color: 'var(--dim)' } }, t('trigger.help_quick'))
+      : null,
+
+    h('div', { style: { marginTop: 10 } },
+      isPro
+        ? h('button', {
+            className: 'btn btn-primary',
+            disabled: loading,
+            onClick: onSearch,
+            style: { padding: '8px 14px', borderRadius: 8, cursor: loading ? 'wait' : 'pointer' },
+          }, loading ? t('trigger.btn_loading') : t('trigger.btn'))
+        : h('button', {
+            className: 'btn',
+            disabled: true,
+            title: 'Pro plan required',
+            style: { padding: '8px 14px', borderRadius: 8, opacity: 0.6, cursor: 'not-allowed' },
+          }, t('trigger.btn_pro_only')),
+    ),
+    error ? h('div', { style: { marginTop: 6, fontSize: 12, color: 'var(--accent2, #f55)' } }, error) : null,
+  );
+}
+
 // ── TrendModal (side drawer) ───────────────────────────────────────────────────
-function TrendModal({ trend, onClose }) {
+function TrendModal({ trend, onClose, me = null }) {
   const lang = useLang();
   const [imgUrl, setImgUrl] = useState(trend.imageUrl || null);
   const [imgLoading, setImgLoading] = useState(!trend.imageUrl && !!trend.url);
@@ -4730,34 +4991,68 @@ function TrendModal({ trend, onClose }) {
       h('div', { className: 'modal-body' },
 
         // Media — video with image poster if available, otherwise just image
-        // (or a TG-style tile grid when the trend has 2+ photos and no video)
+        // (or a carousel when the trend has 2+ photos and no video).
+        //
+        // Build the merged gallery first — DB imageUrls + preview-sourced
+        // extras (quote-tweet / multi-photo media for Twitter), dedupe
+        // preserving order. Seed with singular imgUrl in case DB only stored
+        // the scalar field. We need the full list even on the video branch
+        // so we can surface non-poster images underneath the player.
         (() => {
           if (imgLoading) return h('div', { className: 'modal-image-loading' });
+
+          const gallery = [];
+          const pushUnique = (u) => { if (u && !gallery.includes(u)) gallery.push(u); };
+          if (imgUrl) pushUnique(imgUrl);
+          if (Array.isArray(trend.imageUrls)) trend.imageUrls.forEach(pushUnique);
+          extraUrls.forEach(pushUnique);
+
           if (trend.videoUrl) {
-            return h('video', {
+            // Video branch — show player primary, then any non-poster images
+            // in a secondary carousel below. Without this, posts that combine
+            // a video + 1-2 photos lose every image except the poster.
+            const auxImgs = gallery.filter(u => u !== imgUrl);
+            const player = h('video', {
               ref: videoVolumeRef,
               className: 'modal-image',
-              style: { height: 'auto', maxHeight: 420, objectFit: 'contain', background: '#000' },
+              style: { background: '#000' },
               src: trend.videoUrl,
               poster: imgUrl || undefined,
               controls: true,
               preload: 'metadata',
               playsInline: true,
             });
+            if (auxImgs.length === 0) {
+              return h('div', { className: 'modal-image-wrap' }, player);
+            }
+            return h('div', null,
+              h('div', { className: 'modal-image-wrap' }, player),
+              h('div', { className: 'modal-aux-gallery' },
+                auxImgs.length >= 2
+                  ? h(ImageCarousel, { urls: auxImgs, variant: 'in-modal' })
+                  : h('div', { className: 'modal-image-wrap' },
+                      h('img', {
+                        className: 'modal-image',
+                        src: auxImgs[0], alt: '', loading: 'lazy',
+                        onError: e => { try { e.target.style.opacity = 0; } catch {} },
+                      })
+                    )
+              )
+            );
           }
-          // Merge DB imageUrls + preview-sourced extras (quote-tweet media for
-          // Twitter), dedupe preserving order. Seed with singular imgUrl too
-          // in case DB only stored the scalar field.
-          const gallery = [];
-          const pushUnique = (u) => { if (u && !gallery.includes(u)) gallery.push(u); };
-          if (imgUrl) pushUnique(imgUrl);
-          if (Array.isArray(trend.imageUrls)) trend.imageUrls.forEach(pushUnique);
-          extraUrls.forEach(pushUnique);
+
           if (gallery.length >= 2) {
             return h(ImageCarousel, { urls: gallery, variant: 'in-modal' });
           }
           if (gallery.length === 1) {
-            return h('img', { className: 'modal-image', src: gallery[0], alt: '', onError: () => setImgUrl(null), loading: 'lazy' });
+            return h('div', { className: 'modal-image-wrap' },
+              h('img', {
+                className: 'modal-image',
+                src: gallery[0], alt: '',
+                onError: () => setImgUrl(null),
+                loading: 'lazy',
+              })
+            );
           }
           return null;
         })(),
@@ -4770,24 +5065,13 @@ function TrendModal({ trend, onClose }) {
           ? h('div', { style: { fontSize: 12, color: 'var(--dim)', fontStyle: 'italic' } }, trend.originalTitle)
           : null,
 
-        // Why it'll pump
-        trend.whyItWillPump ? h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.why_pump')),
-          h('div', { className: 'modal-section-content pump' }, trend.whyItWillPump)
-        ) : null,
-
-        // Why now — concrete triggering event. Always rendered; when the AI
-        // didn't find an explicit cause we show a dim fallback so the user
-        // knows the system ran and intentionally chose not to speculate.
-        h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.why_now')),
-          trend.whyNow
-            ? h('div', { className: 'modal-section-content why-now' }, trend.whyNow)
-            : h('div', {
-                className: 'modal-section-content why-now why-now-empty',
-                style: { color: 'var(--dim)', fontStyle: 'italic', opacity: 0.75 }
-              }, t('modal.why_now_empty'))
-        ),
+        // Trigger — the catalyst behind the trend. Three states:
+        //   1. trigger.text present  → render the deep Grok-reasoning answer
+        //                              (sourced, confidence-scored)
+        //   2. whyNow present        → render the stage-1 short hint as fallback
+        //   3. neither               → render an action button (pro/admin only)
+        //                              that fires the on-demand Grok search
+        h(TriggerSection, { trend, lang, me }),
 
         // AI explanation
         trend.aiExplanation ? h('div', { className: 'modal-section' },
@@ -6170,7 +6454,7 @@ function App() {
     h(StatusBar, { stats, scanning, sources }),
 
     // Side drawer modal
-    modalTrend ? h(TrendModal, { trend: modalTrend, onClose: () => setModalTrend(null) }) : null,
+    modalTrend ? h(TrendModal, { trend: modalTrend, onClose: () => setModalTrend(null), me }) : null,
 
     // ── Nav ──
     h('nav', { className: 'nav' },

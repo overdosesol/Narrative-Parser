@@ -164,31 +164,19 @@ export function resolveMarketStage(signals) {
 /**
  * Optionally upgrade/downgrade a trend's marketStage based on Stage 2 findings.
  * Mutates trend.marketStage in-place; safe to call only when feature is enabled.
+ *
+ * NOTE: as of 2026-04-27 this function is a no-op in the default config.
+ * It used to read `existingCoins` (removed during the narrative-pivot refactor)
+ * and `adjustment` (removed in the Stage 2 token-cost optimization). Kept as
+ * a stub so the call site in scorer.js doesn't have to be branched out, and
+ * so a future market-stage feature can reuse the hook.
+ *
  * @param {object} trend
  * @param {object} stage2Result — parsed JSON from Stage 2 AI response
  */
 export function applyStage2MarketPatch(trend, stage2Result) {
   if (!trend || !stage2Result) return;
-
-  const adj = (stage2Result.adjustment || '').toLowerCase();
-
-  // Upgrade to live if Stage 2 found existing coins with active buzz
-  if (
-    Array.isArray(stage2Result.existingCoins) &&
-    stage2Result.existingCoins.length > 0 &&
-    ['high', 'explosive'].includes(stage2Result.xBuzz)
-  ) {
-    if (trend.marketStage === 'none' || trend.marketStage === 'tokenizing') {
-      trend.marketStage = 'live';
-    }
-  }
-
-  // Downgrade to overheated if rug / late language in adjustment text
-  if (['rugged', 'rug pull', 'dumped', 'honeypot', 'too late'].some(w => adj.includes(w))) {
-    if (trend.marketStage === 'live') {
-      trend.marketStage = 'overheated';
-    }
-  }
+  // Intentionally empty — see note above.
 }
 
 // ── UI / alert helpers ────────────────────────────────────────────────────────

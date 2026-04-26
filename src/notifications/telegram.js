@@ -32,12 +32,13 @@ function buildGrokUrl(trend, lang = 'en') {
  * Each user has their own language, sources, threshold, and subscription.
  */
 class TelegramNotifier {
-  constructor(config, logger, db, solanaMonitor = null) {
+  constructor(config, logger, db, solanaMonitor = null, triggerFinder = null) {
     this.logger = logger;
     this.botToken = config.telegram.botToken;
     this.db = db;
     this.config = config;
     this.solanaMonitor = solanaMonitor; // injected after creation, or passed directly
+    this.triggerFinder = triggerFinder; // optional — pro-only trigger search via Grok reasoning
     this.twitterChecker = new TwitterChecker(config, logger, db);
     this.enabled = !!this.botToken;
     // Rate limiter: max 30 interactions per user per minute
@@ -374,6 +375,26 @@ class TelegramNotifier {
             text: t.xAnalysisLocked || 'X Analysis is locked for this plan',
             show_alert: true,
           });
+        }
+
+        // ── Trigger search (on-demand Grok reasoning) ────────────────────
+        else if (data === 'trigger_locked') {
+          await this.bot.answerCallbackQuery(query.id, {
+            text: t.triggerLocked || 'Trigger search is for Pro plan',
+            show_alert: true,
+          });
+        }
+        else if (data.startsWith('trigger:')) {
+          // Plan gate — pro and admin only
+          if (user.plan_name !== 'pro' && user.plan_name !== 'admin') {
+            await this.bot.answerCallbackQuery(query.id, {
+              text: t.triggerLocked || 'Trigger search is for Pro plan',
+              show_alert: true,
+            });
+            return;
+          }
+          const trendId = parseInt(data.split(':')[1], 10);
+          await this._handleTriggerSearch(chatId, trendId, query, user);
         }
 
         // ── X Analysis refresh (1h cooldown) ──────────────────────────────
@@ -727,7 +748,10 @@ class TelegramNotifier {
         url:           row.url,
         memePotential: metrics.memePotential || 0,
         predictedLifespan: metrics.predictedLifespan || null,
-        whyItWillPump: metrics.whyItWillPump || null,
+        // Optional pitch line — only show on the /top card if a pro user
+        // already ran a deep trigger search for this trend. No fallback to the
+        // legacy whyItWillPump, no auto-generation, no Stage-1 hint.
+        triggerText:   row.trigger_text || null,
         tgMessageUrl:  metrics.tgMessageUrl || null,
       };
     });
@@ -772,9 +796,12 @@ class TelegramNotifier {
       report += `<code>${scoreBar(tr.memePotential)}</code>  ${catIco}`;
       if (lifeLbl) report += '  ' + lifeLbl;
       report += '\n';
-      // Pitch line if available
-      if (tr.whyItWillPump) {
-        report += `\u{1F4A1} <i>${this._escHtml(tr.whyItWillPump)}</i>\n`;
+      // Pitch line — only shown if a Pro user has already searched the trigger
+      // (deep Grok-reasoning catalyst summary). Truncated for the /top card so
+      // the report stays compact; full text is available in the alert thread.
+      if (tr.triggerText) {
+        const short = tr.triggerText.length > 220 ? tr.triggerText.slice(0, 217) + '...' : tr.triggerText;
+        report += `\u{1F4A1} <i>${this._escHtml(short)}</i>\n`;
       }
       // Links
       const links = [];
@@ -972,10 +999,19 @@ class TelegramNotifier {
   }
 
   /**
-   * Attach all alert buttons: X Analysis + Ask Grok + 👍/👎 feedback.
+   * Attach all alert buttons: X Analysis + Trigger + Ask Grok + 👍/👎 feedback.
    * `trend` is optional — when provided, we add a deep-link button that opens
    * grok.com with a pre-filled prompt asking about the narrative's virality.
-   * Replaces the old attachXButton (kept as alias for compatibility).
+   *
+   * Layout (3 rows max for mobile readability):
+   *   [ X Analysis ] [ Trigger ]
+   *   [ Ask Grok ]
+   *   [ 👍 ]        [ 👎 ]
+   *
+   * Trigger button shows different label depending on cache state:
+   *   - 💡 Trigger  → result already in DB, click is instant
+   *   - 🔍 Trigger  → no result yet, click triggers Grok reasoning (~30-60s)
+   *   - 🔒 Trigger  → user is on a non-pro plan
    */
   async attachAlertButtons(chatId, messageId, dbId, userOrLang = 'en', trend = null) {
     if (!this.bot || !messageId || !dbId) return;
@@ -986,23 +1022,37 @@ class TelegramNotifier {
     const xText = isLocked ? (t.xAnalysisLockedBtn || '\u{1F512} X Analysis') : t.xAnalysisBtn;
     const xData = isLocked ? 'x_locked' : `x_analysis:${dbId}`;
 
-    const topRow = [{ text: xText, callback_data: xData }];
+    // Trigger button — three states reflect plan + cache
+    const isPro = plan === 'pro' || plan === 'admin';
+    let triggerText, triggerData;
+    if (!isPro) {
+      triggerText = t.triggerLockedBtn || '\u{1F512} Trigger';
+      triggerData = 'trigger_locked';
+    } else {
+      // Cheap DB peek — no Grok call. Tells us if we should show 💡 (cached) or 🔍 (new).
+      const cached = this.db?.getTrendTrigger ? this.db.getTrendTrigger(dbId) : null;
+      triggerText = cached ? (t.triggerCachedBtn || '\u{1F4A1} Trigger') : (t.triggerBtn || '\u{1F50D} Trigger');
+      triggerData = `trigger:${dbId}`;
+    }
+
+    const topRow = [
+      { text: xText,        callback_data: xData },
+      { text: triggerText,  callback_data: triggerData },
+    ];
+    const rows = [topRow];
+
     const grokUrl = buildGrokUrl(trend, lang);
     if (grokUrl) {
-      topRow.push({ text: t.btnAskGrok, url: grokUrl });
+      rows.push([{ text: t.btnAskGrok, url: grokUrl }]);
     }
+    rows.push([
+      { text: '\u{1F44D}', callback_data: `feedback:1:${dbId}` },
+      { text: '\u{1F44E}', callback_data: `feedback:-1:${dbId}` },
+    ]);
 
     try {
       await this.bot.editMessageReplyMarkup(
-        {
-          inline_keyboard: [
-            topRow,
-            [
-              { text: '\u{1F44D}', callback_data: `feedback:1:${dbId}` },
-              { text: '\u{1F44E}', callback_data: `feedback:-1:${dbId}` },
-            ],
-          ],
-        },
+        { inline_keyboard: rows },
         { chat_id: chatId, message_id: messageId }
       );
     } catch (e) {
@@ -1222,6 +1272,153 @@ class TelegramNotifier {
     } catch (err) {
       this.logger.error(`X Analysis refresh failed: ${err.message}`);
       await this.bot.sendMessage(chatId, t.xAnalysisError(this._escHtml(err.message)), { parse_mode: 'HTML' });
+    }
+  }
+
+  // ── Trigger search (on-demand Grok reasoning) ─────────────────────────────
+
+  /**
+   * Render a trigger payload (text + sources + confidence) into an HTML message
+   * matching the project's alert style. Used both for cached hits and fresh
+   * Grok results, so they always look the same to the user.
+   */
+  _renderTriggerMessage(payload, lang) {
+    const t = getTranslations(lang);
+    const lines = [];
+    lines.push(`${t.triggerHeader}\n${this._escHtml(payload.text)}`);
+    if (Array.isArray(payload.sources) && payload.sources.length > 0) {
+      const links = payload.sources
+        .filter(s => typeof s === 'string' && s.trim().length > 1)
+        .map(s => {
+          const handle = s.startsWith('@') ? s.slice(1) : s;
+          return `<a href="https://x.com/${encodeURIComponent(handle)}">${this._escHtml('@' + handle)}</a>`;
+        });
+      if (links.length) lines.push(`\n${t.triggerSourcesHdr} ${links.join(', ')}`);
+    }
+    if (typeof payload.confidence === 'number' && payload.confidence > 0) {
+      lines.push(`\n${t.triggerConfidence(payload.confidence)}`);
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * Handler for the "Trigger" button on alert cards.
+   *
+   * Flow:
+   *   1. If trigger already in DB → render & return (no Grok call, no cooldown).
+   *   2. Plan gate is enforced upstream (callback dispatcher) — by the time we
+   *      get here the user is pro/admin.
+   *   3. Per-user 15min cooldown (admin bypasses) — checked against the last
+   *      time THIS user actually triggered a Grok call (cached reads don't count).
+   *   4. DB-level claim via `db.claimTriggerSearch` to dedupe parallel clicks.
+   *   5. Call Grok → save result → render. On failure release the lock so a
+   *      retry is possible.
+   */
+  async _handleTriggerSearch(chatId, trendId, query, user) {
+    const t = getTranslations(user.language);
+    const cbId = query.id;
+    const messageId = query.message?.message_id;
+
+    if (!this.triggerFinder || !this.triggerFinder.enabled) {
+      await this.bot.answerCallbackQuery(cbId, {
+        text: t.triggerDisabled || 'Trigger search disabled',
+        show_alert: true,
+      }).catch(() => {});
+      return;
+    }
+
+    const trend = this.db?.getTrendById ? this.db.getTrendById(trendId) : null;
+    if (!trend) {
+      await this.bot.answerCallbackQuery(cbId, {
+        text: t.trendNotFound, show_alert: false,
+      }).catch(() => {});
+      return;
+    }
+
+    // ── Step 1: cached-read fast path ─────────────────────────────────────
+    const existing = this.db.getTrendTrigger(trendId);
+    if (existing && existing.text) {
+      await this.bot.answerCallbackQuery(cbId, { text: t.triggerHeader || '💡 Trigger' }).catch(() => {});
+      await this.bot.sendMessage(chatId, this._renderTriggerMessage(existing, user.language), {
+        parse_mode: 'HTML',
+        reply_to_message_id: messageId,
+        disable_web_page_preview: true,
+      });
+      return;
+    }
+
+    // ── Step 2: cooldown (15min, admin bypass) ────────────────────────────
+    const COOLDOWN_MS = 15 * 60 * 1000;
+    if (user.plan_name !== 'admin') {
+      const lastAt = this.db.getLastTriggerSearchByUser(String(chatId));
+      if (lastAt) {
+        const elapsedMs = Date.now() - new Date(lastAt + 'Z').getTime();
+        if (elapsedMs < COOLDOWN_MS) {
+          const minLeft = Math.max(1, Math.ceil((COOLDOWN_MS - elapsedMs) / 60000));
+          await this.bot.answerCallbackQuery(cbId, {
+            text: t.triggerCooldown(minLeft),
+            show_alert: true,
+          }).catch(() => {});
+          return;
+        }
+      }
+    }
+
+    // ── Step 3: claim the lock atomically ─────────────────────────────────
+    const claim = this.db.claimTriggerSearch(trendId, chatId);
+    if (!claim.claimed) {
+      if (claim.state === 'cached' && claim.trend?.trigger_text) {
+        // Race: another caller filled it between our check and the claim.
+        // Reuse the already-loaded row — saves one SELECT.
+        const payload = {
+          text:       claim.trend.trigger_text,
+          sources:    (() => { try { return JSON.parse(claim.trend.trigger_sources || '[]'); } catch { return []; } })(),
+          confidence: claim.trend.trigger_confidence | 0,
+        };
+        await this.bot.answerCallbackQuery(cbId, { text: t.triggerHeader || '💡 Trigger' }).catch(() => {});
+        await this.bot.sendMessage(chatId, this._renderTriggerMessage(payload, user.language), {
+          parse_mode: 'HTML',
+          reply_to_message_id: messageId,
+          disable_web_page_preview: true,
+        });
+        return;
+      }
+      // Another user is currently calling Grok — show toast and bail
+      await this.bot.answerCallbackQuery(cbId, {
+        text: t.triggerInFlight || 'Another user is searching this trigger',
+        show_alert: true,
+      }).catch(() => {});
+      return;
+    }
+
+    // ── Step 4: ack with loading toast (alert-style so user knows it's slow) ──
+    await this.bot.answerCallbackQuery(cbId, {
+      text: t.triggerLoading || 'Searching...',
+      show_alert: true,
+    }).catch(() => {});
+
+    // ── Step 5: actual Grok call ──────────────────────────────────────────
+    try {
+      const result = await this.triggerFinder.findTrigger(trend);
+      this.db.saveTrendTrigger(trendId, result);
+
+      const payload = { text: result.text, sources: result.sources, confidence: result.confidence };
+      await this.bot.sendMessage(chatId, this._renderTriggerMessage(payload, user.language), {
+        parse_mode: 'HTML',
+        reply_to_message_id: messageId,
+        disable_web_page_preview: true,
+      });
+
+      // Update the original alert's keyboard so the button now shows 💡 (cached)
+      // for everyone who comes back to this message later.
+      this.attachAlertButtons(chatId, messageId, trendId, user, trend).catch(() => {});
+    } catch (err) {
+      this.db.releaseTriggerLock(trendId);
+      this.logger.error(`Trigger search failed for trend #${trendId}: ${err.message}`);
+      await this.bot.sendMessage(chatId, t.triggerError(this._escHtml(err.message)), {
+        parse_mode: 'HTML',
+        reply_to_message_id: messageId,
+      });
     }
   }
 

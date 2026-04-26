@@ -1642,14 +1642,24 @@ function PaymentsPage() {
 // Polls /api/pipeline on a short interval so active stages light up in near
 // real time while the scan is running. Between cycles it shows numbers from
 // the last completed cycle so the panel is never a dead ghost.
+// Pipeline stages — the upstream "ai" marker is split into Stage 1 (base
+// scoring, configurable provider) and Stage 2 (Grok + x_search). Both cards
+// light up while currentStage is 'ai' since we don't get a sub-stage signal
+// mid-call. Reminder: this whole file lives inside a template literal, so
+// NEVER use backticks in comments here — they'll close the outer literal.
 const PIPELINE_STAGES = [
-  { id: 'collect', icon: '📡', label: 'Collect',  hint: 'Apify scrapers'   },
-  { id: 'dedupe',  icon: '🧩', label: 'Dedupe',   hint: 'Aggregator'        },
-  { id: 'cluster', icon: '🗂',  label: 'Cluster',  hint: 'Junk filter'       },
-  { id: 'ai',      icon: '🧠', label: 'AI',       hint: 'Stage 1 + Grok'    },
-  { id: 'save',    icon: '💾', label: 'Save',     hint: 'Persist to DB'     },
-  { id: 'alerts',  icon: '📣', label: 'Alerts',   hint: 'Telegram push'     },
+  { id: 'collect', icon: '📡', label: 'Collect',         hint: 'Apify scrapers'        },
+  { id: 'dedupe',  icon: '🧩', label: 'Dedupe',          hint: 'Aggregator'             },
+  { id: 'cluster', icon: '🗂',  label: 'Cluster',         hint: 'Junk filter'            },
+  { id: 'stage1',  icon: '🧠', label: 'Stage 1',         hint: 'Base scoring (GPT/Grok)' },
+  { id: 'stage2',  icon: '🔍', label: 'Stage 2',         hint: 'Grok + x_search'         },
+  { id: 'save',    icon: '💾', label: 'Save',            hint: 'Persist to DB'          },
+  { id: 'alerts',  icon: '📣', label: 'Alerts',          hint: 'Telegram push'          },
 ];
+
+// Both stage1 and stage2 cards highlight while the upstream marker is 'ai',
+// because the scorer doesn't surface intra-call progress events.
+const PIPELINE_AI_IDS = new Set(['stage1', 'stage2']);
 
 function PipelineFlow() {
   const h = React.createElement;
@@ -1673,13 +1683,18 @@ function PipelineFlow() {
   const live     = state.running && state.cycleInProgress;
   const counts   = live ? state.cycleInProgress : (state.lastCycle || {});
   const curStage = state.currentStage || 'idle';
-  const curIdx   = PIPELINE_STAGES.findIndex(s => s.id === curStage);
+  // Map upstream 'ai' marker to its first AI sub-card for ordering math.
+  const effectiveCurStage = curStage === 'ai' ? 'stage1' : curStage;
+  const curIdx = PIPELINE_STAGES.findIndex(s => s.id === effectiveCurStage);
 
   let subtitle;
   if (state.running) {
+    const activeLabel = curStage === 'ai'
+      ? 'Stage 1 / Stage 2'
+      : (PIPELINE_STAGES[curIdx]?.label || 'работает');
     subtitle = h('span', null,
       h('span', { className: 'pflow-live' }),
-      'Live — ' + (PIPELINE_STAGES[curIdx]?.label || 'работает') + '...'
+      'Live — ' + activeLabel + '...'
     );
   } else if (state.lastCycle) {
     const ago = Math.max(0, Math.round((Date.now() - (state.lastCycle.completedAt || 0)) / 1000));
@@ -1692,15 +1707,28 @@ function PipelineFlow() {
 
   const fmt = (v) => (v === undefined || v === null ? '—' : String(v));
 
+  // Per-stage tooltip — for AI cards, surface the actual model that ran this
+  // cycle (Stage 1 is configurable, Stage 2 is always Grok). Pulls from the
+  // running cycle if live, falls back to lastCycle when between scans.
+  const stage1Model = counts.stage1Model || state.lastCycle?.stage1Model || null;
+  const stage2Model = counts.stage2Model || state.lastCycle?.stage2Model || null;
+  const stageTitle = (s) => {
+    if (s.id === 'stage1' && stage1Model) return s.hint + ' · ' + stage1Model;
+    if (s.id === 'stage2' && stage2Model) return s.hint + ' · ' + stage2Model;
+    return s.hint;
+  };
+
   const nodes = [];
   PIPELINE_STAGES.forEach((s, i) => {
-    const isActive = live && curStage === s.id;
+    // While the orchestrator marker is 'ai', light up BOTH stage1 + stage2
+    // cards (we don't get a sub-stage event mid-scoring).
+    const isActive = live && (curStage === s.id || (curStage === 'ai' && PIPELINE_AI_IDS.has(s.id)));
     const isDone   = live ? (curIdx > i) : !!state.lastCycle;
     nodes.push(
       h('div', {
         key: s.id,
         className: 'pflow-node' + (isActive ? ' active' : '') + (!isActive && isDone ? ' done' : ''),
-        title: s.hint,
+        title: stageTitle(s),
       },
         h('div', { className: 'pflow-ico' }, s.icon),
         h('div', { className: 'pflow-lbl' }, s.label),
@@ -1727,8 +1755,9 @@ function PipelineFlow() {
       ? h('div', { className: 'pflow-foot' },
           h('span', null, 'Собрано → ', h('b', null, fmt(state.lastCycle.collect)),
             ' • После dedupe → ', h('b', null, fmt(state.lastCycle.dedupe)),
-            ' • AI → ', h('b', null, fmt(state.lastCycle.ai)),
-            ' • Алертов отправлено → ', h('b', null, fmt(state.lastCycle.alerts))
+            ' • Stage 1 → ', h('b', null, fmt(state.lastCycle.stage1 ?? state.lastCycle.ai)),
+            ' • Stage 2 → ', h('b', null, fmt(state.lastCycle.stage2 ?? 0)),
+            ' • Алертов → ', h('b', null, fmt(state.lastCycle.alerts))
           )
         )
       : null
@@ -3410,9 +3439,10 @@ function SubmitPage() {
         t.junkPenalty > 0 && scoreBox('🗑 Junk', t.junkPenalty, 'score-bad')
       ),
 
-      // Narrative fields
-      t.whyItWillPump && narrativeBox('🔥 Почему залетит', t.whyItWillPump),
-      t.whyNow && narrativeBox('⚡ Триггер (Why Now)', t.whyNow),
+      // Narrative fields. Legacy whyItWillPump removed — replaced by the
+      // on-demand trigger search (rendered separately when present, see below).
+      t.triggerText && narrativeBox('💡 Триггер (Grok deep)', t.triggerText),
+      t.whyNow && narrativeBox('⚡ Триггер (stage-1)', t.whyNow),
       t.aiExplanation && narrativeBox('🤖 AI объяснение', t.aiExplanation),
       t.storyHook && narrativeBox('📖 Story Hook', '"' + t.storyHook + '"'),
 
@@ -3561,7 +3591,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
         predictedLifespan: trend.predictedLifespan,
         aiExplanation: trend.aiExplanation,
         whyNow: trend.whyNow,
-        whyItWillPump: trend.whyItWillPump,
+        triggerText: trend.triggerText || trend.trigger?.text || null,
         narrativePhase: trend.narrativePhase,
         marketStage: trend.marketStage,
         alertScore: trend.alertScore,
@@ -3621,7 +3651,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
   // Rebuild a scorer-shaped trend object from a DB row (for re-sending an alert
   // on a trend that was already saved). DB row is mostly flat — metrics live
   // inside raw_metrics as JSON. We restore the same field names the
-  // Telegram notifier reads (metrics.imageUrls, whyItWillPump, storyHook, etc).
+  // Telegram notifier reads (metrics.imageUrls, storyHook, etc).
   _hydrateTrendFromDb(row) {
     if (!row) return null;
     let metrics = {};
@@ -3651,8 +3681,12 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
       velocity:        metrics.velocity        ?? 0,
       uniquePlatforms: metrics.uniquePlatforms ?? 1,
       aiExplanation:   row.ai_explanation,
-      whyItWillPump:   metrics.whyItWillPump || '',
       whyNow:          row.why_now || '',
+      // Deep trigger from on-demand Grok-reasoning search (filled by Pro click,
+      // shared across users). May be null when no user has searched yet.
+      triggerText:     row.trigger_text || null,
+      triggerSources:  (() => { try { return JSON.parse(row.trigger_sources || '[]'); } catch { return []; } })(),
+      triggerConfidence: row.trigger_confidence | 0,
       predictedLifespan: row.predicted_lifespan,
       xSearchData:     metrics.xSearchData || { storyScore: metrics.storyScore || 0, storyHook: metrics.storyHook || '' },
       metrics,

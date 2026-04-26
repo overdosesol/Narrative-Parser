@@ -131,7 +131,6 @@ For EACH trend, return a JSON object with these exact fields:
 - "category"          : one of [meme, elon, animals, tech_drama, degenerates, celebrity, sports_degen, ai_drama, boring, other]
 - "sentiment"         : one of [positive, negative, neutral, mixed]
 - "explanation"       : 1-2 sentences WHY this is (or isn't) a great memecoin narrative — IN ENGLISH
-- "whyItWillPump"     : one punchy degen pitch line (e.g. "Elon retweeted a frog — $FROG launches at 3am") — IN ENGLISH. Empty string if memePotential < 30.
 - "whyNow"            : ONE short sentence naming the specific, concrete EVENT driving this trend RIGHT NOW (who did what, or what just happened). Only fill this if the data clearly points to a real triggering event — a tweet by a named person, a news story, a launch, a scandal, a viral clip, etc. If there is NO obvious trigger, or you would have to guess, return an empty string "". Do NOT speculate. Do NOT restate the title. IN ENGLISH.
 - "predictedLifespan" : one of [flash (hours), short (1-2 days), medium (3-7 days), long (weeks+)]
 
@@ -143,60 +142,34 @@ ${trendList}`;
 
 // ─── Stage 2: X Search deep-dive prompt ──────────────────────────────────────
 
-export const STAGE2_SYSTEM_PROMPT = `You are DEGEN-PARSER doing a DEEP NARRATIVE VERIFICATION pass. You have access to X Search — use it to check real-time Twitter/X discussions about the trend.
+// Compressed 2026-04-27 to cut Stage 2 input cost. Removed inline examples
+// (Punch monkey / Moo Deng / Hawk Tuah) — Grok knows these. Removed dead
+// `adjustment` field (was only consumed by market-stage.js which is itself
+// feature-flagged off and now reads nothing). Removed `xSentiment` field —
+// never consumed downstream. Result: ~750 → ~330 tokens of system prompt.
+export const STAGE2_SYSTEM_PROMPT = `You are DEGEN-PARSER verifying a trend against live X discussion. Search X, judge, adjust. Do NOT evaluate coins/tickers — focus on the narrative itself.
 
-Your task: verify whether this trend is a GENUINE, organically spreading narrative on X right now, and ADJUST the scores accordingly. Do NOT search for or evaluate specific coins/tickers — focus strictly on the trend/narrative itself.
+Adjustments to memePotential:
+• Massive organic buzz, many independent accounts, memes forming → +10..+25
+• Clear momentum growing → +5..+15
+• Stale / peaked / nobody still talks about it → -15..-30
+• Backlash killing meme energy → -15..-25
+• Bot / spam / single-account amplification → -20..-40
+• No real X discussion found → -5..-15
 
-SEARCH STRATEGY:
-1. Search X for the trend topic using the main keywords from the title
-2. Judge: how much real, organic buzz exists? Is the narrative spreading or fading? Is the tone positive, negative, or mixed?
-3. Look for signs of ORGANIC virality (many independent accounts, memes forming, variations) vs ASTROTURF / bot amplification / single-account spam
-4. Adjust scores based on what the X signal actually shows
+storyScore (0-100) — stickiness of the story (named character + conflict + stakes = high). ADDITIVE booster only, never penalizes.
+• 85-100: named character + conflict + stakes + shareable backstory
+• 60-84: strong named character or memorable hook
+• 30-59: mild hook, specific moment but no arc
+• 0-29: no character / no story / generic
 
-ADJUSTMENT RULES:
-• Massive organic buzz, many independent accounts, memes forming → BOOST memePotential by 10-25 points
-• Clear narrative momentum (volume growing, not shrinking) → BOOST by 5-15 points
-• Trend is stale / dying / already peaked / nobody still talking about it → REDUCE by 15-30 points
-• Controversial / banned / strong negative backlash that kills meme energy → REDUCE by 15-25 points
-• Mostly bot / spam / single-account amplification, not organic → REDUCE by 20-40 points
-• No meaningful X discussion found → slight reduction (5-15) for lack of buzz
-• Genuine cultural moment, shareable, meme-shaped → lean toward the upper end of the range
+subjectName + nameStrength — tickerable proper name attached to the narrative. Animal/character/person/catchphrase/$TICKER all OK. Generic descriptors and topic labels do NOT count → return "". ADDITIVE booster only, never penalizes.
+• 85-100: short, phonetic, unique, already memed
+• 60-84: solid name, easily shortened to ticker
+• 30-59: long, generic, or competes with existing tokens
+• 0-29: weak / no name
 
-━━━ STORY / NARRATIVE DEPTH (storyScore) ━━━
-Judge the STICKINESS of the story itself, separate from raw virality. A rich story-hook is what turns a generic cute animal into a legendary coin (Moo Deng, Peanut the Squirrel, Punch the monkey bullied by her troop in a Japanese zoo whose only possession is her toy — THAT is a story, not just "monkey pic").
-
-storyScore rubric (0-100):
-• 85-100: Named character + clear conflict + emotional stakes + shareable backstory (the Punch monkey, Peanut the squirrel seized by the government, Moo Deng's personality arc, a dog saving its owner, an underdog human interest story with a face and a name).
-• 60-84: Strong character or situation with a concrete, memorable hook — named subject, unusual circumstance, or a clear "what happened and why it matters" narrative.
-• 30-59: Mild hook — specific moment or character but without deep stakes or arc (e.g. "this cat reacted funny to vacuum").
-• 0-29: No character, no story, no stakes — generic cute pet, random meme format, news headline without a human/animal anchor.
-
-IMPORTANT: storyScore is ADDITIVE to memePotential downstream — high storyScore BOOSTS, low storyScore does NOT penalize. So do not lower memePotential just because a post lacks a story; simply reflect the story depth honestly in storyScore.
-
-━━━ SUBJECT NAME / TICKER CANDIDATE (subjectName + nameStrength) ━━━
-From the same X search results, identify whether the narrative has a SPECIFIC PROPER NAME that degens could turn into a ticker. This is separate from storyScore — you can have a great story without a tickerable name, and a mediocre story with a killer name. Both bonuses stack.
-
-What counts as a subjectName:
-• Named animal / character: "Peanut", "Moo Deng", "Punch", "Fumo", "Doug the Pug"
-• Named person tied to the narrative: "Elon", "Trump", "Hawk Tuah girl"
-• Short branded phrase / catchphrase: "Hawk Tuah", "Skibidi", "Fanum Tax"
-• Existing ticker mentioned on X: "$BONK", "$WIF", "$CHILLGUY"
-
-What does NOT count (return "" for subjectName):
-• Generic descriptors: "the cat", "this dog", "a frog"
-• Long phrases (>3 words) that won't fit a ticker
-• Topic labels without a character: "AI art", "election drama"
-• Politicians / news figures where the narrative is the event, not the person
-
-nameStrength rubric (0-100) — how tickerable the name is:
-• 85-100: Short (1-2 syllables), phonetic, unique, already memed on X, natural ticker ($PEANUT, $MOODENG, $PUNCH). Degens will use this exact string.
-• 60-84: Solid name — 1-3 words, memorable, clearly attached to the narrative, easily shortened to a ticker.
-• 30-59: Name exists but is long, generic, or competes with existing tokens (e.g. "Brian the Dog" — fine but forgettable).
-• 0-29: Weak or no name — only generic descriptors available, or a name so long/bland it won't stick.
-
-IMPORTANT: nameStrength is ADDITIVE, booster-only, NEVER penalizes. If there is no clean name, return subjectName: "" and nameStrength: 0 — the trend simply gets no bonus, not a penalty.
-
-Always respond with ONLY valid JSON. No markdown, no preamble.`;
+Respond with ONLY valid JSON. No markdown, no preamble.`;
 
 export function buildStage2Prompt(trend) {
   let detail = `Trend: "${trend.originalTitle || trend.title}"`;
@@ -205,23 +178,95 @@ export function buildStage2Prompt(trend) {
   detail += `\nInitial memePotential: ${trend.memePotential}`;
   detail += `\nInitial viralityScore: ${trend.score}`;
   detail += `\nCategory: ${trend.category}`;
-  return `Use X Search to verify this trend and ADJUST scores if needed.
+  return `Verify this trend on X and adjust scores.
 
 ${detail}
 
-Search X/Twitter for discussions about this trend (the NARRATIVE, not coins). Then return a JSON object with these fields:
-- "memePotential"     : adjusted 0-100 score (explain why you changed it)
+Return JSON with these fields ONLY:
+- "memePotential"     : adjusted 0-100
 - "viralityScore"     : adjusted 0-100
-- "xBuzz"             : one of [none, low, medium, high, explosive]
-- "narrativeMomentum" : one of [fading, flat, building, exploding] — is the conversation growing or dying?
-- "organicity"        : one of [organic, mixed, astroturf] — does the buzz look like real people or bots/spam?
-- "xSentiment"        : one of [positive, negative, neutral, mixed]
-- "storyScore"        : 0-100 — narrative depth / story-hook strength (see rubric in system prompt). Booster-only, never penalizes generic content.
-- "storyHook"         : ONE short sentence naming the actual story (character, conflict, stakes). Empty string if storyScore < 30. — IN ENGLISH
-- "subjectName"       : the specific proper name/ticker candidate attached to the narrative (e.g. "Peanut", "Moo Deng", "Hawk Tuah", "$BONK"), or "" if none. See rubric in system prompt. Booster-only.
-- "nameStrength"      : 0-100 — how tickerable that name is (see rubric). Return 0 if subjectName is "". Booster-only, never penalizes.
-- "adjustment"        : brief explanation of what you found on X and why you adjusted scores — IN ENGLISH
-- "whyItWillPump"     : updated degen pitch focused on the NARRATIVE — IN ENGLISH (empty string if memePotential < 30)
+- "xBuzz"             : [none|low|medium|high|explosive]
+- "narrativeMomentum" : [fading|flat|building|exploding]
+- "organicity"        : [organic|mixed|astroturf]
+- "storyScore"        : 0-100 (booster only)
+- "storyHook"         : ≤80 chars, ONE short sentence naming character/conflict/stakes. Empty string if storyScore < 30. ENGLISH.
+- "subjectName"       : proper name / ticker candidate, or "" if none
+- "nameStrength"      : 0-100 (0 if subjectName is "")
 
-Respond ONLY with a JSON object. No markdown fences, no extra text.`;
+JSON only, no markdown, no extra text.`;
+}
+
+// ─── Trigger search (on-demand, replaces whyItWillPump) ──────────────────────
+//
+// Run on user click only — NOT in the automatic scoring pipeline. Uses Grok
+// reasoning (grok-4-1-fast-reasoning) + x_search to identify the SPECIFIC
+// catalyst that's driving a trend RIGHT NOW. Result is cached in DB and
+// shared across all users (first click triggers Grok, the rest read from DB).
+//
+// This is intentionally factual (not a degen pitch) — names, dates, source
+// accounts. Reasoning mode is justified because we want Grok to:
+//   1. read multiple X search results
+//   2. cross-reference timestamps to find the actual trigger event
+//   3. identify amplifier accounts vs originator
+//   4. distinguish "ongoing chatter" from "just-broke catalyst"
+
+export const TRIGGER_SYSTEM_PROMPT = `You are a narrative-catalyst analyst. Given a trending topic, your job is to find the SPECIFIC EVENT happening RIGHT NOW that's driving the conversation on X.
+
+Your tools:
+- x_search: read actual top tweets about the trend in the last 24-48 hours
+- reasoning: cross-reference timestamps, identify originator vs amplifiers, distinguish "the catalyst" from "ongoing chatter"
+
+OUTPUT REQUIREMENTS:
+- 2-3 plain-English sentences naming: WHAT happened, WHO is involved (real names/handles), WHEN it broke
+- Cite specific X accounts that posted the most amplified content
+- Confidence score reflecting how certain you are this is THE driver (vs noise)
+
+WHAT COUNTS AS A TRIGGER:
+- A specific viral post (with author + approximate time)
+- A celebrity / authority quote-tweet or reply
+- A breaking news event (launch, leak, arrest, death, scandal)
+- A meme-format moment that just took off (and you can name the originator)
+- A coordinated drop (NFT mint, token launch, product reveal)
+
+WHAT DOES NOT COUNT (return confidence < 40 + acknowledge the absence):
+- Generic ongoing chatter without a clear inciting moment
+- Vague "people are talking about X" without a named trigger event
+- Speculation about why something MIGHT be trending
+
+RULES:
+- NO degen pitch. NO "this will pump because..." NO ticker promotion. Pure factual catalyst summary.
+- Names, dates, numbers ONLY if x_search confirms them. No invented attribution.
+- If you searched and found nothing concrete, set confidence < 40 and trigger to "No specific catalyst found — narrative appears to be ongoing chatter without a clear trigger event."
+- ENGLISH output.
+
+Always respond with ONLY valid JSON. No markdown, no preamble.`;
+
+export function buildTriggerPrompt(trend) {
+  let detail = `Trend: "${trend.original_title || trend.originalTitle || trend.title || ''}"`;
+  detail += `\nSource: ${trend.source || 'unknown'}`;
+  if (trend.aiExplanation || trend.ai_explanation) {
+    detail += `\nInitial pipeline analysis: ${trend.aiExplanation || trend.ai_explanation}`;
+  }
+
+  // Pull subject name from xSearchData if available — gives Grok a high-signal
+  // anchor to search for instead of parsing it from the title.
+  let subjectName = null;
+  try {
+    const rm = trend.raw_metrics ? JSON.parse(trend.raw_metrics) : (trend.metrics || {});
+    subjectName = rm?.xSearchData?.subjectName || null;
+  } catch { /* corrupt JSON, ignore */ }
+  if (subjectName) detail += `\nKnown subject: ${subjectName}`;
+
+  return `Find the current narrative trigger for this trend using x_search + reasoning.
+
+${detail}
+
+Search X/Twitter for the most viral discussion in the last 24-48 hours about this trend. Identify the ONE specific event/post/news that's driving it RIGHT NOW.
+
+Return ONLY this JSON shape:
+{
+  "trigger":    "<2-3 sentences naming what/who/when, in English>",
+  "confidence": <0-100 integer — how certain you are this is THE driver vs noise>,
+  "sources":    ["@handle1", "@handle2", ...]   // up to 5 X accounts that amplified the trigger
+}`;
 }

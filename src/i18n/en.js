@@ -170,6 +170,21 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
   xAnalysisGrokLine:   (buzz, momentum, organicity) =>
     `buzz=${buzz} \u00B7 momentum=${momentum} \u00B7 organicity=${organicity}`,
 
+  // ── Trigger search (on-demand Grok reasoning catalyst lookup) ──────────
+  triggerBtn:        '\u{1F50D} Trigger',
+  triggerCachedBtn:  '\u{1F4A1} Trigger',
+  triggerLockedBtn:  '\u{1F512} Trigger (Pro)',
+  triggerLocked:     '\u{1F512} Trigger search is a Pro-plan feature. Upgrade to unlock.',
+  triggerLoading:    '\u{1F50D} Searching trigger... (~30-60s, reasoning mode)',
+  triggerInFlight:   '\u{1F50D} Another user is already searching this trend’s trigger. Try again in ~30s.',
+  triggerCooldown:   (min) => `\u{23F3} You can run another trigger search in ${min} min`,
+  triggerHeader:     '\u{1F4A1} <b>Trigger:</b>',
+  triggerSourcesHdr: '\u{1F4E1} <b>Sources:</b>',
+  triggerConfidence: (pct) => `<i>Confidence: ${pct}%</i>`,
+  triggerNotFound:   'No specific catalyst found — narrative appears to be ongoing chatter without a clear trigger event.',
+  triggerError:      (err) => `\u{274C} Trigger search failed: ${err}`,
+  triggerDisabled:   '\u{274C} Trigger search is currently unavailable (XAI_API_KEY not configured).',
+
   // ── Errors ─────────────────────────────────────────────────────────────
   dbUnavailable: '\u{274C} Database unavailable',
   trendNotFound: '\u{274C} Trend not found.',

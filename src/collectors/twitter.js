@@ -266,7 +266,19 @@ class TwitterCollector extends BaseCollector {
     //   ≥ 10 000 views (significant reach)
     //   viralScore ≥ 35 (composite signal)
     // Hard filter: 500K+ views required. If views unavailable — fallback to 10K+ likes.
-    const meetsBar = views > 0 ? views >= 500_000 : likes >= 10_000;
+    //
+    // CJK-script tweets get a harder bar — the Apify firehose pulls in too
+    // much low-signal Asian-language virality (idol fandom, regional memes,
+    // news copypasta) that meets the global threshold but never converts into
+    // a tradeable narrative on EN/global crypto twitter.
+    //   • Chinese (zh): 4× — biggest source of noise, mostly mainland reposts
+    //   • Japanese (ja) / Korean (ko): 2× — noisier than EN but more often
+    //     genuinely on-trend (idol launches, anime/game IP)
+    const cjkScript = _detectCjkScript(text);
+    const cjkMult   = cjkScript === 'zh' ? 4 : cjkScript ? 2 : 1;
+    const viewsBar  = 500_000 * cjkMult;
+    const likesBar  = 10_000  * cjkMult;
+    const meetsBar  = views > 0 ? views >= viewsBar : likes >= likesBar;
     if (!meetsBar) return null;
 
     const createdAt = tweet.created_at || tweet.createdAt || null;
@@ -491,6 +503,49 @@ class TwitterCollector extends BaseCollector {
   normalize(item) {
     return item; // already normalized in _normalize()
   }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Detect dominant CJK script in a tweet.
+ *
+ * Returns one of: 'zh' (Chinese-only Han chars), 'ja' (any Hiragana/Katakana),
+ * 'ko' (any Hangul), or null (not CJK-dominant).
+ *
+ * Logic:
+ *  - Counts CJK characters across Han + Hiragana/Katakana + Hangul ranges.
+ *  - Requires ≥30 % of all Unicode letters to be CJK — otherwise null.
+ *  - Once CJK-dominant: presence of kana → 'ja', presence of hangul → 'ko',
+ *    only Han ideographs → 'zh' (the Chinese case).
+ *
+ * Why script-specific detection: Chinese pulls 4× more low-signal virality
+ * (regional news, idol gossip, copypasta) through Apify than ja/ko, so it
+ * gets a stricter floor in `_normalize`.
+ */
+function _detectCjkScript(text) {
+  if (!text) return null;
+  // Hiragana (3040-309F) + Katakana (30A0-30FF) — Japanese-exclusive
+  const kanaRe   = /[぀-ゟ゠-ヿ]/g;
+  // Hangul Syllables (AC00-D7AF) — Korean-exclusive
+  const hangulRe = /[가-힯]/g;
+  // Han ideographs (CJK Ext-A 3400-4DBF + CJK Unified 4E00-9FFF) — shared
+  const hanRe    = /[㐀-䶿一-鿿]/g;
+
+  const kanaCount   = (text.match(kanaRe)   || []).length;
+  const hangulCount = (text.match(hangulRe) || []).length;
+  const hanCount    = (text.match(hanRe)    || []).length;
+  const cjkCount    = kanaCount + hangulCount + hanCount;
+  if (cjkCount === 0) return null;
+
+  const letterMatches = text.match(/\p{L}/gu);
+  const letters = letterMatches ? letterMatches.length : 0;
+  if (letters === 0) return null;
+  if ((cjkCount / letters) < 0.30) return null;
+
+  if (kanaCount > 0)   return 'ja';
+  if (hangulCount > 0) return 'ko';
+  return 'zh'; // pure Han, no kana, no hangul
 }
 
 export default TwitterCollector;
