@@ -5,6 +5,7 @@ import path from 'path';
 import { spawn } from 'child_process';
 import { formatTelegramAlert, formatTwitterResult } from './formatter.js';
 import { getTranslations } from '../i18n/index.js';
+import { normalizeLifespan } from '../analysis/lifespan.js';
 import TwitterChecker from '../collectors/twitter-check.js';
 import { UserRateLimiter } from '../utils/rate-limiter.js';
 
@@ -160,14 +161,34 @@ class TelegramNotifier {
     this.bot.on('message', async (msg) => {
       const chatId = String(msg.chat.id);
       const text = msg.text || '';
-      // Ignore commands
-      if (text.startsWith('/')) return;
 
       const state = this._awaitingInput.get(chatId);
+
+      // Allow `/skip` to abort an in-progress wizard cleanly. Other commands
+      // are handled by their own onText handlers, so we ignore them here.
+      if (text.startsWith('/')) {
+        if (state && text.trim().toLowerCase().startsWith('/skip')) {
+          this._awaitingInput.delete(chatId);
+          const u = this.db.getOrCreateUser(msg.chat.id, msg.from?.username);
+          const tr = getTranslations(u.language);
+          await this.bot.sendMessage(msg.chat.id, tr.feedbackReasonSkipped || 'Cancelled.', {
+            parse_mode: 'HTML',
+          }).catch(() => {});
+        }
+        return;
+      }
+
       if (!state) return;
 
       const user = this.db.getOrCreateUser(msg.chat.id, msg.from?.username);
       const t = getTranslations(user.language);
+
+      // 5-minute timeout — drop stale states so a user who clicks the button
+      // but never replies isn't surprised days later when they say something.
+      if (state.startedAt && Date.now() - state.startedAt > 5 * 60 * 1000) {
+        this._awaitingInput.delete(chatId);
+        return;
+      }
 
       if (state.type === 'threshold') {
         this._awaitingInput.delete(chatId);
@@ -183,6 +204,31 @@ class TelegramNotifier {
           parse_mode: 'HTML',
           reply_markup: this._mainMenuKeyboard({ ...user, alert_threshold: val }),
         }).catch(() => {});
+      }
+
+      else if (state.type === 'feedback_reason') {
+        this._awaitingInput.delete(chatId);
+        const reason = text.trim();
+        // Hard cap mirrors db.setFeedbackReason — message would be silently
+        // truncated otherwise; tell the user instead so they can retry.
+        if (reason.length > 240) {
+          await this.bot.sendMessage(msg.chat.id, t.feedbackReasonTooLong || 'Too long (240 chars max). Tap the button again to retry.', {
+            parse_mode: 'HTML',
+          }).catch(() => {});
+          return;
+        }
+        const ok = this.db.setFeedbackReason(state.trendId, chatId, reason);
+        if (ok) {
+          this.logger.info(`Feedback reason saved (${reason.length} chars) for trend ${state.trendId} by ${chatId}`);
+          await this.bot.sendMessage(msg.chat.id, t.feedbackReasonSaved || 'Reason saved — thank you!', {
+            parse_mode: 'HTML',
+          }).catch(() => {});
+        } else {
+          // Vote was deleted between button-click and reply
+          await this.bot.sendMessage(msg.chat.id, t.feedbackReasonNoVote || 'No active vote to attach this to.', {
+            parse_mode: 'HTML',
+          }).catch(() => {});
+        }
       }
     });
 
@@ -442,6 +488,53 @@ class TelegramNotifier {
             this.db.recordFeedback(trendId, String(chatId), finalVote, weight, planName);
             this.logger.info(`Feedback btn ${finalVote > 0 ? '+1' : finalVote < 0 ? '-1' : '0'} (w=${weight}, plan=${planName}) for "${trend.title}"`);
             await this.bot.answerCallbackQuery(query.id, { text: ackText });
+
+            // ── Reason row toggle ─────────────────────────────────────────
+            // Append a "Reason for rating" row when there's an active vote;
+            // strip it when the vote was just removed. We surgically modify
+            // the existing keyboard (filter out any prior fb_reason row, then
+            // optionally append) so we don't need to re-derive plan-locked
+            // states for the X Analysis / Trigger buttons here.
+            try {
+              const existingRows = query.message?.reply_markup?.inline_keyboard || [];
+              const baseRows = existingRows.filter(row =>
+                !row.some(b => typeof b.callback_data === 'string' && b.callback_data.startsWith('fb_reason:'))
+              );
+              const newRows = [...baseRows];
+              if (finalVote !== 0) {
+                newRows.push([{ text: t.btnFeedbackReason, callback_data: `fb_reason:${trendId}` }]);
+              }
+              await this.bot.editMessageReplyMarkup(
+                { inline_keyboard: newRows },
+                { chat_id: chatId, message_id: query.message.message_id }
+              ).catch(() => {});
+            } catch (err) {
+              // Non-fatal — the vote was already recorded above
+              this.logger.warn(`Could not toggle reason button: ${err.message}`);
+            }
+          }
+        }
+
+        // ── Reason-for-rating button (FSM entry) ──────────────────────────
+        // Pressing this puts the user into `_awaitingInput` for `feedback_reason`
+        // — the next non-command text message they send is captured as the
+        // reason for their existing vote. /skip or 5-min timeout cancels.
+        else if (data.startsWith('fb_reason:')) {
+          const trendId = parseInt(data.split(':')[1], 10);
+          const userVote = this.db?.getUserVote ? this.db.getUserVote(trendId, String(chatId)) : null;
+          if (!userVote) {
+            await this.bot.answerCallbackQuery(query.id, {
+              text: t.feedbackReasonNoVote || 'Vote first, then add a reason',
+              show_alert: false,
+            });
+          } else {
+            this._awaitingInput.set(String(chatId), {
+              type: 'feedback_reason',
+              trendId,
+              startedAt: Date.now(),
+            });
+            await this.bot.answerCallbackQuery(query.id);
+            await this.bot.sendMessage(chatId, t.feedbackReasonPrompt, { parse_mode: 'HTML' }).catch(() => {});
           }
         }
 
@@ -787,7 +880,8 @@ class TelegramNotifier {
         user.language === 'en' && tr.originalTitle ? tr.originalTitle : tr.title
       );
       const catIco  = catIcon(tr.category);
-      const lifeLbl = tr.predictedLifespan ? lifeIcon(tr.predictedLifespan) : '';
+      // Normalize legacy descriptive forms ("flash (hours)") from old DB rows.
+      const lifeLbl = tr.predictedLifespan ? lifeIcon(normalizeLifespan(tr.predictedLifespan)) : '';
 
       report += '\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n';
       // Number + title
@@ -1497,11 +1591,15 @@ class TelegramNotifier {
     // Weighting off → only admin votes count (weight=1), all others are ignored (weight=0)
     if (!enabled) return { weight: planName === 'admin' ? 1 : 0, planName };
 
+    // Defaults match the rebalanced scheme set by the DB migration on first
+    // boot (2026-04-27). If those settings keys exist (they will, post-
+    // migration) the migration values win; the defaults below are only used
+    // for a brand-new install or if an operator manually deleted the keys.
     const weights = {
-      admin: parseFloat(this.db?.getSetting('feedbackWeightAdmin', '3') || '3'),
-      pro:   parseFloat(this.db?.getSetting('feedbackWeightPro',   '2') || '2'),
-      test:  parseFloat(this.db?.getSetting('feedbackWeightTest',  '1') || '1'),
-      free:  parseFloat(this.db?.getSetting('feedbackWeightFree',  '1') || '1'),
+      admin: parseFloat(this.db?.getSetting('feedbackWeightAdmin', '5')   || '5'),
+      pro:   parseFloat(this.db?.getSetting('feedbackWeightPro',   '2.5') || '2.5'),
+      test:  parseFloat(this.db?.getSetting('feedbackWeightTest',  '0.5') || '0.5'),
+      free:  parseFloat(this.db?.getSetting('feedbackWeightFree',  '0.2') || '0.2'),
     };
 
     const weight = weights[planName] ?? 1;

@@ -50,12 +50,15 @@ services:
       retries: 3
       start_period: 5s
     
-    # Логирование
+    # Логирование (Docker stdout ring buffer)
+    # 50m × 5 = 250 MB total. NB: это только для `docker logs` —
+    # приложение всё равно пишет в /logs/{date}.log в named volume,
+    # который переживает ребилды и хранит полную историю по дням.
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
         labels: "app=catalyst"
 
 volumes:

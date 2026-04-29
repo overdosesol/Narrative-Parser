@@ -11,6 +11,9 @@ import Aggregator from './analysis/aggregator.js';
 import Scorer, { loadAlertWeights, computeAlertScore, feedbackBoostFromStats } from './analysis/scorer.js';
 import NarrativeClusterer from './analysis/clusterer.js';
 import TriggerFinder from './analysis/trigger-finder.js';
+import NanoClassifier from './analysis/nano-classifier.js';
+import GeminiCaptioner from './analysis/gemini-captioner.js';
+import PreStage from './analysis/pre-stage.js';
 import TelegramNotifier from './notifications/telegram.js';
 import SolanaPayMonitor from './billing/solana-pay.js';
 import DashboardServer from './dashboard/server.js';
@@ -27,7 +30,24 @@ logger.info('══════════════════════�
 const db         = new TrendDatabase(config.dbPath, logger);
 const aggregator = new Aggregator(db, logger);
 const clusterer  = new NarrativeClusterer(db, logger);
-const scorer     = new Scorer(config, logger, db);
+
+// ── Stage 0 (PreStage) — text + visual enrichment before scoring ──────────
+// nano: gpt-5.4-nano via OPENAI_API_KEY (text). gemini: gemini-3.1-flash
+// via OPENROUTER_API_KEY (vision). Both fail gracefully — when either key
+// is missing the corresponding sub-stage is skipped, scoring works as before.
+// Pass `db` so the classifier can read its admin-toggle setting at runtime.
+// Without `db` the classifier still works — just no live admin toggle.
+const nanoClassifier  = new NanoClassifier(config, logger, db);
+const geminiCaptioner = new GeminiCaptioner(config, logger);
+const preStage = new PreStage(logger, { nanoClassifier, geminiCaptioner });
+if (preStage.enabled) {
+  logger.info('PreStage enabled: nano=' + (nanoClassifier.enabled ? 'on' : 'off') +
+              ', gemini=' + (geminiCaptioner.enabled ? 'on' : 'off'));
+} else {
+  logger.info('PreStage disabled (no Stage 0 keys configured)');
+}
+
+const scorer = new Scorer(config, logger, db, preStage);
 
 // On-demand trigger search (Pro-plan button in TG + dashboard).
 // Disabled gracefully when XAI_API_KEY is missing — `enabled` flag exposed
@@ -96,7 +116,7 @@ const appState = {
   disabledCollectors: new Set(),
   lastStorageCheckAt: 0,
   // Pipeline observability — drives the admin flow-diagram animation.
-  // currentStage: idle|collect|dedupe|cluster|ai|save|alerts|done
+  // currentStage: idle|collect|dedupe|cluster|prestage|ai|save|alerts|done
   currentStage: 'idle',
   stageStartedAt: null,
   cycleStartedAt: null,
@@ -200,6 +220,7 @@ dashboard.start();
 const admin = new AdminServer(config, logger, db, telegram.bot, appState, () => runScanCycle(), {
   scorer,
   telegram,       // full wrapper — needed for sendAlertToUser + attachXButton
+  triggerFinder,  // optional Grok deep-search; SubmitPage button → /api/trends/:id/trigger
 });
 admin.start();
 
@@ -226,6 +247,9 @@ async function runScanCycle() {
   appState.cycleStartedAt = cycleStart;
   appState.cycleInProgress = {
     collect: 0, dedupe: 0, cluster: 0,
+    // `prestage` = trends enriched by Stage 0 (nano + gemini). Counts as 0
+    // when PreStage is disabled — card still appears in the pipeline UI.
+    prestage: 0,
     // `ai` kept for backwards compat (= total trends scored). New split:
     // `stage1` = trends through base scoring, `stage2` = actual x_search calls.
     ai: 0, stage1: 0, stage2: 0,
@@ -264,12 +288,58 @@ async function runScanCycle() {
       return;
     }
 
-    // Step 2.5: Pre-AI cluster routing — signal quality layer
+    // ─── PR-2 PIPELINE ORDER ─────────────────────────────────────────────
+    // Aggregator → cheapDedup → PreStage → SmartCluster → Stage 1 → Stage 2
+    //
+    // PreStage now runs BEFORE clustering so the clusterer sees Gemini's
+    // visualCaption/videoSummary and nano's entityCanonical at decision
+    // time — semantically richer signal than title alone. The cheap dedup
+    // step protects PreStage from paying for exact-text bot copypaste
+    // ladders before the smart cluster pass collapses real narratives.
+    //
+    // Cost note: items that the smart clusterer eventually drops or marks
+    // `save_only` now still pay for PreStage (1 nano + 1 gemini call each).
+    // cheapDedup mitigates the worst case; the rest is the price for a
+    // clusterer that actually understands content. ────────────────────────
+
+    // Step 2.4: cheapDedup — pure in-memory, exact-text/url collisions.
+    const uniqueTrends = clusterer.cheapDedup(newTrends);
+
+    // Step 2.5: PreStage (Stage 0) — text + visual enrichment.
+    // Tracked as a separate pipeline stage so the admin Pipeline card
+    // animates it distinctly. PreStage NEVER filters/scores — output goes
+    // into trend.preStage and is read by buildAnalysisPrompt + clusterer's
+    // similarity function. Failures degrade silently (preStage = null).
+    if (preStage.enabled) {
+      setPipelineStage('prestage');
+      const ps0 = Date.now();
+      try {
+        await preStage.enrichBatch(uniqueTrends);
+      } catch (e) {
+        logger.warn(`PreStage threw, continuing without enrichment: ${e.message}`);
+      }
+      const enrichedCount = uniqueTrends.filter(t => t.preStage).length;
+      appState.cycleInProgress.prestage = enrichedCount;
+      // Surface model names so the admin Pipeline card tooltip shows what
+      // actually ran (Gemini may have fallen back silently).
+      appState.cycleInProgress.nanoModel   = nanoClassifier.enabled  ? nanoClassifier.model    : null;
+      appState.cycleInProgress.geminiModel = geminiCaptioner.enabled ? geminiCaptioner._activeModel : null;
+      logger.info(`PreStage: ${enrichedCount}/${uniqueTrends.length} trends enriched in ${Date.now() - ps0}ms`);
+    } else {
+      appState.cycleInProgress.prestage = 0;
+    }
+
+    // Step 2.6: Smart cluster routing — multi-signal similarity. Now reads
+    // PreStage outputs (videoSummary, visualCaption, entityCanonical) for
+    // semantically-aware clustering. async because of OpenAI embeddings +
+    // image-hash batches; degrades to fewer signals or Jaccard on failure.
     setPipelineStage('cluster');
-    const { priority, toScore, toSave, droppedCount } = clusterer.route(newTrends);
+    const { priority, toScore, toSave, droppedCount } = await clusterer.route(uniqueTrends);
     appState.cycleInProgress.cluster = (priority?.length || 0) + (toScore?.length || 0);
 
-    // Save "save_only" items directly (no AI cost, no alerts)
+    // Save "save_only" items directly (no AI cost, no alerts). They now
+    // carry PreStage data into the DB even though they never went to Stage 1
+    // — a future cycle that re-clusters this narrative will benefit.
     for (const trend of toSave) {
       db.saveTrend({
         ...trend,

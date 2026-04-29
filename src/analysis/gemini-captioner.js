@@ -1,0 +1,609 @@
+/**
+ * GeminiCaptioner — Stage 0b vision preprocessing.
+ *
+ * Two-provider failover (2026-04-28 architecture):
+ *   - PRIMARY:  Direct Google AI Studio (`generativelanguage.googleapis.com`)
+ *               — supports BOTH images AND native video (up to 30s) via
+ *                 inlineData with base64-encoded bytes.
+ *               — geo-restricted (Germany/US/most-EU = supported,
+ *                 RU/BY/etc = blocked).
+ *   - FALLBACK: OpenRouter (`openrouter.ai/api/v1`)
+ *               — gemini-2.5-flash via OpenAI-compatible chat/completions.
+ *               — IMAGES ONLY (OpenRouter can't reliably proxy video).
+ *               — for video trends the fallback uses the poster image,
+ *                 sacrificing temporal info but keeping vision available.
+ *
+ * Failover triggers (any of these on a Google call → try OpenRouter next):
+ *   - HTTP 429 (rate limit / quota exceeded)
+ *   - HTTP 403 with FAILED_PRECONDITION (geo block, billing disabled)
+ *   - HTTP 5xx (upstream issue)
+ *   - Network/timeout errors
+ *
+ * Cooldown: after 3 consecutive Google failures, skip Google for 5 min and
+ * route directly to OpenRouter. Resets on first Google success after window.
+ *
+ * NEVER filters, NEVER scores. Failures degrade silently (preStage.gemini = null).
+ *
+ * Output shape per trend:
+ *   {
+ *     visualCaption:    "Factual 1-2 sentence description",
+ *     visibleText:      "Text visible in the visual",
+ *     mood:             "Short emotional tone tag",
+ *     mediaType:        "image" | "video",
+ *     videoSummary:     "Temporal description for video, empty for image",
+ *     videoDurationSec: number | null,
+ *     videoTruncated:   boolean   // true when fell back to poster from video
+ *     provider:         "google" | "openrouter"   // which one served the call
+ *   }
+ */
+
+import { spawn } from 'child_process';
+import crypto from 'crypto';
+
+const VISION_SYSTEM_PROMPT = `You are a VISUAL DESCRIPTION preprocessor for a memecoin trend analyzer. Your ONLY job: describe what is shown in the image or video factually so the downstream scorer has accurate visual context.
+
+You DO NOT score. You DO NOT judge. You DO NOT filter. Even if the visual looks weird, low-quality, or off-topic, you STILL describe it accurately — the next stage decides what to do with the info.
+
+For each input, return:
+- "visualCaption":  ONE OR TWO sentences describing WHAT is visible (subjects, scene, art style). ≤300 chars. Concrete and factual ("Cartoon TREE characters with anthropomorphic faces in brown earth-tone palette") not promotional ("amazing viral meme!").
+- "visibleText":    Any text, captions, watermarks, or on-screen writing visible IN the visual. Empty string if none. Quote it directly.
+- "mood":           SHORT phrase (1-3 words) describing emotional tone — absurd, wholesome, dramatic, surreal, humorous, ominous, mundane, etc.
+- "videoSummary":   For VIDEO: how the content unfolds over time. ≤200 chars. Empty string for static images.
+
+If the visual is a video, focus on: opening shot, key action/transition, visible captions/audio cues. Analyze the FIRST 30 SECONDS only — ignore content past that.
+
+Respond with ONLY valid JSON. No markdown, no preamble.`;
+
+const GOOGLE_RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    visualCaption: { type: 'string' },
+    visibleText:   { type: 'string' },
+    mood:          { type: 'string' },
+    videoSummary:  { type: 'string' },
+  },
+  required: ['visualCaption', 'visibleText', 'mood', 'videoSummary'],
+};
+
+export class GeminiCaptioner {
+  constructor(config, logger) {
+    this.logger = logger;
+
+    // ── Primary: Direct Google AI Studio ────────────────────────────────────
+    this.googleKey   = process.env.GOOGLE_AI_API_KEY || '';
+    this.googleModel = process.env.GOOGLE_AI_MODEL
+      || process.env.GOOGLE_AI_VIDEO_MODEL    // back-compat alias
+      || 'gemini-2.5-flash';
+    this.googleBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
+
+    // ── Fallback: OpenRouter ────────────────────────────────────────────────
+    this.openRouterKey   = process.env.OPENROUTER_API_KEY || '';
+    this.openRouterModel = process.env.OPENROUTER_VISION_MODEL          || 'google/gemini-2.5-flash';
+    this.openRouterFallbackModel = process.env.OPENROUTER_VISION_MODEL_FALLBACK || 'google/gemini-2.5-flash';
+    this.openRouterBaseUrl = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+
+    // ── Knobs ───────────────────────────────────────────────────────────────
+    this.timeoutMs   = parseInt(process.env.STAGE0_GEMINI_TIMEOUT_MS    || '45000', 10);
+    this.downloadTimeoutMs = parseInt(process.env.STAGE0_DOWNLOAD_TIMEOUT_MS || '15000', 10);
+    this.videoMaxSec = parseInt(process.env.STAGE0_VIDEO_MAX_SEC || '30',  10);
+    this.videoMaxMb  = parseInt(process.env.STAGE0_VIDEO_MAX_MB  || '20',  10);
+    this.imageMaxMb  = parseInt(process.env.STAGE0_IMAGE_MAX_MB  || '5',   10);
+
+    // ── Cooldown for primary provider ───────────────────────────────────────
+    // After N consecutive Google failures, skip it for `cooldownMs` and route
+    // straight to OpenRouter. Reset counter on first success after cooldown.
+    this.cooldownThreshold = parseInt(process.env.STAGE0_GOOGLE_COOLDOWN_FAILURES || '3', 10);
+    this.cooldownMs        = parseInt(process.env.STAGE0_GOOGLE_COOLDOWN_MS       || '300000', 10);   // 5 min default
+    this._googleFailures   = 0;
+    this._googleCooldownUntil = 0;
+
+    // OpenRouter primary→fallback model (one-shot, like before — protects
+    // against admin setting a model that doesn't exist on OpenRouter).
+    this._openRouterActiveModel = this.openRouterModel;
+    this._openRouterPrimaryFailed = false;
+
+    // ── URL → caption cache (TikTok thumbnails repeat across cycles) ──────
+    this._cache = new Map();
+    this._cacheTTLms = parseInt(process.env.STAGE0_GEMINI_CACHE_TTL_SEC || '300', 10) * 1000;
+
+    this.hasGoogle     = !!this.googleKey;
+    this.hasOpenRouter = !!this.openRouterKey;
+    this.enabled       = this.hasGoogle || this.hasOpenRouter;
+
+    if (!this.enabled) {
+      this.logger?.warn?.('GeminiCaptioner disabled — neither GOOGLE_AI_API_KEY nor OPENROUTER_API_KEY set');
+    } else {
+      this.logger?.info?.(
+        `GeminiCaptioner: primary=${this.hasGoogle ? 'google:' + this.googleModel : 'none'}, ` +
+        `fallback=${this.hasOpenRouter ? 'openrouter:' + this.openRouterModel : 'none'}`
+      );
+    }
+  }
+
+  // Back-compat for admin Pipeline tooltip
+  get _activeModel() { return this.googleModel; }
+
+  /**
+   * Caption a single trend. Returns metadata or null. Never throws.
+   */
+  async captionTrend(trend) {
+    if (!this.enabled || !trend) return null;
+
+    // Collectors write videoUrl into trend.metrics.videoUrl (twitter, reddit);
+    // dashboard hoists it later, but during the pipeline (Stage 0 → cluster →
+    // Stage 1/2) it lives inside metrics. Read both for safety so Gemini can
+    // actually see the video instead of always falling through to the poster.
+    const videoUrl = trend.videoUrl || trend.metrics?.videoUrl || null;
+    const isVideo  = !!videoUrl;
+    const posterUrl = trend.metrics?.imageUrls?.[0] || trend.imageUrl || null;
+    if (!isVideo && !posterUrl) return null;
+
+    // Primary URL = video for video trends, poster for image trends
+    const primaryUrl = isVideo ? videoUrl : posterUrl;
+    const cacheKey = this._hash(primaryUrl);
+    const cached = this._cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.result;
+
+    let videoDurationSec = null;
+    let result = null;
+    let videoTruncated = false;
+    // Why we fell through to the poster (used by the admin badge so we don't
+    // mislead with "видео > 30s" when the real reason was a Google 503/cooldown).
+    //   'duration_exceeded' — duration > STAGE0_VIDEO_MAX_SEC
+    //   'native_unavailable' — native video call failed (Google down/cooldown,
+    //                          or fallback was OpenRouter which is image-only)
+    let truncationReason = null;
+    let provider = null;
+
+    if (isVideo) {
+      // Probe duration once — long videos always go straight to poster path.
+      videoDurationSec = await this._probeVideoDuration(primaryUrl).catch(() => null);
+      const tooLong = videoDurationSec !== null && videoDurationSec > this.videoMaxSec;
+
+      if (tooLong) {
+        this.logger?.info?.(`[GeminiCaptioner] video ${videoDurationSec.toFixed(1)}s > ${this.videoMaxSec}s cap, using poster`);
+        if (!posterUrl) return null;
+        videoTruncated = true;
+        truncationReason = 'duration_exceeded';
+        ({ result, provider } = await this._captionImageWithFailover(posterUrl, trend));
+      } else {
+        // 1) Try Google native video
+        if (this._canUseGoogle()) {
+          const r = await this._tryGoogleMedia(primaryUrl, 'video', trend);
+          if (r) {
+            this._recordGoogleSuccess();
+            result = r;
+            provider = 'google';
+          } else {
+            this._recordGoogleFailure();
+          }
+        }
+        // 2) On video failure → poster image via OpenRouter (or Google, whichever is healthy)
+        if (!result && posterUrl) {
+          this.logger?.warn?.('[GeminiCaptioner] native video unavailable, falling back to poster');
+          videoTruncated = true;
+          truncationReason = 'native_unavailable';
+          ({ result, provider } = await this._captionImageWithFailover(posterUrl, trend));
+        }
+      }
+    } else {
+      ({ result, provider } = await this._captionImageWithFailover(primaryUrl, trend));
+    }
+
+    if (!result) return null;
+
+    const enriched = {
+      ...result,
+      mediaType: videoTruncated ? 'image' : (isVideo ? 'video' : 'image'),
+      videoDurationSec,
+      videoTruncated,
+      truncationReason,
+      videoMaxSec: isVideo ? this.videoMaxSec : null,
+      provider,
+    };
+
+    this._cache.set(cacheKey, { result: enriched, expiresAt: Date.now() + this._cacheTTLms });
+    if (this._cache.size > 500) {
+      const oldestKey = this._cache.keys().next().value;
+      this._cache.delete(oldestKey);
+    }
+
+    return enriched;
+  }
+
+  /**
+   * Caption a batch — concurrency-capped fan-out. Returns array aligned to input.
+   */
+  async captionBatch(trends, { concurrency = 4 } = {}) {
+    if (!this.enabled || !Array.isArray(trends) || trends.length === 0) {
+      return (trends || []).map(() => null);
+    }
+    const results = new Array(trends.length).fill(null);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(concurrency, trends.length) }, async () => {
+      while (cursor < trends.length) {
+        const i = cursor++;
+        try { results[i] = await this.captionTrend(trends[i]); }
+        catch (e) { this.logger?.warn?.(`[GeminiCaptioner] trend #${i} failed: ${e.message}`); }
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
+
+  // ── Image flow with failover (Google primary → OpenRouter fallback) ────────
+
+  async _captionImageWithFailover(imageUrl, trend) {
+    // 1) Try Google direct
+    if (this._canUseGoogle()) {
+      const r = await this._tryGoogleMedia(imageUrl, 'image', trend);
+      if (r) {
+        this._recordGoogleSuccess();
+        return { result: r, provider: 'google' };
+      }
+      this._recordGoogleFailure();
+    }
+    // 2) Fall back to OpenRouter
+    if (this.hasOpenRouter) {
+      const r = await this._tryOpenRouterImage(imageUrl, trend);
+      if (r) return { result: r, provider: 'openrouter' };
+    }
+    return { result: null, provider: null };
+  }
+
+  // ── Google direct API call (handles both image and video via inlineData) ──
+
+  /**
+   * Download → base64 → POST to Google generateContent. Returns parsed
+   * caption object, or null on any failure (caller decides whether to
+   * fall back to OpenRouter).
+   */
+  async _tryGoogleMedia(url, kind /* 'image' | 'video' */, trend) {
+    if (!this.hasGoogle) return null;
+    const startedAt = Date.now();
+    const maxBytes = (kind === 'video' ? this.videoMaxMb : this.imageMaxMb) * 1024 * 1024;
+
+    // 1. HEAD probe for early size rejection
+    let contentLength = null;
+    try {
+      const head = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(8000) });
+      const cl = head.headers.get('content-length');
+      if (cl) contentLength = parseInt(cl, 10);
+    } catch { /* HEAD optional */ }
+    if (contentLength && contentLength > maxBytes) {
+      this.logger?.info?.(`[GeminiCaptioner] ${kind} ${(contentLength / 1024 / 1024).toFixed(1)}MB > ${maxBytes / 1024 / 1024}MB cap, skipping`);
+      return null;
+    }
+
+    // 2. Download bytes
+    let buffer;
+    let downloadContentType = null;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(this.downloadTimeoutMs) });
+      if (!res.ok) {
+        this.logger?.warn?.(`[GeminiCaptioner] ${kind} download HTTP ${res.status}`);
+        return null;
+      }
+      downloadContentType = res.headers.get('content-type') || null;
+      buffer = Buffer.from(await res.arrayBuffer());
+      if (buffer.length > maxBytes) {
+        this.logger?.info?.(`[GeminiCaptioner] ${kind} ${(buffer.length / 1024 / 1024).toFixed(1)}MB exceeds cap after download, skipping`);
+        return null;
+      }
+    } catch (e) {
+      this.logger?.warn?.(`[GeminiCaptioner] ${kind} download failed: ${e.message}`);
+      return null;
+    }
+
+    // 3. Validate payload BEFORE shipping it to Google.
+    //
+    // Without this guard we'd send any non-image bytes to generateContent
+    // labelled as image/jpeg → reliably eat 400 INVALID_ARGUMENT
+    // ("Unable to process input image"). Verified via curl on 2026-04-29:
+    // empty body, HTML 404 pages, redirect-HTML — all reproduce the 400.
+    //
+    // Twitter/Reddit CDN URLs expire silently (HTTP 200 with HTML body, or
+    // HTTP 200 with 0-byte body, or 404), so this happens regularly in prod.
+    // We refuse to send and let the caller fall back to OpenRouter.
+    if (buffer.length === 0) {
+      this.logger?.warn?.(
+        `[GeminiCaptioner] ${kind} download returned empty buffer ` +
+        `(stale CDN / 0-byte response, ct=${downloadContentType || 'none'}) — ` +
+        `url=${String(url).slice(0, 120)}`
+      );
+      return null;
+    }
+    const sniffedMime = kind === 'video'
+      ? this._sniffVideoMime(buffer)
+      : this._sniffImageMime(buffer);
+    if (!sniffedMime) {
+      const firstBytesHex = buffer.slice(0, 16).toString('hex');
+      const firstBytesAscii = buffer.slice(0, 80).toString('utf8').replace(/[^\x20-\x7e]/g, '.');
+      this.logger?.warn?.(
+        `[GeminiCaptioner] ${kind} buffer signature unknown — refusing to ship to Google ` +
+        `(would cause 400 INVALID_ARGUMENT). ` +
+        `size=${buffer.length}b ct=${downloadContentType || 'none'} ` +
+        `first16=${firstBytesHex} preview="${firstBytesAscii}" ` +
+        `url=${String(url).slice(0, 120)}`
+      );
+      return null;
+    }
+    const mimeType = sniffedMime;
+    const base64 = buffer.toString('base64');
+
+    const userText = kind === 'video'
+      ? `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this video focusing on the FIRST 30 SECONDS ONLY. Return JSON {visualCaption, visibleText, mood, videoSummary}.`
+      : `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image and return JSON {visualCaption, visibleText, mood, videoSummary} where videoSummary is empty string for static images.`;
+
+    const apiUrl = `${this.googleBaseUrl}/models/${this.googleModel}:generateContent?key=${encodeURIComponent(this.googleKey)}`;
+    const body = {
+      systemInstruction: { parts: [{ text: VISION_SYSTEM_PROMPT }] },
+      contents: [{
+        parts: [
+          { text: userText },
+          { inlineData: { mimeType, data: base64 } },
+        ],
+      }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: GOOGLE_RESPONSE_SCHEMA,
+      },
+    };
+
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        // 4xx = our problem (bad payload, bad mime, oversized, bad auth) →
+        // log full body + payload metadata so we can actually diagnose.
+        // 5xx = Google's problem (overload, internal error) → keep short
+        // because body is just a generic "high demand" template and we'd
+        // flood logs during their incidents.
+        if (res.status >= 400 && res.status < 500) {
+          // Note: at this point `mimeType` is guaranteed to be a sniffed
+          // signature (we refuse non-image/non-video buffers above), so
+          // payload-shape 400s mean Google found something else wrong —
+          // safety filter, schema mismatch, oversized inline data, etc.
+          const meta = {
+            kind,
+            status: res.status,
+            sentMime: mimeType,
+            bufferBytes: buffer.length,
+            bufferMb: +(buffer.length / 1024 / 1024).toFixed(2),
+            headContentLength: contentLength,
+            headMissing: contentLength === null,
+            downloadContentType,
+            url: String(url).slice(0, 120),
+            trendTitle: String(trend?.title || '').slice(0, 80),
+            trendSource: trend?.source || trend?.metrics?.source || null,
+          };
+          this.logger?.warn?.(
+            `[GeminiCaptioner] Google ${kind} HTTP ${res.status} (CLIENT ERROR — investigate): ${errBody}`,
+            meta
+          );
+        } else {
+          this.logger?.warn?.(`[GeminiCaptioner] Google ${kind} HTTP ${res.status}: ${errBody.slice(0, 200)}`);
+        }
+        return null;
+      }
+
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!text) {
+        this.logger?.warn?.(`[GeminiCaptioner] Google ${kind} returned empty text`);
+        return null;
+      }
+      const parsed = this._parseJsonLoose(text);
+      if (!parsed) {
+        this.logger?.warn?.(`[GeminiCaptioner] Google ${kind} parse failed: ${text.slice(0, 80)}`);
+        return null;
+      }
+
+      const elapsedMs = Date.now() - startedAt;
+      const inputTok  = data.usageMetadata?.promptTokenCount     || 0;
+      const outputTok = data.usageMetadata?.candidatesTokenCount || 0;
+      this.logger?.info?.(
+        `[GeminiCaptioner] google ${kind} caption in ${elapsedMs}ms ` +
+        `(model=${this.googleModel}, ${(buffer.length / 1024 / 1024).toFixed(2)}MB, tokens=${inputTok}+${outputTok}) ` +
+        `— "${(trend.title || '').slice(0, 50)}"`
+      );
+
+      return {
+        visualCaption: String(parsed.visualCaption || '').trim().slice(0, 400),
+        visibleText:   String(parsed.visibleText   || '').trim().slice(0, 200),
+        mood:          String(parsed.mood          || '').trim().slice(0, 60),
+        videoSummary:  String(parsed.videoSummary  || '').trim().slice(0, 250),
+      };
+    } catch (e) {
+      this.logger?.warn?.(`[GeminiCaptioner] Google ${kind} call failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  // ── OpenRouter fallback (image only — OpenRouter can't proxy video) ───────
+
+  async _tryOpenRouterImage(imageUrl, trend) {
+    if (!this.hasOpenRouter) return null;
+
+    const payload = {
+      messages: [
+        { role: 'system', content: VISION_SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image and return JSON {visualCaption, visibleText, mood, videoSummary} where videoSummary must be empty string.` },
+            { type: 'image_url', image_url: { url: imageUrl } },
+          ],
+        },
+      ],
+      response_format: { type: 'json_object' },
+    };
+
+    const tryModel = async (modelName) => {
+      const startedAt = Date.now();
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
+      try {
+        const res = await fetch(`${this.openRouterBaseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + this.openRouterKey,
+            'HTTP-Referer': 'https://catalyst.app',
+            'X-Title': 'Catalyst PreStage Vision',
+          },
+          body: JSON.stringify({ model: modelName, ...payload }),
+          signal: ctrl.signal,
+        });
+        const elapsedMs = Date.now() - startedAt;
+
+        if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          const looksLikeUnknownModel = res.status === 404 ||
+            /not a valid model|model not found|invalid model|no such model/i.test(body);
+          if (looksLikeUnknownModel) {
+            throw Object.assign(new Error('model-not-found: ' + body.slice(0, 120)), { code: 'MODEL_NOT_FOUND' });
+          }
+          throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+        }
+        const data = await res.json();
+        const raw = data.choices?.[0]?.message?.content || '';
+        if (!raw) throw new Error('empty content');
+        const parsed = this._parseJsonLoose(raw);
+        if (!parsed) throw new Error('parse-failure: ' + raw.slice(0, 80));
+
+        const inputTok  = data.usage?.prompt_tokens     || 0;
+        const outputTok = data.usage?.completion_tokens || 0;
+        this.logger?.info?.(
+          `[GeminiCaptioner] openrouter image caption in ${elapsedMs}ms ` +
+          `(model=${modelName}, tokens=${inputTok}+${outputTok}) — "${(trend.title || '').slice(0, 50)}"`
+        );
+
+        return {
+          visualCaption: String(parsed.visualCaption || '').trim().slice(0, 400),
+          visibleText:   String(parsed.visibleText   || '').trim().slice(0, 200),
+          mood:          String(parsed.mood          || '').trim().slice(0, 60),
+          videoSummary:  '',
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const modelUsed = this._openRouterActiveModel;
+    try {
+      return await tryModel(modelUsed);
+    } catch (e) {
+      if (e.code === 'MODEL_NOT_FOUND' && modelUsed === this.openRouterModel) {
+        if (!this._openRouterPrimaryFailed) {
+          this._openRouterPrimaryFailed = true;
+          this._openRouterActiveModel = this.openRouterFallbackModel;
+          this.logger?.warn?.(`[GeminiCaptioner] OpenRouter primary model ${this.openRouterModel} not available, switching to ${this.openRouterFallbackModel}`);
+        }
+        try { return await tryModel(this.openRouterFallbackModel); }
+        catch (e2) {
+          this.logger?.warn?.(`[GeminiCaptioner] OpenRouter fallback also failed: ${e2.message}`);
+          return null;
+        }
+      }
+      this.logger?.warn?.(`[GeminiCaptioner] OpenRouter call failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  // ── Cooldown bookkeeping for the primary provider ─────────────────────────
+
+  _canUseGoogle() {
+    return this.hasGoogle && Date.now() >= this._googleCooldownUntil;
+  }
+
+  _recordGoogleSuccess() {
+    this._googleFailures = 0;
+    if (this._googleCooldownUntil) {
+      this.logger?.info?.('[GeminiCaptioner] Google AI back to healthy, exiting cooldown');
+      this._googleCooldownUntil = 0;
+    }
+  }
+
+  _recordGoogleFailure() {
+    this._googleFailures++;
+    if (this._googleFailures >= this.cooldownThreshold) {
+      this._googleCooldownUntil = Date.now() + this.cooldownMs;
+      this._googleFailures = 0;
+      const minutes = Math.round(this.cooldownMs / 60000);
+      this.logger?.warn?.(`[GeminiCaptioner] Google AI failed ${this.cooldownThreshold}× in a row, cooling down for ~${minutes}min — routing to OpenRouter`);
+    }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  _probeVideoDuration(videoUrl) {
+    return new Promise((resolve) => {
+      const proc = spawn('ffprobe', [
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        videoUrl,
+      ]);
+      let buf = '';
+      let settled = false;
+      const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
+      proc.stdout.on('data', d => { buf += d.toString(); });
+      proc.on('error', () => finish(null));
+      proc.on('close', (code) => {
+        if (code !== 0) return finish(null);
+        const sec = parseFloat(buf.trim());
+        finish(Number.isFinite(sec) && sec > 0 ? sec : null);
+      });
+      setTimeout(() => {
+        if (!settled) { try { proc.kill('SIGKILL'); } catch {} finish(null); }
+      }, 5000);
+    });
+  }
+
+  _sniffImageMime(buffer) {
+    if (buffer.length < 12) return null;
+    if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'image/jpeg';
+    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return 'image/png';
+    if (buffer.slice(0, 4).toString() === 'GIF8') return 'image/gif';
+    if (buffer.slice(0, 4).toString() === 'RIFF' && buffer.slice(8, 12).toString() === 'WEBP') return 'image/webp';
+    return null;
+  }
+
+  _sniffVideoMime(buffer) {
+    if (buffer.length < 12) return null;
+    if (buffer.slice(4, 8).toString() === 'ftyp') {
+      const brand = buffer.slice(8, 12).toString();
+      if (brand.startsWith('qt')) return 'video/quicktime';
+      return 'video/mp4';
+    }
+    if (buffer[0] === 0x1A && buffer[1] === 0x45 && buffer[2] === 0xDF && buffer[3] === 0xA3) {
+      return 'video/webm';
+    }
+    return null;
+  }
+
+  _parseJsonLoose(text) {
+    let s = String(text || '').trim();
+    if (s.startsWith('```')) s = s.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+    try { return JSON.parse(s); } catch { /* try to find first {…} block */ }
+    const m = s.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch {} }
+    return null;
+  }
+
+  _hash(str) {
+    return crypto.createHash('sha1').update(String(str)).digest('hex').slice(0, 16);
+  }
+}
+
+export default GeminiCaptioner;

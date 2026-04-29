@@ -1,9 +1,11 @@
 import {
   SYSTEM_PROMPT,
   buildAnalysisPrompt,
+  STAGE1_RESPONSE_SCHEMA,
   STAGE2_SYSTEM_PROMPT,
   buildStage2Prompt,
 } from './prompts.js';
+import { normalizeLifespan } from './lifespan.js';
 // [MARKET_STAGE] optional import — remove this line + applyStage2MarketPatch call to disable
 import { applyStage2MarketPatch } from './market-stage.js';
 
@@ -178,9 +180,12 @@ export function computeAlertScore(trend, w = DEFAULT_ALERT_WEIGHTS) {
  *  - Stage 2 gating: threshold 78, cap 3, skip google_trends, novelty gate
  */
 class Scorer {
-  constructor(config, logger, db) {
+  constructor(config, logger, db, preStage = null) {
     this.logger  = logger;
     this.db      = db;
+    // Optional Stage 0 preprocessor — text + visual enrichment.
+    // When null/disabled the pipeline runs exactly as before (back-compat).
+    this.preStage = preStage;
 
     this.providers = {
       xai: {
@@ -191,7 +196,13 @@ class Scorer {
       openai: {
         apiKey: process.env.OPENAI_API_KEY || '',
         baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
-        defaultModel: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+        // Default bumped 2026-04-27: gpt-4.1-mini → gpt-5.4-mini.
+        // Nominal price ×1.88 input / ×2.81 output, but cached input is $0.075/1M
+        // (10× cheaper) and our SYSTEM_PROMPT (~1.2K tokens, stable) is auto-cached
+        // by the Responses API across batches in a 5-min window → real cost ≈ ×1.1.
+        // Knowledge cutoff Aug-2025 (vs Jun-2024 on 4.1-mini) materially improves
+        // recognition of recent meme/celebrity references.
+        defaultModel: process.env.OPENAI_MODEL || 'gpt-5.4-mini',
       },
     };
 
@@ -202,17 +213,37 @@ class Scorer {
     // inside scoreTrends() so changes apply without restart.
     this.stage2Threshold = 60;   // memePotential >= this → Stage 2 candidate
     this.stage2Model = 'grok-4-1-fast-non-reasoning';
-    this.stage2MaxCalls = 6;     // cap x_search calls per cycle (cost control)
+    // Cap reduced 6 → 3 (2026-04-29): logs showed cycles rarely hit the cap,
+    // so the existing budget was paying for borderline candidates. With cap=3
+    // we deep-dive only on the strongest signals; the remaining Stage 2 slots
+    // are recoverable through admin UI override if some cycle truly needs it.
+    this.stage2MaxCalls = 3;
 
     // Stage 2 cost knobs (env-tunable, no restart needed if read per cycle).
-    // - XAI_STAGE2_MAX_RESULTS: tweets per x_search call (default 10, was ~25
-    //   from xAI's silent default). Biggest single lever on input tokens.
+    // - XAI_STAGE2_MAX_RESULTS: tweets per x_search call. Default reduced
+    //   10 → 5 (2026-04-29): one Stage 2 call was eating ~23K input tokens
+    //   because x_search dumps each tweet's full payload (text + author +
+    //   timestamps + entities + media URLs ≈ 1K tokens/tweet) back into the
+    //   model context. With max_tool_calls=2 that's 2×10×~1K = ~20K. Halving
+    //   max_results halves Stage 2 input cost while still giving Grok 10
+    //   tweets across 2 search angles — enough to judge buzz/momentum
+    //   without losing the second-angle refinement.
     // - XAI_STAGE2_LOOKBACK_HOURS: how far back x_search looks (48h default).
     // - XAI_STAGE2_MAX_TOOL_CALLS: hard cap on consecutive x_search calls in
     //   one Grok response (default 2). Stops the model from over-fanning.
-    this.stage2MaxResults     = Math.max(1, Math.min(30, parseInt(process.env.XAI_STAGE2_MAX_RESULTS, 10)     || 10));
+    this.stage2MaxResults     = Math.max(1, Math.min(30, parseInt(process.env.XAI_STAGE2_MAX_RESULTS, 10)     || 5));
     this.stage2LookbackHours  = Math.max(1, Math.min(168, parseInt(process.env.XAI_STAGE2_LOOKBACK_HOURS, 10) || 48));
     this.stage2MaxToolCalls   = Math.max(1, Math.min(5, parseInt(process.env.XAI_STAGE2_MAX_TOOL_CALLS, 10)   || 2));
+
+    // Stage 1 reasoning effort (gpt-5.x reasoning-capable models only).
+    // Empty / "off" = don't send `reasoning` param at all → back-compat with
+    // non-reasoning models like gpt-4.1-mini and current xAI defaults.
+    // For reasoning models the `temperature` param is incompatible — the
+    // existing 400-retry path in _callResponsesAPI already strips it.
+    const rawEffort = String(process.env.OPENAI_REASONING_EFFORT || '').trim().toLowerCase();
+    this.openaiReasoningEffort = ['minimal', 'low', 'medium', 'high'].includes(rawEffort)
+      ? rawEffort
+      : null;
 
     if (!this.current.enabled) {
       this.logger.warn('AI API key not set for selected provider — AI scoring disabled, using heuristics');
@@ -249,22 +280,83 @@ class Scorer {
     };
   }
 
+  // ─── Stage 1 calibration examples (admin-curated) ─────────────────────────
+  //
+  // Read enabled rows from the stage1_examples table and format them as a
+  // semi-static block that lives BETWEEN the static SYSTEM_PROMPT and the
+  // volatile feedback context. Examples teach the model the rubric by
+  // pattern; mistakes teach it which HARD RULES it commonly violates.
+  //
+  // Cache behavior: this block changes only when the admin edits an example
+  // in the UI. Within a single cycle (and usually for hours/days at a time)
+  // it stays byte-identical → falls into the OpenAI auto-cache prefix along
+  // with SYSTEM_PROMPT. Per-request cost ≈ free.
+  //
+  // Empty / table-missing → returns '' silently. The bare rubric in
+  // SYSTEM_PROMPT is enough to function; examples only sharpen calibration.
+  _buildExamplesContext() {
+    if (!this.db || typeof this.db.listStage1Examples !== 'function') return '';
+    try {
+      const rows = this.db.listStage1Examples({ enabledOnly: true });
+      if (!rows || rows.length === 0) return '';
+
+      const examples = rows.filter(r => r.kind === 'example');
+      const mistakes = rows.filter(r => r.kind === 'mistake');
+
+      let ctx = '';
+      if (examples.length > 0) {
+        ctx += '\n\n━━━ CALIBRATION EXAMPLES (mirror these scores) ━━━';
+        ctx += '\n' + examples.map(e =>
+          `  • "${e.title}" [${e.category || 'other'}] → memePotential ${e.memePotential ?? 0}` +
+          (e.rationale ? ` — ${e.rationale}` : '')
+        ).join('\n');
+      }
+      if (mistakes.length > 0) {
+        ctx += '\n\n━━━ COMMON MISTAKES TO AVOID ━━━';
+        ctx += '\n' + mistakes.map(m =>
+          `  ✗ "${m.title}"${m.rationale ? ` — ${m.rationale}` : ''}`
+        ).join('\n');
+      }
+      return ctx;
+    } catch (e) {
+      this.logger.warn(`_buildExamplesContext failed: ${e.message}`);
+      return '';
+    }
+  }
+
   // ─── Feedback context (built once per scoreTrends call) ────────────────────
 
   _buildFeedbackContext() {
     if (!this.db) return '';
     try {
+      // getLikedNarratives / getDislikedNarratives now filter out bare free
+      // votes (weight < 0.5) UNLESS a reason was attached — so this list
+      // already represents "high-signal" feedback. `topReason` is the highest-
+      // weight reason text among voters (admin/pro win when multiple exist).
+      // Reasons can be in any language; SYSTEM_PROMPT enforces English output.
       const liked    = this.db.getLikedNarratives(7, 8);
       const disliked = this.db.getDislikedNarratives(7, 8);
+
+      // Cap reason length per item — long rants would crowd out the rubric.
+      const fmtReason = (r) => {
+        if (!r) return '';
+        const clean = String(r).replace(/\s+/g, ' ').trim();
+        return clean.length > 120 ? ` — "${clean.slice(0, 117)}..."` : ` — "${clean}"`;
+      };
+
       let ctx = '';
       if (liked.length > 0) {
         ctx += '\n\n━━━ USER PREFERENCES (apply these) ━━━';
         ctx += '\nUSER LIKED (boost similar narratives):';
-        ctx += '\n' + liked.map(t => `  + "${t.title}" [${t.category}]`).join('\n');
+        ctx += '\n' + liked.map(t =>
+          `  + "${t.title}" [${t.category}]${fmtReason(t.topReason)}`
+        ).join('\n');
       }
       if (disliked.length > 0) {
         ctx += '\nUSER DISLIKED (penalize similar narratives):';
-        ctx += '\n' + disliked.map(t => `  - "${t.title}" [${t.category}]`).join('\n');
+        ctx += '\n' + disliked.map(t =>
+          `  - "${t.title}" [${t.category}]${fmtReason(t.topReason)}`
+        ).join('\n');
       }
       return ctx;
     } catch (e) {
@@ -297,9 +389,34 @@ class Scorer {
       return trends.map(t => this._applyHeuristic(t));
     }
 
-    // Build feedback context ONCE for the whole cycle
+    // ── Stage 0: PreStage enrichment (idempotent safety net) ───────────────
+    // Since PR-2, PreStage runs in index.js BEFORE the clusterer so the
+    // clusterer can use Gemini/nano outputs as similarity signals. By the
+    // time we reach the scorer, every trend already has `trend.preStage`
+    // (either an object or null). The idempotency guard inside enrichBatch
+    // (`'preStage' in t`) makes this call a no-op in normal flow.
+    //
+    // Why keep the call at all: the manual-submit path in admin still hands
+    // raw single trends straight to scorer.scoreTrends without going
+    // through index.js's pipeline — this branch enriches those.
+    if (this.preStage && this.preStage.enabled) {
+      try {
+        await this.preStage.enrichBatch(trends);
+      } catch (e) {
+        this.logger.warn(`PreStage threw (continuing without enrichment): ${e.message}`);
+      }
+    }
+
+    // Build the assembled system prompt ONCE for the whole cycle. Order
+    // matters for prompt-cache stability:
+    //   1. SYSTEM_PROMPT     — fully static (rubric, hard rules)
+    //   2. examples block    — semi-static (admin edits via /api/stage1-examples)
+    //   3. feedback context  — volatile (re-sampled from feedback_votes each cycle)
+    // OpenAI's auto-cache hits any prefix >1024 tokens that's byte-identical
+    // within 5 minutes, so the static + semi-static head almost always caches.
+    const examplesContext = this._buildExamplesContext();
     const feedbackContext = this._buildFeedbackContext();
-    const systemPrompt    = SYSTEM_PROMPT + feedbackContext;
+    const systemPrompt    = SYSTEM_PROMPT + examplesContext + feedbackContext;
 
     // ── Stage 1: base scoring ──
     const batchSize = 8;
@@ -428,19 +545,31 @@ class Scorer {
 
   async _analyzeBatchStage1(trends, metrics = null, systemPrompt = null) {
     const prompt  = buildAnalysisPrompt(trends);
-    const sysMsg  = systemPrompt || (SYSTEM_PROMPT + this._buildFeedbackContext());
+    // Mirror the assembly order in scoreTrends() when called standalone
+    // (e.g. from manual-submit pipeline) so cache prefix stays consistent.
+    const sysMsg  = systemPrompt || (SYSTEM_PROMPT + this._buildExamplesContext() + this._buildFeedbackContext());
 
     if (metrics) {
       metrics.stage1Calls += 1;
     }
 
+    // Structured Outputs + reasoning effort are only attached for OpenAI inside
+    // _callResponsesAPI — for xAI runs they are silently ignored, so this call
+    // shape is provider-agnostic. The schema guarantees JSON shape (no parse
+    // retries) and reasoning='low' on gpt-5.x adds a small thinking budget for
+    // edge-case classification (genuine novelty vs mega-account noise) at
+    // ~+30% output tokens.
     const { text: raw, inputTokens, outputTokens } = await this._callResponsesAPI({
       input: [
         { role: 'system', content: sysMsg  },
         { role: 'user',   content: prompt  },
       ],
       temperature: 0.25,
-      // No tools for Stage 1
+      responseSchema: {
+        name: 'trend_analyses',
+        schema: STAGE1_RESPONSE_SCHEMA,
+      },
+      reasoningEffort: this.openaiReasoningEffort,
     });
 
     if (metrics) {
@@ -504,7 +633,9 @@ class Scorer {
         // Trigger event — only populated when the model found an explicit cause.
         // We trim and cap to keep it one line; empty string means "no trigger".
         whyNow:           (a.whyNow || '').trim().slice(0, 280),
-        predictedLifespan:a.predictedLifespan || 'unknown',
+        // Normalize so legacy descriptive forms ("flash (hours)") that may
+        // appear from non-strict providers get folded back to bare keywords.
+        predictedLifespan:normalizeLifespan(a.predictedLifespan) || 'unknown',
         isGenuinelyInteresting: a.isGenuinelyInteresting ?? true,
       };
     });
@@ -702,7 +833,15 @@ class Scorer {
   /**
    * Call the Responses API and return { text, inputTokens, outputTokens }.
    */
-  async _callResponsesAPI({ input, tools, temperature, runtimeOverride = null, maxToolCalls = null }) {
+  async _callResponsesAPI({
+    input,
+    tools,
+    temperature,
+    runtimeOverride = null,
+    maxToolCalls = null,
+    responseSchema = null,        // { name, schema } → text.format json_schema
+    reasoningEffort = null,       // 'minimal' | 'low' | 'medium' | 'high'
+  }) {
     const runtime = runtimeOverride || this.current;
     const body = {
       model: runtime.model,
@@ -715,6 +854,28 @@ class Scorer {
     // Grok happily fans out 3-4 searches per response and quadruples input
     // tokens via accumulated tool results in the reasoning context.
     if (maxToolCalls && Number.isFinite(maxToolCalls)) body.max_tool_calls = maxToolCalls;
+
+    // Structured Outputs (OpenAI Responses API). xAI Grok does not currently
+    // honor `text.format = json_schema` reliably — only attach when we're
+    // explicitly talking to OpenAI. Schema name must be alphanumeric+_ only.
+    if (responseSchema && runtime.provider === 'openai') {
+      body.text = {
+        format: {
+          type: 'json_schema',
+          name: responseSchema.name || 'response',
+          schema: responseSchema.schema,
+          strict: true,
+        },
+      };
+    }
+
+    // Reasoning effort — only meaningful for reasoning-capable models. We pass
+    // it whenever caller asked for it and provider is OpenAI; for non-reasoning
+    // models the API returns 400 and we fall through to a retry without it
+    // (handled in the catch-block below, same pattern as the temperature retry).
+    if (reasoningEffort && runtime.provider === 'openai') {
+      body.reasoning = { effort: reasoningEffort };
+    }
 
     const doRequest = async (requestBody) => {
       const response = await fetch(`${runtime.baseUrl}/responses`, {
@@ -741,15 +902,27 @@ class Scorer {
     try {
       data = await doRequest(body);
     } catch (err) {
+      const errBlob = err.errorText || err.message || '';
       const unsupportedTemp =
         body.temperature !== undefined &&
         err.status === 400 &&
-        /unsupported parameter:\s*'temperature'|temperature.*not supported/i.test(err.errorText || err.message);
+        /unsupported parameter:\s*'temperature'|temperature.*not supported/i.test(errBlob);
+      const unsupportedReasoning =
+        body.reasoning !== undefined &&
+        err.status === 400 &&
+        /unsupported parameter:\s*'reasoning'|reasoning.*not supported|does not support reasoning/i.test(errBlob);
+      const unsupportedSchema =
+        body.text?.format?.type === 'json_schema' &&
+        err.status === 400 &&
+        /(text\.format|json_schema|response_format).*not supported|unsupported parameter:\s*'text'/i.test(errBlob);
 
-      if (unsupportedTemp) {
+      if (unsupportedTemp || unsupportedReasoning || unsupportedSchema) {
         const retryBody = { ...body };
-        delete retryBody.temperature;
-        this.logger.info(`Retrying ${runtime.provider}:${runtime.model} without temperature`);
+        const dropped = [];
+        if (unsupportedTemp)      { delete retryBody.temperature; dropped.push('temperature'); }
+        if (unsupportedReasoning) { delete retryBody.reasoning;   dropped.push('reasoning'); }
+        if (unsupportedSchema)    { delete retryBody.text;        dropped.push('json_schema'); }
+        this.logger.info(`Retrying ${runtime.provider}:${runtime.model} without ${dropped.join('+')}`);
         data = await doRequest(retryBody);
       } else {
         throw err;

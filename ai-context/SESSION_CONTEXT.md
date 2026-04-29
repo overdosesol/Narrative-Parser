@@ -56,7 +56,7 @@
   - Gate-loop в `src/index.js` оценивает **все** гейты (threshold / hard_junk / source / dedup / daily / cap / send) и пишет массив `gates[{ name, passed, detail }]` — не short-circuit'ит на первом провале (кроме cap/daily — там `break`)
   - Admin page `DecisionsPage` (`src/admin/server.js`): карточки с clickable source URL, gate-chips ✓/✗ (title=detail на ховере), breakdown в моно-боксе, left-border accent по вердикту; auto-refresh 10s; filter chips (all/sent/skipped) + reason counts
   - Endpoint: `GET /api/alert-decisions?filter=&reason=&limit=` → `{ total, counts, items }`
-- **NarrativeClusterer** (pre-AI слой): Aggregator → Clusterer → Scorer; Jaccard threshold=0.40; routing: `priority`/`stage1`/`save_only`/`drop`; routing теперь через `emergenceScore` (не прямые условия)
+- **NarrativeClusterer** (pre-AI слой): с **2026-04-29** позиция в pipeline = `Aggregator → cheapDedup → PreStage → Clusterer → Scorer` (см. ниже Pipeline order PR-2). Multi-signal similarity (embeddings + image hash + entity overlap + ticker + time penalty), Jaccard оставлен как fallback. Routing: `priority`/`stage1`/`save_only`/`drop` через `emergenceScore`
 - **EmergenceScore** (0–100): три пути — `max(spread, breakout) + ideaBoost`, cap 100
   - Spread: платформы(0–30)+velocity(0–25)+organicSpread(0–20)+noveltyStage(0–15)+authorDiversity(0–10)
   - Breakout: для одиночного вирусного поста (views/likes/retweets/engRate) — detects Twitter/TikTok breakout; dampened by `_normalizeBreakoutByFollowers(score, peakFollowers, engRate)` для мега-аккаунтов
@@ -81,22 +81,133 @@
   - Feedback context строится один раз на цикл в `_buildFeedbackContext()`, не на каждый batch
   - `_callResponsesAPI` возвращает `{ text, inputTokens, outputTokens }` (реальные токены из `data.usage`)
   - Stage 1 batch size: 5 → 8
-  - Stage 2 gate: threshold 78 → **60** (2026-04-22, больше пропускаем в deep-dive после narrative pivot), cap **6** на цикл (было 3), skip google_trends, novelty gate (`clusterMetrics.isNovel !== false`)
+  - Stage 2 gate: threshold 78 → **60** (2026-04-22, больше пропускаем в deep-dive после narrative pivot), cap **3** на цикл (после 2026-04-29; раньше 6), skip google_trends, novelty gate (`clusterMetrics.isNovel !== false`)
   - Stage 2 output: `narrativeMomentum` + `organicity` (заменили `existingCoins` — coin-search логика убрана целиком). 2026-04-27: убраны `xSentiment` и `adjustment` (никем не читались)
   - Prompt: description truncated 250 → 100; поля `titleRu` и `isGenuinelyInteresting` удалены из output spec
   - Логируется `total_in`/`total_out` (реальные токены) после каждого цикла
-- **Stage 2 cost knobs** (2026-04-27):
-  - `x_search` теперь вызывается с явными параметрами: `max_search_results: 10` (env `XAI_STAGE2_MAX_RESULTS`, default 10, был дефолт xAI ~25), `from_date` за 48h (env `XAI_STAGE2_LOOKBACK_HOURS`, default 48), `sources: [{type:'x'}]`, `return_citations: false`
+- **Stage 2 cost knobs** (2026-04-27, обновлено 2026-04-29):
+  - `x_search` теперь вызывается с явными параметрами: `max_search_results: 5` (env `XAI_STAGE2_MAX_RESULTS`, default снижен 10 → **5** в 2026-04-29), `from_date` за 48h (env `XAI_STAGE2_LOOKBACK_HOURS`, default 48), `sources: [{type:'x'}]`, `return_citations: false`
   - `max_tool_calls: 2` в body (env `XAI_STAGE2_MAX_TOOL_CALLS`, default 2) — Grok не может делать >2 последовательных x_search в одном ответе. Без этого fan-out в 3-4 вызова раздувал input квадратично
   - STAGE2_SYSTEM_PROMPT сжат ~750 → ~330 токенов: убраны inline-примеры (Punch monkey/Moo Deng/Hawk Tuah — Grok их знает) и дублирующие IMPORTANT
   - `storyHook` cap 80 chars при парсинге (был 100-150 prose)
   - `market-stage.js applyStage2MarketPatch` теперь no-op stub (читал `adjustment` + `existingCoins`, оба удалены; вызов оставлен для будущего)
-  - Совокупный эффект: Stage 2 input -60…-70%, output -20…-25%
+  - **2026-04-29**: Stage 1 `explanation` json_schema `maxLength: 220` (strict-enforced на модели). Stage 2 `buildStage2Prompt` сжат + defensive `aiExplanation` cap 220 chars
+  - **Текущая стоимость Stage 2**: ~$153/мес (1 call/cycle × 96 cycles/day × 5.3¢). До 2026-04-29 было ~$288/мес. Подробный анализ batch / Apify / mini-replacement вариантов (всё отклонено) — см. WORKLOG 2026-04-29
 
 ## AI модели (UI curated)
 
 - xAI: `grok-4-1-fast-non-reasoning`, `grok-4-fast-non-reasoning`, `grok-4.20-0309-non-reasoning`, `grok-3-mini`
-- OpenAI: `gpt-4.1-mini`, `gpt-4.1`, `gpt-4o-mini`, `gpt-4o`, `gpt-5-mini`, `gpt-5`
+- OpenAI: `gpt-4.1-mini`, `gpt-4.1`, `gpt-4o-mini`, `gpt-4o`, `gpt-5-mini`, `gpt-5`, `gpt-5.4-mini` (default), `gpt-5.4-nano`, `gpt-5.4`
+
+### Stage 1 calibration examples (admin-curated)
+- Таблица `stage1_examples` (`kind`, `title`, `category`, `meme_potential`, `rationale`, `enabled`, `sort_order`). Сидится 9+3 примерами на первой миграции (маркер `stage1ExamplesSeededV1`)
+- Scorer: `_buildExamplesContext()` рендерит enabled rows в 2 блока — «CALIBRATION EXAMPLES» (с category/score/rationale) и «COMMON MISTAKES TO AVOID». Sysmsg композиция: `SYSTEM_PROMPT + examplesContext + feedbackContext` (static → semi-static → volatile для max cache hit)
+- Admin: вкладка «🎓 AI Examples» (`ExamplesPage`) — CRUD + tabs Examples/Mistakes + preview byte-identical того что попадёт в промпт + budget bar (Активных / Токенов / Cost). 2026-04-28: Cost теперь динамический — `tokenEst × $0.075/M (cached) × 21600 циклов/мес`; для дефолтных 12 примеров (~555 ток) показывает `≈ $0.90/мес`. Tooltip раскрывает формулу
+- API: `GET/POST /api/stage1-examples`, `PUT/DELETE /api/stage1-examples/:id`. Валидация на boundary (`_validateStage1Example`): kind enum, category enum, title 5-200, rationale 10-400, memePotential 0-100. Soft cap 50 records
+- Применяется на следующем цикле скоринга (~2 минуты), не требует рестарта. Cache invalidates на каждом edit, но в пределах одного цикла все батчи хитают
+
+### Stage 1 (OpenAI only) — фичи Responses API
+- **Default model**: `gpt-5.4-mini` (knowledge cutoff Aug-2025, reasoning-capable). Авто-кэш SYSTEM_PROMPT (~1.2K tokens) даёт реальную цену ≈ ×1.1 vs `gpt-4.1-mini`
+- **Structured Outputs (json_schema)**: `STAGE1_RESPONSE_SCHEMA` экспортится из `prompts.js`; передаётся в `text.format` ТОЛЬКО для `provider === 'openai'`. Гарантирует shape `{trends: [...]}` → ноль parse-failures. Для xAI/Grok schema не отправляется, парсер фолбэчит на `parsed.trends || parsed.results || [parsed]`
+- **Reasoning effort**: env `OPENAI_REASONING_EFFORT` (`minimal|low|medium|high|<empty>`, default `low`). Только для OpenAI provider. Не-reasoning модели (gpt-4.1-mini и т.п.) автоматически ретраятся без `reasoning` через 400-error path в `_callResponsesAPI` (зеркало existing temperature-retry)
+
+### Stage 0 PreStage — text + visual enrichment (2026-04-28)
+- **Purpose**: Stage 1/2 видели только текст → слепы для visual-driven мемов (TikTok с `#tungtungtungsahur` и пустым description). PreStage обогащает каждый трейнд machine-generated метаданными ПЕРЕД scoring'ом
+- **Контракт**: НИКОГДА не фильтрует, не скорит, не дропает. Все входные трейнды одинаково проходят дальше. Failures degrade silently (`trend.preStage = null` → Stage 1 видит то же что раньше)
+- **Sub-stages** (запускаются параллельно через `Promise.all`):
+  - **Nano** (`gpt-5.4-nano` через OPENAI_API_KEY) — text-only enrichment. Batched JSON-schema call. Output: `topicSummary` (1-sentence rephrasing), `entityCanonical[]` (proper nouns), `language` (ISO 639-1), `slangDecoded`. **Kill-switch** (2026-04-29): env `STAGE0_NANO_ENABLED=0` (panic) + DB setting `nanoEnabled` (admin toggle, runtime). Под A/B-тестом — гипотеза что gpt-5.4-mini делает 80% этой работы натуральным образом
+  - **Nano inputs** (расширены 2026-04-29): кроме title+description (cap 600 chars) теперь видит `r/<subreddit>`, `#<sourceHashtag>`, `by @<author>`, `link:<domain>` (если домен не из standard feed-list), и `RelatedPosts:` — sibling titles из текущего кластера (top 5 by engagement, dedup нормализацией). Метрики (views/likes/velocity) НЕ передаются — nano enricher, не scorer
+  - **Gemini Captioner** — failover-architecture (см. ниже): primary Google AI direct + fallback OpenRouter. Output: `visualCaption`, `visibleText`, `mood`, `mediaType`, `videoSummary`, `videoDurationSec`, `videoTruncated`, `provider`
+- **Failover policy для vision**:
+  - **Primary**: Direct Google AI Studio (`generativelanguage.googleapis.com`) — поддерживает images и native video через `inlineData` base64. Геоограничение (Germany supported). Дешевле OpenRouter
+  - **Fallback**: OpenRouter `gemini-2.5-flash` (image-only — для видео всегда poster). Срабатывает на 429, 403 FAILED_PRECONDITION, 5xx, download failures
+  - **Cooldown circuit-breaker**: 3 неудачи Google подряд → 5 мин принудительно через OpenRouter. Первый успех после окна снимает блок. Параметры `STAGE0_GOOGLE_COOLDOWN_*`
+- **Видео policy** (обновлено 2026-04-29): `ffprobe` замеряет длительность; если ≤ `STAGE0_VIDEO_MAX_SEC` (default **60**, было 30) — Google native video (download → base64 → inlineData). Если длиннее — poster через failover-цепочку. Sopровождающие лимиты: `STAGE0_VIDEO_MAX_MB=40`, `STAGE0_GEMINI_TIMEOUT_MS=90000`
+- **`videoUrl` source of truth**: коллекторы (twitter `:411`, reddit `:350`) кладут URL в `trend.metrics.videoUrl`, не top-level. До 2026-04-29 captioner читал `trend.videoUrl` (top-level) и получал undefined — нативное видео НИКОГДА не пробовалось. Фикс: `videoUrl = trend.videoUrl || trend.metrics?.videoUrl`. TikTok-коллектор `videoUrl` не выставляет вообще (только thumbnail), поэтому TikTok-тренды останутся image-only пока не достанем MP4 из Apify response
+- **Persistence**: `trend.preStage` сохраняется в `raw_metrics.preStage` (без новых колонок), восстанавливается через `_hydrateTrendFromDb` — повторный просмотр в админке не платит дважды
+- **Stage 1 prompt**: `buildAnalysisPrompt` добавляет к каждой trend-секции строки `Topic:`, `Entities:`, `Slang:`, `Visual:`, `Video:`, `VisibleText:`, `Mood:`. SYSTEM_PROMPT расширен блоком «PRESTAGE METADATA (when present)» с явной инструкцией: trust visual over title когда они противоречат, не авто-бустить score за наличие метаданных
+- **Стоимость**: ~$50-70/мес при ~30 трейндов/цикл, 720 циклов/день. OpenRouter активируется только при failover — обычно <5% запросов туда уходит
+- **Файлы**: `src/analysis/{nano-classifier,gemini-captioner,pre-stage}.js` (новые); `scorer.js`, `prompts.js`, `db/database.js`, `admin/server.js`, `index.js`, `.env.example` (модифицированы)
+- **ENV ключи (минимум один из двух)**:
+  - `GOOGLE_AI_API_KEY` (primary, native video) + `GOOGLE_AI_MODEL=gemini-2.5-flash`
+  - `OPENROUTER_API_KEY` (fallback) + `OPENROUTER_VISION_MODEL=google/gemini-2.5-flash`
+  - Параметры: `STAGE0_VIDEO_MAX_SEC`, `STAGE0_VIDEO_MAX_MB`, `STAGE0_IMAGE_MAX_MB`, `STAGE0_GEMINI_TIMEOUT_MS`, `STAGE0_DOWNLOAD_TIMEOUT_MS`, `STAGE0_GEMINI_CACHE_TTL_SEC`, `STAGE0_GOOGLE_COOLDOWN_FAILURES`, `STAGE0_GOOGLE_COOLDOWN_MS`, `STAGE0_NANO_MAX_BATCH`
+- **Kill switch**: оба ключа пустые → vision сабстадия molча skipped, nano работает соло. Если только Google → нет fallback при failure. Если только OpenRouter → нет native video (всегда через poster)
+- **Admin SubmitPage**: секция «🎨 Stage 0 PreStage (контекст для скорера)» — фиолетовый блок с двумя под-блоками (Nano text + Gemini visual). Показывает `videoTruncated: true` когда был fallback на poster
+
+### Pipeline order (актуально 2026-04-29 после PR-2)
+```
+collect → cheapDedup → PreStage → Cluster (multi-signal) → Stage 1 → Stage 2 → Save → Alerts
+```
+- **PreStage перед Cluster** — clusterer теперь использует Gemini's `videoSummary`/`visualCaption` и nano's `entityCanonical` для multi-signal similarity (см. ниже). На первом цикле уже есть данные, не на втором как было до PR-2
+- **cheapDedup** — новая стадия в `clusterer.cheapDedup(items)` (zero-API). Бакеты по `(source, normalised-title)` и по `url` — collapse exact-text/url дубли ДО PreStage чтобы не платить Gemini за copypaste-цепочки. Логирует `cheapDedup: N → M` только когда что-то схлопнулось
+- **save_only теперь тоже получают PreStage** — данные сохраняются в `raw_metrics.preStage`, будущие циклы берут из кэша
+- **`scorer.preStage.enrichBatch` вызывается только в admin manual-submit** (минует index.js); в нормальном flow это no-op через idempotency guard `'preStage' in t`
+
+### Multi-signal clustering (PR-1, 2026-04-29)
+- **Заменили Jaccard на тайтлах** на weighted similarity score из 4 сигналов; пороги/веса в DB-настройках, тюнятся через админку без передеплоя
+- **Сигналы и веса (defaults)**:
+  - `clusterWeightEmbedding=0.40` — `text-embedding-3-small` cosine (1536-dim, L2-normalised). Cosine 0.5..1.0 squashed в 0..1
+  - `clusterWeightPhash=0.30` — dHash thumbnails (sharp resize 9×8 grayscale → adjacent-pixel diff → 64-bit BigInt). Hamming < 16 = soft match
+  - `clusterWeightEntity=0.20` — `entityCanonical[]` overlap (требует nano включённого; кросс-языковой буст «Илон Маск» = «Elon Musk»)
+  - `clusterWeightTicker=0.10` — shared `$TICKER` regex `\$[A-Z]{2,10}\b`. Разные тикеры → ×0.85 на final score
+  - `clusterTimePenaltyHours=24` — линейный damp 1.0 → 0.7 если items >24h apart
+- **Threshold**: `clusterSimThreshold=0.55`. Renormalisation: если сигнал `null` (нет картинки / nano выключен / OpenAI лёг) — вес перераспределяется по остальным
+- **Защитные сетки**:
+  - `CLUSTER_MULTI_SIGNAL=0` env → panic switch к Jaccard
+  - Если ВСЕ сигналы null → автоматический fallback на Jaccard. Лог `strategy=multi-signal|jaccard-fallback`
+  - Embeddings + hash оба NEVER throw, в худшем случае возвращают null
+- **Файлы**: `src/analysis/embeddings.js` (new, ~150 строк), `src/analysis/image-hash.js` (new, ~190 строк), `clusterer.js` (refactor: `route()` async, `_clusterBySimilarity`, `_similarity`, `_embeddingText`, `_pickHashUrl`, `cheapDedup`)
+- **Стоимость**: <$1/мес добавки (embeddings $0.0001/цикл, hash локально)
+- **Latency**: route() с ~10ms (Jaccard) → ~1.5-2.5s (один OpenAI batch + parallel image fetches с concurrency 4)
+- **Sharp как dependency**: `sharp ^0.34.0` в `package.json`. Prebuilt бинарники — Docker rebuild +30-60s, runtime — без apk-зависимостей (libvips bundled в `@img/sharp-libvips-linuxmusl-x64`)
+- **Reminder**: `npm ci` требует sync lock-file → после ЛЮБОГО `dependencies` change запускать локально `npm install --package-lock-only` ДО `deploy.ps1` (см. ловушку в WORKLOG)
+
+### Stage 2 cost knobs (2026-04-29 update)
+- `stage2MaxCalls` default 6 → **3** (DB-tunable через `stage2MaxCalls` setting в админке)
+- `XAI_STAGE2_MAX_RESULTS` default 10 → **5** (env). Главный рычаг — снижает sources × $5/1000 (это 94% стоимости Stage 2)
+- `XAI_STAGE2_MAX_TOOL_CALLS=2` (без изменений; ещё $73/мес можно сэкономить понизив до 1, но качество может пострадать)
+- Stage 1 `explanation` field: json_schema `maxLength: 220` (strict) → модель физически не возвращает >220 chars output. Раньше «1-2 sentences» → 300-500 chars
+- **Текущая стоимость Stage 2**: ~$153/мес при 1 call/cycle × 96 cycles/day. До PR было ~$288/мес
+- **x_search billing мнемоника**: `$5 per 1000 sources, NOT per call`. `max_results=5 × max_tool_calls=2 = 10 sources × $0.005 = $0.05` на Stage 2. Plus Grok токены ~$0.003. **Итого ~5.3¢ на Stage 2 вызов**
+
+### Nano kill switch (2026-04-29)
+- ENV `STAGE0_NANO_ENABLED=0` — panic switch (force-disable, читается в constructor)
+- DB setting `nanoEnabled` (default `'1'`) — admin runtime toggle, читается на КАЖДЫЙ batch (no restart)
+- API: `GET/POST /api/prestage/nano[/toggle]`
+- UI: «🎨 Stage 0 — PreStage» секция в админке (`PreStageSection`) рядом с ScannerConfigSection. Карточка nano (toggle), карточка Gemini (read-only — у gemini свой failover)
+- При выключении: log `[NanoClassifier] skipped — disabled via admin panel`. PreStage работает соло на gemini
+- **Hypothesis тестируется в проде**: gpt-5.4-mini в Stage 1 делает 80% работы nano натуральным образом. Уникальный сигнал nano — `entityCanonical` для cross-language clusterer entity-overlap (вес 0.20 в multi-signal). Через неделю A/B решение остаётся ли nano
+
+### Dashboard inline reason editor (2026-04-29)
+- В `TrendModal` после голоса 👍/👎 — textarea «Почему такая оценка?» (≤240 chars), Save/Clear, Cmd+Enter
+- Только в modal variant; feed-карточки чистые
+- Endpoint `POST /api/trends/:id/feedback` поддерживает: vote-only (как раньше), reason-only (без `vote` → не трогает голос), vote+reason
+- DB helper `getUserVoteWithReason(trendId, chatId)` → `{vote, reason}` одним запросом
+- Stage 1 промпт уже видит reason через `_buildFeedbackContext` (`getLikedNarratives`/`getDislikedNarratives` → `topReason` field) — никаких scorer-правок не нужно
+
+### TikTok video limits (2026-04-29 update)
+- `STAGE0_VIDEO_MAX_SEC` 30 → **60**
+- `STAGE0_VIDEO_MAX_MB` 20 → **40** (60s видео в high-bitrate легко 25-30MB)
+- `STAGE0_GEMINI_TIMEOUT_MS` 45000 → **90000** (60s upload + processing на slow connection)
+- Стоимость: Gemini ~1 frame/sec → 60s видео ≈ 10-14K input tokens × $0.30/M = ~$0.004. <$1/мес добавки
+
+### Gemini captioner reliability hardening (2026-04-29)
+Долгая дебаг-сессия по жалобе «Gemini описывает только 1 кадр» вскрыла 4 проблемы. Все пофикшены, кроме 3 косметических TODO ниже.
+- **Payload guard ПЕРЕД отправкой в Google** (`_tryGoogleMedia`): refuse to ship если `buffer.length === 0` или `_sniffImageMime/_sniffVideoMime(buffer)` returns null. Это спасает от reliable 400 INVALID_ARGUMENT когда CDN отдаёт HTML/0-bytes/redirect (Twitter image URL'ы протухают молча: HTTP 200 + HTML body). Подтверждено curl-репродукцией. Лог при срабатывании содержит `bufferBytes`, `downloadContentType`, `first16` hex, `preview` 80 байт ASCII, `url` — за один WARN сразу видно что прилетело
+- **`truncationReason` field** в gemini-captioner output: `'duration_exceeded'` (видео длиннее cap'а) / `'native_unavailable'` (Google video failed/cooldown → fell on poster) / `null`. Плюс `videoMaxSec` для UI. Админ-бейдж в `admin/server.js:4060` ветвит на 3 варианта вместо хардкода «видео > 30s, использован poster»
+- **4xx vs 5xx differentiated logging** в `_tryGoogleMedia`: 4xx → полный errBody + structured meta (sentMime, bufferBytes, headContentLength, downloadContentType, url, trendTitle, trendSource); 5xx → `.slice(0, 200)` чтобы во время Google-инцидентов не флудить. Маркер `(CLIENT ERROR — investigate)` в 4xx-логе сразу подсказывает оператору что копать
+- **Docker log rotation**: `docker-compose.yml` 10m × 3 → **50m × 5** (30 MB → 250 MB ring buffer для `docker logs`). Persistent file-log в `/logs/{date}.log` (named volume `catalyst_logs`) пишется параллельно и переживает ребилды — единственный надёжный путь дебажить пост-фактум, потому что `docker logs` стирается при `docker compose up -d --build`
+- **TODO (мелкие, не сделано)**:
+  1. Hardcoded `"FIRST 30 SECONDS ONLY"` в video prompt (`gemini-captioner.js:335`) — заменить на `${this.videoMaxSec}` чтобы синхронизировалось с env-варом
+  2. `OPENROUTER_VISION_MODEL=google/gemini-3.1-flash` в `.env.example` — несуществующая модель, фоллбэкает на 2.5-flash с warn'ом каждый цикл. Поменять на `google/gemini-2.5-flash` напрямую
+  3. На production-сервере `.env` всё ещё `STAGE0_VIDEO_MAX_SEC=30` — `sed` + `docker compose up -d` синкнут
+
+### Lifespan keywords — single source of truth (2026-04-28)
+- Файл `src/analysis/lifespan.js` экспортит `LIFESPAN_VALUES = ['flash','short','medium','long']`, `LIFESPAN_DESCRIPTORS`, `normalizeLifespan(v)`, `assertCoversLifespans(name, map)`
+- **Все потребители импортят из этого модуля**: `prompts.js` (schema enum + текст промпта), `scorer.js` (normalize AI-ответа), `dashboard/server.js` (normalize при чтении из БД + инжект массива в SPA через `${JSON.stringify(LIFESPAN_VALUES)}`), `i18n/en.js`+`ru.js` (assert при загрузке модуля), `notifications/telegram.js` + `formatter.js` (normalize перед lookup)
+- **Гарантия**: переименование/добавление значения в `LIFESPAN_VALUES` ломает `import` i18n-модулей синхронно с человеко-читаемой ошибкой `<map> is missing lifespan keys: [...]`. Бот не стартанёт пока не дополнишь карты — больше нет тихого `'—'` в UI
+- Старые DB-строки с descriptive формой (`"flash (hours)"`) нормализуются на лету в `normalizeLifespan` — миграция БД не нужна
 
 ## Контекст-файлы
 
@@ -111,10 +222,18 @@
 - **Пересчёт**: `trends.user_feedback` = `ROUND(SUM(vote * weight))` по `feedback_votes` после каждого голоса
 - **Настройка в админке** (BotPage): секция "👍 Взвешенный фидбек"
   - Toggle вкл/выкл (`feedbackWeightingEnabled`)
-  - 4 числовых поля: `feedbackWeightAdmin` (def=3), `feedbackWeightPro` (def=2), `feedbackWeightTest` (def=1), `feedbackWeightFree` (def=1)
+  - 4 числовых поля: `feedbackWeightAdmin` (def=**5**), `feedbackWeightPro` (def=**2.5**), `feedbackWeightTest` (def=**0.5**), `feedbackWeightFree` (def=**0.2**) — ребаланс 2026-04-27, admin теперь ×25 vs free
   - API: `GET/POST /api/feedback-config`
+  - Одноразовая миграция: маркер `feedbackWeightsRebalancedV2='1'` в settings гарантирует что переписываем только при первом старте; ручные правки оператора затем не затираются
 - **Режим выключено**: учитываются ТОЛЬКО голоса Admin (weight=1); все остальные получают weight=0 → не влияют на `user_feedback`
 - **Статистика**: `db.getFeedbackStats(trendId)` → `{ likes, dislikes, weightedScore }`
+
+### Reason-for-rating wizard (Telegram, 2026-04-27)
+- После 👍/👎 в callback feedback handler'е keyboard алерта получает доп ряд `✏️ Причина оценки` (callback `fb_reason:<trendId>`); при снятии голоса ряд убирается. Реакции эмодзи (не buttons) wizard НЕ запускают
+- Клик `fb_reason:` → `_awaitingInput.set(chatId, {type:'feedback_reason', trendId, startedAt})`. Следующий не-командный текст ловится в `bot.on('message')`, проходит cap **240 chars**, идёт в `db.setFeedbackReason(trendId, chatId, reason)`. `/skip` отменяет. 5-минутный timeout на state
+- Колонка `feedback_votes.reason TEXT` (NULL = no reason). При смене направления голоса reason обнуляется автоматически в `recordFeedback`
+- AI-promp injection: `_buildFeedbackContext` в scorer.js рендерит `+ "Title" [category] — "reason"` (cap 120 chars per item). `getLikedNarratives`/`getDislikedNarratives` фильтруют через `weight >= 0.5` ИЛИ непустой reason — голые free-голоса без обоснования больше не попадают в промпт. Юзер пишет на любом языке, AI отвечает на английском
+- Дашборд: панель «💬 Причины оценок (последние)» в SettingsPage под weights блоком; эндпоинт `GET /api/feedback-recent?limit=N` (default 30, max 100)
 
 ## Известные нюансы
 
@@ -144,6 +263,12 @@
   - Esc: закрывает модалку / модальный trend / возвращает в Feed из Stats
 - **Modal sheets**: Settings / Account / Stats открываются как центрированные модальные окна с `backdrop-filter: blur(14px)` и затемнением; body scroll lock; закрываются по Esc, клику по фону или ✕. Лента (`dashboard-grid`) всегда рендерится под оверлеем. Компонент: `Sheet`. Классический 2-col layout удалён
 - **AccountPanel** — отдельная панель (hero card + аватар + plan badge + подписка + threshold + logout). `Row`/`Toggle` на module-scope (ранее были внутри SettingsPanel — приводило к ReferenceError)
+
+### Dashboard modal updates (2026-04-28)
+- **Stats grid в TrendModal**: 6 ячеек ровно 3×2 — Meme score / Срок жизни / Виральность // Сентимент / **Платформ** / **Скорость**. Метрика «Видели N раз» удалена (не несла полезного смысла — счётчик повторных скан-detection'ов одного и того же URL). Поле `times_seen` в БД и `timesSeen` в payload оставлены для возможной аналитики, фронт игнорирует
+- **Платформы**: `uniquePlatforms` — 1 = серое; ≥2 = зелёное `🌐 N` + tooltip «Кросс-платформа»
+- **Скорость**: `velocity` через `fmtVelocity` → `12.5/ч ↑` / `12.5/h ↑`; 0 → dim `—`
+- **Modal media фиксы**: `body.prefs-compact .img-carousel.in-modal { height: 440px }` явно перебивает базовый compact-override (CSS specificity wars); `video.modal-image { aspect-ratio: 16/9; height: 100% }` — без этого `<video>` до загрузки metadata схлопывался в плоский 2:1 letterbox; `.modal-image-wrap { min-height: 260px }` — страховка от Twitter poster'ов с экзотическим crop'ом
 
 ## Telegram avatar → dashboard (2026-04-20)
 
@@ -185,21 +310,13 @@
 - **Telegram alert**: строка `🔥 <b>{whyNow}</b>` над обычным AI-блоком в `formatter.js`
 - **Стоимость**: +20-40 токенов на ответ, <$0.50/мес
 
-## Персонализированный ранг (2026-04-20)
+## Персонализированный ранг — УДАЛЁН (2026-04-27)
 
-- **Модель данных**:
-  - `feedback_votes` — источник правды для голосов (уже существовал): `(trend_id, chat_id, vote±1, weight, plan_name)`
-  - `trends.user_feedback` — глобальный агрегат (уже существовал), не используется для ранжирования
-  - Новое: `users.personalization_enabled INTEGER NOT NULL DEFAULT 1` — per-user toggle
-- **DB helpers** (`database.js`):
-  - `getCategoryPreferences(chatId, days=30)` → `{ category: net }` (JOIN feedback_votes × trends, SUM(vote × weight), GROUP BY category)
-  - `getPersonalizationEnabled(chatId)` / `setPersonalizationEnabled(chatId, enabled)`
-- **Ранжирование** (`_handleTrends`): при `sort=rank` + auth + toggle=ON + prefs≠{} — `ORDER BY (CAST(JSON_EXTRACT(raw_metrics, '$.rankScore') AS INT) + CASE category WHEN 'X' THEN +3 ... ELSE 0 END) DESC`; каждый boost clamp'ится к ±15; SQL-эскейп category names
-- **API**: `GET/POST /api/personalization` — управление toggle и чтение prefs map (list, sorted desc)
-- **UI**: `PersonalizationCard` в `SettingsPanel` — независимый компонент, фетчит `/api/personalization`; toggle (🎯) + грид чипов `.pref-chip.up` (зелёные `+N`) / `.down` (красные `−N`); empty-state «проголосуй за несколько трендов»
-- **Переводы EN+RU**: `settings.personalization*`
-- **Важно**: feedback и персонализация — два read-пути на одних и тех же голосах. Глобальный `trends.user_feedback` продолжает отражать общую реакцию; per-user boost — дополнительный слой поверх `rankScore`, работает только для авторизованных и только в дефолтной сортировке `rank`
-- **Окно**: последние 30 дней (старые голоса не учитываются, но остаются в глобальном счётчике)
+Per-user category boost для дашборд-ранжирования был выпилен 2026-04-27 (см. WORKLOG того же дня). Оставшиеся следы:
+- Колонка `users.personalization_enabled` физически в БД (SQLite не любит DROP COLUMN); никем не читается, никем не пишется. При следующей крупной миграции БД можно будет дропнуть
+- Глобальные голоса по-прежнему влияют на скоринг через `_buildFeedbackContext` в scorer.js — это другой путь, **он остаётся**
+- `feedback_votes` таблица + reasons wizard + взвешивание по плану — всё работает как было
+- Sort=rank теперь = одинаковый глобальный порядок для всех авторизованных и неавторизованных юзеров
 
 ## Dashboard UX polish (2026-04-20)
 
@@ -208,9 +325,14 @@
 - Top Narratives: 5 → 10 (SQL LIMIT + client .slice)
 - Удалены: «Source Pulse» дубль в правой колонке, 📋 copy-title button в карточках
 
-## Ловушка server.js — backticks в комментариях
+## Ловушка server.js — backticks И escape-sequences в SPA-строках
 
-И `src/dashboard/server.js`, и `src/admin/server.js` — огромные inline React SPA внутри template literal. **Любой бэктик в `//` комментарии ломает outer literal** с `SyntaxError: Unexpected identifier '<token>'`. Ловили уже 4 раза (id, videoUrl, ref, id в admin). Правило: в этих файлах **никогда** не писать `` `token` `` в комментариях. Всегда `node -c <file>` перед деплоем.
+И `src/dashboard/server.js`, и `src/admin/server.js` — огромные inline React SPA внутри template literal. Два класса ошибок которые `node --check` НЕ ловит:
+
+1. **Backticks в комментариях**. Любой `` `token` `` в `//` комментарии ломает outer literal с `SyntaxError: Unexpected identifier '<token>'`. Ловили 5+ раз. Правило: в этих файлах **никогда** не писать backtick в комментариях.
+2. **Escape-sequences `\n` `\t` `\r` в строках**. `'foo\n'` внутри SPA — outer literal съедает `\n` (превращает в реальный newline) → unterminated string в браузере → `Uncaught SyntaxError: Invalid or unexpected token` → чёрный экран. Ловили 2026-04-27 в `ExamplesPage.buildPreview`. **Решение**: `String.fromCharCode(10)` для newline, `String.fromCharCode(9)` для tab. Альтернатива — `\\n` (двойное экранирование), но `String.fromCharCode` понятнее в diff.
+
+**Проверка SPA отдельно** (ловит оба класса): extract `<script>...</script>` из template literal, unescape `\\\\` → `\\`, `` \\` `` → `` ` ``, `\\$` → `$`, прогнать через `vm.Script(...)`. `node --check` outer-файла недостаточно — он валидирует только outer JS.
 
 ## Twitter/X scraper — pluggable actor registry (2026-04-22)
 

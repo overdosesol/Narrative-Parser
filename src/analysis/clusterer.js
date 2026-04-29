@@ -4,6 +4,12 @@ import { detectMarketSignals, resolveMarketStage } from './market-stage.js';
 // [JUNK_FILTER] optional import — remove this line + base.junkPenalty block to disable
 import { calculateJunkPenalty } from './junk-filter.js';
 
+// [MULTI_SIGNAL] semantic + perceptual similarity inputs. Both modules degrade
+// to null on any failure, so the clusterer keeps working even if OpenAI or
+// the image fetch is down — it just falls back to fewer signals.
+import { EmbeddingsClient, cosineSimilarity } from './embeddings.js';
+import { ImageHasher, hashSimilarity } from './image-hash.js';
+
 /**
  * NarrativeClusterer — pre-AI signal quality layer
  *
@@ -27,17 +33,46 @@ import { calculateJunkPenalty } from './junk-filter.js';
  *   • Author diversity(0–10): many voices = organic, one voice = shill
  */
 class NarrativeClusterer {
-  constructor(db, logger) {
+  constructor(db, logger, opts = {}) {
     this.db     = db;
     this.logger = logger;
 
-    // ── Clustering params ────────────────────────────────────────────────
+    // ── Multi-signal similarity (PR-1) ───────────────────────────────────
+    // The clusterer combines several similarity signals to decide whether
+    // two items describe the same narrative:
+    //   • Title/description embedding cosine        (semantic)
+    //   • Thumbnail dHash similarity                (visual)
+    //   • Shared $TICKER bonus                      (lexical, regex)
+    //   • Time-distance penalty                     (recency)
+    //
+    // Each weight + the merge threshold are read from DB settings so they
+    // can be tuned via the admin panel without redeploying. Defaults below
+    // were chosen so a clean "Elon tweets X" → "Musk on X" pair lands
+    // around 0.6 (above default 0.55 threshold), while loosely related
+    // items stay under 0.4.
+    const readSetting = (k, d) => {
+      const raw = this.db?.getSetting?.(k);
+      if (raw === undefined || raw === null || raw === '') return d;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : d;
+    };
+    this.SIM_THRESHOLD     = readSetting('clusterSimThreshold',     0.55);
+    this.SIM_WEIGHT_EMBED  = readSetting('clusterWeightEmbedding',  0.40);
+    this.SIM_WEIGHT_PHASH  = readSetting('clusterWeightPhash',      0.30);
+    this.SIM_WEIGHT_ENTITY = readSetting('clusterWeightEntity',     0.20);
+    this.SIM_WEIGHT_TICKER = readSetting('clusterWeightTicker',     0.10);
+    this.SIM_TIME_PENALTY_HOURS = readSetting('clusterTimePenaltyHours', 24);
+
+    // Multi-signal infrastructure. Both clients can be disabled (missing
+    // API key / opt-out env var) and the clusterer will fall back gracefully.
+    this.embeddings = opts.embeddings || new EmbeddingsClient({}, logger);
+    this.imageHasher = opts.imageHasher || new ImageHasher({}, logger);
+    this.MULTI_SIGNAL_ENABLED = process.env.CLUSTER_MULTI_SIGNAL !== '0';
+
+    // ── Legacy Jaccard params (used as fallback when all signals null) ──
     this.JACCARD_THRESHOLD = 0.40; // word-set overlap to merge into one cluster
     this.MIN_WORDS         = 1;    // allow short meme titles ("capybara", "$PEPE") to
-                                   //   cluster with longer variants. Jaccard 0.40 is
-                                   //   strict enough on its own: two single-word titles
-                                   //   only merge if the word is identical, which is
-                                   //   exactly the meme-overlap case we want.
+                                   //   cluster with longer variants.
 
     // ── DB lookback ──────────────────────────────────────────────────────
     this.DB_WINDOW_HOURS = 48;
@@ -61,17 +96,136 @@ class NarrativeClusterer {
   // ── Public API ────────────────────────────────────────────────────────────
 
   /**
+   * Cheap pre-PreStage dedup pass (PR-2).
+   *
+   * Pipeline order is now:
+   *   aggregator → cheapDedup → PreStage → route → scorer
+   *
+   * PreStage costs money (Gemini per image, nano per text). Without a pre-
+   * filter, exact-duplicate items would each pay separately even though they
+   * describe identical content. cheapDedup is the cheap insurance: pure
+   * in-memory, microseconds, no API calls. It collapses **only obvious**
+   * duplicates — bot copypaste, exact reposts, same external URL — because
+   * any heuristic stronger than that requires the very signals (embeddings,
+   * pHash, semantic) that PreStage will produce.
+   *
+   * Things that are NOT cheapDedup's job:
+   *   - DB-history-based "seen N times before" drop → that's `route()` later
+   *   - Multi-platform spread merging                → that's `route()` later
+   *   - Junk filtering                               → that's `route()` later
+   *
+   * Items collapsed here keep their highest-engagement representative; the
+   * losers are dropped entirely (we won't see their data again this cycle).
+   * That's intentional — they were exact dupes by definition.
+   *
+   * @param {Array} items
+   * @returns {Array} unique items, same shape as input
+   */
+  cheapDedup(items) {
+    if (!Array.isArray(items) || items.length < 2) return items || [];
+
+    // Bucket by (source, normalised-title) — a same-source bucket of size > 1
+    // is a copypaste ladder. Keep the highest-engagement entry from each
+    // bucket; drop the rest.
+    const bySourceTitle = new Map();
+    const byUrl         = new Map();
+    const out           = [];
+    let droppedTitle = 0, droppedUrl = 0;
+
+    for (const item of items) {
+      const titleNorm = String(item.title || '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+      const sourceKey = `${item.source || ''}::${titleNorm}`;
+
+      // Identical post URL across multiple items — extremely rare but seen
+      // when collectors race on the same Reddit /r/all spike.
+      const url = item.url || item.metrics?.permalink || '';
+      if (url) {
+        const prev = byUrl.get(url);
+        if (prev) {
+          if (this._engScore(item) > this._engScore(prev)) {
+            // Replace the weaker dupe in `out` with `item`
+            const idx = out.indexOf(prev);
+            if (idx !== -1) out[idx] = item;
+            byUrl.set(url, item);
+            // Re-sync source-title bucket too
+            bySourceTitle.set(sourceKey, item);
+          }
+          droppedUrl++;
+          continue;
+        }
+      }
+
+      if (titleNorm.length > 0) {
+        const prev = bySourceTitle.get(sourceKey);
+        if (prev) {
+          if (this._engScore(item) > this._engScore(prev)) {
+            const idx = out.indexOf(prev);
+            if (idx !== -1) out[idx] = item;
+            bySourceTitle.set(sourceKey, item);
+            if (url) byUrl.set(url, item);
+          }
+          droppedTitle++;
+          continue;
+        }
+        bySourceTitle.set(sourceKey, item);
+      }
+
+      if (url) byUrl.set(url, item);
+      out.push(item);
+    }
+
+    if (droppedTitle + droppedUrl > 0) {
+      this.logger?.info?.(
+        `[Clusterer] cheapDedup: ${items.length} → ${out.length} ` +
+        `(droppedTitle=${droppedTitle}, droppedUrl=${droppedUrl})`
+      );
+    }
+    return out;
+  }
+
+  /**
    * Route items to different pipeline lanes.
+   *
+   * Async because we now pre-compute embedding vectors and image hashes for
+   * all items in a single batched pass before clustering. These are cheap
+   * (~1.5–2.5s wall time for 100 items: one OpenAI batch call + ≤4 parallel
+   * image fetches) and let the similarity scoring do real semantic work
+   * instead of crude word-set overlap.
+   *
    * @param {Array} items — output of aggregator.process() (already DB-filtered)
    * @returns {{ priority: Array, toScore: Array, toSave: Array, droppedCount: number }}
    */
-  route(items) {
+  async route(items) {
     if (items.length === 0) {
       return { priority: [], toScore: [], toSave: [], droppedCount: 0 };
     }
 
-    const clusters = this._clusterByJaccard(items);
-    this.logger.info(`[Clusterer] ${items.length} items → ${clusters.length} clusters`);
+    // Multi-signal pre-compute: enrich each item with `_embedding` (Float32Array
+    // or null) and `_imageHash` (BigInt or null) BEFORE clustering. Both calls
+    // are best-effort — if either fails the similarity function transparently
+    // ignores that signal and re-weights what's left.
+    if (this.MULTI_SIGNAL_ENABLED) {
+      try {
+        await this._precomputeSignals(items);
+      } catch (e) {
+        this.logger?.warn?.(`[Clusterer] signal pre-compute failed (${e.message}) — falling back to Jaccard`);
+      }
+    }
+
+    // Pick clustering strategy: multi-signal if any item has a usable signal,
+    // otherwise legacy Jaccard so the system never goes mute even if BOTH
+    // OpenAI and image fetches collapse simultaneously.
+    const haveAnySignal = items.some(it => it._embedding || it._imageHash != null);
+    const clusters = (this.MULTI_SIGNAL_ENABLED && haveAnySignal)
+      ? this._clusterBySimilarity(items)
+      : this._clusterByJaccard(items);
+    this.logger.info(
+      `[Clusterer] ${items.length} items → ${clusters.length} clusters ` +
+      `(strategy=${haveAnySignal && this.MULTI_SIGNAL_ENABLED ? 'multi-signal' : 'jaccard-fallback'})`
+    );
 
     const priority = [];
     const toScore  = [];
@@ -97,6 +251,30 @@ class NarrativeClusterer {
 
       // Attach cluster context so scorer can use emergenceScore + phase
       cluster.representative.clusterMetrics = metrics;
+
+      // Sibling titles for PreStage (nano) — gives the text enricher more
+      // context than a single representative title, especially valuable when
+      // titles vary in wording but describe the same event. Dedup by
+      // normalized form so a copypaste cluster doesn't waste tokens. Cap at
+      // 5 to bound prompt size; siblings are ranked by engagement so the
+      // most "real" variations win.
+      try {
+        const seen = new Set();
+        const siblings = [];
+        const sortedSibs = cluster.items
+          .filter(i => i !== cluster.representative)
+          .sort((a, b) => this._engScore(b) - this._engScore(a));
+        for (const sib of sortedSibs) {
+          const t = (sib.title || '').trim();
+          if (!t) continue;
+          const norm = t.toLowerCase().replace(/\s+/g, ' ');
+          if (seen.has(norm)) continue;
+          seen.add(norm);
+          siblings.push(t);
+          if (siblings.length >= 5) break;
+        }
+        cluster.representative.clusterSiblingTitles = siblings;
+      } catch (_) { /* never break pipeline on sibling collection */ }
 
       // Aggregate image URLs across the cluster — gives alerts a mini gallery
       // when the same narrative hits multiple platforms. Dedup, cap at 10.
@@ -214,6 +392,197 @@ class NarrativeClusterer {
   _engScore(item) {
     const m = item.metrics || {};
     return (m.engagement || 0) + (m.upvotes || 0) + (m.likes || 0) + (m.views || 0) / 100;
+  }
+
+  // ── Multi-signal clustering (PR-1) ────────────────────────────────────────
+
+  /**
+   * Pre-compute per-item embedding vectors and image hashes in batch. Mutates
+   * each item with `_embedding` and `_imageHash` fields used by `_similarity`
+   * during the clustering pass. Failures are silent — the corresponding field
+   * stays null and the similarity function downweights to remaining signals.
+   *
+   * Note on embedding text: since PR-2, PreStage runs BEFORE the clusterer,
+   * so `trend.preStage` is populated (object or null) for every item by the
+   * time we get here. When non-null we fold gemini's visualCaption /
+   * videoSummary / nano's topicSummary into the embedding text so the
+   * vector captures visual + decoded semantics — that's the whole reason
+   * we reordered the pipeline. When PreStage failed (preStage === null,
+   * e.g. all vision providers down) we fall back to title + description,
+   * which is still better than word-set Jaccard would have been.
+   */
+  async _precomputeSignals(items) {
+    // 1) Embeddings — one batch call for all items.
+    const texts = items.map(it => this._embeddingText(it));
+    const vectors = await this.embeddings.embedBatch(texts);
+    for (let i = 0; i < items.length; i++) items[i]._embedding = vectors[i] || null;
+
+    // 2) Image hashes — bounded-concurrency parallel fetches. We pick ONE
+    //    representative URL per item (preferring an explicit image, then a
+    //    thumbnail, then the first gallery URL) so we don't multiply network
+    //    traffic by gallery size — the rep URL is enough for "same meme".
+    const urls = items.map(it => this._pickHashUrl(it));
+    const hashes = await this.imageHasher.hashBatch(urls);
+    for (let i = 0; i < items.length; i++) items[i]._imageHash = hashes[i] ?? null;
+  }
+
+  _embeddingText(item) {
+    const parts = [];
+    if (item.title)        parts.push(item.title);
+    if (item.description)  parts.push(String(item.description).slice(0, 400));
+    const ps = item.preStage;
+    if (ps?.gemini?.videoSummary)  parts.push('[video] ' + ps.gemini.videoSummary);
+    if (ps?.gemini?.visualCaption) parts.push('[visual] ' + ps.gemini.visualCaption);
+    if (ps?.gemini?.visibleText)   parts.push('[on-screen] ' + ps.gemini.visibleText);
+    if (ps?.nano?.topicSummary)    parts.push('[topic] ' + ps.nano.topicSummary);
+    return parts.filter(Boolean).join('\n');
+  }
+
+  _pickHashUrl(item) {
+    const m = item.metrics || {};
+    return m.imageUrl
+        || m.thumbnailUrl
+        || (Array.isArray(m.imageUrls) && m.imageUrls[0])
+        || null;
+  }
+
+  /**
+   * Multi-signal greedy clustering. For each unassigned item, scan remaining
+   * items and merge any whose `_similarity` exceeds SIM_THRESHOLD. Greedy
+   * matches the existing Jaccard pass shape so all downstream code (metrics,
+   * representative selection, gallery aggregation) keeps working unchanged.
+   */
+  _clusterBySimilarity(items) {
+    const clusters = [];
+    const assigned = new Set();
+    for (let i = 0; i < items.length; i++) {
+      if (assigned.has(i)) continue;
+      const cluster = { items: [items[i]], representative: items[i] };
+      assigned.add(i);
+      for (let j = i + 1; j < items.length; j++) {
+        if (assigned.has(j)) continue;
+        const sim = this._similarity(items[i], items[j]);
+        if (sim >= this.SIM_THRESHOLD) {
+          cluster.items.push(items[j]);
+          assigned.add(j);
+        }
+      }
+      // Representative: highest engagement (same rule as Jaccard path)
+      cluster.representative = cluster.items.reduce((best, item) =>
+        this._engScore(item) >= this._engScore(best) ? item : best
+      );
+      clusters.push(cluster);
+    }
+    return clusters;
+  }
+
+  /**
+   * Weighted similarity in [0, 1]. Each signal contributes its weight scaled
+   * by its strength (cosine for embeddings, normalised hash similarity for
+   * images, Jaccard-like for entities, presence boolean for tickers). Weights
+   * are renormalised over signals that are actually present — so an item
+   * pair with no embedding but matching images still gets a sensible score.
+   * A small recency penalty is applied at the end.
+   */
+  _similarity(a, b) {
+    let score = 0;
+    let weightUsed = 0;
+
+    // 1) Title/description embedding cosine (semantic)
+    if (a._embedding && b._embedding) {
+      const cos = cosineSimilarity(a._embedding, b._embedding);
+      // Cosines are usually 0.3–0.95 even for unrelated short texts — squash
+      // the bottom of the range so noise doesn't accumulate. 0 below 0.5,
+      // linear from 0.5→1.0 above. Tunable later if needed.
+      const normalised = Math.max(0, (cos - 0.5) * 2);
+      score      += this.SIM_WEIGHT_EMBED * normalised;
+      weightUsed += this.SIM_WEIGHT_EMBED;
+    }
+
+    // 2) Image dHash similarity (visual)
+    if (a._imageHash != null && b._imageHash != null) {
+      const sim = hashSimilarity(a._imageHash, b._imageHash);
+      score      += this.SIM_WEIGHT_PHASH * sim;
+      weightUsed += this.SIM_WEIGHT_PHASH;
+    }
+
+    // 3) Entity overlap (from PreStage nano if available, else 0). When neither
+    //    item has nano output, this signal is absent — weightUsed stays low and
+    //    the others decide.
+    const ea = a.preStage?.nano?.entityCanonical;
+    const eb = b.preStage?.nano?.entityCanonical;
+    if (Array.isArray(ea) && Array.isArray(eb) && ea.length > 0 && eb.length > 0) {
+      const sa = new Set(ea.map(s => String(s).toLowerCase().trim()));
+      const sb = new Set(eb.map(s => String(s).toLowerCase().trim()));
+      let inter = 0;
+      for (const x of sa) if (sb.has(x)) inter++;
+      const overlap = inter / Math.max(sa.size, sb.size);
+      score      += this.SIM_WEIGHT_ENTITY * overlap;
+      weightUsed += this.SIM_WEIGHT_ENTITY;
+    }
+
+    // 4) Shared $TICKER bonus — cheap regex lift. Common in memecoin posts;
+    //    when the same ticker appears in both, it's a strong "same narrative"
+    //    hint independent of phrasing.
+    const ta = this._tickers(a);
+    const tb = this._tickers(b);
+    if (ta.length > 0 && tb.length > 0) {
+      const sa = new Set(ta);
+      const shared = tb.some(t => sa.has(t));
+      if (shared) {
+        score      += this.SIM_WEIGHT_TICKER;
+        weightUsed += this.SIM_WEIGHT_TICKER;
+      } else {
+        // Different tickers actively mentioned → likely different narratives.
+        // Penalise lightly so the score doesn't slip past threshold on text
+        // alone when tickers explicitly disagree.
+        score *= 0.85;
+      }
+    }
+
+    if (weightUsed === 0) return 0;
+    // Renormalise — score is on a [0, weightUsed] scale; re-stretch to [0, 1].
+    let final = score / weightUsed;
+
+    // 5) Recency penalty: if items were first seen >N hours apart, soften.
+    //    Two posts about "the same trend" hours apart usually still are; days
+    //    apart usually aren't. Linear damp 1.0 → 0.7 over the configured
+    //    horizon.
+    try {
+      const tsA = this._firstSeenMs(a);
+      const tsB = this._firstSeenMs(b);
+      if (tsA && tsB) {
+        const dh = Math.abs(tsA - tsB) / 3_600_000;
+        const horizon = Math.max(1, this.SIM_TIME_PENALTY_HOURS);
+        if (dh > horizon) {
+          const damp = Math.max(0.7, 1 - 0.3 * Math.min(1, (dh - horizon) / horizon));
+          final *= damp;
+        }
+      }
+    } catch (_) { /* timestamp parse edge cases — ignore */ }
+
+    return final;
+  }
+
+  _tickers(item) {
+    // Prefer pre-extracted tickers from the collector; fall back to a regex
+    // sweep over the title so single-source items still benefit.
+    const fromMetrics = item.metrics?.tickers;
+    if (Array.isArray(fromMetrics) && fromMetrics.length > 0) {
+      return fromMetrics.map(t => String(t).toUpperCase().replace(/^\$/, ''));
+    }
+    const matches = String(item.title || '').match(/\$([A-Z]{2,10})\b/g) || [];
+    return matches.map(s => s.replace(/^\$/, ''));
+  }
+
+  _firstSeenMs(item) {
+    // Items can carry timestamps in several shapes depending on collector.
+    const v = item.firstSeenAt || item.first_seen_at || item.metrics?.publishedAt || item.metrics?.createdAt;
+    if (!v) return null;
+    if (v instanceof Date) return v.getTime();
+    if (typeof v === 'number') return v;
+    const t = Date.parse(v);
+    return Number.isFinite(t) ? t : null;
   }
 
   // ── DB history ────────────────────────────────────────────────────────────

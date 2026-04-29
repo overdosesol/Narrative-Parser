@@ -115,6 +115,79 @@ class TrendDatabase {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_feedback_votes_trend ON feedback_votes(trend_id)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_feedback_votes_chat  ON feedback_votes(chat_id)`);
 
+    // Optional free-form reason attached to a vote — set via the "Reason"
+    // button in Telegram after the user has voted. Empty / NULL when no
+    // reason was provided. Capped at 240 chars at write time to keep the
+    // AI prompt context bounded; any truncation happens BEFORE insert.
+    addIfMissing('feedback_votes', 'reason', 'TEXT');
+
+    // ── Stage 1 calibration examples (admin-curated, fed into SYSTEM_PROMPT) ─
+    // Each row is either a calibration example (specific trend → known score)
+    // or a "mistake" / anti-pattern (rule the model commonly violates).
+    // Operator manages these via the admin Examples page; scorer reads enabled
+    // rows once per cycle and concatenates them into the cacheable prefix of
+    // the system prompt. Empty table → falls back to bare rubric (no harm).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS stage1_examples (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind            TEXT NOT NULL DEFAULT 'example' CHECK(kind IN ('example','mistake')),
+        title           TEXT NOT NULL,
+        category        TEXT,                              -- one of our enum, NULL for mistakes
+        meme_potential  INTEGER CHECK(meme_potential IS NULL OR (meme_potential BETWEEN 0 AND 100)),
+        rationale       TEXT NOT NULL,
+        enabled         INTEGER NOT NULL DEFAULT 1,
+        sort_order      INTEGER NOT NULL DEFAULT 0,
+        created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_stage1_examples_kind_sort ON stage1_examples(kind, sort_order)`);
+
+    // Seed with default calibration set on first boot. Marker prevents re-seed
+    // after the operator deletes / replaces them. To force re-seed, manually
+    // delete the marker row from settings.
+    if (this.getSetting('stage1ExamplesSeededV1', null) !== '1') {
+      const seed = this.db.prepare(`
+        INSERT INTO stage1_examples (kind, title, category, meme_potential, rationale, sort_order)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      const seedExamples = [
+        // ── Examples (positive calibration across the 0-100 range) ─────────
+        ['example', 'Elon tweets a meme picture (no commentary, just image)', 'elon',         95, 'Mega-impact author + meme image = instant ticker-spawn pattern. Always 90+.',                  10],
+        ['example', 'A-list celebrity does something absurd / embarrassing on camera',         'celebrity',     90, 'Celebrity + absurdity = strong meme energy. Boost only if shareable visual exists.',           20],
+        ['example', 'Bizarre cute animal viral video (penguin/capybara/frog doing weird thing)','animals',      85, 'Cute animals are evergreen meme fuel. Short phonetic name = perfect ticker. No political baggage.', 30],
+        ['example', 'Random street-interview catchphrase goes viral overnight',                'meme',          80, 'Catchy short phrase + organic spread + low-stakes context. Classic meme arc.',                 40],
+        ['example', 'AI chatbot publicly fails / says something deranged in screenshots',      'ai_drama',      60, 'AI weirdness has its own meme cycle but shorter lifespan. Boost if specific named model.',     50],
+        ['example', 'Non-Elon tech CEO makes minor announcement (no drama, no leaked emails)', 'tech_drama',    35, 'Tech news without conflict / scandal = mild interest, not meme territory.',                    60],
+        ['example', 'Sports team wins championship (results only, no narrative arc)',          'sports_degen',  15, 'Standard sports = near-zero meme. Boost ONLY if a player did something absurd/legendary.',     70],
+        ['example', 'Politician signs bill / makes policy speech',                             'boring',         0, 'Politics = 0 by HARD RULE. No exceptions for raw views or breaking-news framing.',            80],
+        ['example', 'Mainstream news article about routine corporate earnings',                'boring',         0, 'Corporate / financial news without scandal = 0. Not meme content even at high reach.',         90],
+        // ── Mistakes (anti-patterns the model commonly slips on) ───────────
+        ['mistake', 'Trump signed an executive order (5M views, top trending)',                null,           null, 'POLITICS RULE: even with viral metrics, score 0. Do not be tempted by raw engagement numbers.', 100],
+        ['mistake', 'Elon tweet "yes." with 8M views from 220M follower account',              null,           null, 'MEGA-ACCOUNT RULE: raw views from huge accounts != novelty. No new idea = score 0-20 max.',    110],
+        ['mistake', 'Crypto token shilling thread mentioning $TICKER 50 times',                null,           null, 'SPAM RULE: set isGenuinelyInteresting=false, memePotential=0. Promotional content is never a real narrative.', 120],
+      ];
+      for (const row of seedExamples) seed.run(...row);
+      this.setSetting('stage1ExamplesSeededV1', '1');
+      this.logger.info(`DB migration: seeded ${seedExamples.length} stage1_examples (operator can edit in admin UI)`);
+    }
+
+    // ── One-time rebalance of feedback weights (2026-04-27) ─────────────────
+    // Old defaults (1/1/2/3 for free/test/pro/admin) made admin only 3× louder
+    // than free, which let mass free votes drown out signal. New defaults give
+    // admin 25× the weight of free (5.0 vs 0.2). The marker below ensures we
+    // overwrite ONCE — after this users can tune values in the admin UI and
+    // the marker prevents any future redo. Skip entirely on a brand-new DB
+    // (the inserts below populate the new defaults from scratch).
+    if (this.getSetting('feedbackWeightsRebalancedV2', null) !== '1') {
+      this.setSetting('feedbackWeightAdmin', '5');
+      this.setSetting('feedbackWeightPro',   '2.5');
+      this.setSetting('feedbackWeightTest',  '0.5');
+      this.setSetting('feedbackWeightFree',  '0.2');
+      this.setSetting('feedbackWeightsRebalancedV2', '1');
+      this.logger.info('DB migration: feedback weights rebalanced (admin=5, pro=2.5, test=0.5, free=0.2)');
+    }
+
     // X Analysis history — one row per actually-executed Apify call. Cached
     // responses are NOT recorded here. Used by the Telegram result card to
     // render "virality delta" (previous score vs current) and for future
@@ -737,6 +810,10 @@ class TrendDatabase {
       alertBreakdown: trend.alertBreakdown  ?? null,
       storyScore:     trend.xSearchData?.storyScore ?? 0,
       storyHook:      trend.xSearchData?.storyHook  ?? '',
+      // PreStage enrichment — persisted so re-scoring or admin SubmitPage
+      // displays the same data that Stage 1 saw, without re-paying for
+      // nano/gemini calls. null when PreStage didn't run or both failed.
+      preStage:       trend.preStage              ?? null,
     });
 
     // UPSERT: if the trend already exists in DB (re-analysis after window expiry),
@@ -1084,16 +1161,20 @@ class TrendDatabase {
    */
   recordFeedback(trendId, chatId, vote, weight = 1, planName = 'free') {
     if (vote === 0) {
-      // Reaction removed — delete the user's vote
+      // Reaction removed — delete the user's vote (and any attached reason)
       this.db.prepare(`DELETE FROM feedback_votes WHERE trend_id = ? AND chat_id = ?`).run(trendId, String(chatId));
     } else {
-      // Upsert: one vote per user per trend (changing vote replaces old one)
+      // Upsert: one vote per user per trend (changing vote replaces old one).
+      // NOTE: switching vote direction (e.g. 👍 → 👎) clears the previously-
+      // attached reason — it described a different opinion. Same-direction
+      // re-votes preserve reason via COALESCE on the existing column.
       this.db.prepare(`
-        INSERT INTO feedback_votes (trend_id, chat_id, vote, weight, plan_name)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO feedback_votes (trend_id, chat_id, vote, weight, plan_name, reason)
+        VALUES (?, ?, ?, ?, ?, NULL)
         ON CONFLICT(trend_id, chat_id) DO UPDATE SET
           vote=excluded.vote, weight=excluded.weight,
-          plan_name=excluded.plan_name, created_at=CURRENT_TIMESTAMP
+          plan_name=excluded.plan_name, created_at=CURRENT_TIMESTAMP,
+          reason = CASE WHEN feedback_votes.vote = excluded.vote THEN feedback_votes.reason ELSE NULL END
       `).run(trendId, String(chatId), vote, weight, planName);
     }
 
@@ -1102,6 +1183,31 @@ class TrendDatabase {
       SELECT COALESCE(SUM(vote * weight), 0) AS weighted FROM feedback_votes WHERE trend_id = ?
     `).get(trendId);
     this.db.prepare(`UPDATE trends SET user_feedback = ? WHERE id = ?`).run(Math.round(weighted), trendId);
+  }
+
+  /**
+   * Attach (or update) a free-form reason to an existing vote. Returns true
+   * if the row existed and was updated, false if there was no vote to attach
+   * the reason to (caller should tell the user to vote first).
+   *
+   * Reason is trimmed and capped at 240 chars — long rants would bloat the
+   * AI prompt context. NULL/empty string clears the reason.
+   *
+   * @param {number} trendId
+   * @param {string} chatId
+   * @param {string|null} reason
+   * @returns {boolean}
+   */
+  setFeedbackReason(trendId, chatId, reason) {
+    let clean = null;
+    if (reason != null) {
+      clean = String(reason).trim().slice(0, 240);
+      if (clean.length === 0) clean = null;
+    }
+    const result = this.db.prepare(
+      `UPDATE feedback_votes SET reason = ? WHERE trend_id = ? AND chat_id = ?`
+    ).run(clean, trendId, String(chatId));
+    return result.changes > 0;
   }
 
   /**
@@ -1130,74 +1236,197 @@ class TrendDatabase {
     return row ? row.vote : null;
   }
 
-  getLikedNarratives(days = 7, limit = 10) {
-    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    return this.db.prepare(`
-      SELECT title, category, user_feedback FROM trends
-      WHERE user_feedback > 0 AND first_seen_at > ?
-      ORDER BY user_feedback DESC LIMIT ?
-    `).all(cutoff, limit);
+  /**
+   * Like getUserVote, but also returns the attached reason. Used by the
+   * dashboard to pre-fill the inline "why this rating?" editor in the modal.
+   * Returns { vote, reason } or null when the user hasn't voted.
+   */
+  getUserVoteWithReason(trendId, chatId) {
+    const row = this.db.prepare(
+      `SELECT vote, reason FROM feedback_votes WHERE trend_id = ? AND chat_id = ?`
+    ).get(trendId, String(chatId));
+    if (!row) return null;
+    return { vote: row.vote, reason: row.reason || '' };
   }
 
-  getDislikedNarratives(days = 7, limit = 10) {
+  // ─── Liked / Disliked narratives (used for AI feedback context) ────────────
+  //
+  // Returns title + category + the highest-weight reason text per trend.
+  // Filtering rules (mirror the scorer's needs):
+  //   - At least one vote on the trend must come from a non-trivial source —
+  //     either weight ≥ minWeight (default 0.5 → drops bare free votes) OR
+  //     a reason is attached (free vote with a real explanation is valuable).
+  //   - Trends WITH a reason float to the top — they're concrete examples for
+  //     the AI to learn from. Bare popularity comes second.
+  // `topReason` is picked by max weight, then most recent — so admin/pro
+  // explanations win over free even when both are present.
+  //
+  // Schema returned: { title, category, user_feedback, topReason | null }
+  getLikedNarratives(days = 7, limit = 10, minWeight = 0.5) {
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     return this.db.prepare(`
-      SELECT title, category, user_feedback FROM trends
-      WHERE user_feedback < 0 AND first_seen_at > ?
-      ORDER BY user_feedback ASC LIMIT ?
-    `).all(cutoff, limit);
+      SELECT t.title, t.category, t.user_feedback,
+        (SELECT fv.reason FROM feedback_votes fv
+         WHERE fv.trend_id = t.id AND fv.vote > 0 AND fv.reason IS NOT NULL AND TRIM(fv.reason) != ''
+         ORDER BY fv.weight DESC, fv.created_at DESC LIMIT 1) AS topReason
+      FROM trends t
+      WHERE t.user_feedback > 0 AND t.first_seen_at > ?
+        AND EXISTS (
+          SELECT 1 FROM feedback_votes fv2
+          WHERE fv2.trend_id = t.id AND fv2.vote > 0
+            AND (fv2.weight >= ? OR (fv2.reason IS NOT NULL AND TRIM(fv2.reason) != ''))
+        )
+      ORDER BY (CASE WHEN topReason IS NOT NULL THEN 1 ELSE 0 END) DESC,
+               t.user_feedback DESC
+      LIMIT ?
+    `).all(cutoff, minWeight, limit);
+  }
+
+  getDislikedNarratives(days = 7, limit = 10, minWeight = 0.5) {
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    return this.db.prepare(`
+      SELECT t.title, t.category, t.user_feedback,
+        (SELECT fv.reason FROM feedback_votes fv
+         WHERE fv.trend_id = t.id AND fv.vote < 0 AND fv.reason IS NOT NULL AND TRIM(fv.reason) != ''
+         ORDER BY fv.weight DESC, fv.created_at DESC LIMIT 1) AS topReason
+      FROM trends t
+      WHERE t.user_feedback < 0 AND t.first_seen_at > ?
+        AND EXISTS (
+          SELECT 1 FROM feedback_votes fv2
+          WHERE fv2.trend_id = t.id AND fv2.vote < 0
+            AND (fv2.weight >= ? OR (fv2.reason IS NOT NULL AND TRIM(fv2.reason) != ''))
+        )
+      ORDER BY (CASE WHEN topReason IS NOT NULL THEN 1 ELSE 0 END) DESC,
+               t.user_feedback ASC
+      LIMIT ?
+    `).all(cutoff, minWeight, limit);
   }
 
   /**
-   * Compute a per-user category preference map from their 👍/👎 history over
-   * the last `days` days. Returns `{ "AI/Tech": +3, "Politics": -2, ... }`.
+   * Recent feedback votes WITH a reason attached (for admin dashboard).
+   * Joined to trends so the UI can show what was being discussed. Anonymized
+   * `chat_id` (last 4 digits only) is enough for operator inspection.
    *
-   * Each like on a trend in category C contributes `+vote.weight` (default 1),
-   * each dislike contributes `-vote.weight`. Categories with zero net score
-   * are included too (so the UI can show them as "neutral") but callers
-   * usually drop zeros for display.
-   *
-   * Used by the dashboard rank-sort boost and by the settings UI.
+   * @param {number} limit
+   * @returns {Array<{title, category, vote, weight, plan_name, reason, created_at, chat_short}>}
    */
-  getCategoryPreferences(chatId, days = 30) {
-    if (!chatId) return {};
-    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    const rows = this.db.prepare(`
-      SELECT t.category AS category,
-             SUM(fv.vote * fv.weight) AS net
+  getRecentFeedbackReasons(limit = 30) {
+    return this.db.prepare(`
+      SELECT t.title, t.category,
+             fv.vote, fv.weight, fv.plan_name, fv.reason, fv.created_at,
+             SUBSTR(fv.chat_id, -4) AS chat_short
       FROM feedback_votes fv
       JOIN trends t ON t.id = fv.trend_id
-      WHERE fv.chat_id = ?
-        AND fv.created_at > ?
-        AND t.category IS NOT NULL
-        AND t.category <> ''
-      GROUP BY t.category
-    `).all(String(chatId), cutoff);
-    const map = {};
-    for (const r of rows) {
-      if (r.category) map[r.category] = Math.round(r.net || 0);
-    }
-    return map;
+      WHERE fv.reason IS NOT NULL AND TRIM(fv.reason) != ''
+      ORDER BY fv.created_at DESC
+      LIMIT ?
+    `).all(limit);
+  }
+
+  // ─── Stage 1 calibration examples (CRUD for admin UI + scorer reads) ─────
+  //
+  // The scorer calls listStage1Examples({enabledOnly:true}) once per cycle to
+  // build the cacheable examples block in SYSTEM_PROMPT. The admin UI calls
+  // the full CRUD set. Validation happens at the API boundary (admin/server.js)
+  // — these methods trust their inputs but still cap critical fields to keep
+  // the DB sane if called directly from a script.
+
+  /**
+   * @param {object} opts
+   * @param {boolean} [opts.enabledOnly=false] — only enabled rows (scorer mode)
+   * @param {string|null}  [opts.kind=null]    — 'example' | 'mistake' | null=both
+   */
+  listStage1Examples({ enabledOnly = false, kind = null } = {}) {
+    let where = '1=1';
+    const params = [];
+    if (enabledOnly) where += ' AND enabled = 1';
+    if (kind)        { where += ' AND kind = ?'; params.push(kind); }
+    return this.db.prepare(`
+      SELECT id, kind, title, category, meme_potential AS memePotential,
+             rationale, enabled, sort_order AS sortOrder,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM stage1_examples
+      WHERE ${where}
+      ORDER BY kind ASC, sort_order ASC, id ASC
+    `).all(...params);
   }
 
   /**
-   * Read/write the per-user personalization toggle stored on the users row.
-   * Missing user → default to enabled (true). `set` accepts any truthy value.
+   * @returns {number} new row id
    */
-  getPersonalizationEnabled(chatId) {
-    if (!chatId) return true;
-    const row = this.db.prepare(
-      `SELECT personalization_enabled AS v FROM users WHERE telegram_chat_id = ?`
-    ).get(String(chatId));
-    return row ? !!row.v : true;
+  createStage1Example({ kind, title, category, memePotential, rationale, enabled = 1, sortOrder = 0 }) {
+    const cleanKind  = kind === 'mistake' ? 'mistake' : 'example';
+    const cleanTitle = String(title || '').trim().slice(0, 200);
+    const cleanRat   = String(rationale || '').trim().slice(0, 400);
+    // mistakes have no category / score; examples must have both
+    const cleanCat   = cleanKind === 'mistake' ? null : (String(category || '').trim() || null);
+    const cleanMP    = cleanKind === 'mistake'
+      ? null
+      : Math.max(0, Math.min(100, parseInt(memePotential, 10) || 0));
+    const result = this.db.prepare(`
+      INSERT INTO stage1_examples (kind, title, category, meme_potential, rationale, enabled, sort_order)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(cleanKind, cleanTitle, cleanCat, cleanMP, cleanRat, enabled ? 1 : 0, parseInt(sortOrder, 10) || 0);
+    return result.lastInsertRowid;
   }
 
-  setPersonalizationEnabled(chatId, enabled) {
-    if (!chatId) return;
-    this.db.prepare(
-      `UPDATE users SET personalization_enabled = ? WHERE telegram_chat_id = ?`
-    ).run(enabled ? 1 : 0, String(chatId));
+  /**
+   * Patch fields. Pass only the keys you want to change. Returns true if a
+   * row was updated, false if id was missing.
+   */
+  updateStage1Example(id, patch = {}) {
+    const fields = [];
+    const params = [];
+    if (patch.kind !== undefined) {
+      fields.push('kind = ?');
+      params.push(patch.kind === 'mistake' ? 'mistake' : 'example');
+    }
+    if (patch.title !== undefined) {
+      fields.push('title = ?');
+      params.push(String(patch.title || '').trim().slice(0, 200));
+    }
+    if (patch.category !== undefined) {
+      fields.push('category = ?');
+      params.push(patch.category ? String(patch.category).trim() : null);
+    }
+    if (patch.memePotential !== undefined) {
+      fields.push('meme_potential = ?');
+      params.push(patch.memePotential === null ? null : Math.max(0, Math.min(100, parseInt(patch.memePotential, 10) || 0)));
+    }
+    if (patch.rationale !== undefined) {
+      fields.push('rationale = ?');
+      params.push(String(patch.rationale || '').trim().slice(0, 400));
+    }
+    if (patch.enabled !== undefined) {
+      fields.push('enabled = ?');
+      params.push(patch.enabled ? 1 : 0);
+    }
+    if (patch.sortOrder !== undefined) {
+      fields.push('sort_order = ?');
+      params.push(parseInt(patch.sortOrder, 10) || 0);
+    }
+    if (fields.length === 0) return false;
+    fields.push('updated_at = CURRENT_TIMESTAMP');
+    params.push(parseInt(id, 10));
+    const r = this.db.prepare(`UPDATE stage1_examples SET ${fields.join(', ')} WHERE id = ?`).run(...params);
+    return r.changes > 0;
   }
+
+  deleteStage1Example(id) {
+    const r = this.db.prepare(`DELETE FROM stage1_examples WHERE id = ?`).run(parseInt(id, 10));
+    return r.changes > 0;
+  }
+
+  countStage1Examples() {
+    return this.db.prepare(`SELECT COUNT(*) AS c FROM stage1_examples`).get().c;
+  }
+
+  // Personalization API removed 2026-04-27. The previous helpers
+  // (getCategoryPreferences, getPersonalizationEnabled, setPersonalizationEnabled)
+  // powered a per-user category boost on the dashboard rank sort. Removing
+  // them simplifies ranking semantics — all users now see the same global
+  // ordering. The users.personalization_enabled column is left in place;
+  // SQLite has no cheap DROP COLUMN and the column has no consumers anymore.
 
   close() {
     this.db.close();

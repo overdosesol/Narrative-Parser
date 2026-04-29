@@ -1,7 +1,9 @@
 /**
  * Russian translations
  */
-export default {
+import { LIFESPAN_VALUES, assertCoversLifespans } from '../analysis/lifespan.js';
+
+const ru = {
   // ── Bot welcome & commands ─────────────────────────────────────────────
   welcome: `\u{1F431} <b>\u{041F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}! \u{042D}\u{0442}\u{043E} Catalyst</b>
 
@@ -119,8 +121,9 @@ export default {
     sports_degen: '\u{1F3C6}', ai_drama: '\u{1F916}', other: '\u{1F4CC}', boring: '\u{1F634}',
   },
   topLifeIcons: {
-    'flash (hours)': '\u26A1', 'short (1-2 days)': '\u{1F552}',
-    'medium (3-7 days)': '\u{1F4C5}', 'long (weeks+)': '\u{1F4C6}',
+    // Keys derive from LIFESPAN_VALUES — see src/analysis/lifespan.js.
+    // Legacy descriptive forms normalized away upstream.
+    flash: '\u26A1', short: '\u{1F552}', medium: '\u{1F4C5}', long: '\u{1F4C6}',
   },
 
   // ── Status ─────────────────────────────────────────────────────────────
@@ -220,13 +223,28 @@ export default {
   },
 
   lifespans: {
-    'flash (hours)': '\u{26A1} \u{041C}\u{043E}\u{043B}\u{043D}\u{0438}\u{044F} (\u{0447}\u{0430}\u{0441}\u{044B})',
-    'short (1-2 days)': '\u{1F550} \u{041A}\u{043E}\u{0440}\u{043E}\u{0442}\u{043A}\u{0438}\u{0439} (1-2 \u{0434}\u{043D}\u{044F})',
-    'medium (3-7 days)': '\u{1F4C5} \u{0421}\u{0440}\u{0435}\u{0434}\u{043D}\u{0438}\u{0439} (3-7 \u{0434}\u{043D}\u{0435}\u{0439})',
-    'long (weeks+)': '\u{1F4C6} \u{0414}\u{043B}\u{0438}\u{043D}\u{043D}\u{044B}\u{0439} (\u{043D}\u{0435}\u{0434}\u{0435}\u{043B}\u{0438}+)',
+    // Keys derive from LIFESPAN_VALUES — see src/analysis/lifespan.js.
+    flash:  '\u{26A1} \u{041C}\u{043E}\u{043B}\u{043D}\u{0438}\u{044F} (\u{0447}\u{0430}\u{0441}\u{044B})',
+    short:  '\u{1F550} \u{041A}\u{043E}\u{0440}\u{043E}\u{0442}\u{043A}\u{0438}\u{0439} (1-2 \u{0434}\u{043D}\u{044F})',
+    medium: '\u{1F4C5} \u{0421}\u{0440}\u{0435}\u{0434}\u{043D}\u{0438}\u{0439} (3-7 \u{0434}\u{043D}\u{0435}\u{0439})',
+    long:   '\u{1F4C6} \u{0414}\u{043B}\u{0438}\u{043D}\u{043D}\u{044B}\u{0439} (\u{043D}\u{0435}\u{0434}\u{0435}\u{043B}\u{0438}+)',
     'unknown': '\u{2753} \u{041D}\u{0435}\u{0438}\u{0437}\u{0432}\u{0435}\u{0441}\u{0442}\u{043D}\u{043E}',
   },
+
+  // Причина оценки — Feedback reason wizard
+  btnFeedbackReason: '\u{270F}\u{FE0F} Причина оценки',
+  feedbackReasonPrompt: '\u{1F4DD} <b>Почему такая оценка?</b>\n\nНапиши одно короткое предложение (любой язык). /skip — отменить. Макс 240 символов.',
+  feedbackReasonSaved: '\u{2705} <b>Причина сохранена.</b> AI учтёт это при оценке похожих трендов.',
+  feedbackReasonSkipped: '\u{1F44C} Отменено — ваша оценка осталась без изменений.',
+  feedbackReasonNoVote: '\u{26A0}\u{FE0F} Вы не голосовали за этот тренд, или голос уже удалён. Сначала проголосуйте.',
+  feedbackReasonTooLong: '\u{26A0}\u{FE0F} Слишком длинно (макс 240 символов). Нажмите кнопку ещё раз.',
 };
+
+// Loud failure at module load if the i18n maps drift from LIFESPAN_VALUES.
+assertCoversLifespans('ru.topLifeIcons', ru.topLifeIcons);
+assertCoversLifespans('ru.lifespans',    ru.lifespans);
+
+export default ru;
 
 function scoreEmoji(score) {
   if (score >= 90) return '\u{1F525}\u{1F525}\u{1F525}';
