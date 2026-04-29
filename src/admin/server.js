@@ -67,9 +67,10 @@ class AdminServer {
     this.appState = appState || { paused: false, disabledCollectors: new Set() };
     this.scanFn = scanFn; // optional callback to trigger manual scan
     // Injected components for the manual-submit feature (POST /api/submit-narrative).
-    // Both are optional — if absent the endpoint returns 503.
+    // All optional — handlers return 503 when missing.
     this.scorer = extras.scorer || null;
     this.telegram = extras.telegram || null;
+    this.triggerFinder = extras.triggerFinder || null;  // Grok deep-search for SubmitPage trigger button
     this.port = parseInt(process.env.ADMIN_PORT || '8080');
     this.host = process.env.ADMIN_HOST || '127.0.0.1';
     this.adminKey = process.env.ADMIN_API_KEY || '';
@@ -195,10 +196,14 @@ class AdminServer {
   _getFeedbackConfig() {
     return {
       enabled:     this.db.getSetting('feedbackWeightingEnabled', '1') !== '0',
-      weightAdmin: parseFloat(this.db.getSetting('feedbackWeightAdmin', '3') || '3'),
-      weightPro:   parseFloat(this.db.getSetting('feedbackWeightPro',   '2') || '2'),
-      weightTest:  parseFloat(this.db.getSetting('feedbackWeightTest',  '1') || '1'),
-      weightFree:  parseFloat(this.db.getSetting('feedbackWeightFree',  '1') || '1'),
+      // Defaults mirror the one-time rebalance migration in database.js
+      // (admin=5, pro=2.5, test=0.5, free=0.2). The migration writes these
+      // keys explicitly, so these fallbacks only matter for ops who deleted
+      // the rows manually.
+      weightAdmin: parseFloat(this.db.getSetting('feedbackWeightAdmin', '5')   || '5'),
+      weightPro:   parseFloat(this.db.getSetting('feedbackWeightPro',   '2.5') || '2.5'),
+      weightTest:  parseFloat(this.db.getSetting('feedbackWeightTest',  '0.5') || '0.5'),
+      weightFree:  parseFloat(this.db.getSetting('feedbackWeightFree',  '0.2') || '0.2'),
     };
   }
 
@@ -208,6 +213,56 @@ class AdminServer {
     if (weightPro   !== undefined) this.db.setSetting('feedbackWeightPro',   String(parseFloat(weightPro)   || 1));
     if (weightTest  !== undefined) this.db.setSetting('feedbackWeightTest',  String(parseFloat(weightTest)  || 1));
     if (weightFree  !== undefined) this.db.setSetting('feedbackWeightFree',  String(parseFloat(weightFree)  || 1));
+  }
+
+  // Stage 1 examples — boundary validation. Returns null on OK, error string
+  // on first failure. `partial` mode (PUT) only checks fields that are present;
+  // `full` mode (POST) requires the minimum useful payload.
+  // Category enum mirrors STAGE1_RESPONSE_SCHEMA — keep in sync if either changes.
+  _validateStage1Example(body, { partial = false } = {}) {
+    if (!body || typeof body !== 'object') return 'Body must be an object';
+    const CATEGORY_ENUM = ['meme','elon','animals','tech_drama','degenerates',
+                            'celebrity','sports_degen','ai_drama','boring','other'];
+    const needsField = (key) => !partial || body[key] !== undefined;
+
+    if (needsField('kind')) {
+      if (body.kind !== 'example' && body.kind !== 'mistake') {
+        return 'kind must be "example" or "mistake"';
+      }
+    }
+    if (needsField('title')) {
+      const t = String(body.title || '').trim();
+      if (t.length < 5)   return 'title is too short (min 5 chars)';
+      if (t.length > 200) return 'title is too long (max 200 chars)';
+    }
+    if (needsField('rationale')) {
+      const r = String(body.rationale || '').trim();
+      if (r.length < 10)  return 'rationale is too short (min 10 chars)';
+      if (r.length > 400) return 'rationale is too long (max 400 chars)';
+    }
+    // For "example" kind we additionally require category + memePotential.
+    // For "mistake" kind those fields are NULL by design.
+    const isExample = partial
+      ? (body.kind === undefined ? null : body.kind === 'example')
+      : body.kind === 'example';
+    if (isExample === true || (isExample === null && body.category !== undefined)) {
+      if (body.category !== undefined && body.category !== null) {
+        if (!CATEGORY_ENUM.includes(String(body.category))) {
+          return `category must be one of: ${CATEGORY_ENUM.join(', ')}`;
+        }
+      } else if (!partial) {
+        return 'category is required for kind=example';
+      }
+    }
+    if (isExample === true || (isExample === null && body.memePotential !== undefined)) {
+      if (body.memePotential !== undefined && body.memePotential !== null) {
+        const n = parseInt(body.memePotential, 10);
+        if (isNaN(n) || n < 0 || n > 100) return 'memePotential must be 0..100';
+      } else if (!partial) {
+        return 'memePotential is required for kind=example';
+      }
+    }
+    return null;
   }
 
   _getScannerConfig() {
@@ -837,6 +892,60 @@ class AdminServer {
         return json(res, 200, { ok: true, ...this._getFeedbackConfig() });
       }
 
+      // ── Stage 1 calibration examples (admin-curated few-shot for SYSTEM_PROMPT) ──
+      // Reads/writes go straight to db.{list|create|update|delete}Stage1Example.
+      // Validation happens here at the boundary — strict caps + enum checks so
+      // a bad request gets a 400 before it touches the row writer.
+      if (path === '/api/stage1-examples' && method === 'GET') {
+        const filterKind = url.searchParams.get('kind');
+        const items = this.db.listStage1Examples({
+          kind: (filterKind === 'example' || filterKind === 'mistake') ? filterKind : null,
+        });
+        return json(res, 200, {
+          items,
+          count: items.length,
+          enabledCount: items.filter(i => i.enabled).length,
+        });
+      }
+
+      if (path === '/api/stage1-examples' && method === 'POST') {
+        const body = await parseBody(req);
+        const err = this._validateStage1Example(body, { partial: false });
+        if (err) return json(res, 400, { error: err });
+        // Soft cap warning vs hard cap rejection. 50 is a sanity ceiling —
+        // the cacheable prefix shouldn't grow unbounded as operators add more.
+        if (this.db.countStage1Examples() >= 50) {
+          return json(res, 400, { error: 'Too many examples (max 50). Disable or delete some first.' });
+        }
+        const id = this.db.createStage1Example(body);
+        return json(res, 201, { id, ok: true });
+      }
+
+      const updMatch = path.match(/^\/api\/stage1-examples\/(\d+)$/);
+      if (updMatch && method === 'PUT') {
+        const body = await parseBody(req);
+        // Partial update — only validate fields actually present in patch
+        const err = this._validateStage1Example(body, { partial: true });
+        if (err) return json(res, 400, { error: err });
+        const ok = this.db.updateStage1Example(parseInt(updMatch[1], 10), body);
+        return json(res, ok ? 200 : 404, ok ? { ok: true } : { error: 'Not found' });
+      }
+
+      if (updMatch && method === 'DELETE') {
+        const ok = this.db.deleteStage1Example(parseInt(updMatch[1], 10));
+        return json(res, ok ? 200 : 404, ok ? { ok: true } : { error: 'Not found' });
+      }
+
+      // ── Recent feedback reasons (for the admin "voice of the user" panel) ──
+      // Lightweight read — last N votes that actually carry a written reason.
+      // Renders as a table under the feedback-weights section so the operator
+      // can see WHY users react the way they do, not just the aggregate score.
+      if (path === '/api/feedback-recent' && method === 'GET') {
+        const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get('limit') || '30', 10)));
+        const items = this.db.getRecentFeedbackReasons(limit) || [];
+        return json(res, 200, { items });
+      }
+
       // ── AI Config ──
       if (path === '/api/ai-config' && method === 'GET') {
         return json(res, 200, this._getAiConfig());
@@ -1045,6 +1154,45 @@ class AdminServer {
         }
       }
 
+      // ── On-demand Grok trigger search for SubmitPage ──────────────────
+      // POST /api/trends/:id/trigger
+      // Mirrors dashboard's endpoint but stripped of plan/cooldown checks
+      // (admin is fully privileged). If a trigger was previously saved for
+      // this trend the cached payload is returned — operator can re-run
+      // the scan-cycle if they want a fresh search.
+      const triggerMatch = path.match(/^\/api\/trends\/(\d+)\/trigger$/);
+      if (triggerMatch && method === 'POST') {
+        if (!this.triggerFinder || !this.triggerFinder.enabled) {
+          return json(res, 503, { error: 'Trigger search disabled (XAI_API_KEY missing)' });
+        }
+        const trendId = parseInt(triggerMatch[1], 10);
+        const row = this.db.getTrendById?.(trendId);
+        if (!row) return json(res, 404, { error: 'Trend not found' });
+
+        // Return cached if present
+        const cached = this.db.getTrendTrigger?.(trendId);
+        if (cached && cached.text) {
+          return json(res, 200, { ...cached, fromCache: true });
+        }
+
+        try {
+          const trend = this._hydrateTrendFromDb(row);
+          const started = Date.now();
+          this.logger.info(`[AdminTrigger] searching trigger for trend #${trendId} (${trend.title?.slice(0, 60)})`);
+          const result = await this.triggerFinder.findTrigger(trend);
+          const elapsedMs = Date.now() - started;
+          this.logger.info(`[AdminTrigger] done in ${elapsedMs}ms — confidence=${result.confidence}, sources=${(result.sources || []).length}`);
+          // Persist so subsequent loads see it
+          try { this.db.saveTrendTrigger?.(trendId, result); } catch (e) {
+            this.logger.warn(`[AdminTrigger] saveTrendTrigger failed: ${e.message}`);
+          }
+          return json(res, 200, { ...result, fromCache: false, elapsedMs });
+        } catch (e) {
+          this.logger.error(`[AdminTrigger] failed: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+      }
+
       // ── Pipeline flow (live stage + counters for the flow diagram) ──
       if (path === '/api/pipeline' && method === 'GET') {
         return json(res, 200, {
@@ -1096,6 +1244,30 @@ class AdminServer {
           this.logger.error(`[Admin] Failed to persist disabledCollectors: ${e.message}`);
         }
         return json(res, 200, { name, enabled: !dc.has(name) });
+      }
+
+      // ── PreStage / nano admin toggle ──────────────────────────────────────
+      // Soft kill switch for the gpt-5.4-nano text-enrichment sub-stage.
+      // Flips a DB setting that NanoClassifier consults at the start of
+      // each batch — applies on the very next cycle, no restart needed.
+      // Use this to A/B whether nano enrichment actually moves the needle
+      // for our scoring + clustering quality.
+      if (path === '/api/prestage/nano' && method === 'GET') {
+        const v = this.db.getSetting?.('nanoEnabled', '1');
+        return json(res, 200, { enabled: String(v) !== '0' });
+      }
+      if (path === '/api/prestage/nano/toggle' && method === 'POST') {
+        const cur = this.db.getSetting?.('nanoEnabled', '1');
+        const next = String(cur) === '0' ? '1' : '0';
+        try {
+          this.db.setSetting('nanoEnabled', next);
+        } catch (e) {
+          this.logger.error(`[Admin] Failed to persist nanoEnabled: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+        const enabled = next !== '0';
+        this.logger.info(`[Admin] PreStage nano ${enabled ? 'ENABLED' : 'DISABLED'}`);
+        return json(res, 200, { enabled });
       }
 
       return json(res, 404, { error: 'Not found' });
@@ -1239,6 +1411,68 @@ textarea.msg-input:focus{border-color:var(--accent)}
 .toggle-slider:before{content:'';position:absolute;height:18px;width:18px;left:3px;top:3px;background:#94a3b8;border-radius:50%;transition:.25s}
 input:checked+.toggle-slider{background:var(--green)}
 input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
+/* Examples page (AI calibration few-shot manager) */
+.exp-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.exp-tabs{display:flex;gap:6px}
+.exp-tab{padding:8px 14px;background:transparent;border:1px solid transparent;border-radius:8px;cursor:pointer;font-size:13px;color:var(--text2);display:flex;align-items:center;gap:8px;transition:all .15s}
+.exp-tab:hover{background:rgba(255,255,255,.04);color:var(--text)}
+.exp-tab.active{background:rgba(20,184,166,.12);border-color:rgba(20,184,166,.35);color:var(--text)}
+.exp-tab-count{background:rgba(255,255,255,.08);padding:1px 8px;border-radius:10px;font-size:10px;font-weight:700;font-variant-numeric:tabular-nums}
+.exp-tab.active .exp-tab-count{background:var(--accent);color:#fff}
+.exp-spacer{flex:1}
+.exp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
+.exp-card{background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.005));border:1px solid var(--border);border-radius:12px;padding:14px;transition:all .18s;display:flex;flex-direction:column;gap:10px;position:relative}
+.exp-card:hover{transform:translateY(-2px);border-color:rgba(20,184,166,.35);box-shadow:0 8px 20px rgba(0,0,0,.2)}
+.exp-card.disabled{opacity:.45}
+.exp-card.editing{border-color:var(--accent);box-shadow:0 0 0 2px rgba(20,184,166,.2)}
+.exp-card-id{position:absolute;top:10px;right:12px;font-size:10px;color:var(--text3);font-family:monospace;letter-spacing:.3px}
+.exp-card-head{display:flex;align-items:flex-start;gap:12px}
+.exp-score{width:54px;height:54px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;flex-shrink:0;font-variant-numeric:tabular-nums}
+.exp-score.high{background:rgba(34,197,94,.18);color:#22c55e;border:1px solid rgba(34,197,94,.3)}
+.exp-score.mid{background:rgba(251,191,36,.18);color:#fbbf24;border:1px solid rgba(251,191,36,.3)}
+.exp-score.low{background:rgba(255,107,107,.18);color:#ff6b6b;border:1px solid rgba(255,107,107,.3)}
+.exp-score.warn{background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3);font-size:24px}
+.exp-card-meta{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px;padding-right:36px}
+.exp-cat-chip{display:inline-block;background:rgba(20,184,166,.12);color:var(--accent);font-size:10px;padding:2px 8px;border-radius:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;align-self:flex-start}
+.exp-mistake-chip{display:inline-block;background:rgba(239,68,68,.12);color:#f87171;font-size:10px;padding:2px 8px;border-radius:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;align-self:flex-start}
+.exp-card-title{font-size:14px;font-weight:600;color:var(--text);line-height:1.35;word-break:break-word}
+.exp-card-rationale{font-size:12px;color:var(--text2);line-height:1.5;font-style:italic}
+.exp-card-foot{display:flex;align-items:center;gap:8px;padding-top:10px;border-top:1px solid var(--border)}
+.exp-icon-btn{background:transparent;border:1px solid var(--border);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px;color:var(--text2);display:inline-flex;align-items:center;gap:5px;transition:all .15s}
+.exp-icon-btn:hover{background:rgba(255,255,255,.04);border-color:var(--accent);color:var(--text)}
+.exp-icon-btn.danger:hover{border-color:#ff6b6b;color:#ff6b6b;background:rgba(239,68,68,.05)}
+.exp-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:9999;animation:expFadeIn .18s ease-out}
+.exp-modal{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:24px;max-width:580px;width:90%;max-height:85vh;overflow-y:auto;box-shadow:0 24px 60px rgba(0,0,0,.5);animation:expSlideUp .22s ease-out}
+.exp-modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border)}
+.exp-modal-title{font-size:16px;font-weight:600;margin:0}
+.exp-modal-close{background:transparent;border:none;cursor:pointer;color:var(--text2);font-size:22px;line-height:1;padding:4px 10px;border-radius:6px}
+.exp-modal-close:hover{background:rgba(255,255,255,.06);color:var(--text)}
+.exp-modal-foot{display:flex;align-items:center;gap:10px;padding-top:16px;margin-top:8px;border-top:1px solid var(--border)}
+@keyframes expFadeIn{from{opacity:0}to{opacity:1}}
+@keyframes expSlideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+.exp-form-row{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+.exp-form-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+.exp-form-input{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 12px;font-size:13px;color:var(--text);outline:none;font-family:inherit;width:100%;box-sizing:border-box}
+.exp-form-input:focus{border-color:var(--accent)}
+.exp-form-textarea{min-height:80px;resize:vertical;line-height:1.5}
+.exp-form-counter{font-size:10px;color:var(--text3);text-align:right}
+.exp-radio-group{display:flex;gap:10px}
+.exp-radio{flex:1;padding:12px 14px;border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:10px;background:var(--bg3);font-size:13px}
+.exp-radio:hover{border-color:rgba(20,184,166,.4)}
+.exp-radio.active{border-color:var(--accent);background:rgba(20,184,166,.08);color:var(--text)}
+.exp-radio-icon{font-size:18px}
+.exp-slider-row{display:flex;align-items:center;gap:14px}
+.exp-slider-row input[type="range"]{flex:1;accent-color:var(--accent)}
+.exp-slider-num{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums;min-width:38px;text-align:center;padding:6px 10px;border-radius:8px;background:var(--bg3);border:1px solid var(--border)}
+.exp-empty{text-align:center;padding:48px 20px;color:var(--text2);border:2px dashed var(--border);border-radius:12px;background:rgba(255,255,255,.01)}
+.exp-empty-icon{font-size:48px;opacity:.4;margin-bottom:12px;display:block}
+.exp-budget{display:flex;gap:18px;padding:14px 18px;background:rgba(20,184,166,.04);border:1px solid rgba(20,184,166,.15);border-radius:10px;margin-bottom:14px;font-size:12px;color:var(--text2);align-items:center;flex-wrap:wrap}
+.exp-budget-stat{display:flex;flex-direction:column;gap:2px}
+.exp-budget-num{font-size:18px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;line-height:1.1}
+.exp-budget-label{font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.exp-budget-divider{width:1px;background:var(--border);align-self:stretch}
+.exp-preview-pre{margin-top:10px;background:#0a0a0a;border:1px solid var(--border);border-radius:8px;padding:14px;font-size:11px;color:var(--text2);max-height:400px;overflow:auto;white-space:pre-wrap;font-family:Consolas,Monaco,monospace;line-height:1.6}
+@media (max-width:780px){.exp-grid{grid-template-columns:1fr}}
 /* Collector cards grid */
 .collector-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:24px}
 .collector-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:14px;transition:border-color .2s}
@@ -1647,14 +1881,20 @@ function PaymentsPage() {
 // light up while currentStage is 'ai' since we don't get a sub-stage signal
 // mid-call. Reminder: this whole file lives inside a template literal, so
 // NEVER use backticks in comments here — they'll close the outer literal.
+// Stage order mirrors src/index.js cycle. Since PR-2 the order is:
+//   collect → dedupe (cheap) → prestage → cluster (multi-signal) → stage1/2 → save → alerts
+// PreStage runs BEFORE the clusterer so the multi-signal similarity (embeddings,
+// image hash, entity overlap) sees gemini/nano outputs at decision time.
 const PIPELINE_STAGES = [
-  { id: 'collect', icon: '📡', label: 'Collect',         hint: 'Apify scrapers'        },
-  { id: 'dedupe',  icon: '🧩', label: 'Dedupe',          hint: 'Aggregator'             },
-  { id: 'cluster', icon: '🗂',  label: 'Cluster',         hint: 'Junk filter'            },
-  { id: 'stage1',  icon: '🧠', label: 'Stage 1',         hint: 'Base scoring (GPT/Grok)' },
-  { id: 'stage2',  icon: '🔍', label: 'Stage 2',         hint: 'Grok + x_search'         },
-  { id: 'save',    icon: '💾', label: 'Save',            hint: 'Persist to DB'          },
-  { id: 'alerts',  icon: '📣', label: 'Alerts',          hint: 'Telegram push'          },
+  { id: 'collect',  icon: '📡', label: 'Collect',  hint: 'Apify scrapers'                                          },
+  { id: 'dedupe',   icon: '🧩', label: 'Dedupe',   hint: 'Aggregator + cheap exact-dupe collapse'                  },
+  // Stage 0: text + visual enrichment (nano + gemini). Never filters/scores.
+  { id: 'prestage', icon: '🎨', label: 'Stage 0',  hint: 'PreStage: gpt-5.4-nano + Gemini Flash'                   },
+  { id: 'cluster',  icon: '🗂',  label: 'Cluster',  hint: 'Multi-signal: embeddings + image hash + entities + junk' },
+  { id: 'stage1',   icon: '🧠', label: 'Stage 1',  hint: 'Base scoring (GPT/Grok)'                                 },
+  { id: 'stage2',   icon: '🔍', label: 'Stage 2',  hint: 'Grok + x_search'                                         },
+  { id: 'save',     icon: '💾', label: 'Save',     hint: 'Persist to DB'                                           },
+  { id: 'alerts',   icon: '📣', label: 'Alerts',   hint: 'Telegram push'                                           },
 ];
 
 // Both stage1 and stage2 cards highlight while the upstream marker is 'ai',
@@ -1691,7 +1931,9 @@ function PipelineFlow() {
   if (state.running) {
     const activeLabel = curStage === 'ai'
       ? 'Stage 1 / Stage 2'
-      : (PIPELINE_STAGES[curIdx]?.label || 'работает');
+      : curStage === 'prestage'
+        ? 'Stage 0 (nano + Gemini)'
+        : (PIPELINE_STAGES[curIdx]?.label || 'работает');
     subtitle = h('span', null,
       h('span', { className: 'pflow-live' }),
       'Live — ' + activeLabel + '...'
@@ -1712,9 +1954,18 @@ function PipelineFlow() {
   // running cycle if live, falls back to lastCycle when between scans.
   const stage1Model = counts.stage1Model || state.lastCycle?.stage1Model || null;
   const stage2Model = counts.stage2Model || state.lastCycle?.stage2Model || null;
+  // Stage 0 sub-models — surfaced from cycle metrics if backend reports them
+  const nanoModel    = counts.nanoModel    || state.lastCycle?.nanoModel    || null;
+  const geminiModel  = counts.geminiModel  || state.lastCycle?.geminiModel  || null;
   const stageTitle = (s) => {
     if (s.id === 'stage1' && stage1Model) return s.hint + ' · ' + stage1Model;
     if (s.id === 'stage2' && stage2Model) return s.hint + ' · ' + stage2Model;
+    if (s.id === 'prestage') {
+      const parts = [];
+      if (nanoModel)   parts.push('nano: ' + nanoModel);
+      if (geminiModel) parts.push('vision: ' + geminiModel);
+      return parts.length ? s.hint + ' · ' + parts.join(', ') : s.hint;
+    }
     return s.hint;
   };
 
@@ -1755,6 +2006,10 @@ function PipelineFlow() {
       ? h('div', { className: 'pflow-foot' },
           h('span', null, 'Собрано → ', h('b', null, fmt(state.lastCycle.collect)),
             ' • После dedupe → ', h('b', null, fmt(state.lastCycle.dedupe)),
+            // Stage 0 surfaces only when PreStage actually ran this cycle.
+            (state.lastCycle.prestage > 0)
+              ? h('span', null, ' • Stage 0 → ', h('b', null, fmt(state.lastCycle.prestage)))
+              : null,
             ' • Stage 1 → ', h('b', null, fmt(state.lastCycle.stage1 ?? state.lastCycle.ai)),
             ' • Stage 2 → ', h('b', null, fmt(state.lastCycle.stage2 ?? 0)),
             ' • Алертов → ', h('b', null, fmt(state.lastCycle.alerts))
@@ -1878,6 +2133,10 @@ function ScannersPage() {
 
     // Scanner tuning config (presets, thresholds, storage floor)
     React.createElement(ScannerConfigSection, null),
+
+    // PreStage (Stage 0) sub-stage toggles — currently a kill-switch for
+    // the gpt-5.4-nano text enrichment, A/B-tested against value vs latency.
+    React.createElement(PreStageSection, null),
 
     // Per-preset junk-filter weights (politics/kpop/celeb/meme-shape/safe-override)
     React.createElement(FilterProfilesSection, null),
@@ -2182,6 +2441,130 @@ const FILTER_PRESET_META = {
   celebrities: { icon: '⭐', label: 'Знаменитости' },
   events:      { icon: '🌍', label: 'События' },
 };
+
+// ── Stage 0 / PreStage controls ─────────────────────────────────────────────
+//
+// Currently shows a single toggle for the gpt-5.4-nano text-enrichment
+// sub-stage. Set up as part of an A/B test (2026-04-29) — we suspect Stage 1
+// (gpt-5.4-mini) does most of nano's work natively (slang decoding, entity
+// canonicalisation, paraphrasing) and the only unique signal nano adds is
+// cross-language entity overlap for the clusterer (~20% of similarity weight).
+//
+// Toggling this flips a DB setting that NanoClassifier consults at the start
+// of each batch — applies on the very next cycle without restart. After ~7
+// days of running with nano OFF, compare cluster quality + Stage 1 score
+// distribution against the pre-toggle baseline, then decide whether to keep
+// or drop nano permanently.
+function PreStageSection() {
+  const h = React.createElement;
+  const [nanoEnabled, setNanoEnabled] = useState(null); // null = loading
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    fetch('/api/prestage/nano')
+      .then(r => r.json())
+      .then(d => setNanoEnabled(!!d.enabled))
+      .catch(e => setErr('Не удалось загрузить статус: ' + e.message));
+  }, []);
+
+  const toggleNano = async () => {
+    if (busy) return;
+    setBusy(true); setErr('');
+    try {
+      const r = await fetch('/api/prestage/nano/toggle', { method: 'POST' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      setNanoEnabled(!!d.enabled);
+    } catch (e) {
+      setErr('Не удалось переключить: ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return h('div', { className: 'broadcast-box', style: { marginTop: 16 } },
+    h('h3', { style: { marginBottom: 6 } }, '🎨 Stage 0 — PreStage'),
+    h('p', {
+      style: { fontSize: 12, color: 'var(--text3)', marginBottom: 16, lineHeight: 1.5 }
+    }, 'Подготовка контекста перед скорингом. Текущий A/B: проверяем нужен ли nano-классификатор или Stage 1 (gpt-5.4-mini) справляется сам.'),
+
+    h('div', {
+      className: 'collector-grid',
+      style: { gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))' }
+    },
+      // Nano card — the actual A/B-test toggle
+      h('div', {
+        className: 'collector-card ' + (nanoEnabled ? 'enabled' : 'disabled')
+      },
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' } },
+          h('div', null,
+            h('div', { className: 'collector-icon' }, '📝'),
+            h('div', { className: 'collector-name', style: { marginTop: 8 } }, 'Nano (gpt-5.4-nano)')
+          ),
+          // Render the toggle ONLY after we have a definitive state — keeps
+          // the slider from flickering through "off → on" on first paint.
+          nanoEnabled !== null && h('label', { className: 'toggle' },
+            h('input', {
+              type: 'checkbox',
+              checked: nanoEnabled,
+              disabled: busy,
+              onChange: toggleNano
+            }),
+            h('span', { className: 'toggle-slider' })
+          )
+        ),
+        h('div', {
+          className: 'collector-status ' + (nanoEnabled ? 'on' : 'off'),
+          style: { marginTop: 12 }
+        },
+          nanoEnabled === null ? '○ Загрузка...'
+            : nanoEnabled       ? '● Активен — обогащает текст перед Stage 1'
+                                : '○ Отключён — Stage 1 видит только сырые title+description'
+        ),
+        h('div', {
+          style: { fontSize: 11, color: 'var(--text3)', marginTop: 10, lineHeight: 1.5 }
+        },
+          'Выход: topicSummary, entityCanonical, slangDecoded, language. ',
+          'Применяется на следующем цикле без перезапуска.'
+        )
+      ),
+
+      // Gemini card — read-only status, no toggle (gemini fails over to
+      // OpenRouter automatically; "disable" doesn't make sense as a button).
+      // Shown for symmetry so the section reflects the full Stage 0.
+      h('div', {
+        className: 'collector-card enabled',
+        style: { opacity: 0.85 }
+      },
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' } },
+          h('div', null,
+            h('div', { className: 'collector-icon' }, '🖼️'),
+            h('div', { className: 'collector-name', style: { marginTop: 8 } }, 'Gemini Vision')
+          ),
+          h('span', {
+            style: { fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '.5px' }
+          }, 'auto')
+        ),
+        h('div', { className: 'collector-status on', style: { marginTop: 12 } },
+          '● Google direct → OpenRouter fallback'
+        ),
+        h('div', {
+          style: { fontSize: 11, color: 'var(--text3)', marginTop: 10, lineHeight: 1.5 }
+        },
+          'Описывает картинки и видео. Без выключателя — деградирует автоматически при сбое API.'
+        )
+      )
+    ),
+
+    err && h('div', {
+      style: {
+        marginTop: 14, padding: '10px 14px', borderRadius: 8,
+        background: 'rgba(239,68,68,.1)', color: 'var(--red)', fontSize: 13
+      }
+    }, err)
+  );
+}
 
 function FilterProfilesSection() {
   const h = React.createElement;
@@ -2893,8 +3276,11 @@ function BotPage() {
   const [aiModelsError, setAiModelsError] = useState('');
   const [editedPlans, setEditedPlans] = useState({});
   const [msg, setMsg] = useState('');
-  const [fbCfg, setFbCfg] = useState({ enabled:true, weightAdmin:3, weightPro:2, weightTest:1, weightFree:1 });
+  // Defaults mirror the rebalanced scheme (admin=5, pro=2.5, test=0.5, free=0.2)
+  // — overwritten on first render by the GET /api/feedback-config response.
+  const [fbCfg, setFbCfg] = useState({ enabled:true, weightAdmin:5, weightPro:2.5, weightTest:0.5, weightFree:0.2 });
   const [fbSaving, setFbSaving] = useState(false);
+  const [recentReasons, setRecentReasons] = useState([]);
   const [bcast, setBcast] = useState('');
   const [bcastPlan, setBcastPlan] = useState('all');
   const [bcastResult, setBcastResult] = useState(null);
@@ -2942,7 +3328,14 @@ function BotPage() {
     loadAiConfig();
     loadAiModels();
     api('/api/feedback-config').then(c=>setFbCfg(c)).catch(()=>{});
+    api('/api/feedback-recent?limit=30').then(d=>setRecentReasons(d.items||[])).catch(()=>{});
   },[]);
+
+  // Refresh recent reasons after the operator saves weights — quick way to
+  // verify the panel works without waiting for a new vote
+  const reloadRecentReasons = () => {
+    api('/api/feedback-recent?limit=30').then(d=>setRecentReasons(d.items||[])).catch(()=>{});
+  };
 
   const setPlanField = (id, field, val) => {
     setEditedPlans(prev=>({...prev,[id]:{...(prev[id]||{}), [field]:val}}));
@@ -3272,6 +3665,153 @@ function BotPage() {
           'Применяется к новым реакциям мгновенно, без перезапуска'
         )
       )
+    ),
+
+    // Recent feedback reasons panel — voice-of-the-user view. Populated by the
+    // Telegram "Reason for rating" wizard. Helps the operator see what users
+    // actually think (free text), not just aggregate +/- counts.
+    // (Reminder: this whole file lives inside a template literal — do NOT use
+    //  backticks in comments. Use single quotes only.)
+    React.createElement('div',{className:'broadcast-box',style:{marginTop:14}},
+      React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:14}},
+        React.createElement('h3',{style:{margin:0}},'💬 Причины оценок (последние)'),
+        React.createElement('button',{className:'btn btn-sm',onClick:reloadRecentReasons,style:{fontSize:11}},
+          '↻ Обновить'
+        )
+      ),
+      React.createElement('p',{style:{fontSize:12,color:'var(--text2)',marginTop:0,marginBottom:14}},
+        'Свободные комментарии от юзеров, привязанные к их 👍/👎 в Telegram. Эти причины пробрасываются в Stage 1 промпт AI.'
+      ),
+      recentReasons.length === 0
+        ? React.createElement('div',{style:{fontSize:13,color:'var(--text2)',padding:16,textAlign:'center'}},
+            'Пока нет причин — юзеры либо не голосовали с пояснением, либо ещё не нажимали «Причина оценки».'
+          )
+        : React.createElement('div',{style:{maxHeight:380,overflowY:'auto',display:'flex',flexDirection:'column',gap:8}},
+            ...recentReasons.map((r,i) => {
+              const voteIcon = r.vote > 0 ? '👍' : '👎';
+              const planColor =
+                r.plan_name === 'admin' ? '#f87171' :
+                r.plan_name === 'pro'   ? 'var(--accent)' :
+                r.plan_name === 'test'  ? '#fbbf24' : 'var(--text2)';
+              const dt = new Date(r.created_at + 'Z');
+              const timeStr = isNaN(dt.getTime()) ? r.created_at : dt.toLocaleString();
+              return React.createElement('div',{
+                key: i,
+                style: {
+                  background:'var(--bg3)',
+                  border:'1px solid var(--border)',
+                  borderRadius:6,
+                  padding:'8px 10px',
+                  fontSize:13,
+                  display:'flex',
+                  flexDirection:'column',
+                  gap:4,
+                }
+              },
+                React.createElement('div',{style:{display:'flex',alignItems:'center',gap:8,fontSize:11,color:'var(--text2)'}},
+                  React.createElement('span',{style:{fontSize:14}},voteIcon),
+                  React.createElement('span',{style:{color:planColor,fontWeight:600,textTransform:'uppercase'}},r.plan_name||'free'),
+                  React.createElement('span',null,'× '+(r.weight??1)),
+                  React.createElement('span',{style:{marginLeft:'auto'}},timeStr),
+                ),
+                React.createElement('div',{style:{fontWeight:600,color:'var(--text)'}},'"'+(r.title||'')+'"'),
+                React.createElement('div',{style:{color:'var(--text2)',fontStyle:'italic'}},r.reason||'')
+              );
+            })
+          )
+    )
+  );
+}
+
+// ── ScoreBar (visual progress bar 0-100) — used in SubmitPage ───────────────
+// Mirrors dashboard's ScoreBar without depending on dashboard CSS. Color
+// scales with value so high scores pop visually. The "sub" prop accepts
+// any React node and is rendered under the bar (used for storyHook quotes).
+function AdminScoreBar({ label, value, sub, color }) {
+  const v = Math.max(0, Math.min(100, Math.round(value || 0)));
+  const c = color || (v >= 80 ? '#22c55e' : v >= 60 ? '#84cc16' : v >= 40 ? '#eab308' : v >= 20 ? '#f97316' : '#6b7280');
+  return React.createElement('div', { style: { marginBottom: 8 } },
+    React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text2)', marginBottom: 4 } },
+      React.createElement('span', { style: { fontWeight: 600 } }, label),
+      React.createElement('span', { style: { fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, color: c } }, v + '/100')
+    ),
+    React.createElement('div', { style: { height: 6, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 3, overflow: 'hidden' } },
+      React.createElement('div', { style: { width: v + '%', height: '100%', background: c, transition: 'width .35s ease' } })
+    ),
+    sub ? React.createElement('div', { style: { marginTop: 4, fontSize: 11, color: 'var(--text3)' } }, sub) : null
+  );
+}
+
+// ── AdminTriggerSection — Grok deep-search button + result render ──────────
+// Local React state holds the optimistic-update path: clicking the button
+// fires POST /api/trends/:id/trigger, replaces section content with the
+// returned payload (text + sources + confidence). If a trigger already
+// exists on the trend (fresh from DB), button is replaced by content.
+function AdminTriggerSection({ trend, onUpdate }) {
+  const [data, setData]       = useState(trend.triggerText ? { text: trend.triggerText, sources: trend.triggerSources || [], confidence: trend.triggerConfidence || 0 } : null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError]     = useState(null);
+
+  const onSearch = async () => {
+    if (loading || !trend.id) return;
+    setLoading(true); setError(null);
+    try {
+      const res = await api('/api/trends/' + trend.id + '/trigger', 'POST', {});
+      if (res && res.text) {
+        const next = { text: res.text, sources: res.sources || [], confidence: res.confidence | 0 };
+        setData(next);
+        if (typeof onUpdate === 'function') onUpdate(next);
+      } else {
+        setError('Пустой ответ от Grok — попробуй позже');
+      }
+    } catch (e) {
+      setError(e.message || 'Ошибка поиска триггера');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // State 1: have a trigger payload — render text + sources + confidence
+  if (data && data.text) {
+    return React.createElement('div', { style: { padding: '12px 14px', background: 'rgba(255,107,107,.06)', border: '1px solid rgba(255,107,107,.18)', borderRadius: 8, marginBottom: 12 } },
+      React.createElement('div', { style: { fontSize: 10, fontWeight: 700, color: '#ff6b6b', marginBottom: 6, letterSpacing: '.5px', textTransform: 'uppercase' } }, '💡 Триггер (Grok deep)'),
+      React.createElement('div', { style: { fontSize: 13, lineHeight: 1.5, color: 'var(--text)' } }, data.text),
+      Array.isArray(data.sources) && data.sources.length > 0
+        ? React.createElement('div', { style: { marginTop: 8, fontSize: 11, color: 'var(--text3)' } },
+            'Источники: ',
+            data.sources.map((s, i) => {
+              const handle = s.startsWith('@') ? s.slice(1) : s;
+              return React.createElement('a', {
+                key: 'src' + i,
+                href: 'https://x.com/' + encodeURIComponent(handle),
+                target: '_blank', rel: 'noopener',
+                style: { marginRight: 8, color: '#5bc0eb' },
+              }, '@' + handle);
+            })
+          )
+        : null,
+      typeof data.confidence === 'number' && data.confidence > 0
+        ? React.createElement('div', { style: { marginTop: 4, fontSize: 11, color: 'var(--text3)', fontStyle: 'italic' } },
+            'Уверенность: ' + data.confidence + '%')
+        : null
+    );
+  }
+
+  // State 2/3: no trigger yet — show whyNow as fallback + search button
+  return React.createElement('div', { style: { padding: '12px 14px', background: 'rgba(255,107,107,.04)', border: '1px solid rgba(255,107,107,.12)', borderRadius: 8, marginBottom: 12 } },
+    React.createElement('div', { style: { fontSize: 10, fontWeight: 700, color: '#ff6b6b', marginBottom: 6, letterSpacing: '.5px', textTransform: 'uppercase' } }, '💡 Триггер'),
+    trend.whyNow
+      ? React.createElement('div', { style: { fontSize: 13, lineHeight: 1.5, color: 'var(--text)' } }, trend.whyNow)
+      : React.createElement('div', { style: { fontSize: 12, color: 'var(--text3)', fontStyle: 'italic' } }, 'Stage 1 не нашёл явного триггера'),
+    React.createElement('div', { style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 } },
+      React.createElement('button', {
+        className: 'btn btn-primary btn-sm',
+        disabled: loading || !trend.id,
+        onClick: onSearch,
+        title: 'Запустить Grok x_search для поиска конкретного триггера',
+        style: { padding: '6px 12px', fontSize: 12 },
+      }, loading ? '⏳ Поиск...' : '🔍 Найти триггер (Grok)'),
+      error ? React.createElement('span', { style: { fontSize: 11, color: '#ff6b6b' } }, '⚠ ' + error) : null
     )
   );
 }
@@ -3428,25 +3968,186 @@ function SubmitPage() {
       ),
       alertError && React.createElement('div',{style:{marginBottom:12,padding:10,background:'rgba(248,113,113,.08)',border:'1px solid rgba(248,113,113,.25)',borderRadius:8,fontSize:12,color:'#f87171'}},'⚠ ' + alertError),
 
-      // Metrics grid
-      React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))',gap:10,marginBottom:16}},
-        scoreBox('💎 Meme',  t.memePotential || 0, memeCls),
-        scoreBox('📈 Score', t.score         || 0),
-        scoreBox('🚀 Alert', t.alertScore    || 0),
-        scoreBox('✨ Emergence', t.emergenceScore || 0),
-        scoreBox('🔥 Adoption',  t.adoptionScore  || 0),
-        (t.storyScore || 0) > 0 && scoreBox('📖 Story', t.storyScore),
-        t.junkPenalty > 0 && scoreBox('🗑 Junk', t.junkPenalty, 'score-bad')
+      // ── Pipeline trace (NEW 2026-04-28) ───────────────────────────────────
+      // Tells the operator which stages ran and why a stage was skipped.
+      // Crucial when memePotential is low and Stage 2 silently doesn't fire.
+      result.pipeline && React.createElement('div',{style:{display:'flex',gap:10,marginBottom:14,flexWrap:'wrap'}},
+        React.createElement('span',{className:'chip',style:{background:result.pipeline.stage1Ran?'rgba(34,197,94,.12)':'rgba(120,120,120,.12)',color:result.pipeline.stage1Ran?'#4ade80':'var(--text3)',border:'1px solid '+(result.pipeline.stage1Ran?'rgba(34,197,94,.3)':'var(--border)')}},
+          (result.pipeline.stage1Ran?'✓':'✗')+' Stage 1'
+        ),
+        React.createElement('span',{
+          className:'chip',
+          title: result.pipeline.stage2SkipReason || 'Stage 2 ran',
+          style:{background:result.pipeline.stage2Ran?'rgba(34,197,94,.12)':'rgba(234,179,8,.10)',color:result.pipeline.stage2Ran?'#4ade80':'#eab308',border:'1px solid '+(result.pipeline.stage2Ran?'rgba(34,197,94,.3)':'rgba(234,179,8,.25)')}},
+          (result.pipeline.stage2Ran?'✓':'⏭')+' Stage 2'+(result.pipeline.stage2SkipReason?' — '+result.pipeline.stage2SkipReason:'')
+        )
       ),
 
-      // Narrative fields. Legacy whyItWillPump removed — replaced by the
-      // on-demand trigger search (rendered separately when present, see below).
-      t.triggerText && narrativeBox('💡 Триггер (Grok deep)', t.triggerText),
-      t.whyNow && narrativeBox('⚡ Триггер (stage-1)', t.whyNow),
-      t.aiExplanation && narrativeBox('🤖 AI объяснение', t.aiExplanation),
-      t.storyHook && narrativeBox('📖 Story Hook', '"' + t.storyHook + '"'),
+      // ── Score grid: всегда показываем все доступные метрики ──────────────
+      React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))',gap:10,marginBottom:16}},
+        scoreBox('💎 Meme',     t.memePotential   || 0, memeCls),
+        scoreBox('📈 Score',    t.score           || 0),
+        scoreBox('🚀 Alert',    t.alertScore      || 0),
+        scoreBox('✨ Emergence',t.emergenceScore  || 0),
+        scoreBox('🔥 Adoption', t.adoptionScore   || 0),
+        t.viralityScore !== null && t.viralityScore !== undefined && scoreBox('⚡ Virality (S1)', t.viralityScore),
+        (t.storyScore || 0) > 0 && scoreBox('📖 Story',  t.storyScore),
+        t.junkPenalty > 0       && scoreBox('🗑 Junk',   t.junkPenalty, 'score-bad'),
+        // Stage 2 nameStrength — показываем только если бонус-блок отработал
+        t.stage2NameBonus  && scoreBox('🏷 Name str.', t.stage2NameBonus.nameStrength || 0)
+      ),
 
-      // Meta strip
+      // ── Visual score bars (NEW 2026-04-28) — mirror dashboard's modal ────
+      // Emergence + Adoption always render. Story only appears when Stage 2
+      // computed a story score > 0; the hook is shown directly under the bar.
+      React.createElement('div',{style:{padding:'12px 14px',background:'var(--bg2)',border:'1px solid var(--border)',borderRadius:8,marginBottom:12}},
+        React.createElement(AdminScoreBar, { label: '🌊 Emergence', value: t.emergenceScore || 0 }),
+        React.createElement(AdminScoreBar, { label: '🔥 Adoption',  value: t.adoptionScore  || t.memePotential || 0 }),
+        (t.storyScore || 0) > 0 && React.createElement(AdminScoreBar, {
+          label: '📖 Story',
+          value: t.storyScore,
+          sub: t.storyHook
+            ? React.createElement('span', null,
+                React.createElement('span', { style: { color: 'var(--dim)', marginRight: 6 } }, 'Hook:'),
+                React.createElement('span', { style: { color: 'var(--text)', fontStyle: 'italic' } }, '“' + t.storyHook + '”')
+              )
+            : null
+        })
+      ),
+
+      // ── Trigger section: Grok deep-search button + result render ─────────
+      // Replaces the static t.triggerText narrativeBox rendering —
+      // operator can now actually FIRE a trigger search from this page,
+      // with optimistic local update of the result.
+      React.createElement(AdminTriggerSection, {
+        trend: t,
+        // Bubble up to the parent so the section persists across re-renders
+        // (e.g. when sendAlertNow triggers a state update).
+        onUpdate: (next) => setResult(prev => prev ? ({ ...prev, trend: { ...prev.trend, triggerText: next.text, triggerSources: next.sources, triggerConfidence: next.confidence } }) : prev),
+      }),
+
+      t.aiExplanation && narrativeBox('🤖 AI объяснение', t.aiExplanation),
+
+      // ── Source content (description from collector) ────────────────────────
+      t.description && t.description.trim() && narrativeBox('📝 Описание поста', t.description.length > 600 ? t.description.slice(0, 600) + '…' : t.description),
+
+      // ── Stage 0 PreStage enrichment (nano text + gemini vision) ───────────
+      // Shows what the preprocessors fed into Stage 1. Useful for debugging
+      // why a trend got a particular score — if visual/text context was wrong.
+      t.preStage && (t.preStage.nano || t.preStage.gemini) &&
+        React.createElement('div',{style:{padding:'12px 14px',background:'rgba(180,140,255,.06)',border:'1px solid rgba(180,140,255,.18)',borderRadius:8,marginTop:10,marginBottom:10}},
+          React.createElement('div',{style:{fontSize:10,fontWeight:700,color:'#b48cff',marginBottom:8,letterSpacing:'.5px',textTransform:'uppercase'}},'🎨 Stage 0 PreStage (контекст для скорера)'),
+          // Nano: text enrichment
+          t.preStage.nano && React.createElement('div',{style:{marginBottom:t.preStage.gemini?10:0,paddingBottom:t.preStage.gemini?10:0,borderBottom:t.preStage.gemini?'1px solid rgba(180,140,255,.12)':'none'}},
+            React.createElement('div',{style:{fontSize:10,fontWeight:600,color:'var(--text3)',marginBottom:4,letterSpacing:'.3px'}},'📝 Nano (gpt-5.4-nano)'),
+            t.preStage.nano.topicSummary && React.createElement('div',{style:{fontSize:13,color:'var(--text)',marginBottom:4}},
+              React.createElement('span',{style:{color:'var(--text3)'}}, 'Тема: '),
+              t.preStage.nano.topicSummary
+            ),
+            Array.isArray(t.preStage.nano.entityCanonical) && t.preStage.nano.entityCanonical.length > 0 &&
+              React.createElement('div',{style:{fontSize:12,color:'var(--text2)',marginBottom:4}},
+                React.createElement('span',{style:{color:'var(--text3)'}}, 'Сущности: '),
+                t.preStage.nano.entityCanonical.join(', ')
+              ),
+            t.preStage.nano.slangDecoded && t.preStage.nano.slangDecoded.trim() &&
+              React.createElement('div',{style:{fontSize:12,color:'var(--text2)',marginBottom:4,fontStyle:'italic'}},
+                React.createElement('span',{style:{color:'var(--text3)',fontStyle:'normal'}}, 'Slang: '),
+                t.preStage.nano.slangDecoded
+              ),
+            t.preStage.nano.language && t.preStage.nano.language !== 'en' &&
+              React.createElement('span',{style:{fontSize:11,color:'var(--text3)'}}, 'lang=' + t.preStage.nano.language)
+          ),
+          // Gemini: visual enrichment
+          t.preStage.gemini && React.createElement('div',null,
+            React.createElement('div',{style:{fontSize:10,fontWeight:600,color:'var(--text3)',marginBottom:4,letterSpacing:'.3px'}},
+              '🎬 Gemini (' + (t.preStage.gemini.mediaType || 'visual') + ')' +
+              (t.preStage.gemini.videoTruncated
+                ? (t.preStage.gemini.truncationReason === 'duration_exceeded'
+                    ? ' · видео > ' + (t.preStage.gemini.videoMaxSec || 30) + 's, использован poster'
+                    : t.preStage.gemini.truncationReason === 'native_unavailable'
+                      ? ' · нативное видео недоступно, использован poster'
+                      // Back-compat for cached entries written before truncationReason existed
+                      : ' · использован poster')
+                : '') +
+              (t.preStage.gemini.videoDurationSec ? ' · ' + t.preStage.gemini.videoDurationSec.toFixed(1) + 's' : '')
+            ),
+            t.preStage.gemini.visualCaption && React.createElement('div',{style:{fontSize:13,color:'var(--text)',marginBottom:4}},
+              React.createElement('span',{style:{color:'var(--text3)'}}, 'Визуал: '),
+              t.preStage.gemini.visualCaption
+            ),
+            t.preStage.gemini.videoSummary && t.preStage.gemini.videoSummary.trim() &&
+              React.createElement('div',{style:{fontSize:12,color:'var(--text2)',marginBottom:4}},
+                React.createElement('span',{style:{color:'var(--text3)'}}, 'Видео: '),
+                t.preStage.gemini.videoSummary
+              ),
+            t.preStage.gemini.visibleText && t.preStage.gemini.visibleText.trim() &&
+              React.createElement('div',{style:{fontSize:12,color:'var(--text2)',marginBottom:4}},
+                React.createElement('span',{style:{color:'var(--text3)'}}, 'Текст в кадре: '),
+                React.createElement('span',{style:{fontStyle:'italic'}}, '"' + t.preStage.gemini.visibleText + '"')
+              ),
+            t.preStage.gemini.mood && React.createElement('span',{style:{fontSize:11,color:'var(--text3)'}}, 'mood: ' + t.preStage.gemini.mood)
+          )
+        ),
+
+      // ── Raw engagement metrics ─────────────────────────────────────────────
+      // Different sources give different fields — render whatever exists.
+      (t.metrics && (t.metrics.views || t.metrics.likes || t.metrics.upvotes || t.metrics.plays || t.metrics.twitter)) &&
+        React.createElement('div',{style:{padding:'12px 14px',background:'var(--bg2)',border:'1px solid var(--border)',borderRadius:8,marginTop:10}},
+          React.createElement('div',{style:{fontSize:10,fontWeight:700,color:'var(--text3)',marginBottom:8,letterSpacing:'.5px',textTransform:'uppercase'}},'📊 Сырые метрики'),
+          React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:14,fontSize:12,fontFamily:'JetBrains Mono, monospace',color:'var(--text2)'}},
+            t.metrics.views      ? React.createElement('span',null,'👁 '+t.metrics.views.toLocaleString())   : null,
+            t.metrics.upvotes    ? React.createElement('span',null,'⬆ '+t.metrics.upvotes.toLocaleString())  : null,
+            t.metrics.likes      ? React.createElement('span',null,'❤️ '+t.metrics.likes.toLocaleString())   : null,
+            t.metrics.comments   ? React.createElement('span',null,'💬 '+t.metrics.comments.toLocaleString()): null,
+            t.metrics.shares     ? React.createElement('span',null,'🔁 '+t.metrics.shares.toLocaleString())  : null,
+            t.metrics.plays      ? React.createElement('span',null,'▶ '+t.metrics.plays.toLocaleString())    : null,
+            t.metrics.twitter && t.metrics.twitter.totalRetweets ? React.createElement('span',null,'🔁 '+t.metrics.twitter.totalRetweets.toLocaleString()) : null,
+            t.metrics.twitter && t.metrics.twitter.totalLikes    ? React.createElement('span',null,'❤️ '+t.metrics.twitter.totalLikes.toLocaleString())   : null,
+            t.metrics.velocity   ? React.createElement('span',{style:{color:'#5bc0eb'}},'⚡ '+t.metrics.velocity.toFixed(1)+'/h ↑') : null,
+            t.metrics.ageHours !== undefined ? React.createElement('span',null,'⏳ '+t.metrics.ageHours+'h') : null,
+            t.metrics.subreddit  ? React.createElement('span',null,'r/'+t.metrics.subreddit) : null
+          )
+        ),
+
+      // ── Cluster signals (routing decision inputs) ─────────────────────────
+      t.clusterMetrics && React.createElement('div',{style:{padding:'12px 14px',background:'var(--bg2)',border:'1px solid var(--border)',borderRadius:8,marginTop:10}},
+        React.createElement('div',{style:{fontSize:10,fontWeight:700,color:'var(--text3)',marginBottom:8,letterSpacing:'.5px',textTransform:'uppercase'}},'🌐 Сигналы кластера'),
+        React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:12,fontSize:12,color:'var(--text2)'}},
+          (t.metrics?.uniquePlatforms || 1) >= 2
+            ? React.createElement('span',{style:{color:'#22c55e'}},'🌐 '+t.metrics.uniquePlatforms+' платформ')
+            : React.createElement('span',null,'🌐 1 платформа'),
+          t.clusterMetrics.isNovel === false
+            ? React.createElement('span',{style:{color:'#eab308'}},'🔁 Дубль кластера')
+            : React.createElement('span',{style:{color:'#22c55e'}},'🆕 Новый'),
+          (t.clusterMetrics.batchSize > 1) && React.createElement('span',null,'📦 batch:'+t.clusterMetrics.batchSize),
+          (t.clusterMetrics.dbRecentCount > 0) && React.createElement('span',null,'🗄 db:'+t.clusterMetrics.dbRecentCount),
+          (t.clusterMetrics.junkPenalty > 0) && React.createElement('span',{style:{color:'#ef4444'}},'🗑 junk:'+t.clusterMetrics.junkPenalty),
+          t.junkReasons && t.junkReasons.length > 0 && React.createElement('span',{style:{color:'#ef4444'}}, '⚠ '+t.junkReasons.join(', ')),
+          t.memeShapeSignals && t.memeShapeSignals.length > 0 && React.createElement('span',{style:{color:'#22c55e'}}, '✨ '+t.memeShapeSignals.join(', '))
+        )
+      ),
+
+      // ── Stage 2 deep-dive details ─────────────────────────────────────────
+      t.xSearchData && React.createElement('div',{style:{padding:'12px 14px',background:'rgba(91,192,235,.06)',border:'1px solid rgba(91,192,235,.18)',borderRadius:8,marginTop:10}},
+        React.createElement('div',{style:{fontSize:10,fontWeight:700,color:'#5bc0eb',marginBottom:8,letterSpacing:'.5px',textTransform:'uppercase'}},'🔍 Stage 2 (Grok deep-dive)'),
+        React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:14,fontSize:12,color:'var(--text2)',marginBottom:8}},
+          React.createElement('span',null,'X Buzz: ',React.createElement('b',{style:{color:'var(--text)'}},t.xSearchData.xBuzz || 'unknown')),
+          React.createElement('span',null,'Импульс: ',React.createElement('b',{style:{color:'var(--text)'}},t.xSearchData.narrativeMomentum || 'unknown')),
+          React.createElement('span',null,'Органичность: ',React.createElement('b',{style:{color:'var(--text)'}},t.xSearchData.organicity || 'unknown'))
+        ),
+        t.xSearchData.subjectName && React.createElement('div',{style:{fontSize:12,color:'var(--text2)'}},
+          '🏷 Subject: ',React.createElement('b',{style:{color:'var(--text)'}}, '"'+t.xSearchData.subjectName+'"'),
+          ' · strength ',React.createElement('b',{style:{color:'var(--text)'}}, t.xSearchData.nameStrength)
+        ),
+        // Bonus / penalty deltas applied by Stage 2 — explain meme potential drift
+        (t.stage2Penalty || t.stage2StoryBonus || t.stage2NameBonus) && React.createElement('div',{style:{fontSize:11,color:'var(--text3)',marginTop:8,paddingTop:8,borderTop:'1px solid rgba(91,192,235,.15)'}},
+          t.stage2Penalty && t.stage2Penalty.mult < 1 && React.createElement('div',null,'⛔ Penalty ×'+t.stage2Penalty.mult.toFixed(2)+(t.stage2Penalty.reasons?.length?' ('+t.stage2Penalty.reasons.join(', ')+')':'')),
+          t.stage2StoryBonus && t.stage2StoryBonus.bonus > 0 && React.createElement('div',null,'📖 Story bonus +'+t.stage2StoryBonus.bonus+' (story score '+t.stage2StoryBonus.storyScore+')'),
+          t.stage2NameBonus  && t.stage2NameBonus.bonus > 0 && React.createElement('div',null,'🏷 Name bonus +'+t.stage2NameBonus.bonus+' (strength '+t.stage2NameBonus.nameStrength+')')
+        )
+      ),
+
+      // ── Meta chips ─────────────────────────────────────────────────────────
       React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:8,marginTop:14,fontSize:11}},
         t.category && React.createElement('span',{className:'chip'},'📁 ' + t.category),
         t.sentiment && React.createElement('span',{className:'chip'},'💭 ' + t.sentiment),
@@ -3486,6 +4187,390 @@ function scoreBox(label, value, cls) {
   );
 }
 
+// ── ExamplesPage — manage Stage 1 calibration examples + counterexamples ────
+// Operator-curated few-shot block fed into SYSTEM_PROMPT for OpenAI Stage 1.
+// Each row is either:
+//   - kind="example"  — concrete trend with a known memePotential to teach the rubric
+//   - kind="mistake"  — anti-pattern the model commonly slips on (HARD RULES)
+//
+// REMINDERS for editing this whole file:
+//   1. NEVER use backticks in comments — they break the outer template literal
+//   2. NEVER write a backslash followed by n / t / r / u / x ANYWHERE
+//      (strings AND comments) — outer literal eats the escape and shifts the
+//      rest of the line out of context. Use String.fromCharCode for whitespace
+//      and quote-only Unicode characters directly. See SESSION_CONTEXT.
+function ExamplesPage() {
+  const CATEGORIES = ['meme','elon','animals','tech_drama','degenerates',
+                       'celebrity','sports_degen','ai_drama','boring','other'];
+  const NL = String.fromCharCode(10);  // outer-template-safe newline
+
+  const [items, setItems]         = useState([]);
+  const [tab, setTab]             = useState('example');
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [draft, setDraft]         = useState({
+    kind:'example', title:'', category:'meme',
+    memePotential:50, rationale:'', enabled:true, sortOrder:0,
+  });
+  const [msg, setMsg]             = useState('');
+  const [saving, setSaving]       = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+
+  const load = () => api('/api/stage1-examples').then(d => setItems(d.items || [])).catch(()=>{});
+  useEffect(() => { load(); }, []);
+
+  const openNew = (kind) => {
+    setEditingId(null);
+    setDraft({
+      kind: kind || 'example',
+      title:'', category:'meme', memePotential:50, rationale:'',
+      enabled:true, sortOrder: items.length * 10,
+    });
+    setMsg('');
+    setModalOpen(true);
+  };
+
+  const openEdit = (item) => {
+    setEditingId(item.id);
+    setDraft({
+      kind: item.kind, title: item.title, category: item.category || 'meme',
+      memePotential: item.memePotential ?? 50, rationale: item.rationale,
+      enabled: !!item.enabled, sortOrder: item.sortOrder || 0,
+    });
+    setMsg('');
+    setModalOpen(true);
+  };
+
+  const closeModal = () => { setModalOpen(false); setEditingId(null); setMsg(''); };
+
+  const save = async () => {
+    setSaving(true); setMsg('');
+    try {
+      if (editingId) {
+        await api('/api/stage1-examples/' + editingId, 'PUT', draft);
+      } else {
+        await api('/api/stage1-examples', 'POST', draft);
+      }
+      load();
+      closeModal();
+    } catch (e) {
+      setMsg('Ошибка: ' + e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const del = async (id) => {
+    if (!confirm('Удалить?')) return;
+    try { await api('/api/stage1-examples/' + id, 'DELETE'); load(); }
+    catch (e) { setMsg('Ошибка: ' + e.message); }
+  };
+
+  const toggleEnabled = async (item) => {
+    try {
+      await api('/api/stage1-examples/' + item.id, 'PUT', { enabled: !item.enabled });
+      load();
+    } catch (e) { setMsg('Ошибка: ' + e.message); }
+  };
+
+  const exampleCount = items.filter(i => i.kind === 'example').length;
+  const mistakeCount = items.filter(i => i.kind === 'mistake').length;
+  const enabledCount = items.filter(i => i.enabled).length;
+  const visible      = items.filter(i => i.kind === tab);
+  const tokenEst = items
+    .filter(i => i.enabled)
+    .reduce((sum, i) => sum + (i.kind === 'mistake' ? 35 : 50), 0);
+  // Cost: gpt-5.4-mini cached input = $0.075 / 1M tokens.
+  // Cycle interval ~2 min → 720 cycles/day → 21600/month.
+  // Per-month cost = tokenEst * 0.075 / 1e6 * 21600 = tokenEst * 0.00162.
+  // First call after restart pays uncached (~$0.30/1M), but auto-cache (5-min TTL)
+  // covers virtually all subsequent calls — so steady-state is cached price.
+  const costPerMonth = tokenEst * 0.00162;
+  const costPerDay   = tokenEst * 0.000054;
+  const costLabel = (enabledCount === 0)
+    ? '$0'
+    : (costPerMonth < 0.01
+        ? '< $0.01/мес'
+        : '≈ $' + costPerMonth.toFixed(2) + '/мес');
+  const costTooltip = (enabledCount === 0)
+    ? 'Нет активных примеров'
+    : tokenEst + ' ток × $0.075/M (cached) × 21600 циклов/мес ≈ $'
+      + costPerMonth.toFixed(3) + '/мес ($' + costPerDay.toFixed(3) + '/день)';
+
+  // Preview mirrors scorer._buildExamplesContext output exactly. Uses NL
+  // constant to avoid the outer-template escape trap (see top-of-function note).
+  const buildPreview = () => {
+    const ex = items.filter(i => i.enabled && i.kind === 'example');
+    const mi = items.filter(i => i.enabled && i.kind === 'mistake');
+    let p = '';
+    if (ex.length) {
+      p += '━━━ CALIBRATION EXAMPLES (mirror these scores) ━━━' + NL;
+      p += ex.map(e =>
+        '  • "' + e.title + '" [' + (e.category || 'other') + '] → memePotential ' +
+        (e.memePotential ?? 0) + (e.rationale ? ' — ' + e.rationale : '')
+      ).join(NL);
+    }
+    if (mi.length) {
+      if (p) p += NL + NL;
+      p += '━━━ COMMON MISTAKES TO AVOID ━━━' + NL;
+      p += mi.map(m => '  ✗ "' + m.title + '"' + (m.rationale ? ' — ' + m.rationale : '')).join(NL);
+    }
+    return p || '(no enabled examples — falling back to bare rubric)';
+  };
+
+  // ── Card renderer ────────────────────────────────────────────────────────
+  const scoreClass = (n) => n >= 70 ? 'high' : n >= 30 ? 'mid' : 'low';
+
+  const renderCard = (item) => {
+    const isExample = item.kind === 'example';
+    return React.createElement('div', {
+      key: item.id,
+      className: 'exp-card' + (item.enabled ? '' : ' disabled') + (editingId === item.id ? ' editing' : ''),
+    },
+      React.createElement('div', { className: 'exp-card-id' }, '#' + item.id),
+      React.createElement('div', { className: 'exp-card-head' },
+        isExample
+          ? React.createElement('div', { className: 'exp-score ' + scoreClass(item.memePotential || 0) },
+              item.memePotential ?? 0)
+          : React.createElement('div', { className: 'exp-score warn' }, '⚠'),
+        React.createElement('div', { className: 'exp-card-meta' },
+          isExample
+            ? React.createElement('span', { className: 'exp-cat-chip' }, item.category || 'other')
+            : React.createElement('span', { className: 'exp-mistake-chip' }, 'Mistake'),
+          React.createElement('div', { className: 'exp-card-title' }, '"' + item.title + '"')
+        )
+      ),
+      React.createElement('div', { className: 'exp-card-rationale' }, item.rationale),
+      React.createElement('div', { className: 'exp-card-foot' },
+        React.createElement('label', { className: 'toggle-wrap' },
+          React.createElement('label', { className: 'toggle' },
+            React.createElement('input', {
+              type: 'checkbox',
+              checked: !!item.enabled,
+              onChange: () => toggleEnabled(item)
+            }),
+            React.createElement('span', { className: 'toggle-slider' })
+          ),
+          React.createElement('span', { style:{ fontSize:11, color:'var(--text2)' } },
+            item.enabled ? 'enabled' : 'disabled')
+        ),
+        React.createElement('div', { style:{ flex:1 } }),
+        React.createElement('button', {
+          className: 'exp-icon-btn',
+          onClick: () => openEdit(item)
+        }, '✏️ Edit'),
+        React.createElement('button', {
+          className: 'exp-icon-btn danger',
+          onClick: () => del(item.id)
+        }, '🗑')
+      )
+    );
+  };
+
+  // ── Modal editor ─────────────────────────────────────────────────────────
+  const modal = !modalOpen ? null : React.createElement('div', {
+    className: 'exp-modal-backdrop',
+    onClick: (e) => { if (e.target === e.currentTarget) closeModal(); }
+  },
+    React.createElement('div', { className: 'exp-modal' },
+      React.createElement('div', { className: 'exp-modal-head' },
+        React.createElement('h3', { className: 'exp-modal-title' },
+          editingId ? ('✏️ Редактировать #' + editingId) : '+ Добавить новый'
+        ),
+        React.createElement('button', { className: 'exp-modal-close', onClick: closeModal }, '×')
+      ),
+      // Kind radio
+      React.createElement('div', { className: 'exp-form-row' },
+        React.createElement('div', { className: 'exp-form-label' }, 'Тип'),
+        React.createElement('div', { className: 'exp-radio-group' },
+          React.createElement('div', {
+            className: 'exp-radio' + (draft.kind === 'example' ? ' active' : ''),
+            onClick: () => setDraft({...draft, kind:'example'})
+          },
+            React.createElement('span', { className:'exp-radio-icon' }, '📚'),
+            React.createElement('span', null, 'Example (с категорией и score)')
+          ),
+          React.createElement('div', {
+            className: 'exp-radio' + (draft.kind === 'mistake' ? ' active' : ''),
+            onClick: () => setDraft({...draft, kind:'mistake'})
+          },
+            React.createElement('span', { className:'exp-radio-icon' }, '⚠️'),
+            React.createElement('span', null, 'Mistake (анти-паттерн)')
+          )
+        )
+      ),
+      // Title
+      React.createElement('div', { className: 'exp-form-row' },
+        React.createElement('div', { className: 'exp-form-label' }, 'Title (5-200 символов)'),
+        React.createElement('input', {
+          className: 'exp-form-input',
+          maxLength: 200,
+          value: draft.title,
+          placeholder: draft.kind === 'example'
+            ? 'e.g. "Bizarre cute animal viral video"'
+            : 'e.g. "Trump signed an executive order (5M views)"',
+          onChange: e => setDraft({...draft, title: e.target.value})
+        }),
+        React.createElement('div', { className: 'exp-form-counter' }, draft.title.length + ' / 200')
+      ),
+      // Category + score (only for examples)
+      draft.kind === 'example' && React.createElement('div', { className: 'exp-form-row' },
+        React.createElement('div', { className: 'exp-form-label' }, 'Category'),
+        React.createElement('select', {
+          className: 'exp-form-input',
+          value: draft.category,
+          onChange: e => setDraft({...draft, category: e.target.value})
+        }, ...CATEGORIES.map(c => React.createElement('option', { key:c, value:c }, c)))
+      ),
+      draft.kind === 'example' && React.createElement('div', { className: 'exp-form-row' },
+        React.createElement('div', { className: 'exp-form-label' }, 'Meme Potential (0-100)'),
+        React.createElement('div', { className: 'exp-slider-row' },
+          React.createElement('input', {
+            type: 'range', min:0, max:100, step:1,
+            value: draft.memePotential,
+            onChange: e => setDraft({...draft, memePotential: parseInt(e.target.value, 10)})
+          }),
+          React.createElement('div', {
+            className: 'exp-slider-num',
+            style: {
+              color: draft.memePotential >= 70 ? '#22c55e'
+                   : draft.memePotential >= 30 ? '#fbbf24' : '#ff6b6b'
+            }
+          }, draft.memePotential)
+        )
+      ),
+      // Rationale
+      React.createElement('div', { className: 'exp-form-row' },
+        React.createElement('div', { className: 'exp-form-label' },
+          'Rationale (10-400 символов) — почему такой score / в чём ошибка'
+        ),
+        React.createElement('textarea', {
+          className: 'exp-form-input exp-form-textarea',
+          maxLength: 400,
+          value: draft.rationale,
+          placeholder: draft.kind === 'example'
+            ? 'e.g. "Cute animals are evergreen meme fuel. Short phonetic name = perfect ticker."'
+            : 'e.g. "POLITICS RULE: даже с viral metrics, score 0. Не вестись на raw engagement."',
+          onChange: e => setDraft({...draft, rationale: e.target.value})
+        }),
+        React.createElement('div', { className: 'exp-form-counter' }, draft.rationale.length + ' / 400')
+      ),
+      // Enabled + sort_order
+      React.createElement('div', { className: 'exp-form-row', style:{ flexDirection:'row', gap:24, alignItems:'center' } },
+        React.createElement('label', { className:'toggle-wrap' },
+          React.createElement('label', { className: 'toggle' },
+            React.createElement('input', {
+              type:'checkbox', checked: !!draft.enabled,
+              onChange: e => setDraft({...draft, enabled: e.target.checked})
+            }),
+            React.createElement('span', { className:'toggle-slider' })
+          ),
+          React.createElement('span', { style:{ fontSize:12, color:'var(--text2)' } },
+            draft.enabled ? 'Enabled' : 'Disabled')
+        ),
+        React.createElement('label', { style:{ display:'flex', alignItems:'center', gap:8, fontSize:12, color:'var(--text2)' } },
+          React.createElement('span', null, 'Sort:'),
+          React.createElement('input', {
+            type:'number', step:10,
+            className:'exp-form-input', style:{ width:80 },
+            value: draft.sortOrder,
+            onChange: e => setDraft({...draft, sortOrder: parseInt(e.target.value, 10) || 0})
+          })
+        )
+      ),
+      // Validation message inside modal
+      msg && React.createElement('div', {
+        style:{
+          padding:'10px 12px', borderRadius:8, fontSize:12,
+          background: msg.includes('Ошибка') ? 'rgba(239,68,68,.1)' : 'rgba(34,197,94,.1)',
+          color: msg.includes('Ошибка') ? '#ff6b6b' : '#22c55e',
+          marginBottom:10
+        }
+      }, msg),
+      // Footer
+      React.createElement('div', { className: 'exp-modal-foot' },
+        React.createElement('button', {
+          className:'btn btn-primary btn-sm',
+          onClick: save, disabled: saving
+        }, saving ? 'Сохранение...' : (editingId ? '💾 Сохранить' : '+ Добавить')),
+        React.createElement('button', { className:'btn btn-sm', onClick: closeModal }, 'Отмена'),
+        React.createElement('span', { style:{ flex:1 } }),
+        React.createElement('span', { style:{ fontSize:11, color:'var(--text3)' } },
+          'Применится через ~2 минуты на следующем цикле')
+      )
+    )
+  );
+
+  // ── Page ─────────────────────────────────────────────────────────────────
+  return React.createElement('div', { className: 'page' },
+    // Header
+    React.createElement('div', { style:{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:16, gap:16, flexWrap:'wrap' } },
+      React.createElement('div', null,
+        React.createElement('h2', { style:{ margin:0 } }, '🎓 Stage 1 AI Examples'),
+        React.createElement('div', { style:{ fontSize:12, color:'var(--text2)', marginTop:4, maxWidth:600, lineHeight:1.5 } },
+          'Few-shot калибровка для AI-скоринга. Изменения попадают в кэш Responses API и применяются на следующем цикле скоринга (~2 минуты).')
+      ),
+      React.createElement('button', {
+        className:'btn btn-primary btn-sm',
+        style:{ fontSize:13, padding:'8px 14px' },
+        onClick: () => openNew(tab)
+      }, '+ Добавить ' + (tab === 'example' ? 'example' : 'mistake'))
+    ),
+    // Budget bar
+    React.createElement('div', { className:'exp-budget' },
+      React.createElement('div', { className:'exp-budget-stat' },
+        React.createElement('span', { className:'exp-budget-num' }, enabledCount + ' / ' + items.length),
+        React.createElement('span', { className:'exp-budget-label' }, 'Активных')
+      ),
+      React.createElement('div', { className:'exp-budget-divider' }),
+      React.createElement('div', { className:'exp-budget-stat' },
+        React.createElement('span', { className:'exp-budget-num' }, '~' + tokenEst),
+        React.createElement('span', { className:'exp-budget-label' }, 'Токенов / цикл')
+      ),
+      React.createElement('div', { className:'exp-budget-divider' }),
+      React.createElement('div', { className:'exp-budget-stat', title: costTooltip },
+        React.createElement('span', { className:'exp-budget-num', style:{ color:'#22c55e' } }, costLabel),
+        React.createElement('span', { className:'exp-budget-label' }, 'Cost (с кэшем)')
+      ),
+      React.createElement('div', { style:{ flex:1 } }),
+      React.createElement('button', {
+        className:'exp-icon-btn',
+        onClick: () => setShowPreview(!showPreview)
+      }, showPreview ? '⌃ Скрыть preview' : '👁 Preview промпт')
+    ),
+    showPreview && React.createElement('pre', { className:'exp-preview-pre' }, buildPreview()),
+    // Tabs
+    React.createElement('div', { className:'exp-toolbar' },
+      React.createElement('div', { className:'exp-tabs' },
+        ...[['example', '📚 Examples', exampleCount], ['mistake', '⚠️ Mistakes', mistakeCount]].map(([k, l, n]) =>
+          React.createElement('button', {
+            key: k,
+            className: 'exp-tab' + (tab === k ? ' active' : ''),
+            onClick: () => setTab(k)
+          },
+            React.createElement('span', null, l),
+            React.createElement('span', { className:'exp-tab-count' }, n)
+          )
+        )
+      )
+    ),
+    // List or empty state
+    visible.length === 0
+      ? React.createElement('div', { className:'exp-empty' },
+          React.createElement('span', { className:'exp-empty-icon' }, tab === 'example' ? '📚' : '⚠️'),
+          React.createElement('div', { style:{ fontSize:14, marginBottom:8 } }, 'Пока пусто'),
+          React.createElement('div', { style:{ fontSize:12 } },
+            'Добавь первый ' + (tab === 'example' ? 'example' : 'mistake') + ' через кнопку выше')
+        )
+      : React.createElement('div', { className:'exp-grid' }, ...visible.map(renderCard)),
+    // Page-level status (only when modal isn't open)
+    !modalOpen && msg && React.createElement('div', { style:{ marginTop:14, fontSize:12 } },
+      React.createElement('span', { className: msg.includes('Ошибка') ? 'error-msg' : 'success-msg' }, msg)
+    ),
+    modal
+  );
+}
+
 function narrativeBox(label, content) {
   return React.createElement('div',{style:{marginBottom:12}},
     React.createElement('div',{style:{fontSize:10,color:'var(--text3)',marginBottom:4,fontWeight:600,letterSpacing:'.3px'}},label),
@@ -3505,12 +4590,13 @@ function App() {
     {id:'scanners',  icon:'⚙️',  label:'Сканеры'},
     {id:'submit',    icon:'🧪', label:'Ручной анализ'},
     {id:'decisions', icon:'🔔', label:'Алерты'},
+    {id:'examples',  icon:'🎓', label:'AI Examples'},
     {id:'users',     icon:'👥', label:'Пользователи'},
     {id:'payments',  icon:'💳', label:'Платежи'},
     {id:'bot',       icon:'🤖', label:'Бот и планы'},
   ];
 
-  const PAGE = {stats:StatsPage, scanners:ScannersPage, submit:SubmitPage, decisions:DecisionsPage, users:UsersPage, payments:PaymentsPage, bot:BotPage};
+  const PAGE = {stats:StatsPage, scanners:ScannersPage, submit:SubmitPage, decisions:DecisionsPage, examples:ExamplesPage, users:UsersPage, payments:PaymentsPage, bot:BotPage};
   const CurrentPage = PAGE[tab];
 
   return React.createElement('div',{className:'layout'},
@@ -3571,16 +4657,41 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
     const elapsedMs = Date.now() - startedAt;
     this.logger.info(`[ManualSubmit] done in ${elapsedMs}ms — trend #${dbId}, score=${trend.score}, meme=${trend.memePotential}, alerts=${alertResults.filter(a => a.ok).length}/${alertResults.length}`);
 
+    // Stage 2 status — explain to operator why deep-dive ran or didn't.
+    // Mirrors the gate logic in scorer.js (_buildAnalysisPipeline).
+    const s2Threshold = parseInt(this.db.getSetting?.('stage2Threshold', '60'), 10) || 60;
+    const s2Ran = !!trend.xSearchData;
+    let s2SkipReason = null;
+    if (!s2Ran) {
+      if ((trend.memePotential || 0) < s2Threshold) {
+        s2SkipReason = `memePotential ${trend.memePotential || 0} < threshold ${s2Threshold}`;
+      } else if (trend.source === 'google_trends') {
+        s2SkipReason = 'google_trends source skipped from Stage 2';
+      } else if (trend.clusterMetrics?.isNovel === false) {
+        s2SkipReason = 'duplicate cluster (isNovel=false)';
+      } else {
+        s2SkipReason = 'cap reached or Stage 2 disabled';
+      }
+    }
+
     return {
       ok: true,
       elapsedMs,
+      pipeline: {
+        stage1Ran: typeof trend.memePotential === 'number',
+        stage2Ran: s2Ran,
+        stage2SkipReason: s2SkipReason,
+        stage2Threshold: s2Threshold,
+      },
       trend: {
         id: dbId,
         source: trend.source,
         title: trend.title,
         originalTitle: trend.originalTitle || trend.title,
         url: trend.url,
+        description: trend.description || null,
         score: trend.score,
+        viralityScore: trend.viralityScore || null,
         memePotential: trend.memePotential,
         emergenceScore: trend.emergenceScore,
         adoptionScore: trend.adoptionScore,
@@ -3592,10 +4703,25 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
         aiExplanation: trend.aiExplanation,
         whyNow: trend.whyNow,
         triggerText: trend.triggerText || trend.trigger?.text || null,
+        triggerSources: trend.triggerSources || trend.trigger?.sources || [],
+        triggerConfidence: trend.triggerConfidence || trend.trigger?.confidence || 0,
         narrativePhase: trend.narrativePhase,
         marketStage: trend.marketStage,
         alertScore: trend.alertScore,
         junkPenalty: trend.junkPenalty,
+        // Stage 2 deep-dive — only populated when scorer ran x_search
+        xSearchData: trend.xSearchData || null,
+        // Bonus / penalty deltas applied by Stage 2 (helpful for explaining
+        // why memePotential moved between Stage 1 and final)
+        stage2Penalty:    trend.stage2Penalty    || null,
+        stage2StoryBonus: trend.stage2StoryBonus || null,
+        stage2NameBonus:  trend.stage2NameBonus  || null,
+        // Cluster routing inputs (Aggregator → Clusterer outputs)
+        clusterMetrics: trend.clusterMetrics || null,
+        memeShapeSignals: trend.metrics?.memeShapeSignals || null,
+        junkReasons: trend.clusterMetrics?.junkReasons || trend.metrics?.junkReasons || [],
+        // Stage 0 PreStage enrichment (nano text classifier + gemini vision)
+        preStage: trend.preStage || null,
         imageUrls: trend.metrics?.imageUrls || [],
         videoUrl: trend.metrics?.videoUrl || null,
         metrics: trend.metrics,
@@ -3680,6 +4806,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
       junkReasons:     metrics.junkReasons     ?? [],
       velocity:        metrics.velocity        ?? 0,
       uniquePlatforms: metrics.uniquePlatforms ?? 1,
+      // Stage 0 PreStage enrichment — restored from raw_metrics so the
+      // /api/send-alert flow and SubmitPage display see the same context
+      // Stage 1 actually saw at scoring time (no re-paying Gemini/nano).
+      preStage:        metrics.preStage        ?? null,
       aiExplanation:   row.ai_explanation,
       whyNow:          row.why_now || '',
       // Deep trigger from on-demand Grok-reasoning search (filled by Pro click,

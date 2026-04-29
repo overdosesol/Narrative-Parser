@@ -2,6 +2,7 @@
  * Alert formatter — creates localized messages for Telegram (HTML)
  */
 import { getTranslations } from '../i18n/index.js';
+import { normalizeLifespan } from '../analysis/lifespan.js';
 
 const SCORE_EMOJI = (score) => {
   if (score >= 90) return '\u{1F525}\u{1F525}\u{1F525}';
@@ -45,7 +46,9 @@ export function formatTelegramAlert(trend, lang = 'en') {
   const sources = trend.sources ? trend.sources.join(', ') : trend.source;
   const category = t.categories[trend.category] || trend.category || t.categories.other;
   const sentiment = t.sentiments[trend.sentiment] || trend.sentiment || t.sentiments.neutral;
-  const lifespan = t.lifespans[trend.predictedLifespan] || trend.predictedLifespan || t.lifespans.unknown;
+  // Normalize legacy descriptive forms from old DB rows before lookup.
+  const lspKey = normalizeLifespan(trend.predictedLifespan);
+  const lifespan = (lspKey && t.lifespans[lspKey]) || trend.predictedLifespan || t.lifespans.unknown;
 
   msg += DIV + '\n';
   msg += `${escHtml(category)}  \u00B7  ${escHtml(sentiment)}  \u00B7  ${escHtml(lifespan)}\n`;

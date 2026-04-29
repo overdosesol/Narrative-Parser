@@ -9,6 +9,13 @@
  *  - Better multilingual handling (trends come in all languages)
  */
 
+import { LIFESPAN_VALUES, LIFESPAN_DESCRIPTORS } from './lifespan.js';
+
+// Human-readable form for the Stage 1 prompt: "flash=hours, short=1-2 days, ..."
+const LIFESPAN_HINT = LIFESPAN_VALUES
+  .map(k => `${k}=${LIFESPAN_DESCRIPTORS[k]}`)
+  .join(', ');
+
 export const SYSTEM_PROMPT = `You are DEGEN-PARSER, a TRENDS / NARRATIVES analyst. Your focus is on spotting real viral narratives emerging on the internet — the kind of stories, memes, and moments that catch fire across platforms.
 
 Your ONLY job: analyze MAINSTREAM internet trends and determine which ones have genuine narrative/meme energy strong enough that degens on Solana could latch onto them in the next 24-72 hours. Focus on the TREND itself — its shape, novelty, and cultural pull — not on whether a specific coin exists.
@@ -55,6 +62,14 @@ IMPORTANT CONTEXT: The trends you receive are NOT from crypto communities. They 
 7. Never invent context. If you don't know the topic, score conservatively.
 8. Focus on NARRATIVE / MEME POTENTIAL not news importance. A silly cat video can score 90, a major political event scores 0.
 
+━━━ PRESTAGE METADATA (when present) ━━━
+Some trends include machine-generated metadata fields produced BEFORE you (Stage 0 preprocessors):
+- "Topic" / "Slang" / "Entities" / "Language": from a small text-classifier (gpt-5.4-nano)
+- "Visual" / "VisibleText" / "Mood" / "Video": from a vision model (Gemini Flash)
+These fields are FACTUAL DESCRIPTIONS, not opinions. Use them to UNDERSTAND what the post actually contains — especially when the title is just hashtags or non-English slang.
+DO NOT auto-boost score just because rich metadata was provided. A clear visual description of a boring scene is still a boring scene. A vivid bizarre-animal description IS a strong signal — but YOU decide that.
+If the metadata contradicts the title (e.g. title is wholesome but visual shows something offensive), trust the visual.
+
 Always respond with ONLY valid JSON. No markdown, no preamble, no explanation outside the JSON array.`;
 
 export function buildAnalysisPrompt(trends) {
@@ -63,6 +78,29 @@ export function buildAnalysisPrompt(trends) {
 
     if (t.description) {
       detail += `\n   Description: ${t.description}`;
+    }
+
+    // ── PreStage enrichment (Stage 0) — only present when PreStage ran ──
+    // Surface nano text-classifier and gemini vision outputs verbatim.
+    // None of these influence routing; they're context for the scorer.
+    const ps = t.preStage;
+    if (ps?.nano) {
+      const n = ps.nano;
+      if (n.topicSummary)                   detail += `\n   Topic: ${n.topicSummary}`;
+      if (Array.isArray(n.entityCanonical) && n.entityCanonical.length > 0)
+                                            detail += `\n   Entities: ${n.entityCanonical.slice(0, 8).join(', ')}`;
+      if (n.slangDecoded && n.slangDecoded.trim())
+                                            detail += `\n   Slang: ${n.slangDecoded}`;
+      if (n.language && n.language !== 'en') detail += `\n   Language: ${n.language}`;
+    }
+    if (ps?.gemini) {
+      const g = ps.gemini;
+      if (g.visualCaption)                  detail += `\n   Visual: ${g.visualCaption}`;
+      if (g.videoSummary && g.videoSummary.trim())
+                                            detail += `\n   Video: ${g.videoSummary}`;
+      if (g.visibleText && g.visibleText.trim())
+                                            detail += `\n   VisibleText: "${g.visibleText}"`;
+      if (g.mood)                           detail += `\n   Mood: ${g.mood}`;
     }
 
     // [MARKET_STAGE] optional context hint — remove 3 lines to disable
@@ -130,15 +168,84 @@ For EACH trend, return a JSON object with these exact fields:
 - "memePotential"     : 0-100 (how likely degens launch a Solana token today). MUST be 0 for boring/politics/sports-results.
 - "category"          : one of [meme, elon, animals, tech_drama, degenerates, celebrity, sports_degen, ai_drama, boring, other]
 - "sentiment"         : one of [positive, negative, neutral, mixed]
-- "explanation"       : 1-2 sentences WHY this is (or isn't) a great memecoin narrative — IN ENGLISH
+- "explanation"       : ONE short sentence (≤200 chars) WHY this is (or isn't) a great memecoin narrative — IN ENGLISH. Be terse: skip filler words like "this trend" / "is interesting because". State the reason directly.
 - "whyNow"            : ONE short sentence naming the specific, concrete EVENT driving this trend RIGHT NOW (who did what, or what just happened). Only fill this if the data clearly points to a real triggering event — a tweet by a named person, a news story, a launch, a scandal, a viral clip, etc. If there is NO obvious trigger, or you would have to guess, return an empty string "". Do NOT speculate. Do NOT restate the title. IN ENGLISH.
-- "predictedLifespan" : one of [flash (hours), short (1-2 days), medium (3-7 days), long (weeks+)]
+- "predictedLifespan" : one of [${LIFESPAN_VALUES.join(', ')}]   (${LIFESPAN_HINT})
+- "isGenuinelyInteresting": boolean — false ONLY for spam/bot/gibberish (also set memePotential to 0 in that case)
 
-Respond ONLY with a JSON array. No markdown fences, no extra text.
+Respond ONLY with a JSON object of shape { "trends": [ ... ] } where the array
+contains one object per input trend in the SAME ORDER. No markdown fences, no
+extra text. (When the model is invoked with a json_schema response format the
+schema is the source of truth — this text exists for non-strict providers.)
 
 TRENDS:
 ${trendList}`;
 }
+
+// ─── Stage 1 JSON schema (Structured Outputs) ────────────────────────────────
+//
+// Used with OpenAI Responses API `text.format = { type: "json_schema", ... }`.
+// Schema constraints enforced by the API:
+//   - root must be an object (we wrap the array in `{ trends: [...] }`)
+//   - every property must appear in `required`
+//   - `additionalProperties: false` everywhere
+//   - all enums must be exhaustive (we mirror the prompt rubric)
+//
+// Order of fields here must stay aligned with `_analyzeBatchStage1` consumer
+// in scorer.js — adding/removing a field requires both ends.
+export const STAGE1_RESPONSE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['trends'],
+  properties: {
+    trends: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: [
+          'title',
+          'viralityScore',
+          'memePotential',
+          'category',
+          'sentiment',
+          'explanation',
+          'whyNow',
+          'predictedLifespan',
+          'isGenuinelyInteresting',
+        ],
+        properties: {
+          title:                  { type: 'string', description: 'Trend title in English' },
+          viralityScore:          { type: 'integer', minimum: 0, maximum: 100 },
+          memePotential:          { type: 'integer', minimum: 0, maximum: 100 },
+          category: {
+            type: 'string',
+            enum: ['meme', 'elon', 'animals', 'tech_drama', 'degenerates',
+                   'celebrity', 'sports_degen', 'ai_drama', 'boring', 'other'],
+          },
+          sentiment: {
+            type: 'string',
+            enum: ['positive', 'negative', 'neutral', 'mixed'],
+          },
+          // Hard cap at 220 chars — strict json_schema enforces this on the
+          // model side, so we don't need a defensive trim downstream. 220
+          // (not 200) gives a small buffer for output tokenizer rounding.
+          // Originally "1-2 sentences" → models returned 300-500 chars,
+          // ballooning Stage 1 output cost AND polluting Stage 2's input.
+          explanation:            { type: 'string', maxLength: 220, description: 'ONE short sentence (≤200 chars) explaining memecoin potential — terse, no filler' },
+          whyNow:                 { type: 'string', description: 'Concrete trigger event in one short sentence, or empty string' },
+          predictedLifespan: {
+            type: 'string',
+            // Schema enum derived from LIFESPAN_VALUES so renaming breaks
+            // here too — no hardcoded duplicate list.
+            enum: [...LIFESPAN_VALUES, 'unknown'],
+          },
+          isGenuinelyInteresting: { type: 'boolean' },
+        },
+      },
+    },
+  },
+};
 
 // ─── Stage 2: X Search deep-dive prompt ──────────────────────────────────────
 
@@ -171,29 +278,41 @@ subjectName + nameStrength — tickerable proper name attached to the narrative.
 
 Respond with ONLY valid JSON. No markdown, no preamble.`;
 
+// Defensive cap on `aiExplanation` length when re-injected into Stage 2.
+// Stage 1's json_schema now enforces maxLength=220 on `explanation`, so
+// fresh outputs already arrive bounded. This cap stays as a safety net for:
+//   - Older DB rows from before the schema cap (re-scoring path)
+//   - Admin manual-submit flow that bypasses Stage 1's schema
+//   - Any future provider that silently ignores maxLength
+// Costs nothing — the cap is a no-op in the normal happy path.
+const STAGE2_EXPLANATION_CAP = 220;
+
 export function buildStage2Prompt(trend) {
   let detail = `Trend: "${trend.originalTitle || trend.title}"`;
   detail += `\nSource: ${trend.source}`;
-  if (trend.aiExplanation) detail += `\nInitial analysis: ${trend.aiExplanation}`;
-  detail += `\nInitial memePotential: ${trend.memePotential}`;
-  detail += `\nInitial viralityScore: ${trend.score}`;
-  detail += `\nCategory: ${trend.category}`;
+  if (trend.aiExplanation) {
+    const exp = String(trend.aiExplanation);
+    detail += `\nInitial analysis: ${
+      exp.length > STAGE2_EXPLANATION_CAP ? exp.slice(0, STAGE2_EXPLANATION_CAP) + '…' : exp
+    }`;
+  }
+  detail += `\nInitial scores: meme=${trend.memePotential}, viral=${trend.score}, cat=${trend.category}`;
   return `Verify this trend on X and adjust scores.
 
 ${detail}
 
-Return JSON with these fields ONLY:
-- "memePotential"     : adjusted 0-100
-- "viralityScore"     : adjusted 0-100
-- "xBuzz"             : [none|low|medium|high|explosive]
-- "narrativeMomentum" : [fading|flat|building|exploding]
-- "organicity"        : [organic|mixed|astroturf]
-- "storyScore"        : 0-100 (booster only)
-- "storyHook"         : ≤80 chars, ONE short sentence naming character/conflict/stakes. Empty string if storyScore < 30. ENGLISH.
-- "subjectName"       : proper name / ticker candidate, or "" if none
-- "nameStrength"      : 0-100 (0 if subjectName is "")
-
-JSON only, no markdown, no extra text.`;
+Return JSON ONLY (no markdown):
+{
+  "memePotential":      0-100,
+  "viralityScore":      0-100,
+  "xBuzz":              "none|low|medium|high|explosive",
+  "narrativeMomentum":  "fading|flat|building|exploding",
+  "organicity":         "organic|mixed|astroturf",
+  "storyScore":         0-100,
+  "storyHook":          "≤80 chars, character+conflict+stakes; empty if storyScore<30; ENGLISH",
+  "subjectName":        "proper noun / ticker candidate, or empty",
+  "nameStrength":       0-100
+}`;
 }
 
 // ─── Trigger search (on-demand, replaces whyItWillPump) ──────────────────────

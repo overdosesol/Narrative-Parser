@@ -13,6 +13,7 @@
 
 import http from 'http';
 import path from 'path';
+import { LIFESPAN_VALUES, normalizeLifespan } from '../analysis/lifespan.js';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { timingSafeEqual, createHash } from 'crypto';
@@ -231,8 +232,6 @@ class DashboardServer {
       if (path === '/api/config'    && method === 'GET')  return this._handleConfig(req, res);
       if (path === '/api/settings'  && method === 'GET')  return this._handleSettingsGet(req, res);
       if (path === '/api/settings'  && method === 'POST') return this._handleSettingsPost(req, res);
-      if (path === '/api/personalization' && method === 'GET')  return this._handlePersonalizationGet(req, res);
-      if (path === '/api/personalization' && method === 'POST') return this._handlePersonalizationPost(req, res);
       if (path === '/api/user/threshold'  && method === 'POST') return this._handleUserThresholdPost(req, res);
       if (path.match(/^\/api\/collectors\/[\w_]+\/toggle$/) && method === 'POST') return this._handleCollectorToggle(req, res, path);
       if (path.match(/^\/api\/trends\/\d+\/feedback$/) && method === 'POST') return this._handleTrendFeedback(req, res, path);
@@ -454,37 +453,14 @@ class DashboardServer {
 
     const sortParam = url.searchParams.get('sort') || 'rank';
 
-    // ── Personalized rank-sort ─────────────────────────────────────────────
-    // Only for authenticated users who left personalization enabled and have
-    // actually voted on something. Bakes a per-category boost into the SQL
-    // ORDER BY so pagination stays correct; untouched for other sort modes.
-    const authedChatId = String(req.user?.telegram_chat_id || '').trim() || null;
-    let personalBoostSql = '';
-    let activePrefs = null;
-    if (sortParam === 'rank' && authedChatId && this.db.getPersonalizationEnabled(authedChatId)) {
-      const prefs = this.db.getCategoryPreferences(authedChatId, 30);
-      const entries = Object.entries(prefs).filter(([, v]) => v !== 0);
-      if (entries.length) {
-        // Clamp each boost to ±15 so a single heavy category can't dominate.
-        const cases = entries
-          .map(([cat, v]) => {
-            const boost = Math.max(-15, Math.min(15, v));
-            // SQL-escape the category name (single quotes doubled).
-            const safe = String(cat).replace(/'/g, "''");
-            return `WHEN '${safe}' THEN ${boost}`;
-          })
-          .join(' ');
-        personalBoostSql = ` + (CASE category ${cases} ELSE 0 END)`;
-        activePrefs = prefs;
-      }
-    }
-
+    // Sort modes (no per-user personalization — removed 2026-04-27 along with
+    // the per-category boost. Rank is now the same global ordering for everyone.)
     let orderBy;
     if      (sortParam === 'time')      orderBy = 'first_seen_at DESC';
     else if (sortParam === 'virality')  orderBy = 'score DESC';
     else if (sortParam === 'meme')      orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC";
     else if (sortParam === 'emergence') orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) DESC";
-    else                                orderBy = `(CAST(JSON_EXTRACT(raw_metrics, '$.rankScore') AS INT)${personalBoostSql}) DESC`;
+    else                                orderBy = "CAST(JSON_EXTRACT(raw_metrics, '$.rankScore') AS INT) DESC";
 
     const cutoff = new Date(Date.now() - hours * 3_600_000).toISOString();
     let query = `SELECT * FROM trends WHERE first_seen_at > ?`;
@@ -510,12 +486,7 @@ class DashboardServer {
     const userId = String(req.user?.telegram_chat_id || '').trim() || null;
     const trends = rows.map(row => this._formatTrend(row, userId));
 
-    // When personalization was applied, echo a tiny summary so the client
-    // can show an indicator on the settings screen (active prefs map).
-    const payload = { trends, total, limit, offset };
-    if (activePrefs) payload.personalization = { active: true, prefs: activePrefs };
-
-    return json(res, 200, payload);
+    return json(res, 200, { trends, total, limit, offset });
   }
 
   _handleTrend(req, res, path) {
@@ -640,38 +611,6 @@ class DashboardServer {
   }
 
   /**
-   * GET /api/personalization — returns the current user's preference map
-   * (net 👍/👎 score per category over the last 30 days) plus the on/off
-   * toggle. Used by the settings UI to show "we're boosting X, damping Y".
-   */
-  _handlePersonalizationGet(req, res) {
-    const chatId = String(req.user?.telegram_chat_id || '').trim() || null;
-    if (!chatId) return json(res, 401, { error: 'Not authenticated' });
-    const enabled = this.db.getPersonalizationEnabled(chatId);
-    const prefs   = this.db.getCategoryPreferences(chatId, 30);
-    // Convert to a sorted array for stable UI rendering.
-    const list = Object.entries(prefs)
-      .map(([category, net]) => ({ category, net }))
-      .sort((a, b) => b.net - a.net);
-    return json(res, 200, { enabled, prefs: list });
-  }
-
-  /**
-   * POST /api/personalization — accepts `{ enabled: boolean }` and persists
-   * the toggle on the user row. No-op if already in that state.
-   */
-  async _handlePersonalizationPost(req, res) {
-    const chatId = String(req.user?.telegram_chat_id || '').trim() || null;
-    if (!chatId) return json(res, 401, { error: 'Not authenticated' });
-    let body;
-    try { body = await parseBody(req); }
-    catch { return json(res, 400, { error: 'Invalid JSON' }); }
-    const enabled = !!body?.enabled;
-    this.db.setPersonalizationEnabled(chatId, enabled);
-    return json(res, 200, { ok: true, enabled });
-  }
-
-  /**
    * POST /api/user/threshold — user sets their personal alertScore sensitivity.
    * This is the single slider the user tunes in dashboard settings: higher =
    * fewer, only very strong alerts; lower = more alerts. Gated by the global
@@ -726,33 +665,69 @@ class DashboardServer {
     try { body = await parseBody(req); }
     catch (e) { return json(res, 400, { error: e.message }); }
 
-    const vote = parseInt(body?.vote, 10);
-    if (![1, -1, 0].includes(vote)) return json(res, 400, { error: 'vote must be 1, -1 or 0' });
+    // `vote` is optional when the client is ONLY updating the reason text on
+    // an existing vote — in that case we keep whatever vote the user already
+    // has. Validate only when supplied.
+    const voteRaw = body?.vote;
+    const isVoteUpdate = voteRaw !== undefined && voteRaw !== null;
+    let vote = null;
+    if (isVoteUpdate) {
+      vote = parseInt(voteRaw, 10);
+      if (![1, -1, 0].includes(vote)) return json(res, 400, { error: 'vote must be 1, -1 or 0' });
+    }
+
+    // Optional free-form reason. Trimmed/capped is handled by db.setFeedbackReason.
+    // `null` / empty string explicitly clears any previous reason.
+    const reasonProvided = Object.prototype.hasOwnProperty.call(body || {}, 'reason');
+    const reasonRaw = reasonProvided ? body.reason : undefined;
 
     const trend = this.db.getTrendById ? this.db.getTrendById(trendId) : null;
     if (!trend) return json(res, 404, { error: 'Trend not found' });
 
-    // Toggle off if the same vote is sent twice
+    // Toggle off if the same vote is sent twice. When the call is reason-only
+    // (no vote field), keep the existing vote untouched.
     const prev = this.db.getUserVote ? this.db.getUserVote(trendId, userId) : null;
-    const finalVote = (vote !== 0 && prev === vote) ? 0 : vote;
+    let finalVote;
+    if (isVoteUpdate) {
+      finalVote = (vote !== 0 && prev === vote) ? 0 : vote;
 
-    // Weight follows the authenticated user's plan (same as TG bot reactions).
-    const weightingEnabled = this.db?.getSetting?.('feedbackWeightingEnabled', '1') !== '0';
-    let weight = 1;
-    if (weightingEnabled) {
-      const key = 'feedbackWeight' + planName.charAt(0).toUpperCase() + planName.slice(1);
-      weight = parseFloat(this.db?.getSetting?.(key, planName === 'admin' ? '3' : planName === 'pro' ? '2' : '1') || '1');
+      // Weight follows the authenticated user's plan (same as TG bot reactions).
+      const weightingEnabled = this.db?.getSetting?.('feedbackWeightingEnabled', '1') !== '0';
+      let weight = 1;
+      if (weightingEnabled) {
+        const key = 'feedbackWeight' + planName.charAt(0).toUpperCase() + planName.slice(1);
+        weight = parseFloat(this.db?.getSetting?.(key, planName === 'admin' ? '3' : planName === 'pro' ? '2' : '1') || '1');
+      } else {
+        weight = planName === 'admin' ? 1 : 0;
+      }
+      this.db.recordFeedback(trendId, userId, finalVote, weight, planName);
     } else {
-      weight = planName === 'admin' ? 1 : 0;
+      // Reason-only call. If user has no vote, there's nothing to attach the
+      // reason to — surface that explicitly so the UI can prompt to vote first.
+      finalVote = prev || 0;
+      if (finalVote === 0 && reasonProvided && reasonRaw && String(reasonRaw).trim()) {
+        return json(res, 409, { error: 'No active vote to attach a reason to', code: 'no_vote' });
+      }
     }
-    this.db.recordFeedback(trendId, userId, finalVote, weight, planName);
+
+    // Persist reason if the client supplied the field. Skipped when finalVote
+    // is 0 (toggled off) — recordFeedback already deleted the row, so there's
+    // nothing to attach. Empty string / null explicitly clears it.
+    if (reasonProvided && finalVote !== 0) {
+      const cleaned = (reasonRaw == null) ? null : String(reasonRaw);
+      this.db.setFeedbackReason(trendId, userId, cleaned);
+    }
 
     const stats = this.db.getFeedbackStats(trendId);
+    const after = this.db.getUserVoteWithReason
+      ? this.db.getUserVoteWithReason(trendId, userId)
+      : null;
     return json(res, 200, {
       likes:    stats.likes    || 0,
       dislikes: stats.dislikes || 0,
       score:    stats.weightedScore || 0,
       userVote: finalVote || 0,
+      userReason: after?.reason || '',
     });
   }
 
@@ -900,8 +875,8 @@ class DashboardServer {
   _formatTrend(row, userId = null) {
     let metrics = {};
     try { metrics = JSON.parse(row.raw_metrics || '{}'); } catch (e) {}
-    // Feedback (likes / dislikes / user's current vote)
-    let feedback = { likes: 0, dislikes: 0, score: 0, userVote: 0 };
+    // Feedback (likes / dislikes / user's current vote + their attached reason)
+    let feedback = { likes: 0, dislikes: 0, score: 0, userVote: 0, userReason: '' };
     try {
       const fb = this.db.getFeedbackStats ? this.db.getFeedbackStats(row.id) : null;
       if (fb) {
@@ -909,8 +884,17 @@ class DashboardServer {
         feedback.dislikes = fb.dislikes || 0;
         feedback.score    = fb.weightedScore || 0;
       }
-      if (userId && this.db.getUserVote) {
-        feedback.userVote = this.db.getUserVote(row.id, userId) || 0;
+      if (userId) {
+        // Prefer the combined helper so we hydrate vote + reason in one query.
+        if (this.db.getUserVoteWithReason) {
+          const vr = this.db.getUserVoteWithReason(row.id, userId);
+          if (vr) {
+            feedback.userVote   = vr.vote || 0;
+            feedback.userReason = vr.reason || '';
+          }
+        } else if (this.db.getUserVote) {
+          feedback.userVote = this.db.getUserVote(row.id, userId) || 0;
+        }
       }
     } catch (e) {}
     return {
@@ -948,7 +932,9 @@ class DashboardServer {
         confidence:  row.trigger_confidence | 0,
         searchedAt:  row.trigger_searched_at,
       } : null,
-      predictedLifespan: row.predicted_lifespan,
+      // Normalize legacy descriptive form ("flash (hours)") from rows scored
+      // before the bare-keyword migration; SPA only knows bare keywords.
+      predictedLifespan: normalizeLifespan(row.predicted_lifespan),
       url:             row.url,
       tgMessageUrl:    metrics.tgMessageUrl || null,
       userFeedback:    row.user_feedback || 0,
@@ -2737,6 +2723,10 @@ class DashboardServer {
       background: #0a0a12;
       border: 1px solid var(--border);
       display: flex; align-items: center; justify-content: center;
+      /* Fixed min-height keeps the frame from collapsing when the video
+         element renders at its 300×150 default before metadata loads,
+         or when a Twitter poster URL is an oddly cropped banner. */
+      min-height: 260px;
       max-height: 440px;
     }
     .modal-image {
@@ -2746,6 +2736,12 @@ class DashboardServer {
       max-height: 440px;
       object-fit: contain;
     }
+    /* <video> has no intrinsic size until metadata loads (default 300×150,
+       i.e. 2:1). With width:100% + height:auto that produces a flat letterbox
+       and the poster gets squashed to a thin strip. Force a sane 16:9 default
+       — once the real video metadata arrives the browser updates intrinsic
+       dimensions and aspect-ratio is overridden by the natural ratio. */
+    video.modal-image { aspect-ratio: 16 / 9; height: 100%; }
     .modal-image-loading {
       height: 220px; border-radius: 8px;
       background: linear-gradient(90deg, var(--card2) 25%, var(--card3) 50%, var(--card2) 75%);
@@ -2766,14 +2762,7 @@ class DashboardServer {
     .modal-section-content { font-size: 12px; color: var(--text2); line-height: 1.55; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 11px 13px; }
     .modal-section-content.pump { color: var(--orange); border-color: rgba(var(--orange-rgb), .15); background: rgba(var(--orange-rgb), .05); }
     .modal-section-content.why-now { color: #ff6b6b; border-color: rgba(255, 107, 107, .18); background: rgba(255, 107, 107, .06); font-weight: 500; }
-    .pref-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-    .pref-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 999px; font-size: 11px; font-weight: 500; border: 1px solid var(--border); background: var(--card); }
-    .pref-chip-name { color: var(--text2); text-transform: capitalize; }
-    .pref-chip-val  { font-variant-numeric: tabular-nums; font-weight: 600; }
-    .pref-chip.up   { border-color: rgba(34, 197, 94, .25); background: rgba(34, 197, 94, .06); }
-    .pref-chip.up .pref-chip-val   { color: #22c55e; }
-    .pref-chip.down { border-color: rgba(255, 107, 107, .22); background: rgba(255, 107, 107, .05); }
-    .pref-chip.down .pref-chip-val { color: #ff6b6b; }
+    /* .pref-chip* CSS removed 2026-04-27 with PersonalizationCard. */
     .modal-stats-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }
     .modal-stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; }
     .modal-stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: .7px; color: var(--dim); font-weight: 600; }
@@ -3040,6 +3029,64 @@ class DashboardServer {
     .fb-bar-modal .fb-btn .fb-ico { font-size: 14px; }
     .fb-bar-modal .fb-btn .fb-count { font-size: 12px; }
 
+    /* ── Inline "why this rating?" editor (modal variant only) ── */
+    /* Sits directly under the like/dislike buttons. Appears only when the
+       user has an active vote — gives them a place to explain WHY they
+       voted, which the scorer surfaces as Liked/Disliked examples to AI. */
+    .fb-reason {
+      margin-top: 8px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .fb-reason-label {
+      font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
+      text-transform: uppercase; color: var(--muted);
+      display: flex; align-items: center; gap: 5px;
+    }
+    .fb-reason-textarea {
+      width: 100%; min-height: 56px; max-height: 140px;
+      padding: 8px 10px; box-sizing: border-box;
+      background: rgba(255,255,255,.025); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      font-family: inherit; font-size: 12.5px; line-height: 1.4;
+      resize: vertical; outline: none;
+      transition: border-color .15s, background .15s;
+    }
+    .fb-reason-textarea:focus {
+      border-color: rgba(var(--accent-rgb), .45);
+      background: rgba(255,255,255,.04);
+    }
+    .fb-reason-textarea::placeholder { color: var(--dim); }
+    .fb-reason-foot {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; font-size: 10.5px;
+    }
+    .fb-reason-count { color: var(--dim); font-family: 'JetBrains Mono', monospace; }
+    .fb-reason-count.over { color: var(--red2); }
+    .fb-reason-actions { display: flex; gap: 6px; }
+    .fb-reason-btn {
+      padding: 5px 11px; border-radius: 6px;
+      font-family: inherit; font-size: 11px; font-weight: 600;
+      cursor: pointer; transition: all .15s;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,.02); color: var(--muted);
+    }
+    .fb-reason-btn:hover:not(:disabled) {
+      color: var(--text); background: rgba(255,255,255,.05);
+    }
+    .fb-reason-btn:disabled { opacity: .45; cursor: not-allowed; }
+    .fb-reason-btn.primary {
+      border-color: rgba(var(--accent-rgb), .35);
+      color: var(--accent2);
+      background: var(--accent-glow);
+    }
+    .fb-reason-btn.primary:hover:not(:disabled) {
+      background: rgba(var(--accent-rgb), .18);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .35);
+    }
+    .fb-reason-status {
+      font-size: 10.5px; color: var(--accent2); opacity: .9;
+    }
+    .fb-reason-status.error { color: var(--red2); }
+
     /* ── Feed list / cards ── */
     .feed-list {
       display: flex; flex-direction: column; gap: 8px;
@@ -3165,7 +3212,11 @@ class DashboardServer {
       object-fit: contain;
     }
     body.prefs-compact .img-carousel { height: 280px; }
-    .img-carousel.in-modal { height: 440px; border-radius: 8px; }
+    /* in-modal MUST beat body.prefs-compact (which has higher specificity)
+       — without the body-prefix the prefs-compact rule wins and the modal
+       carousel collapses to 280px even on desktop. */
+    .img-carousel.in-modal,
+    body.prefs-compact .img-carousel.in-modal { height: 440px; border-radius: 8px; }
     .img-carousel-nav {
       position: absolute; top: 50%; transform: translateY(-50%);
       width: 38px; height: 38px; border-radius: 50%;
@@ -3519,6 +3570,9 @@ class DashboardServer {
 const { useState, useEffect, useCallback, useRef } = React;
 const h = React.createElement;
 
+// Server-injected — single source of truth lives in src/analysis/lifespan.js.
+const LIFESPAN_VALUES = ${JSON.stringify(LIFESPAN_VALUES)};
+
 // ── Auth token ────────────────────────────────────────────────────────────
 // Login is Telegram-bot-only. The bot issues a 6-digit code bound to a session;
 // verifying the code returns a 64-hex bearer token that is attached to every
@@ -3674,6 +3728,15 @@ const I18N = {
     'feedback.unlike': 'Undo like',
     'feedback.dislike': 'Dislike',
     'feedback.undislike': 'Undo dislike',
+    'feedback.reason.label': 'Why this rating?',
+    'feedback.reason.placeholder': 'One short sentence — what made this great or off?',
+    'feedback.reason.save': 'Save',
+    'feedback.reason.clear': 'Clear',
+    'feedback.reason.saved': 'Saved — AI will use it next cycle',
+    'feedback.reason.cleared': 'Reason cleared',
+    'feedback.reason.error': 'Could not save — try again',
+    'feedback.reason.too_long': 'Max 240 characters',
+    'feedback.reason.help': 'Vote first, then add a reason',
 
     // Feed panel
     'feed.panel.title': 'Narrative Feed',
@@ -3760,8 +3823,8 @@ const I18N = {
     'modal.lifespan': 'Lifespan',
     'modal.virality': 'Virality',
     'modal.sentiment': 'Vibe',
-    'modal.seen': 'Seen',
-    'modal.seen_suffix': 'x',
+    'modal.platforms': 'Platforms',
+    'modal.velocity': 'Velocity',
     'modal.feedback': '💬 Your take',
     'modal.links': '🔗 Links',
     'modal.source_link': '{ico} Source →',
@@ -3813,11 +3876,6 @@ const I18N = {
     'settings.col_right': 'Right column width',
     'settings.col_right_desc': 'Insights / stats panel width. Currently {px}px.',
 
-    'settings.personalization': '🎯 Personalization',
-    'settings.personalization_desc': 'Your 👍 / 👎 votes re-rank the feed. Categories you liked get a boost, ones you disliked get damped. Only affects the default "Rank" sort.',
-    'settings.personalization_toggle': 'Personalized ranking',
-    'settings.personalization_toggle_desc': 'Turn off to see the raw global ranking.',
-    'settings.personalization_empty': 'No votes yet — react to a few trends with 👍 or 👎 to train the feed.',
 
     'settings.behavior': '🔄 Behavior',
     'settings.behavior_desc': 'Source visibility in the feed. New data arrives live — no auto-refresh timer needed.',
@@ -3953,6 +4011,15 @@ const I18N = {
     'feedback.unlike': 'Убрать лайк',
     'feedback.dislike': 'Дизлайк',
     'feedback.undislike': 'Убрать дизлайк',
+    'feedback.reason.label': 'Почему такая оценка?',
+    'feedback.reason.placeholder': 'Одно короткое предложение — что зашло или не зашло?',
+    'feedback.reason.save': 'Сохранить',
+    'feedback.reason.clear': 'Очистить',
+    'feedback.reason.saved': 'Сохранено — AI учтёт в следующем цикле',
+    'feedback.reason.cleared': 'Причина очищена',
+    'feedback.reason.error': 'Не удалось сохранить — попробуй ещё раз',
+    'feedback.reason.too_long': 'Максимум 240 символов',
+    'feedback.reason.help': 'Сначала проголосуй, потом добавь причину',
 
     // Feed panel
     'feed.panel.title': 'Фид нарративов',
@@ -4039,8 +4106,8 @@ const I18N = {
     'modal.lifespan': 'Срок жизни',
     'modal.virality': 'Виральность',
     'modal.sentiment': 'Сентимент',
-    'modal.seen': 'Видели',
-    'modal.seen_suffix': 'раз',
+    'modal.platforms': 'Платформ',
+    'modal.velocity': 'Скорость',
     'modal.feedback': '💬 Ваша оценка',
     'modal.links': '🔗 Ссылки',
     'modal.source_link': '{ico} Источник →',
@@ -4092,11 +4159,6 @@ const I18N = {
     'settings.col_right': 'Ширина правой колонки',
     'settings.col_right_desc': 'Панель инсайтов и статистики. Сейчас {px}px.',
 
-    'settings.personalization': '🎯 Персонализация',
-    'settings.personalization_desc': 'Твои голоса 👍 / 👎 подстраивают ленту. Категории, которые ты лайкал, получают буст, дизлайкнутые — штраф. Работает только в дефолтной сортировке «Rank».',
-    'settings.personalization_toggle': 'Персональный ранг',
-    'settings.personalization_toggle_desc': 'Выключи, чтобы видеть обычный глобальный ранг.',
-    'settings.personalization_empty': 'Голосов ещё нет — оцени несколько трендов через 👍/👎, и лента начнёт подстраиваться.',
 
     'settings.behavior': '🔄 Поведение',
     'settings.behavior_desc': 'Видимость источников в фиде. Новые данные приходят в реальном времени — таймер автообновления не нужен.',
@@ -4180,16 +4242,6 @@ function useLang() {
   return lang;
 }
 function localeTag() { return CURRENT_LANG === 'ru' ? 'ru-RU' : 'en-US'; }
-// Russian plural for the "seen" counter: 1 раз, 2 раза, 5 раз, 11 раз, 21 раз…
-function pluralSeen(n) {
-  const num = Number(n) || 0;
-  if (CURRENT_LANG !== 'ru') return num + 'x';
-  const mod10  = num % 10;
-  const mod100 = num % 100;
-  if (mod10 === 1 && mod100 !== 11) return num + ' раз';
-  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return num + ' раза';
-  return num + ' раз';
-}
 function useTheme() {
   const [theme, setThemeState] = useState(CURRENT_THEME);
   useEffect(() => onThemeChange(setThemeState), []);
@@ -4219,14 +4271,14 @@ const SOURCE_LABELS = { reddit: 'Reddit', google_trends: 'Google', twitter: 'Twi
 const CAT_ICONS     = { meme:'😂', elon:'🚀', animals:'🐾', tech_drama:'💻', degenerates:'🎰', celebrity:'⭐', sports_degen:'🏆', ai_drama:'🤖', boring:'😴', other:'📌' };
 const CAT_CLS       = { meme:'cat-meme', elon:'cat-elon', animals:'cat-animals', tech_drama:'cat-tech_drama', degenerates:'cat-degenerates', celebrity:'cat-celebrity', sports_degen:'cat-sports_degen', ai_drama:'cat-ai_drama', boring:'cat-boring', other:'cat-other' };
 
-// Lifespan key → i18n token. Resolve with lifespanLabel(key).
-const LIFESPAN_KEYS = {
-  'flash (hours)':     'lifespan.flash',
-  'short (1-2 days)':  'lifespan.short',
-  'medium (3-7 days)': 'lifespan.medium',
-  'long (weeks+)':     'lifespan.long',
-  'unknown':           'lifespan.unknown',
-};
+// Lifespan key → i18n token. Built from LIFESPAN_VALUES injected by the
+// server (see src/analysis/lifespan.js). Renaming a value there triggers
+// loud failures upstream (i18n assertCoversLifespans + scorer normalize)
+// rather than silent '—' here.
+const LIFESPAN_KEYS = LIFESPAN_VALUES.reduce(
+  (m, k) => { m[k] = 'lifespan.' + k; return m; },
+  { unknown: 'lifespan.unknown' }
+);
 function lifespanLabel(k) {
   const key = LIFESPAN_KEYS[k];
   return key ? t(key) : '—';
@@ -4521,20 +4573,53 @@ function FeedImage({ trend }) {
 
 // ── FeedCard — new social-feed-style narrative card ──────────────────────────
 // ── Feedback bar (👍 / 👎) — canonical pill style ────────────────────────────
+// In the modal variant, the like/dislike buttons are followed by an inline
+// "Why this rating?" textarea — only rendered while userVote !== 0. The
+// reason text is sent to POST /feedback alongside (or independently of) the
+// vote and is later surfaced to the AI scorer as a Liked/Disliked example.
+const REASON_MAX = 240;
+
 function FeedbackBar({ trend, variant }) {
-  const initial = trend.feedback || { likes: 0, dislikes: 0, userVote: 0 };
+  const initial = trend.feedback || { likes: 0, dislikes: 0, userVote: 0, userReason: '' };
   const [likes,    setLikes]    = useState(initial.likes    || 0);
   const [dislikes, setDislikes] = useState(initial.dislikes || 0);
   const [userVote, setUserVote] = useState(initial.userVote || 0);
   const [busy, setBusy] = useState(false);
 
-  // Resync when the trend prop changes (e.g. list refresh)
+  // Reason editor state (modal variant only — but kept in this component so
+  // the textarea picks up the freshest reason on every prop refresh).
+  const [reasonDraft, setReasonDraft] = useState(initial.userReason || '');
+  const [savedReason, setSavedReason] = useState(initial.userReason || '');
+  const [reasonBusy,  setReasonBusy]  = useState(false);
+  const [statusMsg,   setStatusMsg]   = useState('');
+  const [statusErr,   setStatusErr]   = useState(false);
+  const statusTimerRef = useRef(null);
+
+  // Resync when the trend prop changes (e.g. list refresh / reopen modal)
   useEffect(() => {
-    const fb = trend.feedback || { likes: 0, dislikes: 0, userVote: 0 };
+    const fb = trend.feedback || { likes: 0, dislikes: 0, userVote: 0, userReason: '' };
     setLikes(fb.likes || 0);
     setDislikes(fb.dislikes || 0);
     setUserVote(fb.userVote || 0);
-  }, [trend.id, trend.feedback && trend.feedback.likes, trend.feedback && trend.feedback.dislikes, trend.feedback && trend.feedback.userVote]);
+    // Only reset the draft when the saved reason actually changes — this
+    // avoids stomping on a half-typed message if the parent re-renders for
+    // an unrelated reason (likes count tick from someone else's vote).
+    const incomingReason = fb.userReason || '';
+    if (incomingReason !== savedReason) {
+      setSavedReason(incomingReason);
+      setReasonDraft(incomingReason);
+    }
+  }, [trend.id, trend.feedback && trend.feedback.likes, trend.feedback && trend.feedback.dislikes, trend.feedback && trend.feedback.userVote, trend.feedback && trend.feedback.userReason]);
+
+  // Surface a status hint for ~2s after a save/clear so the user gets
+  // visible confirmation. Cleared on unmount.
+  const flashStatus = (msg, isErr = false) => {
+    setStatusMsg(msg);
+    setStatusErr(isErr);
+    if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
+    statusTimerRef.current = setTimeout(() => setStatusMsg(''), 2400);
+  };
+  useEffect(() => () => { if (statusTimerRef.current) clearTimeout(statusTimerRef.current); }, []);
 
   const vote = async (next) => {
     if (busy) return;
@@ -4557,11 +4642,19 @@ function FeedbackBar({ trend, variant }) {
       setLikes(res.likes || 0);
       setDislikes(res.dislikes || 0);
       setUserVote(res.userVote || 0);
+      // Vote-flip / toggle-off wipes the previously saved reason on the
+      // server (see db.recordFeedback). Mirror that on the client so the
+      // textarea doesn't show stale text. If the server kept it (same-vote
+      // re-press is a no-op), the response carries it back unchanged.
+      const newReason = res.userReason || '';
+      setSavedReason(newReason);
+      setReasonDraft(newReason);
       // Keep trend.feedback cache in sync (affects resync on unrelated updates)
       if (trend.feedback) {
         trend.feedback.likes = res.likes || 0;
         trend.feedback.dislikes = res.dislikes || 0;
         trend.feedback.userVote = res.userVote || 0;
+        trend.feedback.userReason = newReason;
       }
     } catch (err) {
       // Revert on failure
@@ -4571,27 +4664,103 @@ function FeedbackBar({ trend, variant }) {
     }
   };
 
-  return h('div', {
-    className: 'fb-bar' + (variant === 'modal' ? ' fb-bar-modal' : ''),
-    onClick: e => e.stopPropagation()
-  },
-    h('button', {
-      className: 'fb-btn fb-like' + (userVote === 1 ? ' active' : ''),
-      onClick: e => { e.stopPropagation(); vote(1); },
-      disabled: busy,
-      title: userVote === 1 ? t('feedback.unlike') : t('feedback.like')
+  const saveReason = async (textOverride) => {
+    if (reasonBusy) return;
+    if (userVote === 0) return; // guarded — UI hides the controls anyway
+    const raw = (textOverride !== undefined ? textOverride : reasonDraft) || '';
+    if (raw.length > REASON_MAX) {
+      flashStatus(t('feedback.reason.too_long'), true);
+      return;
+    }
+    setReasonBusy(true);
+    try {
+      const res = await api('/trends/' + trend.id + '/feedback', {
+        method: 'POST',
+        // Reason-only update — vote field deliberately omitted so the server
+        // keeps the existing vote intact (see _handleTrendFeedback).
+        body: JSON.stringify({ reason: raw }),
+      });
+      const newReason = res.userReason || '';
+      setSavedReason(newReason);
+      setReasonDraft(newReason);
+      if (trend.feedback) trend.feedback.userReason = newReason;
+      flashStatus(newReason ? t('feedback.reason.saved') : t('feedback.reason.cleared'));
+    } catch (err) {
+      flashStatus(t('feedback.reason.error'), true);
+    } finally {
+      setReasonBusy(false);
+    }
+  };
+
+  const showReasonEditor = variant === 'modal' && userVote !== 0;
+  const draftLen   = (reasonDraft || '').length;
+  const isOverCap  = draftLen > REASON_MAX;
+  const isDirty    = (reasonDraft || '') !== (savedReason || '');
+  const canSave    = isDirty && !isOverCap && !reasonBusy;
+  const canClear   = !!savedReason && !reasonBusy;
+
+  return h('div', { className: 'fb-wrap', onClick: e => e.stopPropagation() },
+    h('div', {
+      className: 'fb-bar' + (variant === 'modal' ? ' fb-bar-modal' : ''),
     },
-      h('span', { className: 'fb-ico' }, '👍'),
-      h('span', { className: 'fb-count' }, likes)
+      h('button', {
+        className: 'fb-btn fb-like' + (userVote === 1 ? ' active' : ''),
+        onClick: e => { e.stopPropagation(); vote(1); },
+        disabled: busy,
+        title: userVote === 1 ? t('feedback.unlike') : t('feedback.like')
+      },
+        h('span', { className: 'fb-ico' }, '👍'),
+        h('span', { className: 'fb-count' }, likes)
+      ),
+      h('button', {
+        className: 'fb-btn fb-dislike' + (userVote === -1 ? ' active' : ''),
+        onClick: e => { e.stopPropagation(); vote(-1); },
+        disabled: busy,
+        title: userVote === -1 ? t('feedback.undislike') : t('feedback.dislike')
+      },
+        h('span', { className: 'fb-ico' }, '👎'),
+        h('span', { className: 'fb-count' }, dislikes)
+      )
     ),
-    h('button', {
-      className: 'fb-btn fb-dislike' + (userVote === -1 ? ' active' : ''),
-      onClick: e => { e.stopPropagation(); vote(-1); },
-      disabled: busy,
-      title: userVote === -1 ? t('feedback.undislike') : t('feedback.dislike')
-    },
-      h('span', { className: 'fb-ico' }, '👎'),
-      h('span', { className: 'fb-count' }, dislikes)
+    showReasonEditor && h('div', { className: 'fb-reason' },
+      h('div', { className: 'fb-reason-label' },
+        h('span', null, '✏️ ' + t('feedback.reason.label'))
+      ),
+      h('textarea', {
+        className: 'fb-reason-textarea',
+        placeholder: t('feedback.reason.placeholder'),
+        maxLength: REASON_MAX + 50, // soft cap; server enforces 240
+        value: reasonDraft,
+        disabled: reasonBusy,
+        onChange: e => setReasonDraft(e.target.value),
+        onKeyDown: e => {
+          // Cmd/Ctrl + Enter saves — common pattern for chat inputs
+          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && canSave) {
+            e.preventDefault();
+            saveReason();
+          }
+        }
+      }),
+      h('div', { className: 'fb-reason-foot' },
+        h('span', {
+          className: 'fb-reason-count' + (isOverCap ? ' over' : '')
+        }, draftLen + ' / ' + REASON_MAX),
+        h('div', { className: 'fb-reason-actions' },
+          canClear && h('button', {
+            className: 'fb-reason-btn',
+            onClick: e => { e.stopPropagation(); setReasonDraft(''); saveReason(''); },
+            disabled: reasonBusy,
+          }, t('feedback.reason.clear')),
+          h('button', {
+            className: 'fb-reason-btn primary',
+            onClick: e => { e.stopPropagation(); saveReason(); },
+            disabled: !canSave,
+          }, t('feedback.reason.save'))
+        )
+      ),
+      statusMsg && h('div', {
+        className: 'fb-reason-status' + (statusErr ? ' error' : '')
+      }, statusMsg)
     )
   );
 }
@@ -4636,7 +4805,6 @@ function FeedCard({ trend, onOpen }) {
   if (platforms > 1) metaParts.push(platforms + 'p');
   const vel = fmtVelocity(velocity);
   if (vel) metaParts.push(vel);
-  if (trend.timesSeen > 1) metaParts.push(trend.timesSeen + 'x');
 
   return h('div', { className: 'feed-card', onClick: handleClick },
     h('div', { className: 'feed-card-head' },
@@ -5161,10 +5329,38 @@ function TrendModal({ trend, onClose, me = null }) {
               h('div', { className: 'modal-stat-label' }, t('modal.sentiment')),
               h('span', { className: sentCls }, sentLabel)
             ),
-            h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, t('modal.seen')),
-              h('span', { style: { fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700 } }, pluralSeen(trend.timesSeen || 1))
-            )
+            // Platforms — cross-platform signal. 1 = monoplatform (muted),
+            // ≥2 = highlighted green (the trend escaped its origin niche).
+            (() => {
+              const p = trend.uniquePlatforms || 1;
+              const cross = p >= 2;
+              return h('div', { className: 'modal-stat' },
+                h('div', { className: 'modal-stat-label' }, t('modal.platforms')),
+                h('span', {
+                  style: {
+                    fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700,
+                    color: cross ? '#22c55e' : 'var(--text2)',
+                  },
+                  title: cross
+                    ? (CURRENT_LANG === 'ru' ? 'Кросс-платформа — мем вышел за пределы одного источника' : 'Cross-platform — escaped origin')
+                    : (CURRENT_LANG === 'ru' ? 'Только один источник' : 'Single source')
+                }, cross ? ('🌐 ' + p) : String(p))
+              );
+            })(),
+            // Velocity — growth rate per hour. fmtVelocity returns null when
+            // velocity ≤ 0; we render an em-dash so the cell stays balanced.
+            (() => {
+              const vel = fmtVelocity(trend.velocity || 0);
+              return h('div', { className: 'modal-stat' },
+                h('div', { className: 'modal-stat-label' }, t('modal.velocity')),
+                h('span', {
+                  style: {
+                    fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700,
+                    color: vel ? 'var(--accent2)' : 'var(--dim)',
+                  }
+                }, vel || '—')
+              );
+            })()
           )
         )
       )
@@ -5518,62 +5714,16 @@ const Row = ({ icon, title, desc, control }) =>
     h('div', { className: 'setting-control' }, control)
   );
 
-// ── PersonalizationCard ───────────────────────────────────────────────────────
-// Fetches the current user's category preference map plus the on/off toggle.
-// Shows the user a transparent view of "the feed boosts these categories and
-// damps those" so they can trust or disable it. No per-trend badges on cards.
-function PersonalizationCard() {
-  const [loading, setLoading] = useState(true);
-  const [enabled, setEnabled] = useState(true);
-  const [prefs,   setPrefs]   = useState([]);     // [{ category, net }]
-  const [err,     setErr]     = useState(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    api('/personalization')
-      .then(d => {
-        if (cancelled) return;
-        setEnabled(!!d.enabled);
-        setPrefs(Array.isArray(d.prefs) ? d.prefs : []);
-      })
-      .catch(e => { if (!cancelled) setErr(e.message || 'load failed'); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, []);
-
-  const toggle = async (v) => {
-    setEnabled(v);
-    try { await api('/personalization', { method: 'POST', body: JSON.stringify({ enabled: v }) }); }
-    catch (e) { setEnabled(!v); setErr(e.message || 'save failed'); }
-  };
-
-  return h('div', { className: 'settings-card' },
-    h('div', { className: 'settings-card-title' }, t('settings.personalization')),
-    h('div', { className: 'settings-card-desc' }, t('settings.personalization_desc')),
-    h(Row, {
-      icon: '🎯', title: t('settings.personalization_toggle'),
-      desc: t('settings.personalization_toggle_desc'),
-      control: h(Toggle, { on: enabled, onChange: toggle }),
-    }),
-    loading
-      ? h('div', { className: 'settings-card-desc' }, '…')
-      : err
-        ? h('div', { className: 'settings-card-desc', style: { color: 'var(--red, #ff6b6b)' } }, err)
-        : prefs.length === 0
-          ? h('div', { className: 'settings-card-desc' }, t('settings.personalization_empty'))
-          : h('div', { className: 'pref-chips' },
-              prefs.map(p => {
-                const up = p.net > 0;
-                const cls = 'pref-chip ' + (up ? 'up' : 'down');
-                const sign = up ? '+' : '';
-                return h('span', { key: p.category, className: cls },
-                  h('span', { className: 'pref-chip-name' }, p.category),
-                  h('span', { className: 'pref-chip-val'  }, sign + p.net)
-                );
-              })
-            )
-  );
-}
+// PersonalizationCard / per-user category boost was removed 2026-04-27.
+// Feed ordering is now uniformly global. Removed pieces (kept here as a
+// pointer for git archeology):
+//   - PersonalizationCard React component (rendered chips of net per-category)
+//   - api('/personalization') GET/POST + matching server handlers
+//   - i18n keys settings.personalization*
+//   - .pref-chip* CSS rules
+//   - getCategoryPreferences / get|setPersonalizationEnabled in db
+// The users.personalization_enabled column is intentionally left in place
+// (SQLite does not support cheap DROP COLUMN; it has no consumers anymore).
 
 function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
   const lang = useLang();
@@ -5729,9 +5879,6 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
         )
       })
     ),
-
-    // ── Personalization (per-category boost from 👍/👎 history) ──
-    h(PersonalizationCard),
 
     // ── Behavior ──
     h('div', { className: 'settings-card' },

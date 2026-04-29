@@ -1,7 +1,9 @@
 /**
  * English translations (default language)
  */
-export default {
+import { LIFESPAN_VALUES, assertCoversLifespans } from '../analysis/lifespan.js';
+
+const en = {
   // ── Bot welcome & commands ─────────────────────────────────────────────
   welcome: `\u{1F431} <b>Hey! Meet Catalyst</b>
 
@@ -119,8 +121,10 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
     sports_degen: '\u{1F3C6}', ai_drama: '\u{1F916}', other: '\u{1F4CC}', boring: '\u{1F634}',
   },
   topLifeIcons: {
-    'flash (hours)': '\u26A1', 'short (1-2 days)': '\u{1F552}',
-    'medium (3-7 days)': '\u{1F4C5}', 'long (weeks+)': '\u{1F4C6}',
+    // Keys derive from LIFESPAN_VALUES — see src/analysis/lifespan.js.
+    // Legacy descriptive forms are normalized away at scorer/dashboard
+    // read sites via normalizeLifespan(), so we don't carry them here.
+    flash: '\u26A1', short: '\u{1F552}', medium: '\u{1F4C5}', long: '\u{1F4C6}',
   },
 
   // ── Status ─────────────────────────────────────────────────────────────
@@ -214,13 +218,30 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
   },
 
   lifespans: {
-    'flash (hours)': '\u{26A1} Flash (hours)',
-    'short (1-2 days)': '\u{1F550} Short (1-2 days)',
-    'medium (3-7 days)': '\u{1F4C5} Medium (3-7 days)',
-    'long (weeks+)': '\u{1F4C6} Long (weeks+)',
+    // Keys derive from LIFESPAN_VALUES — see src/analysis/lifespan.js.
+    flash:  '\u{26A1} Flash (hours)',
+    short:  '\u{1F550} Short (1-2 days)',
+    medium: '\u{1F4C5} Medium (3-7 days)',
+    long:   '\u{1F4C6} Long (weeks+)',
     'unknown': '\u{2753} Unknown',
   },
+
+  // ── Feedback "Reason for rating" wizard ────────────────────────────────
+  // Surfaced after the user taps 👍 / 👎 — they get a "Reason" button which
+  // captures one short text message via _awaitingInput FSM.
+  btnFeedbackReason: '\u{270F}\u{FE0F} Reason for rating',
+  feedbackReasonPrompt: '\u{1F4DD} <b>Why this rating?</b>\n\nReply with one short sentence (any language). Send /skip to cancel. Max 240 characters.',
+  feedbackReasonSaved: '\u{2705} <b>Reason saved.</b> The AI will use it for similar trends next cycle.',
+  feedbackReasonSkipped: '\u{1F44C} Cancelled — your vote stays as is.',
+  feedbackReasonNoVote: '\u{26A0}\u{FE0F} You haven’t voted on this trend, or your vote was removed. Vote again first.',
+  feedbackReasonTooLong: '\u{26A0}\u{FE0F} Too long (max 240 chars). Tap the Reason button again to retry.',
 };
+
+// Loud failure at module load if the i18n maps drift from LIFESPAN_VALUES.
+assertCoversLifespans('en.topLifeIcons', en.topLifeIcons);
+assertCoversLifespans('en.lifespans',    en.lifespans);
+
+export default en;
 
 function scoreEmoji(score) {
   if (score >= 90) return '\u{1F525}\u{1F525}\u{1F525}';
