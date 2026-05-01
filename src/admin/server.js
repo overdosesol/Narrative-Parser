@@ -6,13 +6,6 @@
 import http from 'http';
 import { timingSafeEqual } from 'crypto';
 import {
-  FILTER_PROFILES,
-  PRESET_KEYS,
-  PROFILE_FIELD_RANGES,
-  getEffectiveProfiles,
-  validateProfileOverrides,
-} from '../analysis/filter-profiles.js';
-import {
   PRESET_KEYS as PRESET_CONFIG_KEYS,
   PRESET_GROUPS,
   PRESET_FIELD_RANGES,
@@ -338,25 +331,6 @@ class AdminServer {
     // Block kept for any future global float knobs to slot in.
   }
 
-  // ── Filter profiles (per-preset junk-filter tuning) ─────────────────────────
-  // Returns the full effective table (defaults merged with overrides) plus the
-  // raw overrides blob + field metadata, so the UI can render inputs + reset.
-  _getFilterProfiles() {
-    let overrides = {};
-    const raw = this.db.getSetting('filterProfiles', null);
-    if (raw) {
-      try { overrides = JSON.parse(raw) || {}; }
-      catch (_) { overrides = {}; }
-    }
-    return {
-      defaults:  FILTER_PROFILES,
-      effective: getEffectiveProfiles(overrides),
-      overrides,                       // what's actually stored (sparse)
-      fields:    PROFILE_FIELD_RANGES, // { field: {min,max,step,label,desc} }
-      presets:   PRESET_KEYS,
-    };
-  }
-
   // ── Junk-reason stats over the last N hours ─────────────────────────────────
   // Reads raw_metrics from trends table, aggregates junkReasons occurrences.
   // Used by the admin UI to answer "что у нас чаще всего режет junk-filter?".
@@ -413,16 +387,6 @@ class AdminServer {
       topReasons,
       sourceCounts,
     };
-  }
-
-  _setFilterProfiles(body) {
-    const cleaned = validateProfileOverrides(body?.overrides);
-    // Empty blob → delete the setting to avoid confusing "stored but empty" state
-    if (Object.keys(cleaned).length === 0) {
-      this.db.setSetting('filterProfiles', '');
-    } else {
-      this.db.setSetting('filterProfiles', JSON.stringify(cleaned));
-    }
   }
 
   // ── Preset configs (full per-preset pipeline tuning, PR-1) ──────────────────
@@ -777,23 +741,6 @@ class AdminServer {
         return json(res, 200, this._getAllUsers(s.get('search') || '', s.get('plan') || '', s.get('status') || ''));
       }
 
-      if (path.match(/^\/api\/users\/(\d+)$/) && method === 'PUT') {
-        const id = parseInt(path.split('/')[3]);
-        const body = await parseBody(req);
-        const allowed = ['status', 'plan_id', 'subscription_expires_at', 'alert_threshold'];
-        for (const [k, v] of Object.entries(body)) {
-          if (allowed.includes(k)) this.db.updateUser(id, k, v);
-        }
-        return json(res, 200, { ok: true });
-      }
-
-      if (path.match(/^\/api\/users\/(\d+)\/extend$/) && method === 'POST') {
-        const id = parseInt(path.split('/')[3]);
-        const { days = 30, plan = 'pro' } = await parseBody(req);
-        this.db.upgradePlan(id, plan, days);
-        return json(res, 200, { ok: true });
-      }
-
       if (path.match(/^\/api\/users\/(\d+)\/subscription\/grant$/) && method === 'POST') {
         const id = parseInt(path.split('/')[3]);
         const { plan = 'pro', days = 30 } = await parseBody(req);
@@ -814,18 +761,6 @@ class AdminServer {
         const allowed = ['active', 'paused', 'blocked', 'suspended'];
         if (!allowed.includes(status)) return json(res, 400, { error: 'Invalid status' });
         this.db.updateUser(id, 'status', status);
-        return json(res, 200, { ok: true });
-      }
-
-      if (path.match(/^\/api\/users\/(\d+)\/block$/) && method === 'POST') {
-        const id = parseInt(path.split('/')[3]);
-        this.db.updateUser(id, 'status', 'blocked');
-        return json(res, 200, { ok: true });
-      }
-
-      if (path.match(/^\/api\/users\/(\d+)\/unblock$/) && method === 'POST') {
-        const id = parseInt(path.split('/')[3]);
-        this.db.updateUser(id, 'status', 'active');
         return json(res, 200, { ok: true });
       }
 
@@ -976,20 +911,6 @@ class AdminServer {
           const body = await parseBody(req);
           this._setScannerConfig(body);
           return json(res, 200, { ok: true, ...this._getScannerConfig() });
-        } catch (e) {
-          return json(res, 400, { error: e.message });
-        }
-      }
-
-      // ── Filter profiles — per-preset junk-filter weights ──
-      if (path === '/api/filter-profiles' && method === 'GET') {
-        return json(res, 200, this._getFilterProfiles());
-      }
-      if (path === '/api/filter-profiles' && method === 'POST') {
-        try {
-          const body = await parseBody(req);
-          this._setFilterProfiles(body);
-          return json(res, 200, { ok: true, ...this._getFilterProfiles() });
         } catch (e) {
           return json(res, 400, { error: e.message });
         }
@@ -1342,9 +1263,30 @@ class AdminServer {
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
+  /* Surfaces — admin keeps its terminal-style navy gradient (NOT a dashboard clone) */
   --bg:#091018;--bg2:#101a23;--bg3:#162330;--bg4:#1c2b3a;
-  --accent:#14b8a6;--accent2:#0f766e;--green:#22c55e;--red:#f87171;
-  --yellow:#f59e0b;--blue:#38bdf8;--text:#e5eef7;--text2:#97a8ba;--border:#233447;
+  /* Accent — teal, slightly warmed up for visual punch on hover */
+  --accent:#14b8a6;--accent2:#0f766e;--accent-soft:#5eead4;
+  --accent-rgb:20,184,166;
+  --accent-glow:rgba(20,184,166,.12);
+  --accent-tint:rgba(20,184,166,.06);
+  /* Semantic state — constant across themes */
+  --green:#22c55e;--green-rgb:34,197,94;
+  --red:#f87171;--red-rgb:248,113,113;
+  --yellow:#f59e0b;--yellow-rgb:245,158,11;
+  --blue:#38bdf8;--blue-rgb:56,189,248;
+  --purple:#a78bfa;--purple-rgb:167,139,250;
+  /* Text — full muted ramp */
+  --text:#e5eef7;--text2:#97a8ba;--text3:#6f8095;--muted:#7e90a4;--dim:#5a6b80;
+  /* Borders — full ramp */
+  --border:#233447;--border2:#2d4055;--border3:#1b2a3a;
+  /* Effects */
+  --gloss-top:inset 0 1px 0 rgba(255,255,255,.04);
+  --gloss-edge:inset 0 0 0 1px rgba(255,255,255,.02);
+  --shadow-card:0 12px 32px rgba(0,0,0,.18);
+  --shadow-elev:0 18px 48px rgba(0,0,0,.32);
+  /* Radii */
+  --radius-sm:10px;--radius-md:14px;--radius-lg:16px;--radius-xl:20px;
 }
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:
 linear-gradient(180deg,#081018 0%,#0a1320 100%);color:var(--text);min-height:100vh}
@@ -1353,24 +1295,63 @@ linear-gradient(180deg,#081018 0%,#0a1320 100%);color:var(--text);min-height:100
 .logo{padding:0 22px 22px;border-bottom:1px solid var(--border);margin-bottom:16px}
 .logo h1{font-size:18px;font-weight:800;color:#fff;letter-spacing:-.3px}
 .logo span{font-size:11px;color:var(--accent);letter-spacing:1.2px;text-transform:uppercase}
-.nav-item{display:flex;align-items:center;gap:10px;padding:11px 22px;cursor:pointer;font-size:14px;color:var(--text2);border-radius:0;transition:all .18s}
+.nav-item{display:flex;align-items:center;gap:10px;padding:11px 22px;cursor:pointer;font-size:14px;color:var(--text2);border-radius:0;transition:all .18s;padding-right:14px}
 .nav-item:hover{background:rgba(255,255,255,.03);color:var(--text)}
 .nav-item.active{background:linear-gradient(90deg,rgba(20,184,166,.18),transparent);color:#fff;border-left:3px solid var(--accent)}
 .nav-item.active{padding-left:19px}
 .nav-icon{font-size:16px;width:20px;text-align:center}
+.nav-label{flex:1;min-width:0}
+/* Live hints on sidebar nav-items — small dot or numeric badge to the right.
+   Updated every 12s by App's poll loop. Empty when nothing's pending. */
+.nav-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;animation:nav-pulse 1.5s ease-in-out infinite}
+.nav-dot.paused{background:var(--yellow);box-shadow:0 0 8px rgba(var(--yellow-rgb),.7)}
+.nav-dot.live{background:var(--green);box-shadow:0 0 8px rgba(var(--green-rgb),.7)}
+.nav-badge{font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;background:rgba(var(--accent-rgb),.18);color:var(--accent-soft);font-variant-numeric:tabular-nums;flex-shrink:0;letter-spacing:.2px}
+@keyframes nav-pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .main{flex:1;padding:22px 26px 28px;overflow-y:auto}
 .main-topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px;padding:16px 18px;border:1px solid var(--border);border-radius:16px;background:rgba(16,26,35,.78);backdrop-filter:blur(16px)}
 .main-topbar h2{font-size:20px;font-weight:800;letter-spacing:-.4px}
 .main-topbar p{color:var(--text2);font-size:12px;margin-top:4px}
-.topbar-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.shell-badge{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid rgba(20,184,166,.18);background:rgba(20,184,166,.08);font-size:11px;font-weight:700;color:#b8d6d3;text-transform:uppercase;letter-spacing:.7px}
+/* .topbar-actions removed — old badge layout replaced by .sb-pipeline */
+/* StatusBar — pipeline view always visible at the top of every admin page.
+   Compact stage-row inline with title; shrinks gracefully on narrower screens. */
+.sb-topbar{padding:14px 18px}
+.sb-topbar.is-paused{border-color:rgba(var(--yellow-rgb),.30);background:linear-gradient(180deg,rgba(var(--yellow-rgb),.04),rgba(16,26,35,.78))}
+.sb-head{flex-shrink:0;min-width:0;max-width:280px}
+.sb-head:hover h2{color:var(--accent-soft)}
+.sb-head h2{font-size:18px;font-weight:800;letter-spacing:-.4px;transition:color .15s}
+.sb-head p{color:var(--text2);font-size:12px;margin-top:4px;display:flex;align-items:center;gap:6px;line-height:1.3}
+.sb-live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:sb-blink 1.2s ease-in-out infinite;flex-shrink:0}
+.sb-paused{color:#fde68a;font-weight:600}
+@keyframes sb-blink{0%,100%{opacity:1}50%{opacity:.35}}
+
+.sb-pipeline{flex:1;min-width:0;display:flex;align-items:center;gap:0;justify-content:flex-end;flex-wrap:nowrap}
+.sb-node{flex:0 0 auto;min-width:54px;text-align:center;padding:6px 4px 4px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.015);transition:all .35s ease;position:relative}
+.sb-node.done{border-color:rgba(var(--accent-rgb),.35);background:rgba(var(--accent-rgb),.05)}
+.sb-node.active{border-color:var(--accent);background:rgba(var(--accent-rgb),.14);box-shadow:0 0 0 1px rgba(var(--accent-rgb),.4),0 0 18px rgba(var(--accent-rgb),.32);animation:sb-node-pulse 1.6s ease-in-out infinite}
+.sb-node-ico{font-size:16px;line-height:1;filter:grayscale(.3);transition:filter .3s}
+.sb-node.active .sb-node-ico,.sb-node.done .sb-node-ico{filter:none}
+.sb-node-cnt{font-size:11px;font-weight:700;margin-top:2px;color:var(--text);font-variant-numeric:tabular-nums;line-height:1}
+.sb-node:not(.done):not(.active) .sb-node-cnt{color:var(--text2);font-weight:500}
+.sb-wire{flex:1 1 14px;min-width:8px;max-width:22px;height:2px;align-self:center;background:rgba(255,255,255,.06);border-radius:2px;margin:0 1px;transition:all .35s}
+.sb-wire.done{background:rgba(var(--accent-rgb),.4)}
+.sb-wire.active{background:linear-gradient(90deg,rgba(var(--accent-rgb),.4) 0%,var(--accent) 50%,rgba(var(--accent-rgb),.4) 100%);box-shadow:0 0 6px rgba(var(--accent-rgb),.5);animation:sb-wire-pulse 1.4s ease-in-out infinite}
+@keyframes sb-node-pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.04)}}
+@keyframes sb-wire-pulse{0%,100%{opacity:.7}50%{opacity:1}}
+/* On narrower viewports the pipeline wraps below the head instead of shrinking unreadably */
+@media (max-width:1100px){
+  .sb-topbar{flex-direction:column;align-items:stretch}
+  .sb-head{max-width:none}
+  .sb-pipeline{justify-content:flex-start;flex-wrap:wrap}
+}
 .page-header{margin-bottom:22px}
 .page-header h2{font-size:24px;font-weight:800;letter-spacing:-.5px}
 .page-header p{color:var(--text2);font-size:13px;margin-top:5px;max-width:72ch;line-height:1.5}
 
 /* Cards */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
-.card{background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01));border:1px solid var(--border);border-radius:16px;padding:18px;box-shadow:0 12px 32px rgba(0,0,0,.12)}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01));border:1px solid var(--border);border-radius:var(--radius-lg);padding:18px;box-shadow:var(--shadow-card),var(--gloss-top);transition:border-color .15s,transform .15s,box-shadow .15s}
+.card:hover{border-color:var(--border2);transform:translateY(-1px);box-shadow:var(--shadow-elev),var(--gloss-top)}
 .card-label{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--text2);margin-bottom:8px;font-weight:700}
 .card-value{font-size:28px;font-weight:800;letter-spacing:-.8px}
 .card-sub{font-size:12px;color:var(--text2);margin-top:6px;line-height:1.4}
@@ -1379,7 +1360,7 @@ linear-gradient(180deg,#081018 0%,#0a1320 100%);color:var(--text);min-height:100
 .card.yellow .card-value{color:var(--yellow)}
 .card.blue .card-value{color:var(--blue)}
 .stats-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
-.stats-bottom-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px}
+.stats-bottom-grid{display:grid;grid-template-columns:1fr;gap:16px;margin-top:16px}
 .info-list{display:flex;flex-direction:column;gap:10px}
 .info-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.025);border:1px solid rgba(35,52,71,.7);font-size:12px}
 .info-row strong{color:var(--text);font-size:12px}
@@ -1391,6 +1372,15 @@ linear-gradient(180deg,#081018 0%,#0a1320 100%);color:var(--text);min-height:100
 .table-toolbar{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .search-input{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-size:13px;width:220px;outline:none}
 .search-input:focus{border-color:var(--accent)}
+/* UsersPage row-drawer — replaces a 420px-wide action column. Click ⚙ to
+   reveal full action panel below the row. Single-row-open guarantees a
+   clean focus state. */
+tr.row-open td{background:rgba(var(--accent-rgb),.04)}
+tr.row-drawer td{padding:0;background:rgba(var(--accent-rgb),.04);border-top:1px solid var(--border)}
+.user-actions{display:flex;gap:24px;flex-wrap:wrap;padding:14px 18px}
+.user-actions-group{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.user-actions-label{font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--text3);font-weight:700;margin-right:4px}
+.row-toggle{padding:4px 10px;font-size:14px;line-height:1}
 select.filter{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:7px 10px;color:var(--text);font-size:13px;outline:none}
 table{width:100%;border-collapse:collapse}
 th{padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text2);border-bottom:1px solid var(--border);background:var(--bg3)}
@@ -1438,12 +1428,59 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .chart-bar{flex:1;background:var(--accent);border-radius:3px 3px 0 0;opacity:.7;min-width:12px;transition:all .2s;cursor:pointer;position:relative}
 .chart-bar:hover{opacity:1}
 .chart-bar-label{font-size:9px;color:var(--text2);text-align:center;margin-top:3px}
-.chart-wrap{background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01));border:1px solid var(--border);border-radius:16px;padding:18px;margin-bottom:16px;box-shadow:0 12px 32px rgba(0,0,0,.12)}
+.chart-wrap{background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01));border:1px solid var(--border);border-radius:var(--radius-lg);padding:18px;margin-bottom:16px;box-shadow:var(--shadow-card),var(--gloss-top)}
 .chart-title{font-size:13px;font-weight:700;margin-bottom:12px;color:var(--text2);text-transform:uppercase;letter-spacing:.7px}
+/* DecisionsPage — was 100+ inline-style blocks; pulled into a proper namespace
+   so themes / future restyles don't need surgery on JSX nodes. */
+.dec-page-head{margin-bottom:14px}
+.dec-page-head h2{font-size:22px;font-weight:800;letter-spacing:-.4px;margin-bottom:6px}
+.dec-page-head p{color:var(--muted);font-size:13px;line-height:1.5}
+.dec-filter-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.dec-reason-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;font-size:12px}
+.dec-list{display:flex;flex-direction:column;gap:10px}
+.dec-card{background:var(--bg2);border:1px solid var(--border);border-left:3px solid var(--text3);border-radius:10px;padding:12px 14px;transition:border-color .15s}
+.dec-card.sent{border-left-color:var(--green)}
+.dec-card.skipped{border-left-color:var(--red)}
+.dec-row1{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.dec-time{color:var(--muted);font-size:11px;font-family:'ui-monospace',monospace;white-space:nowrap}
+.dec-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dec-title-link{color:var(--text);text-decoration:none;font-weight:600;font-size:14px;line-height:1.35}
+.dec-title-link:hover{text-decoration:underline}
+.dec-title-arrow{color:var(--muted);font-weight:400;margin-left:6px;font-size:12px}
+.dec-verdict{font-size:12px;font-weight:600;white-space:nowrap;padding:3px 8px;border-radius:4px}
+.dec-verdict.sent{color:var(--green);background:rgba(var(--green-rgb),.12)}
+.dec-verdict.skipped{color:var(--red);background:rgba(var(--red-rgb),.12)}
+.dec-meta-row{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-bottom:8px;align-items:center}
+.dec-meta-row b{color:var(--text2);font-weight:600}
+.dec-atype-chip{font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;border:1px solid transparent}
+.dec-atype-chip.event{color:#ff8a65;background:rgba(255,107,107,.12);border-color:rgba(255,107,107,.35)}
+.dec-atype-chip.trend{color:#2ed573;background:rgba(46,213,115,.12);border-color:rgba(46,213,115,.35)}
+.dec-atype-chip.post{color:#74b9ff;background:rgba(116,185,255,.12);border-color:rgba(116,185,255,.35)}
+.dec-eng-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.dec-eng-chip{font-size:11px;padding:2px 8px;border-radius:10px;border:1px solid var(--border);color:var(--text2);background:rgba(255,255,255,.02);font-family:'ui-monospace',monospace}
+.dec-gate-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.dec-gate-row.no-bd{margin-bottom:0}
+.dec-gate-chip{font-size:11px;padding:2px 8px;border-radius:10px;font-family:'ui-monospace',monospace}
+.dec-gate-chip.passed{color:var(--green);background:rgba(var(--green-rgb),.10);border:1px solid rgba(var(--green-rgb),.40)}
+.dec-gate-chip.failed{color:var(--red);background:rgba(var(--red-rgb),.10);border:1px solid rgba(var(--red-rgb),.40);cursor:help}
+.dec-breakdown{color:var(--muted);font-size:11px;font-family:'ui-monospace',monospace;padding:6px 8px;background:rgba(255,255,255,.02);border-radius:4px;border:1px dashed var(--border)}
 
-/* Broadcast */
-.broadcast-box{background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01));border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:20px;box-shadow:0 12px 32px rgba(0,0,0,.12)}
-.broadcast-box h3{font-size:15px;font-weight:600;margin-bottom:14px}
+/* Maintenance card — full-width DB-housekeeping section under Stats */
+.maintenance-card{margin-top:16px;border-color:rgba(248,113,113,.18);background:linear-gradient(180deg,rgba(248,113,113,.04),rgba(255,255,255,.01))}
+.maintenance-card .chart-title{color:var(--red)}
+.maintenance-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+
+/* Generic card — formerly .broadcast-box, renamed because it was used as
+   the universal section wrapper across BotPage, ScannersPage, ManualPage, etc.
+   Use <Section title icon actions> for new code; .adm-card class still works. */
+.adm-card{background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01));border:1px solid var(--border);border-radius:var(--radius-lg);padding:20px;margin-bottom:20px;box-shadow:var(--shadow-card),var(--gloss-top);transition:border-color .15s,box-shadow .15s}
+.adm-card:hover{border-color:var(--border2)}
+.adm-card h3{font-size:15px;font-weight:600;margin-bottom:14px}
+.adm-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.adm-card-title{font-size:15px;font-weight:600;color:var(--text);display:inline-flex;align-items:center;gap:8px;letter-spacing:-.1px}
+.adm-card-title-ico{font-size:18px;line-height:1}
+.adm-card-desc{font-size:12px;color:var(--text2);margin:-8px 0 12px;line-height:1.5}
+.adm-card-actions{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
 textarea.msg-input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text);font-size:13px;outline:none;resize:vertical;min-height:100px;font-family:inherit}
 textarea.msg-input:focus{border-color:var(--accent)}
 .broadcast-footer{display:flex;gap:10px;align-items:center;margin-top:10px}
@@ -1465,12 +1502,16 @@ input:checked+.toggle-slider{background:var(--green)}
 input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
 /* Examples page (AI calibration few-shot manager) */
 .exp-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
-.exp-tabs{display:flex;gap:6px}
-.exp-tab{padding:8px 14px;background:transparent;border:1px solid transparent;border-radius:8px;cursor:pointer;font-size:13px;color:var(--text2);display:flex;align-items:center;gap:8px;transition:all .15s}
-.exp-tab:hover{background:rgba(255,255,255,.04);color:var(--text)}
-.exp-tab.active{background:rgba(20,184,166,.12);border-color:rgba(20,184,166,.35);color:var(--text)}
-.exp-tab-count{background:rgba(255,255,255,.08);padding:1px 8px;border-radius:10px;font-size:10px;font-weight:700;font-variant-numeric:tabular-nums}
-.exp-tab.active .exp-tab-count{background:var(--accent);color:#fff}
+/* Unified tab strip — used by ExamplesPage, PresetConfigsPage, BotPage sub-tabs.
+   Replaces three near-identical implementations (exp-tab / pcfg-tab / inline). */
+.adm-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px}
+.adm-tabs.bordered{padding-bottom:14px;border-bottom:1px solid var(--border)}
+.adm-tab{position:relative;padding:9px 16px;border-radius:var(--radius-sm);background:var(--bg2);border:1px solid var(--border);color:var(--text2);cursor:pointer;font-size:13px;font-weight:500;transition:all .15s;display:inline-flex;align-items:center;gap:8px;font-family:inherit}
+.adm-tab:hover{border-color:rgba(var(--accent-rgb),.35);color:var(--text)}
+.adm-tab.active{background:linear-gradient(180deg,rgba(var(--accent-rgb),.18),rgba(var(--accent-rgb),.06));border-color:var(--accent);color:var(--text);box-shadow:0 4px 14px rgba(var(--accent-rgb),.16)}
+.adm-tab-count{background:rgba(255,255,255,.08);padding:1px 8px;border-radius:10px;font-size:10px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:.2px}
+.adm-tab.active .adm-tab-count{background:var(--accent);color:#fff}
+.adm-tab-dot{position:absolute;top:6px;right:7px;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px rgba(var(--accent-rgb),.8)}
 .exp-spacer{flex:1}
 .exp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
 .exp-card{background:linear-gradient(180deg,rgba(255,255,255,.025),rgba(255,255,255,.005));border:1px solid var(--border);border-radius:12px;padding:14px;transition:all .18s;display:flex;flex-direction:column;gap:10px;position:relative}
@@ -1534,33 +1575,6 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
 .collector-name{font-weight:600;font-size:15px}
 .collector-status{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
 .collector-status.on{color:var(--green)}
-.collector-status.off{color:var(--red)}
-/* Pipeline flow diagram */
-.pflow-wrap{background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.01));border:1px solid var(--border);border-radius:16px;padding:20px 22px;margin-bottom:20px;box-shadow:0 12px 32px rgba(0,0,0,.12)}
-.pflow-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:18px;flex-wrap:wrap;gap:10px}
-.pflow-head h3{font-size:15px;font-weight:600}
-.pflow-sub{font-size:12px;color:var(--text2)}
-.pflow-sub .pflow-live{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-right:6px;vertical-align:middle;box-shadow:0 0 8px var(--accent);animation:pflow-blink 1.2s ease-in-out infinite}
-.pflow{display:flex;align-items:stretch;gap:0;overflow:visible;padding:18px 6px 20px}
-.pflow-node{flex:0 0 auto;min-width:112px;text-align:center;padding:14px 14px 12px;border:1px solid var(--border);border-radius:14px;background:rgba(255,255,255,.015);transition:all .35s ease;position:relative}
-.pflow-node.done{border-color:rgba(20,184,166,.35);background:rgba(20,184,166,.05)}
-.pflow-node.active{border-color:var(--accent);background:rgba(20,184,166,.12);box-shadow:0 0 0 1px rgba(20,184,166,.35),0 0 28px rgba(20,184,166,.35);animation:pflow-pulse 1.6s ease-in-out infinite}
-.pflow-ico{font-size:22px;line-height:1;margin-bottom:6px;filter:grayscale(.3);transition:filter .3s}
-.pflow-node.active .pflow-ico,.pflow-node.done .pflow-ico{filter:none}
-.pflow-lbl{font-size:10.5px;color:var(--text2);text-transform:uppercase;letter-spacing:.7px;font-weight:700}
-.pflow-node.active .pflow-lbl,.pflow-node.done .pflow-lbl{color:var(--text)}
-.pflow-cnt{font-size:19px;font-weight:700;margin-top:6px;color:var(--text);font-variant-numeric:tabular-nums;line-height:1}
-.pflow-node:not(.done):not(.active) .pflow-cnt{color:var(--text2);font-weight:500}
-.pflow-wire{flex:1 1 34px;min-width:28px;height:2px;align-self:center;background:rgba(255,255,255,.06);border-radius:2px;position:relative;margin:0 -1px}
-.pflow-wire.done{background:rgba(20,184,166,.45)}
-.pflow-wire.active{background:rgba(20,184,166,.12);overflow:hidden}
-.pflow-wire.active::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent 0%,var(--accent) 45%,var(--accent) 55%,transparent 100%);background-size:50% 100%;background-repeat:no-repeat;animation:pflow-flow 1.25s linear infinite}
-.pflow-foot{margin-top:12px;display:flex;justify-content:space-between;font-size:11px;color:var(--text2);letter-spacing:.3px}
-.pflow-foot b{color:var(--text);font-weight:600}
-@keyframes pflow-pulse{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
-@keyframes pflow-flow{0%{background-position:-50% 0}100%{background-position:150% 0}}
-@keyframes pflow-blink{0%,100%{opacity:.4}50%{opacity:1}}
-@media (max-width:780px){.pflow{flex-wrap:wrap;gap:8px}.pflow-wire{display:none}.pflow-node{flex:1 1 calc(33% - 8px)}}
 /* Global scanner status */
 .scanner-status-bar{background:linear-gradient(135deg,rgba(20,184,166,.07),rgba(56,189,248,.04));border:1px solid rgba(20,184,166,.16);border-radius:16px;padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:20px;box-shadow:0 12px 32px rgba(0,0,0,.12)}
 .scanner-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0}
@@ -1602,11 +1616,9 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
 .pcfg-banner-icon{font-size:20px;line-height:1}
 .pcfg-banner-title{font-weight:600;margin-bottom:4px}
 .pcfg-banner-desc{color:var(--text2);font-size:12px}
-.pcfg-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border)}
-.pcfg-tab{position:relative;padding:9px 16px;border-radius:10px;background:var(--bg2);border:1px solid var(--border);color:var(--text2);cursor:pointer;font-size:13px;font-weight:500;transition:all .15s;text-transform:capitalize}
-.pcfg-tab:hover{border-color:rgba(20,184,166,.35);color:var(--text)}
-.pcfg-tab.active{background:linear-gradient(180deg,rgba(20,184,166,.18),rgba(20,184,166,.06));border-color:var(--accent);color:var(--text);box-shadow:0 4px 14px rgba(20,184,166,.16)}
-.pcfg-tab-dot{position:absolute;top:6px;right:7px;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px rgba(20,184,166,.8)}
+/* pcfg-tabs/tab/dot — replaced by unified .adm-tabs (above). Kept only the
+   .adm-tab.capitalize modifier here for the preset tab labels. */
+.adm-tab.capitalize{text-transform:capitalize}
 .pcfg-accordion{margin-bottom:14px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;overflow:hidden}
 .pcfg-accordion[open]{box-shadow:0 6px 20px rgba(0,0,0,.12)}
 .pcfg-accordion-summary{padding:14px 16px;cursor:pointer;font-size:14px;font-weight:600;color:var(--text);user-select:none;display:flex;align-items:center;justify-content:space-between;list-style:none}
@@ -1792,6 +1804,26 @@ async function api(path, method='GET', body=null) {
   return data;
 }
 
+// ── Section primitive ───────────────────────────────────────────────────────
+// Generic card-with-header used across the admin SPA. Pre-PR-2 every page
+// re-rolled its own ".broadcast-box / h3 / actions" combo with subtle
+// inconsistencies. This component centralises that — pass title/icon/desc/
+// actions; children render below the head.
+function Section({ icon, title, desc, actions, className, children, style }) {
+  const cls = 'adm-card' + (className ? ' ' + className : '');
+  return React.createElement('div', { className: cls, style },
+    (title || actions) && React.createElement('div', { className: 'adm-card-head' },
+      title && React.createElement('div', { className: 'adm-card-title' },
+        icon && React.createElement('span', { className: 'adm-card-title-ico' }, icon),
+        React.createElement('span', null, title)
+      ),
+      actions && React.createElement('div', { className: 'adm-card-actions' }, actions)
+    ),
+    desc && React.createElement('div', { className: 'adm-card-desc' }, desc),
+    children
+  );
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 function AuthOverlay({ onAuth }) {
   const [key, setKey] = useState('');
@@ -1850,6 +1882,10 @@ function UsersPage() {
   const [draft, setDraft] = useState({});
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState('');
+  // Inline-drawer per row: only one row open at a time. Replaces a 420px
+  // wide action column that overflowed on laptops with 5 controls crammed
+  // side by side. Click ⚙ → action panel slides open below the row.
+  const [expandedId, setExpandedId] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1937,51 +1973,72 @@ function UsersPage() {
       users.length === 0 ? React.createElement('div',{className:'empty'},'Пользователи не найдены') :
       React.createElement('table',null,
         React.createElement('thead',null,React.createElement('tr',null,
-          ...[['ID','40px'],['Chat ID',''],['Username',''],['Язык','60px'],['План',''],['Статус',''],['Подписка до',''],['Алерты','70px'],['Активность',''],['Управление','420px']].map(([h,w])=>
+          ...[['ID','40px'],['Chat ID',''],['Username',''],['Язык','60px'],['План',''],['Статус',''],['Подписка до',''],['Алерты','70px'],['Активность',''],['','64px']].map(([h,w])=>
             React.createElement('th',{key:h,style:{width:w||'auto'}},h)
           )
         )),
         React.createElement('tbody',null,
-          users.map(u=>React.createElement('tr',{key:u.id},
-            React.createElement('td',null,React.createElement('span',{style:{color:'var(--text2)',fontSize:11}},'#'+u.id)),
-            React.createElement('td',null,React.createElement('span',{className:'sol-addr'},u.telegram_chat_id)),
-            React.createElement('td',null,u.telegram_username?'@'+u.telegram_username:React.createElement('span',{style:{color:'var(--text2)'}},'-')),
-            React.createElement('td',null,React.createElement('span',{className:u.language==='ru'?'tag-ru':'tag-en'},u.language||'en')),
-            React.createElement('td',null,React.createElement('span',{className:'badge badge-'+u.plan_name},u.plan_name)),
-            React.createElement('td',null,React.createElement('span',{className:'badge badge-'+(u.status||'active')},u.status||'active')),
-            React.createElement('td',null,React.createElement('span',{style:{fontSize:12}},fmt(u.subscription_expires_at))),
-            React.createElement('td',null,React.createElement('span',{style:{fontSize:12}},u.alert_count_today||0)),
-            React.createElement('td',null,React.createElement('span',{style:{fontSize:11,color:'var(--text2)'}},fmtDt(u.last_seen_at))),
-            React.createElement('td',null,
-              React.createElement('div',{className:'btn-row'},
-                React.createElement('select',{
-                  className:'filter',
-                  style:{minWidth:100},
-                  value:(draft[u.id]?.plan || u.plan_name || 'free'),
-                  onChange:e=>setUserDraft(u.id,'plan',e.target.value)
-                },
-                  React.createElement('option',{value:'free'},'Free'),
-                  React.createElement('option',{value:'test'},'Test'),
-                  React.createElement('option',{value:'pro'},'Pro'),
-                  React.createElement('option',{value:'admin'},'Admin'),
-                ),
-                React.createElement('input',{
-                  className:'plan-input',
-                  style:{width:74},
-                  type:'number',
-                  min:1,
-                  max:3650,
-                  value:(draft[u.id]?.days || 30),
-                  onChange:e=>setUserDraft(u.id,'days',e.target.value)
-                }),
-                React.createElement('button',{className:'btn btn-primary btn-sm',onClick:()=>grantSubscription(u)},'Выдать'),
-                React.createElement('button',{className:'btn btn-ghost btn-sm',onClick:()=>revokeSubscription(u)},'Снять'),
-                u.status!=='blocked'
-                  ? React.createElement('button',{className:'btn btn-danger btn-sm',onClick:()=>toggleBan(u)},'Бан')
-                  : React.createElement('button',{className:'btn btn-success btn-sm',onClick:()=>toggleBan(u)},'Разбан')
+          users.flatMap(u=>{
+            const open = expandedId === u.id;
+            const row = React.createElement('tr',{key:u.id, className: open ? 'row-open' : ''},
+              React.createElement('td',null,React.createElement('span',{style:{color:'var(--text2)',fontSize:11}},'#'+u.id)),
+              React.createElement('td',null,React.createElement('span',{className:'sol-addr'},u.telegram_chat_id)),
+              React.createElement('td',null,u.telegram_username?'@'+u.telegram_username:React.createElement('span',{style:{color:'var(--text2)'}},'-')),
+              React.createElement('td',null,React.createElement('span',{className:u.language==='ru'?'tag-ru':'tag-en'},u.language||'en')),
+              React.createElement('td',null,React.createElement('span',{className:'badge badge-'+u.plan_name},u.plan_name)),
+              React.createElement('td',null,React.createElement('span',{className:'badge badge-'+(u.status||'active')},u.status||'active')),
+              React.createElement('td',null,React.createElement('span',{style:{fontSize:12}},fmt(u.subscription_expires_at))),
+              React.createElement('td',null,React.createElement('span',{style:{fontSize:12}},u.alert_count_today||0)),
+              React.createElement('td',null,React.createElement('span',{style:{fontSize:11,color:'var(--text2)'}},fmtDt(u.last_seen_at))),
+              React.createElement('td',null,
+                React.createElement('button',{
+                  className:'btn btn-ghost btn-sm row-toggle',
+                  onClick:()=>setExpandedId(open ? null : u.id),
+                  title: open ? 'Закрыть' : 'Действия'
+                }, open ? '▴' : '⚙')
               )
-            )
-          ))
+            );
+            if (!open) return [row];
+            const drawer = React.createElement('tr',{key:u.id+'-drawer', className:'row-drawer'},
+              React.createElement('td',{colSpan:10},
+                React.createElement('div',{className:'user-actions'},
+                  React.createElement('div',{className:'user-actions-group'},
+                    React.createElement('div',{className:'user-actions-label'},'Подписка'),
+                    React.createElement('select',{
+                      className:'filter',
+                      style:{minWidth:100},
+                      value:(draft[u.id]?.plan || u.plan_name || 'free'),
+                      onChange:e=>setUserDraft(u.id,'plan',e.target.value)
+                    },
+                      React.createElement('option',{value:'free'},'Free'),
+                      React.createElement('option',{value:'test'},'Test'),
+                      React.createElement('option',{value:'pro'},'Pro'),
+                      React.createElement('option',{value:'admin'},'Admin'),
+                    ),
+                    React.createElement('input',{
+                      className:'plan-input',
+                      style:{width:84},
+                      type:'number',
+                      min:1,
+                      max:3650,
+                      value:(draft[u.id]?.days || 30),
+                      onChange:e=>setUserDraft(u.id,'days',e.target.value)
+                    }),
+                    React.createElement('span',{style:{fontSize:11,color:'var(--text2)'}},'дней'),
+                    React.createElement('button',{className:'btn btn-primary btn-sm',onClick:()=>grantSubscription(u)},'Выдать'),
+                    React.createElement('button',{className:'btn btn-ghost btn-sm',onClick:()=>revokeSubscription(u)},'Снять')
+                  ),
+                  React.createElement('div',{className:'user-actions-group'},
+                    React.createElement('div',{className:'user-actions-label'},'Статус'),
+                    u.status!=='blocked'
+                      ? React.createElement('button',{className:'btn btn-danger btn-sm',onClick:()=>toggleBan(u)},'🚫 Заблокировать')
+                      : React.createElement('button',{className:'btn btn-success btn-sm',onClick:()=>toggleBan(u)},'✓ Разблокировать')
+                  )
+                )
+              )
+            );
+            return [row, drawer];
+          })
         )
       )
     )
@@ -2015,17 +2072,6 @@ function PaymentsPage() {
     catch(e){ setMsg(e.message); }
   };
 
-  const cleanupAlerts = async () => {
-    const raw = window.prompt('Удалить алерты старше скольких дней?', '30');
-    if (raw === null) return;
-    const days = Math.max(1, Math.min(365, parseInt(raw || '30', 10) || 30));
-    try {
-      const r = await api('/api/alerts/cleanup', 'POST', { days });
-      setMsg('Алерты очищены: тренды ' + r.trendsDeleted + ', нотификации ' + r.notificationsDeleted);
-      setTimeout(()=>setMsg(''), 4000);
-    } catch(e){ setMsg(e.message); }
-  };
-
   const utcDate2 = dt => { if (!dt) return null; const s = dt.includes('Z')||dt.includes('+') ? dt : dt.replace(' ','T')+'Z'; return new Date(s); };
   const fmtDt = dt => { const d = utcDate2(dt); return d ? d.toLocaleString('ru',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—'; };
   const fmtMoney = (amount, currency) => {
@@ -2052,7 +2098,6 @@ function PaymentsPage() {
     React.createElement('div',{className:'table-wrap'},
       React.createElement('div',{className:'table-toolbar'},
         React.createElement('button',{className:'btn btn-ghost btn-sm',onClick:load},'↻ Обновить'),
-        React.createElement('button',{className:'btn btn-danger btn-sm',onClick:cleanupAlerts},'🧹 Очистить алерты'),
         React.createElement('button',{className:'btn btn-danger btn-sm',onClick:cleanup},'🧹 Очистить истекшие'),
         React.createElement('span',{style:{fontSize:12,color:'var(--text2)'}},payments.length+' записей'),
         msg&&React.createElement('span',{className:'success-msg'},msg)
@@ -2119,123 +2164,6 @@ const PIPELINE_STAGES = [
 // because the scorer doesn't surface intra-call progress events.
 const PIPELINE_AI_IDS = new Set(['stage1', 'stage2']);
 
-function PipelineFlow() {
-  const h = React.createElement;
-  const [state, setState] = React.useState(null);
-
-  React.useEffect(() => {
-    let alive = true;
-    const tick = () => {
-      api('/api/pipeline')
-        .then(s => { if (alive) setState(s); })
-        .catch(() => {});
-    };
-    tick();
-    // 2.5s feels snappy without hammering the backend; pulse still reads well.
-    const id = setInterval(tick, 2500);
-    return () => { alive = false; clearInterval(id); };
-  }, []);
-
-  if (!state) return null;
-
-  const live     = state.running && state.cycleInProgress;
-  const counts   = live ? state.cycleInProgress : (state.lastCycle || {});
-  const curStage = state.currentStage || 'idle';
-  // Map upstream 'ai' marker to its first AI sub-card for ordering math.
-  const effectiveCurStage = curStage === 'ai' ? 'stage1' : curStage;
-  const curIdx = PIPELINE_STAGES.findIndex(s => s.id === effectiveCurStage);
-
-  let subtitle;
-  if (state.running) {
-    const activeLabel = curStage === 'ai'
-      ? 'Stage 1 / Stage 2'
-      : curStage === 'prestage'
-        ? 'Stage 0 (nano + Gemini)'
-        : (PIPELINE_STAGES[curIdx]?.label || 'работает');
-    subtitle = h('span', null,
-      h('span', { className: 'pflow-live' }),
-      'Live — ' + activeLabel + '...'
-    );
-  } else if (state.lastCycle) {
-    const ago = Math.max(0, Math.round((Date.now() - (state.lastCycle.completedAt || 0)) / 1000));
-    const agoStr = ago < 60 ? ago + 'с назад' : Math.round(ago / 60) + 'м назад';
-    const dur = state.lastCycle.durationMs ? (state.lastCycle.durationMs / 1000).toFixed(1) + 'с' : '—';
-    subtitle = 'Последний цикл завершён ' + agoStr + ' (за ' + dur + ')';
-  } else {
-    subtitle = 'Ожидание первого цикла...';
-  }
-
-  const fmt = (v) => (v === undefined || v === null ? '—' : String(v));
-
-  // Per-stage tooltip — for AI cards, surface the actual model that ran this
-  // cycle (Stage 1 is configurable, Stage 2 is always Grok). Pulls from the
-  // running cycle if live, falls back to lastCycle when between scans.
-  const stage1Model = counts.stage1Model || state.lastCycle?.stage1Model || null;
-  const stage2Model = counts.stage2Model || state.lastCycle?.stage2Model || null;
-  // Stage 0 sub-models — surfaced from cycle metrics if backend reports them
-  const nanoModel    = counts.nanoModel    || state.lastCycle?.nanoModel    || null;
-  const geminiModel  = counts.geminiModel  || state.lastCycle?.geminiModel  || null;
-  const stageTitle = (s) => {
-    if (s.id === 'stage1' && stage1Model) return s.hint + ' · ' + stage1Model;
-    if (s.id === 'stage2' && stage2Model) return s.hint + ' · ' + stage2Model;
-    if (s.id === 'prestage') {
-      const parts = [];
-      if (nanoModel)   parts.push('nano: ' + nanoModel);
-      if (geminiModel) parts.push('vision: ' + geminiModel);
-      return parts.length ? s.hint + ' · ' + parts.join(', ') : s.hint;
-    }
-    return s.hint;
-  };
-
-  const nodes = [];
-  PIPELINE_STAGES.forEach((s, i) => {
-    // While the orchestrator marker is 'ai', light up BOTH stage1 + stage2
-    // cards (we don't get a sub-stage event mid-scoring).
-    const isActive = live && (curStage === s.id || (curStage === 'ai' && PIPELINE_AI_IDS.has(s.id)));
-    const isDone   = live ? (curIdx > i) : !!state.lastCycle;
-    nodes.push(
-      h('div', {
-        key: s.id,
-        className: 'pflow-node' + (isActive ? ' active' : '') + (!isActive && isDone ? ' done' : ''),
-        title: stageTitle(s),
-      },
-        h('div', { className: 'pflow-ico' }, s.icon),
-        h('div', { className: 'pflow-lbl' }, s.label),
-        h('div', { className: 'pflow-cnt' }, fmt(counts[s.id])),
-      )
-    );
-    if (i < PIPELINE_STAGES.length - 1) {
-      const wireActive = live && curIdx === i + 1;
-      const wireDone   = live ? curIdx > i + 1 : !!state.lastCycle;
-      nodes.push(h('div', {
-        key: 'w' + i,
-        className: 'pflow-wire' + (wireActive ? ' active' : '') + (!wireActive && wireDone ? ' done' : ''),
-      }));
-    }
-  });
-
-  return h('div', { className: 'pflow-wrap' },
-    h('div', { className: 'pflow-head' },
-      h('h3', null, '🔄 Пайплайн'),
-      h('span', { className: 'pflow-sub' }, subtitle)
-    ),
-    h('div', { className: 'pflow' }, nodes),
-    state.lastCycle && !state.running
-      ? h('div', { className: 'pflow-foot' },
-          h('span', null, 'Собрано → ', h('b', null, fmt(state.lastCycle.collect)),
-            ' • После dedupe → ', h('b', null, fmt(state.lastCycle.dedupe)),
-            // Stage 0 surfaces only when PreStage actually ran this cycle.
-            (state.lastCycle.prestage > 0)
-              ? h('span', null, ' • Stage 0 → ', h('b', null, fmt(state.lastCycle.prestage)))
-              : null,
-            ' • Stage 1 → ', h('b', null, fmt(state.lastCycle.stage1 ?? state.lastCycle.ai)),
-            ' • Stage 2 → ', h('b', null, fmt(state.lastCycle.stage2 ?? 0)),
-            ' • Алертов → ', h('b', null, fmt(state.lastCycle.alerts))
-          )
-        )
-      : null
-  );
-}
 
 function ScannersPage() {
   const [state, setState] = React.useState(null);
@@ -2346,8 +2274,7 @@ function ScannersPage() {
         color: msg.includes('Ошибка') ? 'var(--red)' : 'var(--green)', fontSize: 13 }
     }, msg),
 
-    // Live pipeline flow animation — Apify → ... → Alerts
-    React.createElement(PipelineFlow, null),
+    // Pipeline flow moved to the global topbar (StatusBar) — visible from every page.
 
     // Scanner tuning config (presets, thresholds, storage floor)
     React.createElement(ScannerConfigSection, null),
@@ -2356,16 +2283,12 @@ function ScannersPage() {
     // the gpt-5.4-nano text enrichment, A/B-tested against value vs latency.
     React.createElement(PreStageSection, null),
 
-    // Per-preset junk-filter weights moved to "🎛️ Пресеты" tab in 2026-05-01
-    // PR-2 (FilterProfilesSection removed; component definition retained for
-    // potential rollback). JunkStatsSection (observability) stays — it's
-    // pure read-only rolling stats over raw_metrics.
-
-    // Rolling stats on what junk-filter is actually filtering out
+    // Rolling stats on what junk-filter is actually filtering out.
+    // (Per-preset junk weights moved to the "🎛️ Пресеты" tab in PR-2.)
     React.createElement(JunkStatsSection, null),
 
     // Per-platform collector cards
-    React.createElement('div', { className: 'broadcast-box' },
+    React.createElement('div', { className: 'adm-card' },
       React.createElement('h3', { style: { marginBottom: 16 } }, '📡 Площадки'),
       React.createElement('div', { className: 'collector-grid' },
         (state?.collectors || []).map(c =>
@@ -2421,7 +2344,7 @@ function ScannerConfigSection() {
     setSaving(false);
   };
 
-  if (!cfg) return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
+  if (!cfg) return h('div', { className: 'adm-card', style: { marginBottom: 20 } },
     h('div', { className: 'loading' }, 'Загрузка конфига сканера...')
   );
 
@@ -2465,7 +2388,7 @@ function ScannerConfigSection() {
     })
   );
 
-  return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
+  return h('div', { className: 'adm-card', style: { marginBottom: 20 } },
     h('h3', { style: { marginBottom: 6 } }, '🎯 Конфиг сканера'),
     h('p', { style: { color: 'var(--muted)', fontSize: 13, marginBottom: 18 } },
       'Пресет поиска + пороги для алертов/хранения. Применяется со следующего цикла сканера.'),
@@ -2584,19 +2507,6 @@ function ScannerConfigSection() {
   );
 }
 
-// ── Per-preset junk-filter tuning ────────────────────────────────────────────
-// Admin UI for the filterProfiles setting. Each preset (general/animals/...)
-// has its own weights. Overrides are sparse — only fields that differ from
-// the defaults get stored. Shows defaults as hints + a reset chip on modified
-// fields. Changes apply from the next scan cycle (no restart).
-const FILTER_PRESET_META = {
-  general:     { icon: '🌐', label: 'Общий' },
-  animals:     { icon: '🐾', label: 'Животные' },
-  culture:     { icon: '🎭', label: 'Культура' },
-  celebrities: { icon: '⭐', label: 'Знаменитости' },
-  events:      { icon: '🌍', label: 'События' },
-};
-
 // ── Stage 0 / PreStage controls ─────────────────────────────────────────────
 //
 // Currently shows a single toggle for the gpt-5.4-nano text-enrichment
@@ -2638,7 +2548,7 @@ function PreStageSection() {
     }
   };
 
-  return h('div', { className: 'broadcast-box', style: { marginTop: 16 } },
+  return h('div', { className: 'adm-card', style: { marginTop: 16 } },
     h('h3', { style: { marginBottom: 6 } }, '🎨 Stage 0 — PreStage'),
     h('p', {
       style: { fontSize: 12, color: 'var(--text3)', marginBottom: 16, lineHeight: 1.5 }
@@ -2721,231 +2631,6 @@ function PreStageSection() {
   );
 }
 
-function FilterProfilesSection() {
-  const h = React.createElement;
-  const [data, setData]     = useState(null);    // full server response
-  const [draft, setDraft]   = useState({});      // local working copy of overrides
-  const [active, setActive] = useState('general');
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg]       = useState('');
-
-  useEffect(() => {
-    api('/api/filter-profiles')
-      .then(d => { setData(d); setDraft(d.overrides || {}); })
-      .catch(e => setMsg('Ошибка: ' + e.message));
-  }, []);
-
-  const flash = (m) => { setMsg(m); setTimeout(() => setMsg(''), 2500); };
-
-  if (!data) return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
-    h('div', { className: 'loading' }, 'Загрузка профилей фильтров...')
-  );
-
-  const defaults = data.defaults;
-  const fields   = data.fields;
-  const presets  = data.presets;
-
-  // Effective value for a field on a preset = draft[preset][field] if set, else default.
-  const effVal = (preset, field) => {
-    if (draft[preset] && draft[preset][field] != null) return draft[preset][field];
-    return defaults[preset][field];
-  };
-  const isOverridden = (preset, field) => draft[preset] && draft[preset][field] != null;
-
-  const setFieldVal = (preset, field, val) => {
-    const num = Number(val);
-    setDraft(prev => {
-      const next = { ...prev };
-      const patch = { ...(next[preset] || {}) };
-      if (num === defaults[preset][field]) {
-        delete patch[field];
-      } else {
-        patch[field] = num;
-      }
-      if (Object.keys(patch).length === 0) delete next[preset];
-      else next[preset] = patch;
-      return next;
-    });
-  };
-
-  const resetField = (preset, field) => {
-    setDraft(prev => {
-      const next = { ...prev };
-      if (!next[preset]) return prev;
-      const patch = { ...next[preset] };
-      delete patch[field];
-      if (Object.keys(patch).length === 0) delete next[preset];
-      else next[preset] = patch;
-      return next;
-    });
-  };
-
-  const resetPreset = (preset) => {
-    setDraft(prev => {
-      const next = { ...prev };
-      delete next[preset];
-      return next;
-    });
-  };
-
-  const resetAll = () => setDraft({});
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      const res = await api('/api/filter-profiles', 'POST', { overrides: draft });
-      setData(res);
-      setDraft(res.overrides || {});
-      flash('✓ Профили сохранены');
-    } catch (e) {
-      flash('Ошибка: ' + e.message);
-    }
-    setSaving(false);
-  };
-
-  // Count modifications for header badge
-  const modCount = Object.values(draft).reduce((acc, p) => acc + Object.keys(p).length, 0);
-  const activeMods = draft[active] ? Object.keys(draft[active]).length : 0;
-
-  // ── Field row ──
-  const fieldRow = (field) => {
-    const meta = fields[field];
-    const cur  = effVal(active, field);
-    const def  = defaults[active][field];
-    const mod  = isOverridden(active, field);
-    return h('div', { key: field, className: 'scfg-row' },
-      h('div', { className: 'scfg-row-top' },
-        h('span', { className: 'scfg-label' },
-          meta.label,
-          h('span', { style: { marginLeft: 8, fontSize: 11, color: 'var(--muted)', fontWeight: 400 } },
-            meta.desc)
-        ),
-        h('span', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-          mod && h('button', {
-            onClick: () => resetField(active, field),
-            title: 'Сбросить к ' + def,
-            style: {
-              padding: '2px 8px', fontSize: 11, borderRadius: 4,
-              background: 'rgba(239,68,68,.12)', color: 'var(--red)',
-              border: '1px solid rgba(239,68,68,.3)', cursor: 'pointer',
-            },
-          }, '↺ ' + def),
-          h('span', {
-            className: 'scfg-val',
-            style: mod ? { color: 'var(--accent)', fontWeight: 700 } : null,
-          }, cur)
-        )
-      ),
-      h('input', {
-        type: 'range',
-        min: meta.min, max: meta.max, step: meta.step,
-        value: cur,
-        onChange: e => setFieldVal(active, field, e.target.value),
-        className: 'scfg-slider',
-      })
-    );
-  };
-
-  return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
-    h('h3', { style: { marginBottom: 6 } },
-      '🎛️ Профили фильтров по пресетам',
-      modCount > 0 && h('span', {
-        style: {
-          marginLeft: 10, padding: '2px 8px', fontSize: 12,
-          borderRadius: 10, background: 'rgba(20,184,166,.15)',
-          color: 'var(--accent)', fontWeight: 600,
-        },
-      }, modCount + ' изменение' + (modCount === 1 ? '' : modCount < 5 ? 'я' : 'й'))
-    ),
-    h('p', { style: { color: 'var(--muted)', fontSize: 13, marginBottom: 16 } },
-      'Штрафы junk-filter для каждого пресета. Изменения применяются со следующего цикла сканера. ' +
-      'Сохраняются только значения, отличающиеся от дефолтных (sparse override).'
-    ),
-
-    // ── Preset tabs ──
-    h('div', {
-      style: {
-        display: 'flex', gap: 6, marginBottom: 18, flexWrap: 'wrap',
-        padding: 6, background: 'var(--bg2)', borderRadius: 10,
-        border: '1px solid var(--border)',
-      },
-    },
-      presets.map(p => {
-        const meta = FILTER_PRESET_META[p] || { icon: '•', label: p };
-        const mods = draft[p] ? Object.keys(draft[p]).length : 0;
-        const isActive = active === p;
-        return h('button', {
-          key: p,
-          onClick: () => setActive(p),
-          style: {
-            flex: '1 1 auto', minWidth: 110, padding: '8px 12px',
-            borderRadius: 8, cursor: 'pointer',
-            background: isActive ? 'var(--accent)' : 'transparent',
-            color: isActive ? '#fff' : 'var(--text)',
-            border: isActive ? '1px solid var(--accent)' : '1px solid transparent',
-            fontWeight: isActive ? 700 : 500,
-            fontSize: 13,
-            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-          },
-        },
-          h('span', null, meta.icon + ' ' + meta.label),
-          mods > 0 && h('span', {
-            style: {
-              padding: '1px 6px', fontSize: 10, borderRadius: 8,
-              background: isActive ? 'rgba(255,255,255,.22)' : 'rgba(20,184,166,.18)',
-              color: isActive ? '#fff' : 'var(--accent)',
-              fontWeight: 700,
-            },
-          }, mods)
-        );
-      })
-    ),
-
-    // ── Field rows for active preset ──
-    Object.keys(fields).map(fieldRow),
-
-    // ── Per-preset reset + save ──
-    h('div', {
-      style: {
-        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        marginTop: 18, gap: 10, flexWrap: 'wrap',
-      },
-    },
-      h('div', { style: { display: 'flex', gap: 8 } },
-        activeMods > 0 && h('button', {
-          onClick: () => resetPreset(active),
-          style: {
-            padding: '8px 14px', borderRadius: 8, fontSize: 12,
-            background: 'transparent', color: 'var(--red)',
-            border: '1px solid rgba(239,68,68,.4)', cursor: 'pointer',
-          },
-        }, '↺ Сбросить этот пресет'),
-        modCount > 0 && h('button', {
-          onClick: resetAll,
-          style: {
-            padding: '8px 14px', borderRadius: 8, fontSize: 12,
-            background: 'transparent', color: 'var(--muted)',
-            border: '1px solid var(--border)', cursor: 'pointer',
-          },
-        }, '↺ Сбросить все пресеты'),
-      ),
-      h('button', {
-        className: 'btn btn-primary',
-        onClick: save, disabled: saving,
-        style: { padding: '10px 20px' },
-      }, saving ? '⏳ Сохраняю...' : '💾 Сохранить профили')
-    ),
-
-    msg && h('div', {
-      style: {
-        marginTop: 14, padding: '10px 14px', borderRadius: 8,
-        background: msg.includes('Ошибка') ? 'rgba(239,68,68,.1)' : 'rgba(16,185,129,.1)',
-        color: msg.includes('Ошибка') ? 'var(--red)' : 'var(--green)',
-        fontSize: 13,
-      },
-    }, msg)
-  );
-}
 
 // ── Junk-filter observation panel ────────────────────────────────────────────
 // "What is junk-filter actually filtering out?" Shows top reasons over last N
@@ -2977,7 +2662,7 @@ function JunkStatsSection() {
     // eslint-disable-next-line
   }, [hours]);
 
-  return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
+  return h('div', { className: 'adm-card', style: { marginBottom: 20 } },
     h('div', {
       style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 8 }
     },
@@ -3160,20 +2845,22 @@ function DecisionsPage() {
   };
 
   return h('div', null,
-    h('h2', { style: { marginBottom: 6 } }, '🔔 Решения алерт-гейта'),
-    h('p', { style: { color: 'var(--muted)', fontSize: 13, marginBottom: 16 } },
-      'Последние 500 решений, in-memory (сбрасывается при рестарте). Обновляется каждые 10 сек. ' +
-      'Всего в буфере: ' + (data.total || 0) + '.'),
+    h('div', { className: 'dec-page-head' },
+      h('h2', null, '🔔 Решения алерт-гейта'),
+      h('p', null,
+        'Последние 500 решений, in-memory (сбрасывается при рестарте). Обновляется каждые 10 сек. ' +
+        'Всего в буфере: ' + (data.total || 0) + '.')
+    ),
 
     // Filter chips + reason counts
-    h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 } },
+    h('div', { className: 'dec-filter-row' },
       ['all', 'sent', 'skipped'].map(f => h('button', {
         key: f,
         className: 'btn ' + (filter === f ? 'btn-primary' : 'btn-ghost') + ' btn-sm',
         onClick: () => { setFilter(f); setReason(''); }
       }, f === 'all' ? 'Все' : f === 'sent' ? '✓ Отправлены' : '✗ Отсеяны'))
     ),
-    h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 14, fontSize: 12 } },
+    h('div', { className: 'dec-reason-row' },
       Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([r, n]) => {
         const lbl = DECISION_LABELS[r];
         return h('button', {
@@ -3189,11 +2876,10 @@ function DecisionsPage() {
     items.length === 0
       ? h('div', { className: 'empty', style: { padding: 40 } },
           'Пока нет решений — сканер ещё ни разу не гонял алерт-гейт.')
-      : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+      : h('div', { className: 'dec-list' },
           items.map((d, i) => {
             const lbl = DECISION_LABELS[d.reason] || { color: 'var(--text2)', text: d.reason };
             const isSent = d.decision === 'sent';
-            const accent = isSent ? 'var(--green)' : (lbl.color || 'var(--red)');
 
             // Fallback for old decisions without gates[] — synthesize from reason
             const gates = Array.isArray(d.gates) && d.gates.length
@@ -3205,62 +2891,34 @@ function DecisionsPage() {
             const titleNode = d.url
               ? h('a', {
                   href: d.url, target: '_blank', rel: 'noopener noreferrer',
-                  style: { color: 'var(--text)', textDecoration: 'none', fontWeight: 600, fontSize: 14, lineHeight: 1.35 },
-                  onMouseOver: e => e.currentTarget.style.textDecoration = 'underline',
-                  onMouseOut:  e => e.currentTarget.style.textDecoration = 'none',
-                }, (d.title || '—'), h('span', { style: { color: 'var(--muted)', fontWeight: 400, marginLeft: 6, fontSize: 12 } }, '↗'))
-              : h('span', { style: { color: 'var(--text)', fontWeight: 600, fontSize: 14 } }, d.title || '—');
+                  className: 'dec-title-link'
+                }, (d.title || '—'), h('span', { className: 'dec-title-arrow' }, '↗'))
+              : h('span', { className: 'dec-title-link' }, d.title || '—');
 
             return h('div', {
               key: i,
-              style: {
-                background: 'var(--bg2, rgba(255,255,255,0.02))',
-                border: '1px solid var(--border)',
-                borderLeft: '3px solid ' + accent,
-                borderRadius: 8,
-                padding: '12px 14px',
-              }
+              className: 'dec-card ' + (isSent ? 'sent' : 'skipped')
             },
               // Row 1: time + title + verdict
-              h('div', {
-                style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }
-              },
-                h('span', { style: { color: 'var(--muted)', fontSize: 11, fontFamily: 'monospace', whiteSpace: 'nowrap' } }, fmtTime(d.ts)),
-                h('div', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, titleNode),
-                h('span', {
-                  style: {
-                    color: accent, fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap',
-                    padding: '3px 8px', borderRadius: 4,
-                    background: 'color-mix(in srgb, ' + accent + ' 12%, transparent)',
-                  }
-                }, lbl.text)
+              h('div', { className: 'dec-row1' },
+                h('span', { className: 'dec-time' }, fmtTime(d.ts)),
+                h('div', { className: 'dec-title' }, titleNode),
+                h('span', { className: 'dec-verdict ' + (isSent ? 'sent' : 'skipped') }, lbl.text)
               ),
               // Row 2: meta (source, category, score, user)
-              h('div', {
-                style: { display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 11, color: 'var(--muted)', marginBottom: 8 }
-              },
-                d.source    && h('span', null, '📡 ', h('b', { style: { color: 'var(--text2)', fontWeight: 500 } }, d.source)),
-                // Alert-type chip — coloured ring per type so the distribution
-                // is visible at a glance when scanning the decisions list.
-                d.alertType && h('span', {
-                  style: {
-                    fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 999,
-                    color: d.alertType === 'event' ? '#ff8a65' : d.alertType === 'trend' ? '#2ed573' : '#74b9ff',
-                    background: 'color-mix(in srgb, ' + (d.alertType === 'event' ? '#ff6b6b' : d.alertType === 'trend' ? '#2ed573' : '#74b9ff') + ' 12%, transparent)',
-                    border: '1px solid color-mix(in srgb, ' + (d.alertType === 'event' ? '#ff6b6b' : d.alertType === 'trend' ? '#2ed573' : '#74b9ff') + ' 35%, transparent)',
-                  }
-                }, (d.alertType === 'event' ? '📰 EVENT' : d.alertType === 'trend' ? '📈 TREND' : '🚀 POST')),
+              h('div', { className: 'dec-meta-row' },
+                d.source    && h('span', null, '📡 ', h('b', null, d.source)),
+                // Alert-type chip — coloured per type for at-a-glance distribution
+                d.alertType && h('span', { className: 'dec-atype-chip ' + d.alertType },
+                  (d.alertType === 'event' ? '📰 EVENT' : d.alertType === 'trend' ? '📈 TREND' : '🚀 POST')),
                 d.category  && h('span', null, '📂 ', d.category),
                 d.alertScore != null && h('span', null,
-                  'score: ',
-                  h('b', { style: { color: 'var(--text2)', fontWeight: 600 } }, d.alertScore),
-                  ' / ', d.threshold
+                  'score: ', h('b', null, d.alertScore), ' / ', d.threshold
                 ),
                 d.userChatId && h('span', null, '👤 @', d.userChatId)
               ),
               // Row 2b: engagement — raw views/likes/retweets/upvotes from
-              // the collector. For Twitter clusters these are sums across
-              // all tweets in the cluster. Hidden if no data at all.
+              // the collector. Hidden if no data at all.
               (() => {
                 const e = d.engagement || {};
                 const chips = [];
@@ -3270,50 +2928,20 @@ function DecisionsPage() {
                 if (e.replies  != null && fmtNum(e.replies)  != null) chips.push({ icon: '💬', label: 'replies',  val: fmtNum(e.replies) });
                 if (e.upvotes  != null && fmtNum(e.upvotes)  != null) chips.push({ icon: '⬆',  label: 'upvotes',  val: fmtNum(e.upvotes) });
                 if (!chips.length) return null;
-                return h('div', {
-                  style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }
-                },
-                  chips.map((c, ci) => h('span', {
-                    key: ci,
-                    title: c.label,
-                    style: {
-                      fontSize: 11, padding: '2px 8px', borderRadius: 10,
-                      border: '1px solid var(--border)',
-                      color: 'var(--text2)',
-                      background: 'rgba(255,255,255,0.02)',
-                      fontFamily: 'ui-monospace, monospace',
-                    }
-                  }, c.icon + ' ' + c.val))
+                return h('div', { className: 'dec-eng-row' },
+                  chips.map((c, ci) => h('span', { key: ci, className: 'dec-eng-chip', title: c.label }, c.icon + ' ' + c.val))
                 );
               })(),
               // Row 3: gate chips
-              gates.length > 0 && h('div', {
-                style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: d.breakdown ? 8 : 0 }
-              },
-                gates.map((g, gi) => {
-                  const c = g.passed ? 'var(--green)' : 'var(--red)';
-                  return h('span', {
-                    key: gi,
-                    title: g.detail || '',
-                    style: {
-                      fontSize: 11, padding: '2px 8px', borderRadius: 10,
-                      border: '1px solid color-mix(in srgb, ' + c + ' 40%, transparent)',
-                      color: c,
-                      background: 'color-mix(in srgb, ' + c + ' 10%, transparent)',
-                      fontFamily: 'ui-monospace, monospace',
-                      cursor: g.detail ? 'help' : 'default',
-                    }
-                  }, (g.passed ? '✓ ' : '✗ ') + (GATE_LABELS[g.name] || g.name));
-                })
+              gates.length > 0 && h('div', { className: 'dec-gate-row' + (d.breakdown ? '' : ' no-bd') },
+                gates.map((g, gi) => h('span', {
+                  key: gi,
+                  title: g.detail || '',
+                  className: 'dec-gate-chip ' + (g.passed ? 'passed' : 'failed'),
+                }, (g.passed ? '✓ ' : '✗ ') + (GATE_LABELS[g.name] || g.name)))
               ),
               // Row 4: breakdown (monospace, subtle)
-              d.breakdown && h('div', {
-                style: {
-                  color: 'var(--muted)', fontSize: 11, fontFamily: 'ui-monospace, monospace',
-                  padding: '6px 8px', background: 'rgba(255,255,255,0.02)',
-                  borderRadius: 4, border: '1px dashed var(--border)',
-                }
-              }, fmtBreakdown(d.breakdown))
+              d.breakdown && h('div', { className: 'dec-breakdown' }, fmtBreakdown(d.breakdown))
             );
           })
         )
@@ -3323,10 +2951,25 @@ function DecisionsPage() {
 function StatsPage() {
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [maintMsg, setMaintMsg] = useState('');
 
   useEffect(()=>{
     api('/api/stats').then(s=>{ setStats(s); setLoading(false); }).catch(()=>setLoading(false));
   },[]);
+
+  // Cleanup old alerts/notifications. Moved here from PaymentsPage where it
+  // didn't really belong (payments != alerts) — Stats is the natural home for
+  // database-housekeeping actions.
+  const cleanupAlerts = async () => {
+    const raw = window.prompt('Удалить алерты старше скольких дней?', '30');
+    if (raw === null) return;
+    const days = Math.max(1, Math.min(365, parseInt(raw || '30', 10) || 30));
+    try {
+      const r = await api('/api/alerts/cleanup', 'POST', { days });
+      setMaintMsg('Очищено: тренды ' + r.trendsDeleted + ', нотификации ' + r.notificationsDeleted);
+      setTimeout(()=>setMaintMsg(''), 4000);
+    } catch(e){ setMaintMsg('Ошибка: ' + e.message); setTimeout(()=>setMaintMsg(''), 4000); }
+  };
 
   if (loading) return React.createElement('div',{className:'loading'},'Загрузка статистики...');
   if (!stats) return React.createElement('div',{className:'empty'},'Нет данных');
@@ -3383,24 +3026,31 @@ function StatsPage() {
     ),
     React.createElement('div',{className:'stats-bottom-grid'},
       React.createElement('div',{className:'chart-wrap'},
-        React.createElement('div',{className:'chart-title'},'Срез по хранению'),
+        React.createElement('div',{className:'chart-title'},'Срез по хранению и метрики'),
         React.createElement('div',{className:'info-list'},
           React.createElement('div',{className:'info-row'},React.createElement('strong',null,'Размер файла БД'),React.createElement('span',null,fmtBytes(stats.storage.dbBytes))),
           React.createElement('div',{className:'info-row'},React.createElement('strong',null,'Тренды'),React.createElement('span',null,stats.storage.trendsCount)),
           React.createElement('div',{className:'info-row'},React.createElement('strong',null,'Notifications'),React.createElement('span',null,stats.storage.notificationsCount)),
           React.createElement('div',{className:'info-row'},React.createElement('strong',null,'Payments'),React.createElement('span',null,stats.storage.paymentsCount)),
-        )
-      ),
-      React.createElement('div',{className:'chart-wrap'},
-        React.createElement('div',{className:'chart-title'},'Краткие выводы'),
-        React.createElement('div',{className:'info-list'},
           React.createElement('div',{className:'info-row'},React.createElement('strong',null,'Active rate'),React.createElement('span',null,activeShare + '%')),
           React.createElement('div',{className:'info-row'},React.createElement('strong',null,'Paid share'),React.createElement('span',null,paidShare + '%')),
           React.createElement('div',{className:'info-row'},React.createElement('strong',null,'Доход lifetime'),React.createElement('span',null,fmtRevenueByCurrency(stats.revenue.byCurrencyTotal))),
-        ),
-        React.createElement('p',{className:'muted-note',style:{marginTop:14}},
-          'Если нужно быстро проверить здоровье продукта, обычно хватает трёх мест: новые пользователи, доход 30д и размер базы. Они быстрее всего показывают, всё ли идёт в плюс.'
         )
+      )
+    ),
+    // 🧹 Maintenance — DB housekeeping actions. Lives here on Stats because
+    // Stats already shows storage usage, so cleanup buttons sit naturally
+    // next to the "размер БД" KPI. Previously the alerts-cleanup button was
+    // on PaymentsPage which was a semantic mismatch (payments != alerts).
+    React.createElement('div',{className:'chart-wrap maintenance-card'},
+      React.createElement('div',{className:'chart-title'},'🧹 Обслуживание базы'),
+      React.createElement('p',{className:'muted-note',style:{marginBottom:14}},
+        'Регулярные cleanup-операции для удержания размера БД. Удалённое необратимо — но ничего критичного: снимаются старые алерты и истёкшие платёжные интенты.'
+      ),
+      React.createElement('div',{className:'maintenance-actions'},
+        React.createElement('button',{className:'btn btn-danger btn-sm',onClick:cleanupAlerts},'🧹 Очистить старые алерты'),
+        React.createElement('span',{style:{fontSize:12,color:'var(--text2)'}},'удаляет тренды + notifications старше N дней'),
+        maintMsg && React.createElement('span',{className:maintMsg.startsWith('Ошибка')?'error-msg':'success-msg'},maintMsg)
       )
     )
   );
@@ -3458,6 +3108,10 @@ function BotPage() {
   const [managing, setManaging] = useState(false);
   const [aiSaving, setAiSaving] = useState(false);
   const [savingPlan, setSavingPlan] = useState(false);
+  // Sub-tab for BotPage. Splits the previously crammed wall of 7 cards
+  // into 3 focused views: AI / Broadcasts (send + manage + history) /
+  // Plans & Feedback (plans editor + feedback weights + recent reasons).
+  const [subTab, setSubTab] = useState('ai');
 
   const loadBroadcasts = async () => {
     try { setBroadcasts(await api('/api/broadcasts?limit=30&offset=0')); }
@@ -3617,7 +3271,20 @@ function BotPage() {
       React.createElement('div',{className:'card yellow'},React.createElement('div',{className:'card-label'},'Paid plans'),React.createElement('div',{className:'card-value'},paidPlans),React.createElement('div',{className:'card-sub'},'Редактируемые тарифы с оплатой'))
     ),
 
-    React.createElement('div',{className:'broadcast-box'},
+    // Sub-tab strip — 3 focused views instead of one giant scroll
+    React.createElement('div',{className:'adm-tabs bordered'},
+      [
+        ['ai',         '🧠 AI Pipeline'],
+        ['broadcasts', '📢 Рассылки'],
+        ['plans',      '💰 Планы и фидбек'],
+      ].map(([k,l]) => React.createElement('button',{
+        key:k,
+        className:'adm-tab' + (subTab === k ? ' active' : ''),
+        onClick:()=>setSubTab(k)
+      }, l))
+    ),
+
+    subTab === 'ai' && React.createElement('div',{className:'adm-card'},
       React.createElement('h3',null,'🧠 AI Pipeline'),
       React.createElement('p',{style:{fontSize:12,color:'var(--text2)',marginBottom:10}},
         'Stage 1: выбранная модель для основного scoring. Stage 2: x_search через Grok (вкл/выкл одним тумблером).'
@@ -3669,8 +3336,8 @@ function BotPage() {
       )
     ),
 
-    // Broadcast
-    React.createElement('div',{className:'broadcast-box'},
+    // Broadcasts sub-tab — Send / Manage / History
+    subTab === 'broadcasts' && React.createElement('div',{className:'adm-card'},
       React.createElement('h3',null,'📢 Рассылка сообщений'),
       React.createElement('textarea',{className:'msg-input',placeholder:'Введите сообщение... Поддерживается HTML: <b>жирный</b>, <i>курсив</i>, <a href="">ссылка</a>',value:bcast,onChange:e=>setBcast(e.target.value)}),
       React.createElement('div',{className:'broadcast-footer'},
@@ -3686,28 +3353,8 @@ function BotPage() {
       )
     ),
 
-    React.createElement('div',{className:'broadcast-box'},
-      React.createElement('h3',null,'🛠 Управление последней рассылкой'),
-      React.createElement('p',{style:{fontSize:12,color:'var(--text2)',marginBottom:10}},'Работает с последним закрепленным рассылочным сообщением у каждого пользователя.'),
-      React.createElement('textarea',{
-        className:'msg-input',
-        placeholder:'Новый текст для кнопки "Обновить текст" (HTML поддерживается)',
-        value:manageText,
-        onChange:e=>setManageText(e.target.value)
-      }),
-      React.createElement('div',{className:'broadcast-footer'},
-        React.createElement('select',{className:'filter',value:managePlan,onChange:e=>setManagePlan(e.target.value)},
-          React.createElement('option',{value:'free'},'Только Free'),
-          React.createElement('option',{value:'test'},'Только Test'),
-          React.createElement('option',{value:'pro'},'Только Pro'),
-        ),
-        React.createElement('button',{className:'btn btn-primary',onClick:sendBroadcast,disabled:sending||!bcast.trim()},sending?'Отправка...':'📤 Отправить'),
-        bcastResult&&!bcastResult.error&&React.createElement('span',{className:'success-msg'},'✓ Отправлено: '+bcastResult.sent+', ошибок: '+bcastResult.failed),
-        bcastResult&&bcastResult.error&&React.createElement('span',{className:'error-msg'},'Ошибка: '+bcastResult.error)
-      )
-    ),
-
-    React.createElement('div',{className:'broadcast-box'},
+    // 🛠 Manage last pinned broadcast — edit/unpin/delete by plan filter.
+    subTab === 'broadcasts' && React.createElement('div',{className:'adm-card'},
       React.createElement('h3',null,'🛠 Управление последней рассылкой'),
       React.createElement('p',{style:{fontSize:12,color:'var(--text2)',marginBottom:10}},'Работает с последним закрепленным рассылочным сообщением у каждого пользователя.'),
       React.createElement('textarea',{
@@ -3733,7 +3380,7 @@ function BotPage() {
       manageResult&&manageResult.error&&React.createElement('div',{className:'mt16'},React.createElement('span',{className:'error-msg'},'Ошибка: '+manageResult.error))
     ),
 
-    React.createElement('div',{className:'broadcast-box'},
+    subTab === 'broadcasts' && React.createElement('div',{className:'adm-card'},
       React.createElement('h3',null,'🗂 История рассылок'),
       React.createElement('p',{style:{fontSize:12,color:'var(--text2)',marginBottom:10}},'Можно отредактировать, открепить или удалить конкретную рассылку у всех получателей.'),
       broadcasts.length === 0
@@ -3756,8 +3403,8 @@ function BotPage() {
           )
     ),
 
-    // Plans
-    React.createElement('div',{className:'broadcast-box'},
+    // Plans & Feedback sub-tab — Plans / Feedback weights / Recent reasons
+    subTab === 'plans' && React.createElement('div',{className:'adm-card'},
       React.createElement('h3',null,'💰 Настройка планов'),
       React.createElement('div',{style:{borderRadius:8,overflow:'hidden',border:'1px solid var(--border)'}},
         React.createElement('div',{className:'plan-row plan-head'},
@@ -3784,7 +3431,7 @@ function BotPage() {
     ),
 
     // ── Feedback Weighting ──────────────────────────────────────────────
-    React.createElement('div',{className:'broadcast-box'},
+    subTab === 'plans' && React.createElement('div',{className:'adm-card'},
       React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:14}},
         React.createElement('h3',{style:{margin:0}},'👍 Взвешенный фидбек'),
         React.createElement('label',{style:{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:13}},
@@ -3839,7 +3486,7 @@ function BotPage() {
     // actually think (free text), not just aggregate +/- counts.
     // (Reminder: this whole file lives inside a template literal — do NOT use
     //  backticks in comments. Use single quotes only.)
-    React.createElement('div',{className:'broadcast-box',style:{marginTop:14}},
+    subTab === 'plans' && React.createElement('div',{className:'adm-card',style:{marginTop:14}},
       React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:14}},
         React.createElement('h3',{style:{margin:0}},'💬 Причины оценок (последние)'),
         React.createElement('button',{className:'btn btn-sm',onClick:reloadRecentReasons,style:{fontSize:11}},
@@ -4921,15 +4568,15 @@ function ExamplesPage() {
     showPreview && React.createElement('pre', { className:'exp-preview-pre' }, buildPreview()),
     // Tabs
     React.createElement('div', { className:'exp-toolbar' },
-      React.createElement('div', { className:'exp-tabs' },
+      React.createElement('div', { className:'adm-tabs' },
         ...[['example', '📚 Examples', exampleCount], ['mistake', '⚠️ Mistakes', mistakeCount]].map(([k, l, n]) =>
           React.createElement('button', {
             key: k,
-            className: 'exp-tab' + (tab === k ? ' active' : ''),
+            className: 'adm-tab' + (tab === k ? ' active' : ''),
             onClick: () => setTab(k)
           },
             React.createElement('span', null, l),
-            React.createElement('span', { className:'exp-tab-count' }, n)
+            React.createElement('span', { className:'adm-tab-count' }, n)
           )
         )
       )
@@ -5212,7 +4859,7 @@ function PresetConfigsPage() {
   const groups  = data.groups;
 
   // Top-level layout
-  return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
+  return h('div', { className: 'adm-card', style: { marginBottom: 20 } },
     h('h3', { style: { marginBottom: 6 } }, '🎛️ Preset configs'),
 
     h('div', { className: 'pcfg-banner' },
@@ -5229,14 +4876,14 @@ function PresetConfigsPage() {
     ),
 
     // Tab strip
-    h('div', { className: 'pcfg-tabs' },
+    h('div', { className: 'adm-tabs bordered' },
       presets.map(p => h('button', {
         key: p,
-        className: 'pcfg-tab' + (tab === p ? ' active' : ''),
+        className: 'adm-tab capitalize' + (tab === p ? ' active' : ''),
         onClick: () => setTab(p),
       },
         getPresetIcon(p) + ' ' + p,
-        draft[p] ? h('span', { className: 'pcfg-tab-dot', title: 'Has overrides' }) : null
+        draft[p] ? h('span', { className: 'adm-tab-dot', title: 'Has overrides' }) : null
       ))
     ),
 
@@ -5588,9 +5235,134 @@ function SumMeter({ preset, paths, h, getEffective }) {
 }
 
 // ── App Root ──────────────────────────────────────────────────────────────────
+// StatusBar — pipeline visualisation pinned to the top of every page.
+// Replaces the standalone PipelineFlow component in ScannersPage so the
+// operator can see the live cycle from anywhere. Polls every 2.5s. Click
+// the head (title) navigates to Сканеры for full controls.
+function StatusBar({ onNavigate }) {
+  const h = React.createElement;
+  const [state, setState] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      api('/api/pipeline').then(s => { if (alive) setState(s); }).catch(() => {});
+    };
+    tick();
+    const id = setInterval(tick, 2500);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  if (!state) return null;
+
+  // Same routing logic as the old PipelineFlow component
+  const live     = state.running && state.cycleInProgress;
+  const counts   = live ? state.cycleInProgress : (state.lastCycle || {});
+  const curStage = state.currentStage || 'idle';
+  const effectiveCurStage = curStage === 'ai' ? 'stage1' : curStage;
+  const curIdx = PIPELINE_STAGES.findIndex(s => s.id === effectiveCurStage);
+
+  let subtitle;
+  if (state.paused) {
+    subtitle = h('span', { className: 'sb-paused' }, '⏸ Сканер на паузе');
+  } else if (state.running) {
+    const activeLabel = curStage === 'ai' ? 'Stage 1 / Stage 2'
+      : curStage === 'prestage' ? 'Stage 0 (nano + Gemini)'
+      : (PIPELINE_STAGES[curIdx]?.label || 'работает');
+    subtitle = h('span', null,
+      h('span', { className: 'sb-live-dot' }),
+      'Live — ' + activeLabel + '...'
+    );
+  } else if (state.lastCycle) {
+    const ago = Math.max(0, Math.round((Date.now() - (state.lastCycle.completedAt || 0)) / 1000));
+    const agoStr = ago < 60 ? ago + 'с назад' : Math.round(ago / 60) + 'м назад';
+    const dur = state.lastCycle.durationMs ? (state.lastCycle.durationMs / 1000).toFixed(1) + 'с' : '—';
+    subtitle = 'Последний цикл ' + agoStr + ' (за ' + dur + ')';
+  } else {
+    subtitle = 'Ожидание первого цикла...';
+  }
+
+  const fmt = (v) => (v === undefined || v === null ? '—' : String(v));
+
+  // Per-stage tooltip — surfaces actual model used this cycle (Stage 1 is
+  // configurable, Stage 2 is always Grok). Same logic as old PipelineFlow.
+  const stage1Model = counts.stage1Model || state.lastCycle?.stage1Model || null;
+  const stage2Model = counts.stage2Model || state.lastCycle?.stage2Model || null;
+  const nanoModel    = counts.nanoModel    || state.lastCycle?.nanoModel    || null;
+  const geminiModel  = counts.geminiModel  || state.lastCycle?.geminiModel  || null;
+  const stageTitle = (s) => {
+    if (s.id === 'stage1' && stage1Model) return s.label + ' · ' + stage1Model;
+    if (s.id === 'stage2' && stage2Model) return s.label + ' · ' + stage2Model;
+    if (s.id === 'prestage') {
+      const parts = [];
+      if (nanoModel)   parts.push('nano: ' + nanoModel);
+      if (geminiModel) parts.push('vision: ' + geminiModel);
+      return parts.length ? s.label + ' · ' + parts.join(', ') : (s.label + ' · ' + s.hint);
+    }
+    return s.label + ' · ' + s.hint;
+  };
+
+  const nodes = [];
+  PIPELINE_STAGES.forEach((s, i) => {
+    const isActive = live && (curStage === s.id || (curStage === 'ai' && PIPELINE_AI_IDS.has(s.id)));
+    const isDone   = live ? (curIdx > i) : !!state.lastCycle;
+    nodes.push(h('div', {
+      key: s.id,
+      className: 'sb-node' + (isActive ? ' active' : '') + (!isActive && isDone ? ' done' : ''),
+      title: stageTitle(s),
+    },
+      h('div', { className: 'sb-node-ico' }, s.icon),
+      h('div', { className: 'sb-node-cnt' }, fmt(counts[s.id]))
+    ));
+    if (i < PIPELINE_STAGES.length - 1) {
+      const wireActive = live && curIdx === i + 1;
+      const wireDone   = live ? curIdx > i + 1 : !!state.lastCycle;
+      nodes.push(h('div', {
+        key: 'w' + i,
+        className: 'sb-wire' + (wireActive ? ' active' : '') + (!wireActive && wireDone ? ' done' : ''),
+      }));
+    }
+  });
+
+  return h('div', { className: 'main-topbar sb-topbar' + (state.paused ? ' is-paused' : '') },
+    h('div', {
+      className: 'sb-head',
+      onClick: () => onNavigate && onNavigate('scanners'),
+      style: { cursor: onNavigate ? 'pointer' : 'default' },
+      title: 'Открыть Сканеры',
+    },
+      h('h2', null, '🔄 Пайплайн'),
+      h('p', null, subtitle)
+    ),
+    h('div', { className: 'sb-pipeline' }, nodes)
+  );
+}
+
 function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('adminKey'));
   const [tab, setTab] = useState('stats');
+  // Lightweight live indicators on sidebar tabs — paused dot on Сканеры,
+  // unread count on Алерты. Polled every 12s, fail silently. Lets the
+  // operator notice activity without opening every tab.
+  const [navHints, setNavHints] = useState({ paused: false, unsentDecisions: 0 });
+  useEffect(() => {
+    if (!authed) return;
+    const load = async () => {
+      try {
+        const [pipe, dec] = await Promise.all([
+          api('/api/pipeline').catch(()=>null),
+          api('/api/alert-decisions?filter=skipped&limit=1').catch(()=>null),
+        ]);
+        setNavHints({
+          paused: !!pipe?.paused,
+          unsentDecisions: dec?.counts ? Object.values(dec.counts).reduce((a,b)=>a+b,0) : 0,
+        });
+      } catch(_) {}
+    };
+    load();
+    const iv = setInterval(load, 12_000);
+    return () => clearInterval(iv);
+  }, [authed]);
 
   if (!authed) return React.createElement(AuthOverlay,{onAuth:()=>setAuthed(true)});
 
@@ -5615,10 +5387,21 @@ function App() {
         React.createElement('h1',null,'Catalyst'),
         React.createElement('span',null,'Admin Panel')
       ),
-      TABS.map(t=>React.createElement('div',{key:t.id,className:'nav-item'+(tab===t.id?' active':''),onClick:()=>setTab(t.id)},
-        React.createElement('span',{className:'nav-icon'},t.icon),
-        React.createElement('span',null,t.label)
-      )),
+      TABS.map(t=>{
+        // Optional live hint per tab — paused dot for Сканеры, unread badge
+        // for Алерты. Renders to the right of the label when active.
+        let hint = null;
+        if (t.id === 'scanners' && navHints.paused) {
+          hint = React.createElement('span',{className:'nav-dot paused',title:'Сканер на паузе'});
+        } else if (t.id === 'decisions' && navHints.unsentDecisions > 0) {
+          hint = React.createElement('span',{className:'nav-badge'},navHints.unsentDecisions > 99 ? '99+' : navHints.unsentDecisions);
+        }
+        return React.createElement('div',{key:t.id,className:'nav-item'+(tab===t.id?' active':''),onClick:()=>setTab(t.id)},
+          React.createElement('span',{className:'nav-icon'},t.icon),
+          React.createElement('span',{className:'nav-label'},t.label),
+          hint
+        );
+      }),
       React.createElement('div',{style:{marginTop:'auto',padding:'16px 20px',borderTop:'1px solid var(--border)'}},
         React.createElement('button',{className:'btn btn-ghost btn-sm',style:{width:'100%',fontSize:11},onClick:()=>{localStorage.removeItem('adminKey');_apiKey='';setAuthed(false);}},
           '🚪 Выйти'
@@ -5626,6 +5409,7 @@ function App() {
       )
     ),
     React.createElement('main',{className:'main'},
+      React.createElement(StatusBar, { onNavigate: setTab }),
       React.createElement(CurrentPage,null)
     )
   );
