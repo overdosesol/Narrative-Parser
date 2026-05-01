@@ -5394,7 +5394,7 @@ function SourcesAccordion({ preset, draft, data, h, PChips, PSlider }) {
     h('summary', { className: 'pcfg-accordion-summary' },
       h('span', null, '📡 Sources', overridden ? h('span', { className: 'pcfg-override-dot', style: { marginLeft: 8 } }) : null),
       h('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
-        'Reddit · Twitter · TikTok · Google Trends')
+        'Reddit · Twitter · TikTok · X Trends · Google Trends')
     ),
     h('div', { className: 'pcfg-accordion-body' },
       // Reddit
@@ -5434,6 +5434,18 @@ function SourcesAccordion({ preset, draft, data, h, PChips, PSlider }) {
             max: 30, placeholder: 'Например: memecoin',
           })
         )
+      ),
+      // X Trends — internal 30-min refresh via Apify, country=US (English priority).
+      // Two knobs: enabled (0/1 toggle, slider acts as switch) + topN (5..50).
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '📈 X Trends'),
+        h('div', { className: 'pcfg-desc', style: { marginBottom: 8 } },
+          'Trending topics из X (United States). Refresh каждые 30 минут через Apify (~$13/мес). ' +
+          'Все верхние тренды идут через тот же AI скоринг что и tweets/posts.'),
+        h(PSlider, { preset, path: ['sources', 'xtrends', 'enabled'], label: 'Enabled (0/1)',
+                     desc: '1 = ловим X trends в этом пресете, 0 = выкл. Глобальный kill-switch — env X_TRENDS_ENABLED=0.' }),
+        h(PSlider, { preset, path: ['sources', 'xtrends', 'topN'], label: 'Top N trends',
+                     desc: 'Сколько верхних трендов с каждого fetch (~50 в сыром выводе). 5-50, шаг 5.' }),
       ),
       // Google Trends
       h('div', { className: 'pcfg-subsection', style: { opacity: .55 } },

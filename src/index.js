@@ -7,6 +7,7 @@ import RedditCollector from './collectors/reddit.js';
 import GoogleTrendsCollector from './collectors/google-trends.js';
 import TwitterCollector from './collectors/twitter.js';
 import TikTokCollector from './collectors/tiktok.js';
+import XTrendsCollector from './collectors/x-trends.js';
 import Aggregator from './analysis/aggregator.js';
 import Scorer, { loadAlertWeights, computeAlertScore, feedbackBoostFromStats } from './analysis/scorer.js';
 import { getActivePresetConfig } from './analysis/preset-config.js';
@@ -94,6 +95,15 @@ if (config.reddit.enabled)       collectors.push(new RedditCollector(config, log
 if (config.googleTrends.enabled) collectors.push(new GoogleTrendsCollector(config, logger));
 if (config.twitter.enabled)      collectors.push(new TwitterCollector(config, logger, db));
 if (config.tiktok.enabled)       collectors.push(new TikTokCollector(config, logger, db));
+
+// X Trends — separate refresh cadence (30 min) decoupled from main cycle.
+// Internally fetches Apify on its own timer + caches the result; collect()
+// returns a diff. Kill switch: env X_TRENDS_ENABLED=0 OR per-preset xtrends.enabled=0.
+const xTrendsCollector = new XTrendsCollector(config, logger, db);
+if (xTrendsCollector.enabled) {
+  collectors.push(xTrendsCollector);
+  xTrendsCollector.startRefreshTimer();
+}
 
 logger.info(`Active collectors: ${collectors.map(c => c.name).join(', ') || 'none'}`);
 logger.info(`Alert threshold (global default): ${config.alertThreshold}/100`);

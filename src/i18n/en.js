@@ -45,6 +45,7 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
     google_trends: 'Google Trends',
     twitter: 'Twitter/X',
     tiktok: 'TikTok',
+    x_trends: 'X Trends',
   },
 
   // ── Alert types ────────────────────────────────────────────────────────

@@ -38,17 +38,17 @@
 - Stage 1 scoring использует выбранный provider/model, Stage 2 `x_search` принудительно через Grok (xAI, `grok-4-1-fast-non-reasoning`)
 - Для OpenAI `gpt-5-mini` добавлен авто-ретрай без `temperature` (иначе модель отвечает 400)
 - Тикерная логика удалена end-to-end: `suggestedTicker` больше не запрашивается у AI, не сохраняется в `raw_metrics`, не выводится в dashboard/telegram
-- **Alert gate переведён на единую метрику `alertScore`** (2026-04-22, заменил 3 независимых гейта):
+- **Alert gate на единой метрике `alertScore`** (2026-04-22, **per-preset с 2026-05-01**):
   - `alertScore = w_meme·memePotential + w_viral·virality + w_emerg·emergence + w_x·twitterScore + w_fb·feedbackBoost − w_junk·junkPenalty − staleDecay`
   - Положительные веса (POSITIVE = meme/viral/emergence/twitter/feedback) в сумме **≤ 1.0** → скор остаётся в шкале 0-100
-  - Dashboard: юзер крутит **один** ползунок «Чувствительность алертов» (0-100, stored в `users.alert_threshold`)
-  - Admin: крутит веса, junk-multiplier, staleDecay (perHour/grace/cap), hardJunkStop — всё через `/api/scanner-config`
-  - Gate: `alertScore >= max(user.alert_threshold, global alertThreshold)` **AND** `junkPenalty < alertHardJunkStop`
-  - Формула/дефолты: `src/analysis/scorer.js` → `DEFAULT_ALERT_WEIGHTS`, `loadAlertWeights(db)`, `computeAlertScore(trend, w)`; возвращает `{ alertScore, hardJunk, breakdown }`; применено в Stage1/Stage2/heuristic/fallback путях
+  - **Per-preset с 2026-05-01**: веса / staleDecay / hardJunkStop / alertThreshold floor / maxAlertsPerCycle — всё хранится в `settings.presetConfigs.<active>.alerts.*`. Подробности: см. § «Per-preset pipeline configs» ниже
+  - Dashboard: юзер крутит **один** ползунок «Порог Telegram-алертов» (0-100, stored в `users.alert_threshold` per-user — независимо от preset config)
+  - Admin: per-preset настройки через таб `🎛️ Пресеты` (новый UI с budget-clamp слайдерами, chip-input, Σ ≤ 1.0 enforced server-side)
+  - Gate: `alertScore >= max(user.alert_threshold, preset.alerts.thresholds.alertThreshold)` **AND** `junkPenalty < preset.alerts.thresholds.alertHardJunkStop`
+  - Формула: `src/analysis/scorer.js` → `DEFAULT_ALERT_WEIGHTS`, `loadAlertWeights(db)` (теперь читает per-preset), `computeAlertScore(trend, w)`; возвращает `{ alertScore, hardJunk, breakdown }`; применено в Stage1/Stage2/heuristic/fallback путях
   - `feedbackBoost` (0-100, 50 = нейтрально) считается из live `feedback_votes` на момент gate-loop'а в `src/index.js`; < 5 голосов — pull towards 50
-  - `staleDecay`: штраф `perHour * max(0, ageHours - grace)`, capped at `cap`
-  - Dynamic slider limits в admin: track всегда 0..1, в `onChange` clamp к budget = `1 − Σ(других весов)`; FP quantization через integer grid (`Math.round(v * 20)`)
-  - Server-side guard: sum of POSITIVE ≤ 1.0 проверяется в `_setScannerConfig` **до** commit'а любого из весов
+  - `staleDecay`: штраф `perHour * max(0, ageHours - grace)`, capped at `cap`. Per-preset с 2026-05-01 (events: per-hour=5/grace=6h/cap=60 — agressive; animals: 1/48h/20 — gentle)
+  - Server-side guard: sum of POSITIVE ≤ 1.0 проверяется в `validatePresetOverrides` (per preset) **до** commit'а
   - `viralityThreshold` остаётся как legacy setting (используется в скоринге, не в gate)
 - **Alert decisions ring buffer + viewer** (2026-04-22):
   - `appState.alertDecisions[]` (cap 500, in-memory, reset при рестарте); `recordAlertDecision(rec)` в `src/index.js`
@@ -208,6 +208,136 @@ collect → cheapDedup → PreStage → Cluster (multi-signal) → Stage 1 → S
 - **Все потребители импортят из этого модуля**: `prompts.js` (schema enum + текст промпта), `scorer.js` (normalize AI-ответа), `dashboard/server.js` (normalize при чтении из БД + инжект массива в SPA через `${JSON.stringify(LIFESPAN_VALUES)}`), `i18n/en.js`+`ru.js` (assert при загрузке модуля), `notifications/telegram.js` + `formatter.js` (normalize перед lookup)
 - **Гарантия**: переименование/добавление значения в `LIFESPAN_VALUES` ломает `import` i18n-модулей синхронно с человеко-читаемой ошибкой `<map> is missing lifespan keys: [...]`. Бот не стартанёт пока не дополнишь карты — больше нет тихого `'—'` в UI
 - Старые DB-строки с descriptive формой (`"flash (hours)"`) нормализуются на лету в `normalizeLifespan` — миграция БД не нужна
+
+## Per-preset pipeline configs (2026-05-01)
+
+**Концепция**: каждый из 5 пресетов (`general / animals / culture / celebrities / events`) хранит **полный самодостаточный набор** настроек pipeline. Storage — единый JSON-блоб `settings.presetConfigs` (sparse, только overrides от defaults; `validatePresetOverrides` стрипает совпавшие).
+
+**Структура blob** (per preset):
+```
+sources: { reddit: {...}, twitter: {...}, tiktok: {...}, xtrends: {...}, googletrends: {} }
+junk:    { politicsPenalty, kpopPenalty, celebNoisePenalty, noMemeShapePenalty, safeOverrideDivisor, memeShapeBoost }
+alerts:  { thresholds: { alertThreshold, minScoreToSave, maxAlertsPerCycle, alertHardJunkStop },
+           weights:    { weightMemePotential, weightVirality, weightEmergence, weightTwitter, weightFeedback, weightJunk },
+           stale:      { staleDecayPerHour, staleDecayGraceHours, staleDecayCap } }
+cluster: { simThreshold, timePenaltyHours, weightEmbedding, weightPhash, weightEntity, weightTicker }
+```
+
+**Single source of truth**: `src/analysis/preset-config.js`
+- `PRESET_KEYS`, `PRESET_GROUPS`, `PRESET_FIELD_RANGES` (range descriptors для UI + validation), `DEFAULT_PRESET_CONFIGS`
+- `resolvePresetConfig(preset, overrides)` — deep merge defaults + patch
+- `getActivePresetConfig(db)` — one-stop reader для всех consumers (читает `activePreset` setting + резолвит)
+- `validatePresetOverrides(input)` — strict range-check + Σ positive ≤ 1.0 для `alerts.weights` и `cluster.*`
+- `readPresetOverrides(db)` — tolerant JSON-read
+
+**Σ POSITIVE invariant** (enforced server-side в `validatePresetOverrides`):
+- `alerts.weights`: meme + viral + emergence + twitter + feedback ≤ 1.0 (junk — отдельный множитель штрафа, не считается)
+- `cluster`: weightEmbedding + weightPhash + weightEntity + weightTicker ≤ 1.0
+- Все 5 пресетов в текущих defaults Σ = ровно **1.00**
+
+**Per-preset divergence** (после tuning 2026-05-01):
+
+| Aspect | general | animals | culture | celebrities | events |
+|---|---|---|---|---|---|
+| alertThreshold | 60 | 55 | 65 | 70 | 50 |
+| maxAlertsPerCycle | 0 (∞) | 5 | 8 | 6 | 10 |
+| alertHardJunkStop | 70 | 65 | 75 | 65 | 85 |
+| **memePotential** weight | 0.30 | **0.45** | **0.45** | 0.25 | 0.10 |
+| **emergence** weight | 0.25 | 0.10 | 0.10 | 0.20 | **0.35** |
+| **virality** weight | 0.25 | 0.20 | 0.25 | **0.30** | **0.30** |
+| weightJunk multiplier | 0.50 | 0.40 | 0.50 | **0.55** | **0.30** |
+| staleDecayPerHour | 2 | **1** | 3 | 3 | **5** |
+| staleDecayGraceHours | 24 | **48** | 12 | 12 | **6** |
+| staleDecayCap | 30 | 20 | 40 | 40 | **60** |
+| cluster.simThreshold | 0.55 | 0.55 | **0.50** | 0.55 | **0.45** |
+| cluster.timePenaltyHours | 24 | **48** | 12 | 24 | **6** |
+
+**Consumers** (все читают через `getActivePresetConfig(db)`):
+- `scorer.js` `loadAlertWeights(db)` — alerts.weights/.stale/.thresholds.alertHardJunkStop
+- `clusterer.js` `_refreshClusterParams()` (called per `route()`) — cluster.*; junk через построение `{ [activePreset]: cfg.junk }` blob для junk-filter API
+- `collectors/{reddit,twitter,tiktok,x-trends}.js` — sources.* per platform
+- `index.js` alert-loop — alerts.thresholds.* (alertThreshold floor, maxAlertsPerCycle, minScoreToSave)
+
+**Endpoints** (admin-server only — `X-Admin-Key` gate ⇒ operator-only by design):
+- `GET /api/preset-configs` → `{ defaults, effective, overrides, fieldRanges, presets, groups }`
+- `POST /api/preset-configs` `{ overrides }` — валидация + commit
+
+**Migration** (`presetConfigsMigratedV1` marker): one-shot фолд legacy global settings (alertThreshold/alertWeight*/alertStaleDecay*/alertHardJunkStop/maxAlertsPerCycle/minScoreToSave + filterProfiles JSON) во все 5 пресетов. Validator потом стрипает совпавшие с new defaults — blob остаётся компактным. Legacy ключи **не удалены** (fallback safety).
+
+**Cleanup global allowed-lists** (PR-2): из admin `_setScannerConfig` и dashboard `_handleSettings*` allowed-lists убраны 13+6 полей переехавших в per-preset. ScannerConfigSection UI потерял 4 sub-секции (Alerts/Weights/Stale/Storage) + замещён единый banner. `FilterProfilesSection` removed из `ScannersPage` рендеринга (компонент в файле для rollback).
+
+**Admin UI** (вкладка `🎛️ Пресеты`):
+- Tab strip 5 пресетов с override-индикатор `●`
+- 4 аккордеона (`<details>`): 📡 Sources / 🚫 Junk / 🔔 Alerts / 🧬 Cluster
+- Sources содержит per-platform sub-sections (Reddit / Twitter / TikTok / X Trends / Google Trends)
+- `PSlider` (с reset-to-default `↺` button + override-dot), `BudgetSlider` (clamps onChange к remaining budget, показывает `⛔` at limit), `ChipInputBox` (Enter/blur add, Backspace remove last)
+- `SumMeter` под weight-группами — live Σ через prop-drilled `getEffective`
+- Actions: Save / Reload / Reset preset «X» / Clear ALL
+- Debug fallback в `<details>`: 3 inspector pane'а (defaults / effective / draft)
+- CSS namespace `.pcfg-*`
+
+**Trap reminder**: backticks в JSDoc/комментариях SPA template literal ломают outer literal (`Unexpected identifier 'X'`). Поймано дважды в PR-3 (`\`formatValue\`` и `\`siblings\``). В `admin/server.js` внутри `_spa()` — никогда backticks. В `preset-config.js` — безопасно (нет outer template).
+
+## X Trends collector (5-я платформа, 2026-05-01)
+
+**Source identifier**: `x_trends` (соответствует convention `google_trends`)
+
+**Что это**: trending hashtags / topics с x.com (отдельная платформа, **не** tweet search). Параллельная Reddit / Twitter / TikTok / Google Trends.
+
+**Источник данных**: Apify actor `karamelo~twitter-trends-scraper` ($0.29 / 1000 results)
+- Output shape: `{ trend, time, timePeriod, volume }` — `volume` чаще пустая строка (X не экспонит публично)
+- Country: hardcoded `United States` (English priority — единственный язык в US-trends списке)
+
+**Архитектура** (`src/collectors/x-trends.js`):
+- Internal refresh timer (default 30 мин, `X_TRENDS_REFRESH_MINUTES` env) — decoupled от scanner cycle (~90 сек)
+- Memory cache + dedup Map (TTL 6h, re-emit if absent) → `collect()` возвращает diff
+- Hourly externalId bucketing (`xtrends-us-<slug>-<YYYYMMDDHH>`) → DB-dedup catches re-emits within hour
+- `_inFlight` mutex coalesce concurrent refreshes
+- Stale cache fallback: если timer заглох + cache > 2× refresh interval → sync refresh inline в `collect()`
+
+**Item shape** (вписывается в pipeline без изменений):
+```js
+{ source: 'x_trends', externalId: '...', title: 'Good Friday',
+  description: 'Trending #1 on X in United States (Live).',
+  url: 'https://x.com/search?q=Good%20Friday&src=trend',
+  metrics: { rank, country, timePeriod, tweetVolume } }
+```
+
+Идёт через **тот же** pipeline что обычные посты: Aggregator → cheapDedup → PreStage → Clusterer → Stage 1 → Stage 2 → alert-loop. Никаких изменений в scorer/clusterer/prompts.
+
+**Per-preset config** (`sources.xtrends`):
+- `enabled` (int 0/1) — toggle
+- `topN` (int 5-50, step 5) — сколько верхних трендов с каждого fetch
+
+| Preset | enabled | topN |
+|---|---|---|
+| general | 1 | 20 |
+| animals | 1 | 10 |
+| culture | 1 | 25 |
+| celebrities | 1 | 25 |
+| events | 1 | 30 |
+
+**Env vars**:
+```
+X_TRENDS_ENABLED=1                # global kill switch
+X_TRENDS_REFRESH_MINUTES=30       # 5-onwards
+X_TRENDS_COUNTRY=United States
+APIFY_X_TRENDS_ACTOR_ID=karamelo~twitter-trends-scraper
+APIFY_X_TRENDS_KEY=               # optional, fallback APIFY_API_KEY
+```
+
+**Стоимость**: ~30 trends × 48 runs/day × $0.00029 ≈ **$13/мес**. Можно ужать через `X_TRENDS_REFRESH_MINUTES=60` → ~$7/мес.
+
+**Wiring**:
+- `index.js`: `XTrendsCollector` constructor + `startRefreshTimer()` если enabled
+- `dashboard/server.js`: `SOURCE_ICONS['x_trends']='📈'` + `SOURCE_LABELS['x_trends']='X Trends'` + CSS `.feed-avatar.x_trends` (X-blue gradient) + `.source-item[data-src="x_trends"]` + `.pulse-row[data-src="x_trends"]` + sourceOrder + URL on x.com → reuse `trend-link-twitter` className
+- `notifications/telegram.js`: `_sourcesKeyboard` allSources массив включает `x_trends`
+- `i18n/{ru,en}.js`: `sourceNames.x_trends = 'X Trends'`
+- `admin/server.js` `SourcesAccordion`: новый sub-section `📈 X Trends` с 2 PSlider'ами
+
+**Operational notes**:
+- Если actor лёг → `_refresh()` логирует warn, `collect()` отдаёт старый cache (или [] если empty). Pipeline не падает.
+- In-memory `_emitted` survives только в рамках процесса. После рестарта первый цикл может re-emit, но DB hourly-bucket externalId связывает.
 
 ## Контекст-файлы
 
@@ -453,6 +583,53 @@ Per-user category boost для дашборд-ранжирования был в
 - Desc: явно добавлено **«На фид в дашбоде НЕ влияет — для этого есть фильтр Adoption в сайдбаре»**
 - Icon: 🎯 → ✈️ (paper-plane намекает на TG)
 - Серверная логика **не тронута** — `_handleUserThresholdPost` пишет в `users.alert_threshold`, alert-loop читает оттуда
+
+### Source icons — inline SVG logos (2026-05-02)
+
+`SOURCE_LOGOS` (`src/dashboard/server.js` ~line 4862) — настоящие бренд-SVG (simpleicons public-domain, single-color, `fill: currentColor`):
+- **reddit**: Snoo head
+- **google_trends**: G-mark
+- **twitter**: X glyph
+- **tiktok**: music note silhouette
+- **x_trends**: hashtag
+
+Компонент `SourceMark({ src, fallback })` рендерит SVG через `dangerouslySetInnerHTML`; fallback — letter-mark из `SOURCE_ICONS`. CSS `.src-mark-svg { width/height: 60% }` от родительского чипа; Twitter X glyph 56% (тонкий по природе). Используется в `.source-icon` (sidebar) и `.feed-avatar` (TrendCard). Inline text usage (top-narratives meta, telegram keyboard) использует letter-marks из `SOURCE_ICONS` (R/G/𝕏/♪/#) — без SVG.
+
+### Source icons — letter-marks (2026-05-02)
+
+`SOURCE_ICONS` (`src/dashboard/server.js` ~line 4855) теперь brand letter-marks вместо смешанных эмодзи:
+
+| Source | Old | New | Brand color |
+|---|---|---|---|
+| reddit | 🟠 | `R` | `#ff5800` |
+| google_trends | 🔍 | `G` | `#4285f4` |
+| twitter | 𝕏 | `𝕏` | `#ffffff` |
+| tiktok | 🎵 | `♪` | `#ff2469` |
+| x_trends | 📈 | `#` | `#1d9bf0` |
+
+CSS `.source-icon` + `.pulse-icon` синхронно: 22→26px, font-weight 800, brand-color text per `[data-src]`, border alpha .36-.42, gloss-top shadow, hover `scale(1.05)`. `♪` рендерится при font-size 16px чтобы выровнять оптически с остальными буквами.
+
+`.source-eye` (`👁/🙈`) удалён — раньше при hover'е приземлялся прямо на счётчик постов (count chip тоже `position: absolute; right: 8px`). Off-state уже виден через `.source-item.off { opacity: .5 }` + `.source-icon { filter: grayscale(1) }`.
+
+### Sidebar category dropdown (2026-05-02)
+
+Заменили нативный `<select>` для секции КАТЕГОРИЯ на кастомный компонент `CategoryDropdown` (`src/dashboard/server.js`, рядом с `PhaseBadge`). Нативная option-панель chromium игнорирует CSS, выглядела как тёмно-синий UA-список — резало глаз на X-style monochrome теме.
+
+- **Trigger-button**: gloss-top shine + accent-glow при `.open`, rotated caret. Placeholder `◆ Все категории` в muted.
+- **Animated panel — открывается ВВЕРХ** (`bottom: calc(100% + 5px)`) потому что компонент сидит низко в sidebar возле BottomNav. Slide-in 140ms (translateY 4 → 0), max-height 320px со styled scrollbar. Click-outside (`mousedown`) + Esc закрывают. Caret `▴` (закрыт) → `▾` после rotate(180deg).
+- **Опции**: «Все» reset-row + divider + категории из `CAT_ICONS`. Active: `var(--accent-glow)` фон + accent left-border ::before + `✓` справа.
+- **Эмодзи в i18n**: `📂 Категория` → `🏷️ Категория` (RU + EN).
+- **CSS namespace** `.cat-dd-*` (~110 строк) после блока `select { ... }`. Native select стиль оставлен — он используется в других местах.
+
+### Sidebar multi-select для фазы и типа (2026-05-01)
+
+В сайдбаре дашборда чипы **ФАЗА** (early/forming/strong/saturated) и **ТИП** (event/trend/post) теперь поддерживают одновременный выбор нескольких. Чип «Все» (`◆`) остаётся exclusive — клик по нему всегда сбрасывает множество.
+
+- **State**: `phase` (string) → `phases` (отсортированная CSV-строка, `''` = все); `alertTypeFilter` (string) → `alertTypes` (то же). Persist `localStorage.ts_phase_filter` / `ts_alert_type_filter`. Backwards-compat: старые single-value entries валидны как 1-элементный CSV.
+- **Сервер** (`_handleTrends`): `?phase=early,forming` → парсится в массив, фильтруется (только валидные значения), SQL `IN (?,?,...)` с placeholder'ами. Одиночное значение `?phase=early` всё ещё работает (single-element array).
+- **Visible feed (alert-types)**: пользовательский фильтр через `Set(alertTypes.split(','))`. Legacy-rows без `alertType` всё ещё silent-allow.
+- **Toggle логика**: клик по цветному чипу добавляет/убирает свой ключ из CSV; сортируется и записывается обратно. Клик по «Все» — `setPhases('')` / `setAlertTypes('')`.
+- **Render**: внутри `h('div', { className: 'sidebar-phase' }, ...)` IIFE возвращает массив (React flattens), а manual-only chip остался отдельным sibling-аргументом для секции «Тип».
 
 ### Dashboard UI/UX polish (2026-05-01)
 
