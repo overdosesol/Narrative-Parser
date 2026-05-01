@@ -697,7 +697,7 @@ class TelegramNotifier {
   _sourcesKeyboard(user) {
     const t = getTranslations(user.language);
     const disabled = JSON.parse(user.disabled_sources || '[]');
-    const allSources = ['reddit', 'google_trends', 'twitter', 'tiktok'];
+    const allSources = ['reddit', 'google_trends', 'twitter', 'tiktok', 'x_trends'];
 
     const buttons = allSources.map(src => {
       const enabled = !disabled.includes(src);

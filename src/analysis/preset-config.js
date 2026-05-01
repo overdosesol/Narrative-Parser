@@ -74,6 +74,14 @@ export const PRESET_FIELD_RANGES = Object.freeze({
                            label: 'TikTok hashtags',
                            desc: 'Хэштеги без #. По циклу запускается 2 (rotated).' },
     },
+    xtrends: {
+      enabled:           { type: 'int', min: 0, max: 1, step: 1,
+                           label: 'Enabled',
+                           desc: '1 = ловим X trends в этом пресете, 0 = выкл. Источник Apify, refresh 30 мин.' },
+      topN:              { type: 'int', min: 5, max: 50, step: 5,
+                           label: 'Top N trends',
+                           desc: 'Сколько верхних трендов брать с каждого fetch (всего US-trends ~50). Все идут через AI скоринг.' },
+    },
     googletrends: {
       // reserved namespace; per-source fields will be added later
     },
@@ -222,6 +230,8 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         // earlier era — they fit nowhere in the 5 thematic presets.
         hashtags: ['fyp', 'viral', 'trending', 'foryou', 'foryoupage', 'funny', 'tiktok', 'explore', 'comedy', 'relatable'],
       },
+      // X Trends — broad cast, take top 20 (covers most of US live trends)
+      xtrends:      { enabled: 1, topN: 20 },
       googletrends: {},
     },
     junk: {
@@ -267,6 +277,8 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         // Added: dogsoftiktok (massive dedicated tag), catlovers (variant boost).
         hashtags: ['cuteanimals', 'pets', 'doglover', 'catlover', 'animallover', 'wildlife', 'funnyanimals', 'dogsoftiktok', 'catlovers'],
       },
+      // X Trends — animals rarely make top trends, take 10 (less noise)
+      xtrends:      { enabled: 1, topN: 10 },
       googletrends: {},
     },
     junk: {
@@ -320,6 +332,8 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         // the canonical meta-tag for culture-aware viral posts.
         hashtags: ['meme', 'viral', 'fyp', 'trending', 'genz', 'internetculture', 'funny', 'pov', 'brainrot'],
       },
+      // X Trends — memes spike fast in trends, take 25
+      xtrends:      { enabled: 1, topN: 25 },
       googletrends: {},
     },
     junk: {
@@ -368,6 +382,8 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         // Added: bts + blackpink (dominant K-pop fandom hashtags 2026).
         hashtags: ['celebrity', 'celebnews', 'popculture', 'hollywood', 'kpop', 'fandom', 'gossip', 'bts', 'blackpink'],
       },
+      // X Trends — celebs flood the trending list, take 25
+      xtrends:      { enabled: 1, topN: 25 },
       googletrends: {},
     },
     junk: {
@@ -413,6 +429,8 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         // Added: aivideo (AI video viral 2026), severeweather (disaster spikes).
         hashtags: ['news', 'breakingnews', 'sports', 'science', 'tech', 'space', 'world', 'aivideo', 'severeweather'],
       },
+      // X Trends — events dominate trending; take 30 (broadest cap, breaking news drives a lot)
+      xtrends:      { enabled: 1, topN: 30 },
       googletrends: {},
     },
     junk: {

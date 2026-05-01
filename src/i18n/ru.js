@@ -46,6 +46,7 @@ const ru = {
     google_trends: 'Google Trends',
     twitter: 'Twitter/X',
     tiktok: 'TikTok',
+    x_trends: 'X Trends',
   },
 
   // ── Типы алертов ───────────────────────────────────────────────────────

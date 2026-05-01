@@ -524,7 +524,13 @@ class DashboardServer {
     const offset      = parseInt(url.searchParams.get('offset')      || '0',   10);
     const category    = url.searchParams.get('category')    || null;
     const source      = url.searchParams.get('source')      || null;
-    const phase       = url.searchParams.get('phase')       || null;  // 'early'|'forming'|'strong'|'saturated'
+    // phase param accepts a comma-separated list (e.g. ?phase=early,forming).
+    // Empty/null → no phase restriction. Each chip in the sidebar toggles its
+    // value independently; "Все" clears the whole list.
+    const phaseRaw    = url.searchParams.get('phase')       || '';
+    const phaseList   = phaseRaw.split(',')
+      .map(s => s.trim())
+      .filter(s => ['early','forming','strong','saturated'].includes(s));
     const minMeme     = parseInt(url.searchParams.get('minMeme')     || '0',   10);
     const minEmergence = parseInt(url.searchParams.get('minEmergence') || '0', 10);
     const minPlatforms = parseInt(url.searchParams.get('minPlatforms') || '0', 10);
@@ -546,7 +552,11 @@ class DashboardServer {
 
     if (category)         { query += ` AND category = ?`;                                                                              params.push(category); }
     if (source)           { query += ` AND source = ?`;                                                                                params.push(source); }
-    if (phase)            { query += ` AND JSON_EXTRACT(raw_metrics, '$.narrativePhase') = ?`;                                         params.push(phase); }
+    if (phaseList.length > 0) {
+      const placeholders = phaseList.map(() => '?').join(',');
+      query += ` AND JSON_EXTRACT(raw_metrics, '$.narrativePhase') IN (${placeholders})`;
+      params.push(...phaseList);
+    }
     if (minMeme > 0)      { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) >= ?`;                            params.push(minMeme); }
     if (minEmergence > 0) { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) >= ?`;                           params.push(minEmergence); }
     if (minPlatforms > 1) { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) >= 16`; } // uniquePlatforms>=2 ≈ emergence>=16
@@ -615,7 +625,7 @@ class DashboardServer {
   }
 
   _handleSources(req, res) {
-    const sources = ['reddit', 'google_trends', 'twitter', 'tiktok'];
+    const sources = ['reddit', 'google_trends', 'twitter', 'tiktok', 'x_trends'];
     const cutoff  = new Date(Date.now() - 60 * 60_000).toISOString();
 
     const result = sources.map(source => {
@@ -1870,7 +1880,7 @@ class DashboardServer {
          content as the focal point. Tightened vertical padding so the
          sidebar fits a 720p viewport without a vestigial scrollbar. */
       font-size: 10.5px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: .8px; color: var(--muted); padding: 8px 8px 3px;
+      letter-spacing: .8px; color: var(--muted); padding: 5px 8px 2px;
       margin-top: 0;
     }
     .sidebar-section:first-child { margin-top: 0; padding-top: 2px; }
@@ -1951,16 +1961,42 @@ class DashboardServer {
     .source-item.off .source-icon { filter: grayscale(1); }
     .source-item.off .source-count { opacity: .4; }
     .source-icon {
-      width: 22px; height: 22px; border-radius: 6px;
+      width: 26px; height: 26px; border-radius: 7px;
       display: inline-flex; align-items: center; justify-content: center;
-      font-size: 12px; flex-shrink: 0;
+      font-size: 13.5px; font-weight: 800; flex-shrink: 0;
+      font-family: 'Inter', sans-serif; line-height: 1;
       background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.05);
+      color: var(--text2);
       transition: all .18s;
+      box-shadow: var(--gloss-top);
     }
-    .source-item[data-src="reddit"] .source-icon        { background: rgba(255,88,0,.14); border-color: rgba(255,88,0,.25); }
-    .source-item[data-src="google_trends"] .source-icon { background: rgba(66,133,244,.14); border-color: rgba(66,133,244,.28); }
-    .source-item[data-src="twitter"] .source-icon       { background: rgba(255,255,255,.07); border-color: rgba(255,255,255,.12); }
-    .source-item[data-src="tiktok"] .source-icon        { background: rgba(255,0,80,.14); border-color: rgba(255,0,80,.25); }
+    /* Brand-colored letter-marks. Higher border alpha for crisper outline
+       than the previous emoji chips. */
+    .source-item[data-src="reddit"] .source-icon        { background: rgba(255,88,0,.14);   border-color: rgba(255,88,0,.36);   color: #ff5800; }
+    .source-item[data-src="google_trends"] .source-icon { background: rgba(66,133,244,.14); border-color: rgba(66,133,244,.40); color: #4285f4; }
+    .source-item[data-src="twitter"] .source-icon       { background: rgba(255,255,255,.07); border-color: rgba(255,255,255,.22); color: #ffffff; }
+    .source-item[data-src="tiktok"] .source-icon        { background: rgba(255,0,80,.14);   border-color: rgba(255,0,80,.40);   color: #ff2469; font-size: 16px; }
+    .source-item[data-src="x_trends"] .source-icon      { background: rgba(29,155,240,.14); border-color: rgba(29,155,240,.42); color: #1d9bf0; }
+    .source-item:hover .source-icon { transform: scale(1.05); }
+
+    /* SVG brand logos rendered via SourceMark. The chip's color is set
+       per data-src above, SVG fills with currentColor. Letter-mark
+       fallback (.src-mark-text) inherits font-size from chip. */
+    .src-mark-svg {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 60%; height: 60%; line-height: 0;
+    }
+    .src-mark-svg svg {
+      width: 100%; height: 100%;
+      fill: currentColor; display: block;
+    }
+    .src-mark-text { line-height: 1; }
+    /* Inside .feed-avatar (38px chip) — slightly smaller logo to leave breathing room */
+    .feed-avatar .src-mark-svg { width: 58%; height: 58%; }
+    /* X (Twitter) glyph is naturally tall+thin → render slightly larger so
+       optical weight matches Reddit/Google. */
+    .source-item[data-src="twitter"] .src-mark-svg,
+    .feed-avatar.twitter .src-mark-svg { width: 56%; height: 56%; }
     .source-name { flex: 1; letter-spacing: -.1px; }
     .source-count {
       font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 600;
@@ -1969,12 +2005,9 @@ class DashboardServer {
       border: 1px solid var(--border);
     }
     .source-count.hot { color: var(--accent2); background: rgba(var(--accent-rgb), .1); border-color: rgba(var(--accent-rgb), .22); }
-    .source-eye {
-      position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
-      font-size: 11px; opacity: 0; transition: opacity .15s;
-      pointer-events: none;
-    }
-    .source-item:hover .source-eye { opacity: .75; }
+    /* Eye glyph removed — it sat on top of the count chip and hid the number.
+       on/off state is already conveyed by .source-item.off styles
+       (grayscale icon + opacity .5). */
 
     .sidebar-divider { height: 1px; background: var(--border); margin: 6px 6px; }
 
@@ -2231,6 +2264,116 @@ class DashboardServer {
       background-color: var(--accent-glow);
     }
     select option { background: var(--surface); color: var(--text); }
+
+    /* Custom category dropdown — replaces native select to match X-style theme.
+       Native option list is browser-painted (chromium dark UA), here we get
+       full control: hover ripple, animated panel, colored category dots. */
+    .cat-dd { position: relative; width: 100%; }
+    .cat-dd-trigger {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      width: 100%; padding: 8px 11px;
+      background: rgba(255,255,255,.025);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text2);
+      font-size: 11.5px; font-weight: 600;
+      font-family: inherit; cursor: pointer;
+      transition: all .15s; text-align: left;
+      box-shadow: var(--gloss-top);
+    }
+    .cat-dd-trigger:hover {
+      border-color: var(--border2); color: var(--text);
+      background: rgba(255,255,255,.045);
+    }
+    .cat-dd.open .cat-dd-trigger {
+      border-color: rgba(var(--accent-rgb), .4);
+      background: var(--accent-glow);
+      color: var(--text);
+      box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .15);
+    }
+    .cat-dd-trigger.has-value { color: var(--text); }
+    .cat-dd-trigger-ico {
+      flex-shrink: 0; font-size: 14px;
+      filter: saturate(.85);
+    }
+    .cat-dd-trigger-label {
+      flex: 1; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      letter-spacing: .1px;
+    }
+    .cat-dd-trigger-label.is-placeholder { color: var(--muted); font-weight: 500; }
+    .cat-dd-caret {
+      font-size: 9px; color: var(--muted); transition: transform .2s, color .2s;
+      flex-shrink: 0;
+    }
+    .cat-dd.open .cat-dd-caret { transform: rotate(180deg); color: var(--accent2); }
+
+    /* Panel opens UPWARD — anchored to trigger's bottom edge. CategoryDropdown
+       sits low in the sidebar (near BottomNav), so dropping upward avoids
+       overlapping the foot-nav and keeps the active row close to the cursor. */
+    /* No max-height / overflow — list of 10 categories + reset row fits in ~390px,
+       comfortably below typical sidebar height. Panel opens upward, so it grows
+       toward the top of the viewport without ever clipping the trigger. */
+    .cat-dd-panel {
+      position: absolute; bottom: calc(100% + 5px); left: 0; right: 0;
+      z-index: 50;
+      background: var(--surface);
+      border: 1px solid var(--border2);
+      border-radius: 10px;
+      padding: 4px;
+      box-shadow:
+        0 -12px 40px rgba(0,0,0,.55),
+        0 -4px 12px rgba(0,0,0,.35),
+        var(--gloss-edge);
+      animation: cat-dd-slide-up .14s ease-out;
+    }
+    @keyframes cat-dd-slide-up {
+      from { opacity: 0; transform: translateY(4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .cat-dd-divider { height: 1px; background: var(--border); margin: 3px 6px; }
+    .cat-dd-opt {
+      display: flex; align-items: center; gap: 10px;
+      width: 100%; padding: 7px 10px;
+      background: transparent; border: none; border-radius: 6px;
+      color: var(--text2); font-size: 11.5px; font-weight: 500;
+      font-family: inherit; cursor: pointer; text-align: left;
+      transition: background .12s, color .12s;
+      position: relative;
+    }
+    .cat-dd-opt:hover {
+      background: rgba(255,255,255,.045); color: var(--text);
+    }
+    .cat-dd-opt.active {
+      background: var(--accent-glow);
+      color: var(--accent2);
+      font-weight: 700;
+    }
+    .cat-dd-opt.active::before {
+      content: ''; position: absolute; left: 2px; top: 8px; bottom: 8px; width: 2px;
+      background: var(--accent); border-radius: 2px;
+    }
+    .cat-dd-opt-ico {
+      width: 20px; flex-shrink: 0; text-align: center;
+      font-size: 14px; line-height: 1;
+      filter: saturate(.8);
+      transition: filter .12s, transform .12s;
+    }
+    .cat-dd-opt:hover .cat-dd-opt-ico,
+    .cat-dd-opt.active .cat-dd-opt-ico {
+      filter: saturate(1.15);
+      transform: scale(1.08);
+    }
+    .cat-dd-opt-label {
+      flex: 1; text-transform: capitalize;
+      letter-spacing: .15px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .cat-dd-opt-check {
+      flex-shrink: 0;
+      color: var(--accent2);
+      font-size: 11px; font-weight: 700;
+    }
 
     .btn {
       padding: 7px 12px; border-radius: 8px; border: 1px solid transparent;
@@ -3450,6 +3593,7 @@ class DashboardServer {
     .feed-avatar.twitter { background: linear-gradient(135deg, #1a1a1a, #000); color: white; }
     .feed-avatar.tiktok  { background: linear-gradient(135deg, #25f4ee, #fe2c55); color: white; }
     .feed-avatar.google_trends { background: linear-gradient(135deg, #4285f4, #34a853); color: white; }
+    .feed-avatar.x_trends { background: linear-gradient(135deg, #1d9bf0, #0a0a0a); color: white; }
     .feed-avatar.default { background: var(--card3); color: var(--muted); }
 
     .feed-meta { flex: 1; min-width: 0; }
@@ -3779,16 +3923,20 @@ class DashboardServer {
     .pulse-row.off .pulse-icon { filter: grayscale(1); }
     .pulse-row.off .pulse-count { opacity: .5; }
     .pulse-icon {
-      width: 22px; height: 22px; border-radius: 6px;
+      width: 26px; height: 26px; border-radius: 7px;
       display: inline-flex; align-items: center; justify-content: center;
-      font-size: 12px; flex-shrink: 0;
+      font-size: 13.5px; font-weight: 800; flex-shrink: 0;
+      font-family: 'Inter', sans-serif; line-height: 1;
       background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.05);
+      color: var(--text2);
       transition: all .18s;
+      box-shadow: var(--gloss-top);
     }
-    .pulse-row[data-src="reddit"] .pulse-icon        { background: rgba(255,88,0,.14); border-color: rgba(255,88,0,.25); }
-    .pulse-row[data-src="google_trends"] .pulse-icon { background: rgba(66,133,244,.14); border-color: rgba(66,133,244,.28); }
-    .pulse-row[data-src="twitter"] .pulse-icon       { background: rgba(255,255,255,.07); border-color: rgba(255,255,255,.12); }
-    .pulse-row[data-src="tiktok"] .pulse-icon        { background: rgba(255,0,80,.14); border-color: rgba(255,0,80,.25); }
+    .pulse-row[data-src="reddit"] .pulse-icon        { background: rgba(255,88,0,.14);   border-color: rgba(255,88,0,.36);   color: #ff5800; }
+    .pulse-row[data-src="google_trends"] .pulse-icon { background: rgba(66,133,244,.14); border-color: rgba(66,133,244,.40); color: #4285f4; }
+    .pulse-row[data-src="twitter"] .pulse-icon       { background: rgba(255,255,255,.07); border-color: rgba(255,255,255,.22); color: #ffffff; }
+    .pulse-row[data-src="tiktok"] .pulse-icon        { background: rgba(255,0,80,.14);   border-color: rgba(255,0,80,.40);   color: #ff2469; font-size: 16px; }
+    .pulse-row[data-src="x_trends"] .pulse-icon      { background: rgba(29,155,240,.14); border-color: rgba(29,155,240,.42); color: #1d9bf0; }
     .pulse-name {
       flex: 1; font-size: 12px; font-weight: 600; color: var(--text2);
       letter-spacing: -.1px;
@@ -4159,7 +4307,7 @@ const I18N = {
     'sidebar.phase': 'Phase',
     'sidebar.alert_type': 'Type',
     'sidebar.filters': 'Filters',
-    'sidebar.manual_only': 'Manual only',
+    'sidebar.manual_only': 'Manual',
     'feed.atype.event': 'Event',
     'feed.atype.trend': 'Trend',
     'feed.atype.post':  'Post',
@@ -4181,7 +4329,7 @@ const I18N = {
     'sidebar.reset': 'Reset',
     'sidebar.window': '⏱ Window',
     'sidebar.adoption': '💎 Adoption',
-    'sidebar.category': '📂 Category',
+    'sidebar.category': '🏷️ Category',
     'sidebar.all_categories': 'All categories',
     'sidebar.sort': '🔀 Sort',
     'sort.rank': 'Rank',
@@ -4484,7 +4632,7 @@ const I18N = {
     'sidebar.phase': 'Фаза',
     'sidebar.alert_type': 'Тип',
     'sidebar.filters': 'Фильтры',
-    'sidebar.manual_only': 'Только ручные',
+    'sidebar.manual_only': 'Ручные',
     'feed.atype.event': 'Событие',
     'feed.atype.trend': 'Тренд',
     'feed.atype.post':  'Пост',
@@ -4506,7 +4654,7 @@ const I18N = {
     'sidebar.reset': 'Сбросить',
     'sidebar.window': '⏱ Окно',
     'sidebar.adoption': '💎 Adoption',
-    'sidebar.category': '📂 Категория',
+    'sidebar.category': '🏷️ Категория',
     'sidebar.all_categories': 'Все категории',
     'sidebar.sort': '🔀 Сортировка',
     'sort.rank': 'Рейтинг',
@@ -4729,8 +4877,25 @@ const api = (path, opts = {}) => {
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const SOURCE_ICONS  = { reddit: '🟠', google_trends: '🔍', twitter: '𝕏', tiktok: '🎵' };
-const SOURCE_LABELS = { reddit: 'Reddit', google_trends: 'Google', twitter: 'Twitter/X', tiktok: 'TikTok' };
+// Inline SVG logos — real brand marks (Snoo, multicolor-G shape, X glyph,
+// TikTok music note, hashtag for trends). Sourced from simpleicons.org
+// public-domain paths, single-color (fill: currentColor) so the chip's CSS
+// color: <brand> tint paints them. SourceMark component below picks SVG
+// when available, falls back to SOURCE_ICONS letter-marks otherwise.
+const SOURCE_LOGOS = {
+  reddit: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0zm5.01 4.744c.688 0 1.25.561 1.25 1.249a1.25 1.25 0 0 1-2.499.056l-2.597-.547-.8 3.747c1.824.07 3.48.632 4.674 1.488.308-.309.73-.491 1.207-.491.968 0 1.754.786 1.754 1.754 0 .716-.435 1.333-1.01 1.614a3.111 3.111 0 0 1 .042.52c0 2.694-3.13 4.87-7.004 4.87-3.874 0-7.004-2.176-7.004-4.87 0-.183.015-.366.043-.534A1.748 1.748 0 0 1 4.028 12.5c0-.968.786-1.754 1.754-1.754.463 0 .898.196 1.207.49 1.207-.883 2.878-1.43 4.744-1.487l.885-4.182a.342.342 0 0 1 .14-.197.35.35 0 0 1 .238-.042l2.906.617a1.214 1.214 0 0 1 1.108-.701zM9.25 12c-.69 0-1.25.56-1.25 1.25 0 .687.561 1.248 1.25 1.248.687 0 1.248-.561 1.248-1.249 0-.688-.561-1.249-1.249-1.249zm5.5 0c-.687 0-1.248.561-1.248 1.25 0 .687.561 1.248 1.249 1.248.688 0 1.249-.561 1.249-1.249 0-.687-.562-1.249-1.25-1.249zm-5.466 3.99a.327.327 0 0 0-.231.094.33.33 0 0 0 0 .463c.842.842 2.484.913 2.961.913.477 0 2.105-.056 2.961-.913a.361.361 0 0 0 .029-.463.33.33 0 0 0-.464 0c-.547.533-1.684.73-2.512.73-.828 0-1.979-.196-2.512-.73a.326.326 0 0 0-.232-.095z"/></svg>',
+  google_trends: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z"/></svg>',
+  twitter: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>',
+  tiktok: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-5.2 1.74 2.89 2.89 0 0 1 2.31-4.64 2.93 2.93 0 0 1 .88.13V9.4a6.84 6.84 0 0 0-1-.05A6.33 6.33 0 0 0 5.8 20.1a6.34 6.34 0 0 0 10.86-4.43v-7a8.16 8.16 0 0 0 4.77 1.52v-3.4a4.85 4.85 0 0 1-1.84-.1z"/></svg>',
+  x_trends: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5.41 21l.71-4H2.41l.36-2h3.71l1.06-6H3.83l.36-2h3.71l.71-4h2l-.71 4h6l.71-4h2l-.71 4h3.71l-.36 2h-3.71l-1.06 6h3.71l-.36 2h-3.71l-.71 4h-2l.71-4h-6l-.71 4h-2zM9.53 9l-1.06 6h6l1.06-6h-6z"/></svg>'
+};
+
+// Letter-mark fallbacks for inline text contexts (top-narratives meta,
+// telegram keyboard rendering, Markov contexts). Brand-coded but
+// single-character so they don't blow up the line-height. Used wherever
+// SourceMark isn't appropriate (or for unknown sources).
+const SOURCE_ICONS  = { reddit: 'R', google_trends: 'G', twitter: '𝕏', tiktok: '♪', x_trends: '#' };
+const SOURCE_LABELS = { reddit: 'Reddit', google_trends: 'Google', twitter: 'Twitter/X', tiktok: 'TikTok', x_trends: 'X Trends' };
 const CAT_ICONS     = { meme:'😂', elon:'🚀', animals:'🐾', tech_drama:'💻', degenerates:'🎰', celebrity:'⭐', sports_degen:'🏆', ai_drama:'🤖', boring:'😴', other:'📌' };
 const CAT_CLS       = { meme:'cat-meme', elon:'cat-elon', animals:'cat-animals', tech_drama:'cat-tech_drama', degenerates:'cat-degenerates', celebrity:'cat-celebrity', sports_degen:'cat-sports_degen', ai_drama:'cat-ai_drama', boring:'cat-boring', other:'cat-other' };
 
@@ -4748,7 +4913,7 @@ function lifespanLabel(k) {
 }
 
 // Source link labels
-const SOURCE_LINK_LABELS = { reddit: '🟠 Reddit', twitter: '𝕏 Twitter', tiktok: '🎵 TikTok', google_trends: '🔍 Google' };
+const SOURCE_LINK_LABELS = { reddit: '🟠 Reddit', twitter: '𝕏 Twitter', tiktok: '🎵 TikTok', google_trends: '🔍 Google', x_trends: '📈 X Trends' };
 
 // ── Phase constants ──────────────────────────────────────────────────────────
 // hint resolves via t() — call phaseHint(phase) when you need the localized text.
@@ -4837,6 +5002,94 @@ function ScoreBar({ value, label, sub, color }) {
       h('span', { className: 'score-bar-num', style: { color: fill } }, value),
     ),
     sub ? h('div', { className: 'score-bar-sub' }, sub) : null
+  );
+}
+
+// SourceMark — renders a real brand SVG logo inside any chip-style icon
+// container (.source-icon, .feed-avatar, etc). Falls back to the
+// SOURCE_ICONS letter-mark when the source has no SVG, and to a generic
+// '·' when the source is unknown.
+function SourceMark({ src, fallback }) {
+  const svg = SOURCE_LOGOS[src];
+  if (svg) {
+    return h('span', {
+      className: 'src-mark-svg',
+      'aria-hidden': 'true',
+      dangerouslySetInnerHTML: { __html: svg }
+    });
+  }
+  return h('span', { className: 'src-mark-text' }, SOURCE_ICONS[src] || fallback || '·');
+}
+
+// Custom category dropdown — replaces native <select> in the sidebar.
+// Native UA dropdown is essentially unstyleable on chromium (the open
+// list is browser-painted, ignores select { ... } CSS), so we render a
+// fully custom panel: trigger button + animated panel of buttons.
+// Click-outside / Esc / option-click close it. Active option shows
+// accent left-border + check mark. Used in the sidebar filter group.
+function CategoryDropdown({ value, onChange, categories }) {
+  useLang();
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (ev) => {
+      if (ref.current && !ref.current.contains(ev.target)) setOpen(false);
+    };
+    const onKey = (ev) => { if (ev.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const cur = value || '';
+  const curIcon = cur ? (CAT_ICONS[cur] || '🏷️') : '◆';
+  const curLabel = cur ? cur : t('sidebar.all_categories');
+  const isPlaceholder = !cur;
+
+  return h('div', { className: 'cat-dd' + (open ? ' open' : ''), ref },
+    h('button', {
+      type: 'button',
+      className: 'cat-dd-trigger' + (cur ? ' has-value' : ''),
+      onClick: () => setOpen(o => !o),
+      'aria-expanded': open ? 'true' : 'false',
+      'aria-haspopup': 'listbox'
+    },
+      h('span', { className: 'cat-dd-trigger-ico' }, curIcon),
+      h('span', {
+        className: 'cat-dd-trigger-label' + (isPlaceholder ? ' is-placeholder' : '')
+      }, curLabel),
+      h('span', { className: 'cat-dd-caret' }, '▴')
+    ),
+    open ? h('div', { className: 'cat-dd-panel', role: 'listbox' },
+      // "All" reset row
+      h('button', {
+        key: '_all',
+        type: 'button',
+        className: 'cat-dd-opt' + (cur === '' ? ' active' : ''),
+        onClick: () => { onChange(''); setOpen(false); }
+      },
+        h('span', { className: 'cat-dd-opt-ico' }, '◆'),
+        h('span', { className: 'cat-dd-opt-label' }, t('sidebar.all_categories')),
+        cur === '' ? h('span', { className: 'cat-dd-opt-check' }, '✓') : null
+      ),
+      h('div', { className: 'cat-dd-divider' }),
+      // Concrete categories
+      categories.map(c => h('button', {
+        key: c,
+        type: 'button',
+        className: 'cat-dd-opt cat-dd-opt-' + c + (cur === c ? ' active' : ''),
+        onClick: () => { onChange(c); setOpen(false); }
+      },
+        h('span', { className: 'cat-dd-opt-ico' }, CAT_ICONS[c] || '🏷️'),
+        h('span', { className: 'cat-dd-opt-label' }, c),
+        cur === c ? h('span', { className: 'cat-dd-opt-check' }, '✓') : null
+      ))
+    ) : null
   );
 }
 
@@ -5244,6 +5497,7 @@ function FeedCard({ trend, onOpen }) {
 
   const handle = '@' + (trend.source === 'google_trends' ? 'google'
                     : trend.source === 'twitter' ? 'twitter_x'
+                    : trend.source === 'x_trends' ? 'x_trends'
                     : trend.source || 'source');
 
   // Feed-card description: prefer the deep trigger summary (cached Grok result)
@@ -5279,7 +5533,9 @@ function FeedCard({ trend, onOpen }) {
 
   return h('div', { className: 'feed-card' + (isFresh ? ' is-fresh' : ''), onClick: handleClick },
     h('div', { className: 'feed-card-head' },
-      h('div', { className: 'feed-avatar ' + avatarCls }, srcIco),
+      h('div', { className: 'feed-avatar ' + avatarCls },
+        SOURCE_LOGOS[trend.source] ? h(SourceMark, { src: trend.source }) : srcIco
+      ),
       h('div', { className: 'feed-meta' },
         h('div', { className: 'feed-user-row' },
           h('span', { className: 'feed-user' }, srcLbl),
@@ -5581,7 +5837,7 @@ function TrendModal({ trend, onClose, me = null }) {
   const srcIco = SOURCE_ICONS[trend.source] || '📡';
   const srcLbl = SOURCE_LABELS[trend.source] || trend.source;
   const srcLinkCls = trend.source === 'reddit' ? ' trend-link-reddit'
-    : trend.source === 'twitter' ? ' trend-link-twitter'
+    : (trend.source === 'twitter' || trend.source === 'x_trends') ? ' trend-link-twitter'
     : trend.source === 'tiktok' ? ' trend-link-tiktok' : '';
 
   useEffect(() => {
@@ -5979,7 +6235,7 @@ function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }
                 onClick: () => onCollectorToggle(src.source),
                 title: src.enabled ? t('control.disable_source') : t('control.enable_source'),
               },
-                h('span', null, '📡 ' + (src.source === 'google_trends' ? 'Google' : src.source.charAt(0).toUpperCase() + src.source.slice(1))),
+                h('span', null, '📡 ' + (SOURCE_LABELS[src.source] || src.source.charAt(0).toUpperCase() + src.source.slice(1))),
                 h('div', { className: 'source-control-toggle' })
               )
             )
@@ -6099,7 +6355,7 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
         tr.imageUrl
           ? h('img', { src: tr.imageUrl, alt: '', loading: 'lazy', className: 'analyze-thumb' })
           : h('div', { className: 'analyze-thumb-fb' },
-              tr.source === 'twitter' ? '🐦' : tr.source === 'reddit' ? '🟠' : tr.source === 'tiktok' ? '🎵' : '🌐'
+              SOURCE_ICONS[tr.source] || '🌐'
             ),
         h('div', { className: 'analyze-hero-body' },
           h('div', { className: 'analyze-hero-title' }, tr.title),
@@ -6156,7 +6412,7 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
 
 function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
   useLang();
-  const sourceOrder = ['reddit', 'google_trends', 'twitter', 'tiktok'];
+  const sourceOrder = ['reddit', 'google_trends', 'twitter', 'tiktok', 'x_trends'];
   const allSources = sourceOrder.map(name => {
     const hit = (stats?.bySource || []).find(s => s.source === name);
     return { source: name, count: hit ? hit.count : 0 };
@@ -7042,7 +7298,19 @@ function App() {
   const [offset,     setOffset]     = useState(0);
   const [scanning,   setScanning]   = useState(false);
   const [sort,       setSort]       = useState('rank');
-  const [phase,      setPhase]      = useState('');
+  // Phase filter — multi-select. Stored as a sorted comma-separated string
+  // (e.g. 'early,strong'); empty string = no restriction. Persisted in
+  // localStorage. Clicking a chip toggles its membership; the "Все" chip
+  // clears the whole set.
+  const [phases,     setPhases]     = useState(() => {
+    try {
+      const v = localStorage.getItem('ts_phase_filter') || '';
+      const valid = v.split(',').map(s => s.trim()).filter(s =>
+        ['early','forming','strong','saturated'].includes(s)
+      );
+      return valid.sort().join(',');
+    } catch (e) { return ''; }
+  });
   const [view,       setView]       = useState('trends');
   const [modalTrend, setModalTrend] = useState(null);
   const [toasts,     setToasts]     = useState([]);
@@ -7062,13 +7330,18 @@ function App() {
     try { return localStorage.getItem('ts_manual_only') === '1'; }
     catch (e) { return false; }
   });
-  // Alert-type chip filter — '' = all, 'event'|'trend'|'post' = restrict.
-  // Pure client-side (the feed already includes the type per-row), so no
-  // round-trip to the server. Persisted in localStorage.
-  const [alertTypeFilter, setAlertTypeFilter] = useState(() => {
+  // Alert-type chip filter — multi-select. Stored as sorted comma-separated
+  // string (e.g. 'event,post'); empty string = all. Pure client-side (the
+  // feed already includes the type per-row), so no round-trip to the server.
+  // Persisted in localStorage. Backwards-compat: legacy single-value entries
+  // ('event') stay valid as 1-element CSV.
+  const [alertTypes, setAlertTypes] = useState(() => {
     try {
       const v = localStorage.getItem('ts_alert_type_filter') || '';
-      return ['event', 'trend', 'post'].includes(v) ? v : '';
+      const valid = v.split(',').map(s => s.trim()).filter(s =>
+        ['event','trend','post'].includes(s)
+      );
+      return valid.sort().join(',');
     } catch (e) { return ''; }
   });
   const toastId = useRef(0);
@@ -7097,7 +7370,7 @@ function App() {
         '&sort=' + sort +
         (category ? '&category=' + category : '') +
         (source   ? '&source='   + source   : '') +
-        (phase    ? '&phase='    + phase    : '') +
+        (phases   ? '&phase='    + phases   : '') +
         (minMeme > 0 ? '&minMeme=' + minMeme : '');
 
       const [st, tr, sr] = await Promise.all([
@@ -7124,7 +7397,7 @@ function App() {
     const elapsed = Date.now() - started;
     const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
     setTimeout(() => setRefreshPulse(false), remaining);
-  }, [hours, category, source, phase, minMeme, offset, sort]);
+  }, [hours, category, source, phases, minMeme, offset, sort]);
 
   // Full refresh for SSE 'refresh' events and the manual refresh button.
   // Refetches from the top with a big enough limit to cover every page the
@@ -7142,7 +7415,7 @@ function App() {
         '&sort=' + sort +
         (category ? '&category=' + category : '') +
         (source   ? '&source='   + source   : '') +
-        (phase    ? '&phase='    + phase    : '') +
+        (phases   ? '&phase='    + phases   : '') +
         (minMeme > 0 ? '&minMeme=' + minMeme : '');
       const [st, tr, sr] = await Promise.all([
         api('/stats?hours=' + hours),
@@ -7157,7 +7430,7 @@ function App() {
     const elapsed = Date.now() - started;
     const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
     setTimeout(() => setRefreshPulse(false), remaining);
-  }, [hours, category, source, phase, minMeme, offset, sort]);
+  }, [hours, category, source, phases, minMeme, offset, sort]);
 
 
   // Resolve the authenticated user on load / whenever the token changes.
@@ -7322,10 +7595,12 @@ function App() {
     ? searchFiltered.filter(t => !hiddenSources.has(t.source))
     : searchFiltered;
   if (manualOnly) visibleTrends = visibleTrends.filter(t => t.manualSubmitted);
-  if (alertTypeFilter) {
+  if (alertTypes) {
     // Wildcard semantics: legacy rows without alertType still pass any
-    // filter so we don't hide the back-catalog.
-    visibleTrends = visibleTrends.filter(t => !t.alertType || t.alertType === alertTypeFilter);
+    // filter so we don't hide the back-catalog. Multi-select: row passes
+    // if its alertType is in the selected set.
+    const sel = new Set(alertTypes.split(','));
+    visibleTrends = visibleTrends.filter(t => !t.alertType || sel.has(t.alertType));
   }
 
   // ── Auth gate ───────────────────────────────────────────────────────────
@@ -7443,10 +7718,9 @@ function App() {
                 onClick: () => toggle(s.source),
                 title: visible ? t('tooltip.hide_source') : t('tooltip.show_source')
               },
-                h('span', { className: 'source-icon' }, SOURCE_ICONS[s.source] || '📡'),
+                h('span', { className: 'source-icon' }, h(SourceMark, { src: s.source, fallback: '·' })),
                 h('span', { className: 'source-name' }, SOURCE_LABELS[s.source] || s.source),
-                h('span', { className: 'source-count' + (cnt >= 50 ? ' hot' : '') }, cnt),
-                h('span', { className: 'source-eye' }, visible ? '👁' : '🙈')
+                h('span', { className: 'source-count' + (cnt >= 50 ? ' hot' : '') }, cnt)
               );
             }),
 
@@ -7454,43 +7728,69 @@ function App() {
             // Manual-only filter moved here as a sibling row so the source
             // list stays focused on actual data sources. The toggle still
             // affects the visible feed (see visibleTrends below).
+            // Multi-select: each chip toggles its membership in the set;
+            // "Все" clears the whole set.
             h('div', { className: 'sidebar-section' },
               h('span', null, t('sidebar.phase')),
-              phase
-                ? h('span', { className: 'sidebar-section-link', onClick: () => { setPhase(''); setOffset(0); }, title: t('tooltip.reset') }, t('sidebar.reset'))
+              phases
+                ? h('span', { className: 'sidebar-section-link', onClick: () => {
+                    setPhases('');
+                    try { localStorage.setItem('ts_phase_filter', ''); } catch (e) {}
+                    setOffset(0);
+                  }, title: t('tooltip.reset') }, t('sidebar.reset'))
                 : null
             ),
             h('div', { className: 'sidebar-phase' },
-              h('button', {
-                type: 'button',
-                className: 'phase-chip' + (phase === '' ? ' active' : ''),
-                onClick: () => { setPhase(''); setOffset(0); }
-              }, h('span', { className: 'phase-chip-dot' }, '◆'),
-                 h('span', { className: 'phase-chip-label' }, t('feed.filter.all')),
-                 h('span', { className: 'phase-chip-count' }, total)
-              ),
-              ['early','forming','strong','saturated'].map(p =>
-                h('button', {
-                  key: p,
-                  type: 'button',
-                  className: 'phase-chip phase-chip-' + p + (phase === p ? ' active' : ''),
-                  onClick: () => { setPhase(phase === p ? '' : p); setOffset(0); }
-                },
-                  h('span', { className: 'phase-chip-dot' }, PHASE_DOT[p]),
-                  h('span', { className: 'phase-chip-label' }, PHASE_META[p].label)
-                )
-              )
+              (function() {
+                const phaseArr = phases ? phases.split(',') : [];
+                const activeAll = phaseArr.length === 0;
+                const togglePhase = (p) => {
+                  const cur = phases ? phases.split(',') : [];
+                  const next = cur.includes(p) ? cur.filter(x => x !== p) : [...cur, p];
+                  const str = next.sort().join(',');
+                  setPhases(str);
+                  try { localStorage.setItem('ts_phase_filter', str); } catch (e) {}
+                  setOffset(0);
+                };
+                return [
+                  h('button', {
+                    key: '_all',
+                    type: 'button',
+                    className: 'phase-chip' + (activeAll ? ' active' : ''),
+                    onClick: () => {
+                      setPhases('');
+                      try { localStorage.setItem('ts_phase_filter', ''); } catch (e) {}
+                      setOffset(0);
+                    }
+                  }, h('span', { className: 'phase-chip-dot' }, '◆'),
+                     h('span', { className: 'phase-chip-label' }, t('feed.filter.all')),
+                     h('span', { className: 'phase-chip-count' }, total)
+                  ),
+                  ...['early','forming','strong','saturated'].map(p =>
+                    h('button', {
+                      key: p,
+                      type: 'button',
+                      className: 'phase-chip phase-chip-' + p + (phaseArr.includes(p) ? ' active' : ''),
+                      onClick: () => togglePhase(p)
+                    },
+                      h('span', { className: 'phase-chip-dot' }, PHASE_DOT[p]),
+                      h('span', { className: 'phase-chip-label' }, PHASE_META[p].label)
+                    )
+                  )
+                ];
+              })()
             ),
 
             // ── Alert type filter chips (event / trend / post) ──
             // Pure client-side filter — does NOT change subscription. The
             // user's subscription lives in /api/user/alert-types and is
-            // edited from SettingsPanel.
+            // edited from SettingsPanel. Multi-select: each chip toggles
+            // its membership; "Все" clears the whole set.
             h('div', { className: 'sidebar-section' },
               h('span', null, t('sidebar.alert_type')),
-              (alertTypeFilter || manualOnly)
+              (alertTypes || manualOnly)
                 ? h('span', { className: 'sidebar-section-link', onClick: () => {
-                    setAlertTypeFilter('');
+                    setAlertTypes('');
                     try { localStorage.setItem('ts_alert_type_filter', ''); } catch (e) {}
                     if (manualOnly) {
                       setManualOnly(false);
@@ -7500,39 +7800,50 @@ function App() {
                 : null
             ),
             h('div', { className: 'sidebar-phase' },
-              h('button', {
-                type: 'button',
-                className: 'phase-chip' + (alertTypeFilter === '' ? ' active' : ''),
-                onClick: () => {
-                  setAlertTypeFilter('');
-                  try { localStorage.setItem('ts_alert_type_filter', ''); } catch (e) {}
-                }
-              }, h('span', { className: 'phase-chip-dot' }, '◆'),
-                 h('span', { className: 'phase-chip-label' }, t('feed.filter.all'))
-              ),
-              [['event','📰','feed.atype.event'],['trend','📈','feed.atype.trend'],['post','🚀','feed.atype.post']].map(spec => {
-                const key = spec[0], emoji = spec[1], i18nKey = spec[2];
-                return h('button', {
-                  key: key,
-                  type: 'button',
-                  className: 'phase-chip atype-chip-' + key + (alertTypeFilter === key ? ' active' : ''),
-                  onClick: () => {
-                    const next = alertTypeFilter === key ? '' : key;
-                    setAlertTypeFilter(next);
-                    try { localStorage.setItem('ts_alert_type_filter', next); } catch (e) {}
-                  }
-                },
-                  h('span', { className: 'phase-chip-dot' }, emoji),
-                  h('span', { className: 'phase-chip-label' }, t(i18nKey))
-                );
-              }),
+              (function() {
+                const atypeArr = alertTypes ? alertTypes.split(',') : [];
+                const activeAll = atypeArr.length === 0;
+                const toggleAtype = (k) => {
+                  const cur = alertTypes ? alertTypes.split(',') : [];
+                  const next = cur.includes(k) ? cur.filter(x => x !== k) : [...cur, k];
+                  const str = next.sort().join(',');
+                  setAlertTypes(str);
+                  try { localStorage.setItem('ts_alert_type_filter', str); } catch (e) {}
+                };
+                const items = [
+                  h('button', {
+                    key: '_all',
+                    type: 'button',
+                    className: 'phase-chip' + (activeAll ? ' active' : ''),
+                    onClick: () => {
+                      setAlertTypes('');
+                      try { localStorage.setItem('ts_alert_type_filter', ''); } catch (e) {}
+                    }
+                  }, h('span', { className: 'phase-chip-dot' }, '◆'),
+                     h('span', { className: 'phase-chip-label' }, t('feed.filter.all'))
+                  )
+                ];
+                [['event','📰','feed.atype.event'],['trend','📈','feed.atype.trend'],['post','🚀','feed.atype.post']].forEach(spec => {
+                  const key = spec[0], emoji = spec[1], i18nKey = spec[2];
+                  items.push(h('button', {
+                    key: key,
+                    type: 'button',
+                    className: 'phase-chip atype-chip-' + key + (atypeArr.includes(key) ? ' active' : ''),
+                    onClick: () => toggleAtype(key)
+                  },
+                    h('span', { className: 'phase-chip-dot' }, emoji),
+                    h('span', { className: 'phase-chip-label' }, t(i18nKey))
+                  ));
+                });
+                return items;
+              })(),
               // Manual-only toggle styled as a chip — sits inside the same
               // grid as alert-type filters because it's the same axis: "what
-              // kind of trend do I want to see right now". Span = full row.
+              // kind of trend do I want to see right now". Single cell so it
+              // pairs visually next to the Post chip (4 items in 2x2 + ALL header).
               h('button', {
                 type: 'button',
                 className: 'phase-chip atype-chip-manual' + (manualOnly ? ' active' : ''),
-                style: { gridColumn: '1 / -1' },
                 onClick: () => {
                   const next = !manualOnly;
                   setManualOnly(next);
@@ -7588,17 +7899,18 @@ function App() {
                 )
               ),
 
-              // Category (dropdown — too many options for segments)
+              // Category — custom styled dropdown (CategoryDropdown).
+              // Replaced native <select> because chromium paints the option
+              // list itself and ignores most CSS, which clashed with the
+              // X-style monochrome theme. The custom panel matches sidebar
+              // chips: hover ripple, accent left-border on active row.
               h('div', { className: 'filter-group' },
                 h('div', { className: 'filter-label' }, h('span', null, t('sidebar.category'))),
-                h('select', {
+                h(CategoryDropdown, {
                   value: category,
-                  onChange: ev => { setCategory(ev.target.value); setOffset(0); },
-                  style: { width: '100%' }
-                },
-                  h('option', { value: '' }, t('sidebar.all_categories')),
-                  Object.keys(CAT_ICONS).map(c => h('option', { key: c, value: c }, CAT_ICONS[c] + ' ' + c))
-                )
+                  onChange: (v) => { setCategory(v); setOffset(0); },
+                  categories: Object.keys(CAT_ICONS)
+                })
               ),
 
               // Sort order (segmented icons)
