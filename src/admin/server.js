@@ -12,6 +12,14 @@ import {
   getEffectiveProfiles,
   validateProfileOverrides,
 } from '../analysis/filter-profiles.js';
+import {
+  PRESET_KEYS as PRESET_CONFIG_KEYS,
+  PRESET_GROUPS,
+  PRESET_FIELD_RANGES,
+  DEFAULT_PRESET_CONFIGS,
+  getEffectivePresetConfigs,
+  validatePresetOverrides,
+} from '../analysis/preset-config.js';
 import { runManualAnalysis } from '../analysis/manual-analysis.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -267,13 +275,10 @@ class AdminServer {
   }
 
   _getScannerConfig() {
-    // Int settings — thresholds + scan-side gates
+    // Int settings — orthogonal scanner-wide knobs that remain GLOBAL
+    // (not per-preset). Per-preset alert / weights / stale moved to the
+    // "Пресеты" admin tab in 2026-05-01 PR-2.
     const numDefaults = {
-      alertThreshold: 60, minScoreToSave: 0, maxAlertsPerCycle: 0,
-      alertHardJunkStop: 70,
-      alertStaleDecayPerHour: 2,
-      alertStaleDecayGrace:   24,
-      alertStaleDecayCap:     30,
       // Drop Twitter tweets older than this many hours before they enter the pipeline.
       // 0 disables the filter.
       twitterMaxAgeHours: 72,
@@ -294,20 +299,6 @@ class AdminServer {
     merged.activePreset = this.db.getSetting('activePreset', 'general') || 'general';
     // Which Twitter/X scraper is active (maps to an actor in src/collectors/twitter.js)
     merged.twitterActor = (this.db.getSetting('twitterActor', 'kaitoeasyapi') || 'kaitoeasyapi').toLowerCase();
-
-    // Float settings — alertScore component weights
-    const floatDefaults = {
-      alertWeightMemePotential: 0.35,
-      alertWeightVirality:      0.25,
-      alertWeightEmergence:     0.20,
-      alertWeightTwitter:       0.10,
-      alertWeightFeedback:      0.10,
-      alertWeightJunk:          0.50,
-    };
-    for (const [k, v] of Object.entries(floatDefaults)) {
-      const s = this.db.getSetting(k);
-      merged[k] = (s !== undefined && s !== null && s !== '') ? Number(s) : v;
-    }
     return merged;
   }
 
@@ -325,14 +316,11 @@ class AdminServer {
       if (!VALID_TWITTER_ACTORS.has(a)) throw new Error('Invalid twitterActor');
       this.db.setSetting('twitterActor', a);
     }
+    // Allowed-list trimmed in 2026-05-01 PR-2: per-preset fields (alert
+    // thresholds / weights / stale decay / cluster) moved to settings.presetConfigs
+    // and live behind /api/preset-configs. Anything POSTed here gets silently
+    // ignored if not in this list — clients should migrate.
     const allowedInt = {
-      alertThreshold:    { min: 0, max: 100 },
-      minScoreToSave:    { min: 0, max: 100 },
-      maxAlertsPerCycle: { min: 0, max: 50  },
-      alertHardJunkStop: { min: 0, max: 100 },
-      alertStaleDecayPerHour: { min: 0, max: 20 },
-      alertStaleDecayGrace:   { min: 0, max: 168 },
-      alertStaleDecayCap:     { min: 0, max: 100 },
       twitterMaxAgeHours:     { min: 0, max: 720 },
       rescoreCooldownHours:   { min: 0, max: 168 },
       stage2Threshold:        { min: 0, max: 100 },
@@ -346,42 +334,8 @@ class AdminServer {
       }
       this.db.setSetting(key, Math.round(val));
     }
-    const allowedFloat = {
-      alertWeightMemePotential: { min: 0, max: 2 },
-      alertWeightVirality:      { min: 0, max: 2 },
-      alertWeightEmergence:     { min: 0, max: 2 },
-      alertWeightTwitter:       { min: 0, max: 2 },
-      alertWeightFeedback:      { min: 0, max: 2 },
-      alertWeightJunk:          { min: 0, max: 3 },
-    };
-    // Collect float writes, validate per-field ranges, then enforce the
-    // "sum of positive weights ≤ 1.0" invariant BEFORE committing anything.
-    const pendingFloats = {};
-    for (const [key, rules] of Object.entries(allowedFloat)) {
-      if (!(key in body)) continue;
-      const val = Number(body[key]);
-      if (isNaN(val) || val < rules.min || val > rules.max) {
-        throw new Error(`${key}: must be ${rules.min}-${rules.max}`);
-      }
-      pendingFloats[key] = val;
-    }
-
-    const POSITIVE = ['alertWeightMemePotential','alertWeightVirality','alertWeightEmergence','alertWeightTwitter','alertWeightFeedback'];
-    const defaults = { alertWeightMemePotential:0.35, alertWeightVirality:0.25, alertWeightEmergence:0.20, alertWeightTwitter:0.10, alertWeightFeedback:0.10 };
-    const effective = (k) => {
-      if (k in pendingFloats) return pendingFloats[k];
-      const stored = this.db.getSetting(k);
-      return (stored !== undefined && stored !== null && stored !== '') ? Number(stored) : defaults[k];
-    };
-    const sum = POSITIVE.reduce((s, k) => s + (Number(effective(k)) || 0), 0);
-    if (sum > 1.0001) {
-      throw new Error(`sum of positive weights would be ${sum.toFixed(2)} > 1.00 — reduce other weights first`);
-    }
-
-    // Passed validation — now commit
-    for (const [key, val] of Object.entries(pendingFloats)) {
-      this.db.setSetting(key, String(val));
-    }
+    // Float settings — empty after PR-2 (alertWeight* moved to per-preset).
+    // Block kept for any future global float knobs to slot in.
   }
 
   // ── Filter profiles (per-preset junk-filter tuning) ─────────────────────────
@@ -468,6 +422,45 @@ class AdminServer {
       this.db.setSetting('filterProfiles', '');
     } else {
       this.db.setSetting('filterProfiles', JSON.stringify(cleaned));
+    }
+  }
+
+  // ── Preset configs (full per-preset pipeline tuning, PR-1) ──────────────────
+  // Single source of truth for everything that varies by preset: sources,
+  // junk, alerts (thresholds/weights/stale), cluster. Stored as a sparse
+  // JSON blob in settings.presetConfigs — only fields differing from the
+  // defaults in preset-config.js are persisted.
+  //
+  // GET returns enough metadata for the admin UI to render every control:
+  //   - defaults:    full table { <preset>: { sources, junk, alerts, cluster } }
+  //   - effective:   defaults deep-merged with current overrides
+  //   - overrides:   raw sparse blob actually stored
+  //   - fieldRanges: { sources: {...}, junk: {...}, alerts: {...}, cluster: {...} }
+  //   - presets:     ordered list of preset keys (UI tab order)
+  //   - groups:      ordered list of top-level groups (UI accordion order)
+  _getPresetConfigs() {
+    let overrides = {};
+    const raw = this.db.getSetting('presetConfigs', null);
+    if (raw) {
+      try { overrides = JSON.parse(raw) || {}; }
+      catch (_) { overrides = {}; }
+    }
+    return {
+      defaults:    DEFAULT_PRESET_CONFIGS,
+      effective:   getEffectivePresetConfigs(overrides),
+      overrides,
+      fieldRanges: PRESET_FIELD_RANGES,
+      presets:     PRESET_CONFIG_KEYS,
+      groups:      PRESET_GROUPS,
+    };
+  }
+
+  _setPresetConfigs(body) {
+    const cleaned = validatePresetOverrides(body?.overrides);
+    if (Object.keys(cleaned).length === 0) {
+      this.db.setSetting('presetConfigs', '');
+    } else {
+      this.db.setSetting('presetConfigs', JSON.stringify(cleaned));
     }
   }
 
@@ -997,6 +990,21 @@ class AdminServer {
           const body = await parseBody(req);
           this._setFilterProfiles(body);
           return json(res, 200, { ok: true, ...this._getFilterProfiles() });
+        } catch (e) {
+          return json(res, 400, { error: e.message });
+        }
+      }
+
+      // ── Preset configs — full per-preset pipeline tuning (PR-1) ──
+      // Operator-only by virtue of admin-server's X-Admin-Key gate.
+      if (path === '/api/preset-configs' && method === 'GET') {
+        return json(res, 200, this._getPresetConfigs());
+      }
+      if (path === '/api/preset-configs' && method === 'POST') {
+        try {
+          const body = await parseBody(req);
+          this._setPresetConfigs(body);
+          return json(res, 200, { ok: true, ...this._getPresetConfigs() });
         } catch (e) {
           return json(res, 400, { error: e.message });
         }
@@ -1589,6 +1597,53 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
 .scfg-slider{width:100%;-webkit-appearance:none;appearance:none;height:6px;border-radius:3px;background:var(--bg3);outline:none;cursor:pointer}
 .scfg-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 6px rgba(20,184,166,.4)}
 .scfg-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 6px rgba(20,184,166,.4)}
+/* Preset configs page (per-preset pipeline tuning) — 2026-05-01 PR-3 */
+.pcfg-banner{padding:12px 14px;border-radius:10px;background:rgba(20,184,166,.06);border:1px dashed var(--border3);margin-bottom:18px;display:flex;gap:10px;align-items:flex-start;font-size:13px;line-height:1.5}
+.pcfg-banner-icon{font-size:20px;line-height:1}
+.pcfg-banner-title{font-weight:600;margin-bottom:4px}
+.pcfg-banner-desc{color:var(--text2);font-size:12px}
+.pcfg-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border)}
+.pcfg-tab{position:relative;padding:9px 16px;border-radius:10px;background:var(--bg2);border:1px solid var(--border);color:var(--text2);cursor:pointer;font-size:13px;font-weight:500;transition:all .15s;text-transform:capitalize}
+.pcfg-tab:hover{border-color:rgba(20,184,166,.35);color:var(--text)}
+.pcfg-tab.active{background:linear-gradient(180deg,rgba(20,184,166,.18),rgba(20,184,166,.06));border-color:var(--accent);color:var(--text);box-shadow:0 4px 14px rgba(20,184,166,.16)}
+.pcfg-tab-dot{position:absolute;top:6px;right:7px;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px rgba(20,184,166,.8)}
+.pcfg-accordion{margin-bottom:14px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.pcfg-accordion[open]{box-shadow:0 6px 20px rgba(0,0,0,.12)}
+.pcfg-accordion-summary{padding:14px 16px;cursor:pointer;font-size:14px;font-weight:600;color:var(--text);user-select:none;display:flex;align-items:center;justify-content:space-between;list-style:none}
+.pcfg-accordion-summary::-webkit-details-marker{display:none}
+.pcfg-accordion-summary::after{content:'\\25BC';font-size:10px;color:var(--text2);transition:transform .2s}
+.pcfg-accordion[open] .pcfg-accordion-summary::after{transform:rotate(180deg)}
+.pcfg-accordion-summary:hover{background:rgba(255,255,255,.02)}
+.pcfg-accordion-body{padding:8px 16px 16px;border-top:1px solid var(--border)}
+.pcfg-subsection{margin-top:14px;padding:14px;border-radius:8px;background:var(--bg);border:1px solid var(--border)}
+.pcfg-subsection:first-child{margin-top:6px}
+.pcfg-subsection-title{font-size:12px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.pcfg-row{margin-bottom:14px}
+.pcfg-row:last-child{margin-bottom:0}
+.pcfg-row-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;font-size:12px;gap:10px}
+.pcfg-label{color:var(--text);font-weight:500;display:inline-flex;align-items:center;gap:6px}
+.pcfg-row-right{display:inline-flex;align-items:center;gap:8px}
+.pcfg-val{color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums}
+.pcfg-val.over-budget{color:var(--red)}
+.pcfg-override-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 4px rgba(20,184,166,.8)}
+.pcfg-reset-btn{background:transparent;border:1px solid var(--border);color:var(--text2);width:22px;height:22px;border-radius:6px;cursor:pointer;font-size:12px;line-height:1;padding:0;transition:all .15s}
+.pcfg-reset-btn:hover{border-color:var(--accent);color:var(--accent)}
+.pcfg-desc{font-size:11px;color:var(--text2);line-height:1.45;margin-top:4px}
+.pcfg-chips{display:flex;flex-wrap:wrap;gap:6px;padding:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;align-items:center;min-height:46px}
+.pcfg-chip{display:inline-flex;align-items:center;gap:6px;padding:4px 4px 4px 10px;background:rgba(20,184,166,.14);border:1px solid rgba(20,184,166,.3);border-radius:14px;font-size:12px;color:var(--text);max-width:100%}
+.pcfg-chip-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:320px;font-variant-numeric:tabular-nums}
+.pcfg-chip-x{background:transparent;border:none;color:var(--text2);cursor:pointer;width:18px;height:18px;border-radius:50%;font-size:11px;line-height:1;padding:0;transition:all .15s}
+.pcfg-chip-x:hover{background:rgba(239,68,68,.2);color:var(--red)}
+.pcfg-chip-input{flex:1;min-width:140px;background:transparent;border:none;outline:none;color:var(--text);font-size:12px;padding:4px 6px;font-family:inherit}
+.pcfg-chip-input::placeholder{color:var(--text3)}
+.pcfg-budget{margin-top:8px;font-size:12px;color:var(--text2);text-align:right;font-variant-numeric:tabular-nums}
+.pcfg-budget.over{color:var(--red)}
+.pcfg-budget.full{color:var(--green)}
+.pcfg-actions{display:flex;gap:10px;margin-top:18px;padding-top:14px;border-top:1px solid var(--border);align-items:center;flex-wrap:wrap}
+.pcfg-actions-spacer{flex:1}
+.pcfg-status{font-size:12px;padding:8px 12px;border-radius:6px}
+.pcfg-status.ok{background:rgba(34,197,94,.1);color:var(--green)}
+.pcfg-status.err{background:rgba(239,68,68,.1);color:var(--red)}
 /* Submit page (Ручной анализ) — matches the .card / .scanner-status-bar / .exp-card vocabulary used elsewhere */
 .sp-form{display:flex;flex-direction:column;gap:12px}
 .sp-form-label{font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:6px}
@@ -2301,8 +2356,10 @@ function ScannersPage() {
     // the gpt-5.4-nano text enrichment, A/B-tested against value vs latency.
     React.createElement(PreStageSection, null),
 
-    // Per-preset junk-filter weights (politics/kpop/celeb/meme-shape/safe-override)
-    React.createElement(FilterProfilesSection, null),
+    // Per-preset junk-filter weights moved to "🎛️ Пресеты" tab in 2026-05-01
+    // PR-2 (FilterProfilesSection removed; component definition retained for
+    // potential rollback). JunkStatsSection (observability) stays — it's
+    // pure read-only rolling stats over raw_metrics.
 
     // Rolling stats on what junk-filter is actually filtering out
     React.createElement(JunkStatsSection, null),
@@ -2450,75 +2507,26 @@ function ScannerConfigSection() {
       )
     ),
 
-    // Alerts section
-    h('div', { className: 'scfg-section' },
-      h('h4', { className: 'scfg-h4' }, '🔔 Алерты — единый alertScore'),
-      h('p', { className: 'scfg-desc' },
-        'alertScore = сумма взвешенных сигналов − штраф за мусор. Тренд уходит в алерт, если alertScore ≥ порога. ' +
-        'Порог пользователи настраивают сами в дашборде; здесь — floor и веса.'),
-      row('🎯 Минимальный alertScore (floor)', 'alertThreshold', 0, 100, 5),
-      row('📨 Максимум алертов за цикл', 'maxAlertsPerCycle', 0, 20, 1,
-          cfg.maxAlertsPerCycle === 0 ? '∞' : cfg.maxAlertsPerCycle),
-      row('🚫 Hard-stop по junk (никогда не алертить при junk ≥)', 'alertHardJunkStop', 0, 100, 5),
+    // ── Per-preset knobs moved to "🎛️ Пресеты" tab (PR-2 of preset-configs)
+    // Alerts thresholds + weights + stale decay + junk filter + cluster
+    // similarity all live in settings.presetConfigs now and are edited
+    // per-preset. This banner replaces 4 large sub-sections that used to
+    // edit those values globally.
+    h('div', { className: 'scfg-section', style: { padding: 14, background: 'rgba(20,184,166,.06)', borderRadius: 8, border: '1px dashed var(--border3)' } },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, fontSize: 13 } },
+        h('span', { style: { fontSize: 22 } }, '🎛️'),
+        h('div', null,
+          h('div', { style: { fontWeight: 600, marginBottom: 4 } },
+            'Алерты, веса, stale-decay, junk и cluster — теперь в табе «Пресеты»'),
+          h('div', { style: { color: 'var(--muted)', fontSize: 12, lineHeight: 1.5 } },
+            'Per-preset с 2026-05-01: каждый пресет (general/animals/culture/celebrities/events) ' +
+            'хранит свой набор alertThreshold / alertWeight* / staleDecay* / junk-penalties / cluster-similarity. ' +
+            'Активный пресет переключается выше, его настройки применяются на следующем цикле.')
+        )
+      )
     ),
 
-    // Alert score weights — positive weights must sum to ≤ 1.0. Slider track
-    // stays 0..1 for visual reference; dragging past the remaining budget is
-    // clamped in onChange (value can't exceed 1 - sum of others).
-    (() => {
-      const POSITIVE = ['alertWeightMemePotential','alertWeightVirality','alertWeightEmergence','alertWeightTwitter','alertWeightFeedback'];
-      const STEP = 0.05;
-      const sumPositive = POSITIVE.reduce((s, k) => s + (Number(cfg[k]) || 0), 0);
-      const budgetFor = (key) => {
-        const others = POSITIVE.reduce((s, k) => k === key ? s : s + (Number(cfg[k]) || 0), 0);
-        // All weights live on the 0.05 grid. Convert via *20 → round → /20 so
-        // FP artefacts like 0.65 → 0.6500000000000001 don't eat a step.
-        const othersSteps = Math.round(others * 20);
-        const freeSteps = Math.max(0, 20 - othersSteps);
-        return freeSteps / 20;
-      };
-      const weightRow = (label, key) => {
-        const budget = budgetFor(key);
-        const curr = Number(cfg[key]) || 0;
-        const atLimit = curr >= budget - 1e-9;
-        return h('div', { className: 'scfg-row' },
-          h('div', { className: 'scfg-row-top' },
-            h('span', { className: 'scfg-label' }, label),
-            h('span', { className: 'scfg-val', style: atLimit ? { color: 'var(--green)' } : null },
-              curr.toFixed(2) + (atLimit ? ' ⛔' : '')
-            )
-          ),
-          h('input', {
-            type: 'range', min: 0, max: 1, step: STEP,
-            value: curr,
-            onChange: e => {
-              const v = Math.min(+e.target.value, budget);
-              set(key, v);
-            },
-            className: 'scfg-slider'
-          })
-        );
-      };
-      const sumColor = sumPositive > 1.0001 ? 'var(--red)' : (sumPositive > 0.95 ? 'var(--green)' : 'var(--muted)');
-      return h('div', { className: 'scfg-section' },
-        h('h4', { className: 'scfg-h4' }, '⚖️ Веса alertScore'),
-        h('p', { className: 'scfg-desc' },
-          'Каждый сигнал (0–100) умножается на свой вес. Сумма положительных весов не больше 1.0 — чтобы результат оставался в шкале 0–100. ' +
-          'Ползунок упрётся в свободный бюджет: если остальные весят 0.80, этот не уедет выше 0.20. Штраф junk и staleDecay вычитаются отдельно.'),
-        weightRow('🔥 Вес Meme Potential (AI)',    'alertWeightMemePotential'),
-        weightRow('📈 Вес Virality Score',         'alertWeightVirality'),
-        weightRow('🚀 Вес Emergence (кластер)',    'alertWeightEmergence'),
-        weightRow('🐦 Вес Twitter virality',       'alertWeightTwitter'),
-        weightRow('👍 Вес Feedback (global 👍/👎)', 'alertWeightFeedback'),
-        h('div', { style: { marginTop: 10, fontSize: 12, color: sumColor, textAlign: 'right' } },
-          'Σ положительных весов: ' + sumPositive.toFixed(2) + ' / 1.00'),
-        h('div', { style: { marginTop: 14 } },
-          row('🗑️ Множитель штрафа junk',    'alertWeightJunk',          0, 2, STEP, cfg.alertWeightJunk?.toFixed(2)),
-        ),
-      );
-    })(),
-
-    // Stale decay — age-based penalty
+    // Twitter age filter — orthogonal collector knob, stays global.
     h('div', { className: 'scfg-section' },
       h('h4', { className: 'scfg-h4' }, '🐦 Twitter — фильтр по возрасту'),
       h('p', { className: 'scfg-desc' },
@@ -2540,16 +2548,6 @@ function ScannerConfigSection() {
           cfg.rescoreCooldownHours === 0 ? '0 (off)' : cfg.rescoreCooldownHours + 'h'),
     ),
 
-    h('div', { className: 'scfg-section' },
-      h('h4', { className: 'scfg-h4' }, '⏳ Stale decay (штраф за возраст)'),
-      h('p', { className: 'scfg-desc' },
-        'Тренд теряет баллы по мере старения. Grace — сколько часов тренд «молодой» и штрафа нет. ' +
-        'Cap — максимум, сколько баллов можно снять.'),
-      row('📉 Баллов штрафа за каждый час после grace', 'alertStaleDecayPerHour', 0, 10, 1),
-      row('🛡️ Grace-период (часов без штрафа)',          'alertStaleDecayGrace',   0, 72, 1),
-      row('🧢 Максимум штрафа (cap)',                    'alertStaleDecayCap',     0, 80, 5),
-    ),
-
     // AI Stage 2 — deep-dive via x_search (Grok)
     h('div', { className: 'scfg-section' },
       h('h4', { className: 'scfg-h4' }, '🧪 AI Stage 2 · x_search deep-dive'),
@@ -2568,13 +2566,7 @@ function ScannerConfigSection() {
       ),
     ),
 
-    // Storage section
-    h('div', { className: 'scfg-section' },
-      h('h4', { className: 'scfg-h4' }, '🗄️ Хранение'),
-      h('p', { className: 'scfg-desc' },
-        'Нарративы с базовым охватом ниже этого значения не сохраняются в БД вообще.'),
-      row('📊 Базовый охват — floor для сохранения', 'minScoreToSave', 0, 80, 5),
-    ),
+    // Storage floor (minScoreToSave) moved to per-preset in PR-2 — see "Пресеты" tab.
 
     msg && h('div', {
       style: { marginTop: 14, padding: '10px 14px', borderRadius: 8,
@@ -4963,6 +4955,626 @@ function ExamplesPage() {
 // description blocks) now render via .sp-block + .sp-narrative classes
 // for visual consistency with the rest of the SubmitPage card.
 
+// ── PresetConfigsPage — per-preset pipeline tuning (PR-3, full UI) ──────────
+// Operator-only by virtue of the admin server's shared X-Admin-Key gate.
+// Manages settings.presetConfigs blob — overrides for sources / junk /
+// alerts / cluster per preset (general/animals/culture/celebrities/events).
+//
+// PR-3 (this revision) replaces PR-1's JSON textarea with a real UI:
+//   - tab strip (one preset at a time)
+//   - accordions per group (sources / junk / alerts / cluster)
+//   - chip-input for list fields (subreddits / X queries / TikTok hashtags)
+//   - sliders with reset-to-default + override indicator
+//   - dynamic-clamp budget on positive weight groups (alerts.weights, cluster)
+// JSON inspector retained inside <details> as a debug fallback.
+//
+// Template-literal traps (see ExamplesPage):
+//   1) never use backticks in comments
+//   2) never use \\n / \\t / \\r / \\u / \\x in strings or comments
+function PresetConfigsPage() {
+  const h = React.createElement;
+  const [data,   setData]   = useState(null);
+  const [draft,  setDraft]  = useState({});
+  const [tab,    setTab]    = useState('general');
+  const [saving, setSaving] = useState(false);
+  const [msg,    setMsg]    = useState('');
+  const [msgKind, setMsgKind] = useState('ok');
+
+  const load = () => {
+    api('/api/preset-configs')
+      .then(d => { setData(d); setDraft(d.overrides || {}); })
+      .catch(e => { setMsg('Ошибка загрузки: ' + e.message); setMsgKind('err'); });
+  };
+  useEffect(load, []);
+
+  const flash = (m, kind) => {
+    setMsg(m); setMsgKind(kind || 'ok');
+    setTimeout(() => setMsg(''), 3500);
+  };
+
+  // ── Draft mutators ──────────────────────────────────────────────────────
+  // walk(obj, path) — read leaf or undefined; never throws
+  const walk = (root, path) => {
+    let n = root;
+    for (const k of path) {
+      if (n == null || typeof n !== 'object') return undefined;
+      n = n[k];
+    }
+    return n;
+  };
+
+  const getDefault = (preset, path) => walk(data?.defaults?.[preset], path);
+  const getEffective = (preset, path) => {
+    const fromDraft = walk(draft[preset], path);
+    if (fromDraft !== undefined) return fromDraft;
+    return getDefault(preset, path);
+  };
+  const isOverridden = (preset, path) => walk(draft[preset], path) !== undefined;
+
+  // setLeaf — set a leaf in draft; if value equals default, drop the leaf and
+  // garbage-collect empty parent objects up the chain so the blob stays compact.
+  const setLeaf = (preset, path, value) => {
+    setDraft(prev => {
+      const next = JSON.parse(JSON.stringify(prev));
+      const dflt = getDefault(preset, path);
+      const eqDefault = Array.isArray(value) && Array.isArray(dflt)
+        ? value.length === dflt.length && value.every((v, i) => v === dflt[i])
+        : value === dflt;
+
+      if (eqDefault) {
+        // Drop leaf + collapse empty parents
+        if (!next[preset]) return next;
+        const chain = [next[preset]];
+        for (let i = 0; i < path.length - 1; i++) {
+          const node = chain[chain.length - 1];
+          if (!node || typeof node[path[i]] !== 'object') return next;
+          chain.push(node[path[i]]);
+        }
+        const leafParent = chain[chain.length - 1];
+        if (leafParent) delete leafParent[path[path.length - 1]];
+        for (let i = chain.length - 1; i >= 1; i--) {
+          if (Object.keys(chain[i]).length === 0) {
+            delete chain[i - 1][path[i - 1]];
+          }
+        }
+        if (Object.keys(next[preset]).length === 0) delete next[preset];
+        return next;
+      }
+
+      // Walk + create
+      if (!next[preset]) next[preset] = {};
+      let node = next[preset];
+      for (let i = 0; i < path.length - 1; i++) {
+        if (!node[path[i]] || typeof node[path[i]] !== 'object') node[path[i]] = {};
+        node = node[path[i]];
+      }
+      node[path[path.length - 1]] = value;
+      return next;
+    });
+  };
+
+  const resetField = (preset, path) => {
+    const dflt = getDefault(preset, path);
+    if (dflt === undefined) return;
+    setLeaf(preset, path, dflt);
+  };
+
+  const resetPreset = (preset) => {
+    setDraft(prev => {
+      const next = { ...prev };
+      delete next[preset];
+      return next;
+    });
+    flash('Сброшен пресет ' + preset, 'ok');
+  };
+
+  const clearAll = () => {
+    setDraft({});
+    flash('Все overrides будут удалены при Save', 'ok');
+  };
+
+  const reload = () => { load(); flash('Reloaded from server', 'ok'); };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const res = await api('/api/preset-configs', 'POST', { overrides: draft });
+      setData(res);
+      setDraft(res.overrides || {});
+      flash('Сохранено', 'ok');
+    } catch (e) {
+      flash('Ошибка: ' + e.message, 'err');
+    } finally { setSaving(false); }
+  };
+
+  if (!data) return h('div', { style: { padding: 20, color: 'var(--text2)' } },
+    msg || 'Загрузка пресетов...');
+
+  // ── Component primitives ───────────────────────────────────────────────
+  // PSlider — slider row with override indicator + reset-to-default button.
+  // formatValue prop overrides the default display (e.g. "∞" for 0).
+  const PSlider = ({ preset, path, label, desc, formatValue, valStyle, overBudget }) => {
+    const meta = walkRanges(data.fieldRanges, path);
+    if (!meta) return null;
+    const value     = getEffective(preset, path);
+    const dflt      = getDefault(preset, path);
+    const overridden = isOverridden(preset, path);
+    const isFloat   = meta.type === 'float' || (meta.step && meta.step < 1);
+    const display   = formatValue
+      ? formatValue(value)
+      : (isFloat ? Number(value).toFixed(2) : String(value));
+    const dfltDisp  = isFloat ? Number(dflt).toFixed(2) : String(dflt);
+    return h('div', { className: 'pcfg-row' },
+      h('div', { className: 'pcfg-row-top' },
+        h('span', { className: 'pcfg-label' },
+          label,
+          overridden ? h('span', {
+            className: 'pcfg-override-dot',
+            title: 'Overridden (default: ' + dfltDisp + ')'
+          }) : null
+        ),
+        h('span', { className: 'pcfg-row-right' },
+          h('span', {
+            className: 'pcfg-val' + (overBudget ? ' over-budget' : ''),
+            style: valStyle || null
+          }, display),
+          overridden ? h('button', {
+            className: 'pcfg-reset-btn',
+            onClick: () => resetField(preset, path),
+            title: 'Reset to default (' + dfltDisp + ')'
+          }, '↺') : null
+        )
+      ),
+      h('input', {
+        type: 'range',
+        min: meta.min, max: meta.max, step: meta.step,
+        value: value,
+        onChange: e => setLeaf(preset, path, isFloat ? +e.target.value : Math.round(+e.target.value)),
+        className: 'scfg-slider'
+      }),
+      desc ? h('div', { className: 'pcfg-desc' }, desc) : null
+    );
+  };
+
+  // BudgetSlider — like PSlider but clamps onChange to remaining budget so
+  // sum(positive in group) never exceeds 1.0. siblings prop is an array of
+  // sibling field paths (relative to same path-prefix) to sum.
+  const BudgetSlider = ({ preset, path, siblings, label, desc }) => {
+    const meta = walkRanges(data.fieldRanges, path);
+    if (!meta) return null;
+    const others = siblings
+      .filter(s => s.join('/') !== path.join('/'))
+      .reduce((s, p) => s + (Number(getEffective(preset, p)) || 0), 0);
+    const otherSteps = Math.round(others * 20);
+    const budget = Math.max(0, 20 - otherSteps) / 20;
+    const value = getEffective(preset, path);
+    const atLimit = value >= budget - 1e-9;
+    const dflt = getDefault(preset, path);
+    const overridden = isOverridden(preset, path);
+    return h('div', { className: 'pcfg-row' },
+      h('div', { className: 'pcfg-row-top' },
+        h('span', { className: 'pcfg-label' },
+          label,
+          overridden ? h('span', {
+            className: 'pcfg-override-dot',
+            title: 'Overridden (default: ' + dflt.toFixed(2) + ')'
+          }) : null
+        ),
+        h('span', { className: 'pcfg-row-right' },
+          h('span', {
+            className: 'pcfg-val',
+            style: atLimit ? { color: 'var(--green)' } : null
+          }, Number(value).toFixed(2) + (atLimit ? ' ⛔' : '')),
+          overridden ? h('button', {
+            className: 'pcfg-reset-btn',
+            onClick: () => resetField(preset, path),
+            title: 'Reset to default (' + dflt.toFixed(2) + ')'
+          }, '↺') : null
+        )
+      ),
+      h('input', {
+        type: 'range', min: 0, max: 1, step: 0.05,
+        value: value,
+        onChange: e => {
+          const v = Math.min(+e.target.value, budget);
+          setLeaf(preset, path, v);
+        },
+        className: 'scfg-slider'
+      }),
+      desc ? h('div', { className: 'pcfg-desc' }, desc) : null
+    );
+  };
+
+  // PChips — chip-input for list fields. Renders items as removable chips
+  // and an inline input that adds on Enter / blur.
+  const PChips = ({ preset, path, max, placeholder }) => {
+    const items = getEffective(preset, path) || [];
+    const overridden = isOverridden(preset, path);
+    const dflt = getDefault(preset, path) || [];
+    const setList = (next) => setLeaf(preset, path, next);
+    const remove = (idx) => setList(items.filter((_, i) => i !== idx));
+    return h(ChipInputBox, {
+      items, placeholder, max,
+      onAdd: (v) => {
+        if (max && items.length >= max) return;
+        if (items.includes(v)) return;
+        setList([...items, v]);
+      },
+      onRemove: remove,
+      overridden,
+      defaultLen: dflt.length,
+      onReset: () => resetField(preset, path),
+    });
+  };
+
+  // ── Helpers used by primitives ─────────────────────────────────────────
+  const presets = data.presets;
+  const groups  = data.groups;
+
+  // Top-level layout
+  return h('div', { className: 'broadcast-box', style: { marginBottom: 20 } },
+    h('h3', { style: { marginBottom: 6 } }, '🎛️ Preset configs'),
+
+    h('div', { className: 'pcfg-banner' },
+      h('span', { className: 'pcfg-banner-icon' }, 'ℹ️'),
+      h('div', null,
+        h('div', { className: 'pcfg-banner-title' },
+          'Per-preset pipeline tuning'),
+        h('div', { className: 'pcfg-banner-desc' },
+          'Каждый пресет хранит свой набор источников (subreddits / X queries / TikTok hashtags), ' +
+          'junk-штрафов, alert-thresholds + весов, stale-decay и cluster-similarity. ' +
+          'Активный пресет (его настройки реально применяются) переключается в табе «Сканеры». ' +
+          'Здесь редактируются ВСЕ пять пресетов, по одному за раз.')
+      )
+    ),
+
+    // Tab strip
+    h('div', { className: 'pcfg-tabs' },
+      presets.map(p => h('button', {
+        key: p,
+        className: 'pcfg-tab' + (tab === p ? ' active' : ''),
+        onClick: () => setTab(p),
+      },
+        getPresetIcon(p) + ' ' + p,
+        draft[p] ? h('span', { className: 'pcfg-tab-dot', title: 'Has overrides' }) : null
+      ))
+    ),
+
+    // Accordions for the active preset. getEffective is forwarded so the
+    // SumMeter inside Alerts/Cluster can render a live sum of the current
+    // draft (not just the server's last-saved snapshot).
+    h(SourcesAccordion, {
+      preset: tab, draft, data, h,
+      PChips, PSlider,
+    }),
+    h(JunkAccordion, {
+      preset: tab, h, PSlider,
+      fields: data.fieldRanges.junk,
+    }),
+    h(AlertsAccordion, {
+      preset: tab, h, PSlider, BudgetSlider, getEffective,
+      fields: data.fieldRanges.alerts,
+    }),
+    h(ClusterAccordion, {
+      preset: tab, h, PSlider, BudgetSlider, getEffective,
+      fields: data.fieldRanges.cluster,
+    }),
+
+    // Actions
+    h('div', { className: 'pcfg-actions' },
+      h('button', {
+        className: 'btn btn-primary btn-sm',
+        disabled: saving,
+        onClick: save,
+      }, saving ? 'Сохранение...' : '💾 Save'),
+      h('button', {
+        className: 'btn btn-ghost btn-sm',
+        disabled: saving,
+        onClick: reload,
+      }, '↺ Reload from server'),
+      h('button', {
+        className: 'btn btn-ghost btn-sm',
+        disabled: saving || !draft[tab],
+        onClick: () => resetPreset(tab),
+      }, '🧹 Reset preset «' + tab + '»'),
+      h('div', { className: 'pcfg-actions-spacer' }),
+      h('button', {
+        className: 'btn btn-ghost btn-sm',
+        disabled: saving,
+        onClick: clearAll,
+        title: 'Очистить overrides ВСЕХ пресетов',
+      }, '🗑 Clear ALL'),
+      msg ? h('div', { className: 'pcfg-status ' + msgKind }, msg) : null,
+    ),
+
+    // Debug inspector
+    h('details', { style: { marginTop: 14 } },
+      h('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--text2)' } },
+        '🔧 Debug — посмотреть raw blobs (defaults / effective / draft)'
+      ),
+      h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginTop: 10 } },
+        renderInspectorPane(h, 'Defaults · ' + tab, data.defaults[tab]),
+        renderInspectorPane(h, 'Effective · ' + tab, data.effective[tab]),
+        renderInspectorPane(h, 'Draft overrides · ' + tab, draft[tab] || {}),
+      )
+    )
+  );
+}
+
+// ── Module-scope helpers + sub-components for PresetConfigsPage ─────────────
+//
+// These live outside the main function so React doesn't re-create them on
+// every render (would defeat children memoisation if we ever add it).
+
+function walkRanges(root, path) {
+  let n = root;
+  for (const k of path) {
+    if (!n || typeof n !== 'object') return null;
+    n = n[k];
+  }
+  // Only return if it's a leaf descriptor (has .type)
+  return (n && typeof n === 'object' && n.type) ? n : null;
+}
+
+function getPresetIcon(p) {
+  const map = { general: '🌐', animals: '🐾', culture: '🎭', celebrities: '⭐', events: '🌍' };
+  return map[p] || '•';
+}
+
+function renderInspectorPane(h, title, obj) {
+  return h('div', null,
+    h('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--text2)', marginBottom: 4 } }, title),
+    h('pre', {
+      style: {
+        margin: 0, padding: 8, background: 'var(--bg)',
+        color: 'var(--text3)', border: '1px solid var(--border)',
+        borderRadius: 6, fontSize: 10, lineHeight: 1.4,
+        maxHeight: 280, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+      }
+    }, JSON.stringify(obj || {}, null, 2))
+  );
+}
+
+// ── Chip input box (shared by all list fields) ──────────────────────────────
+function ChipInputBox({ items, placeholder, max, onAdd, onRemove, overridden, defaultLen, onReset }) {
+  const h = React.createElement;
+  const [input, setInput] = useState('');
+
+  const commit = () => {
+    const v = input.trim();
+    if (!v) return;
+    onAdd(v);
+    setInput('');
+  };
+
+  return h('div', null,
+    h('div', { className: 'pcfg-chips' },
+      items.map((it, i) => h('span', { key: i + ':' + it, className: 'pcfg-chip' },
+        h('span', { className: 'pcfg-chip-text', title: it }, it),
+        h('button', {
+          className: 'pcfg-chip-x',
+          onClick: () => onRemove(i),
+          title: 'Удалить',
+        }, '✕')
+      )),
+      h('input', {
+        className: 'pcfg-chip-input',
+        value: input,
+        placeholder: placeholder || 'Добавить и нажать Enter',
+        onChange: e => setInput(e.target.value),
+        onKeyDown: e => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(); }
+          else if (e.key === 'Backspace' && !input && items.length > 0) {
+            // Friendly delete-last-on-empty-backspace
+            onRemove(items.length - 1);
+          }
+        },
+        onBlur: commit,
+      })
+    ),
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', marginTop: 6, fontSize: 11, color: 'var(--text3)' } },
+      h('span', null,
+        items.length + (max ? '/' + max : '') + ' items',
+        overridden ? h('span', { className: 'pcfg-override-dot', style: { marginLeft: 6 } }) : null
+      ),
+      overridden ? h('button', {
+        className: 'pcfg-reset-btn',
+        onClick: onReset,
+        title: 'Reset to defaults (' + defaultLen + ' items)',
+        style: { fontSize: 11 },
+      }, '↺ defaults') : null
+    )
+  );
+}
+
+// ── Sources accordion (per-platform sub-sections) ──────────────────────────
+function SourcesAccordion({ preset, draft, data, h, PChips, PSlider }) {
+  const overridden = !!(draft[preset] && draft[preset].sources);
+  return h('details', { className: 'pcfg-accordion', open: true },
+    h('summary', { className: 'pcfg-accordion-summary' },
+      h('span', null, '📡 Sources', overridden ? h('span', { className: 'pcfg-override-dot', style: { marginLeft: 8 } }) : null),
+      h('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+        'Reddit · Twitter · TikTok · Google Trends')
+    ),
+    h('div', { className: 'pcfg-accordion-body' },
+      // Reddit
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '🟠 Reddit'),
+        h('div', { className: 'pcfg-row' },
+          h('div', { className: 'pcfg-row-top' }, h('span', { className: 'pcfg-label' }, 'Subreddits')),
+          h(PChips, {
+            preset, path: ['sources', 'reddit', 'subreddits'],
+            max: 30, placeholder: 'Например: aww (без r/)',
+          })
+        ),
+        h(PSlider, { preset, path: ['sources', 'reddit', 'minUpvotes'], label: 'Min upvotes',
+                     desc: 'Порог апвотов чтобы пост попал в pipeline.' }),
+        h(PSlider, { preset, path: ['sources', 'reddit', 'postsPerSubreddit'], label: 'Posts / subreddit',
+                     desc: 'Сколько hot-постов брать с каждого subreddit’а.' }),
+      ),
+      // Twitter
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '🐦 Twitter / X'),
+        h('div', { className: 'pcfg-row' },
+          h('div', { className: 'pcfg-row-top' }, h('span', { className: 'pcfg-label' }, 'Search queries')),
+          h(PChips, {
+            preset, path: ['sources', 'twitter', 'queries'],
+            max: 20,
+            placeholder: '(elon OR musk) min_faves:10000 -is:retweet',
+          })
+        )
+      ),
+      // TikTok
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '🎵 TikTok'),
+        h('div', { className: 'pcfg-row' },
+          h('div', { className: 'pcfg-row-top' }, h('span', { className: 'pcfg-label' }, 'Hashtags (без #)')),
+          h(PChips, {
+            preset, path: ['sources', 'tiktok', 'hashtags'],
+            max: 30, placeholder: 'Например: memecoin',
+          })
+        )
+      ),
+      // Google Trends
+      h('div', { className: 'pcfg-subsection', style: { opacity: .55 } },
+        h('div', { className: 'pcfg-subsection-title' }, '📊 Google Trends'),
+        h('div', { className: 'pcfg-desc' },
+          'Зарезервированный namespace. Per-source knob’ы (regions / categories / minScore) появятся позже.')
+      )
+    )
+  );
+}
+
+// ── Junk accordion ──────────────────────────────────────────────────────────
+function JunkAccordion({ preset, h, PSlider, fields }) {
+  return h('details', { className: 'pcfg-accordion' },
+    h('summary', { className: 'pcfg-accordion-summary' },
+      h('span', null, '🚫 Junk filter'),
+      h('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+        'Штрафы за политику / k-pop / celeb-noise / нет meme-shape')
+    ),
+    h('div', { className: 'pcfg-accordion-body' },
+      Object.keys(fields).map(field => h(PSlider, {
+        key: field, preset, path: ['junk', field],
+        label: fields[field].label, desc: fields[field].desc,
+      }))
+    )
+  );
+}
+
+// ── Alerts accordion (3 sub-groups) ─────────────────────────────────────────
+function AlertsAccordion({ preset, h, PSlider, BudgetSlider, getEffective, fields }) {
+  const weightSiblings = Object.keys(fields.weights)
+    .filter(k => fields.weights[k].positive)
+    .map(k => ['alerts', 'weights', k]);
+
+  return h('details', { className: 'pcfg-accordion' },
+    h('summary', { className: 'pcfg-accordion-summary' },
+      h('span', null, '🔔 Alerts'),
+      h('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+        'Thresholds · Weights · Stale decay')
+    ),
+    h('div', { className: 'pcfg-accordion-body' },
+      // Thresholds
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '🎯 Thresholds'),
+        Object.keys(fields.thresholds).map(field => h(PSlider, {
+          key: field, preset, path: ['alerts', 'thresholds', field],
+          label: fields.thresholds[field].label,
+          desc: fields.thresholds[field].desc,
+          formatValue: field === 'maxAlertsPerCycle'
+            ? (v => v === 0 ? '∞' : String(v))
+            : null,
+        }))
+      ),
+      // Weights — positive must sum to ≤ 1.0 (BudgetSlider clamps)
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '⚖️ Weights · Σ positive ≤ 1.00'),
+        h('div', { className: 'pcfg-desc', style: { marginBottom: 8 } },
+          'meme + virality + emergence + twitter + feedback ≤ 1.0 (positive). ' +
+          'Каждый ползунок упирается в свободный бюджет от соседей. ' +
+          'junk — отдельный множитель штрафа (вычитается).'),
+        Object.keys(fields.weights)
+          .filter(k => fields.weights[k].positive)
+          .map(field => h(BudgetSlider, {
+            key: field, preset, path: ['alerts', 'weights', field],
+            siblings: weightSiblings,
+            label: '— ' + fields.weights[field].label,
+            desc: fields.weights[field].desc,
+          })),
+        h(SumMeter, { preset, paths: weightSiblings, h, getEffective }),
+        h(PSlider, {
+          preset, path: ['alerts', 'weights', 'weightJunk'],
+          label: '🗑️ junk ' + fields.weights.weightJunk.label,
+          desc: fields.weights.weightJunk.desc,
+        })
+      ),
+      // Stale decay
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '⏳ Stale decay'),
+        h('div', { className: 'pcfg-desc', style: { marginBottom: 8 } },
+          'Тренд теряет баллы по мере старения. Grace — часы без штрафа. Cap — максимальный штраф.'),
+        Object.keys(fields.stale).map(field => h(PSlider, {
+          key: field, preset, path: ['alerts', 'stale', field],
+          label: fields.stale[field].label,
+          desc: fields.stale[field].desc,
+        }))
+      )
+    )
+  );
+}
+
+// ── Cluster accordion ───────────────────────────────────────────────────────
+function ClusterAccordion({ preset, h, PSlider, BudgetSlider, getEffective, fields }) {
+  const clusterWeightSiblings = Object.keys(fields)
+    .filter(k => fields[k].positive)
+    .map(k => ['cluster', k]);
+
+  return h('details', { className: 'pcfg-accordion' },
+    h('summary', { className: 'pcfg-accordion-summary' },
+      h('span', null, '🧬 Cluster'),
+      h('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+        'Similarity weights + threshold')
+    ),
+    h('div', { className: 'pcfg-accordion-body' },
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '⚙️ Threshold + time'),
+        h(PSlider, { preset, path: ['cluster', 'simThreshold'],
+                     label: fields.simThreshold.label, desc: fields.simThreshold.desc }),
+        h(PSlider, { preset, path: ['cluster', 'timePenaltyHours'],
+                     label: fields.timePenaltyHours.label, desc: fields.timePenaltyHours.desc }),
+      ),
+      h('div', { className: 'pcfg-subsection' },
+        h('div', { className: 'pcfg-subsection-title' }, '🧮 Similarity weights · Σ ≤ 1.00'),
+        h('div', { className: 'pcfg-desc', style: { marginBottom: 8 } },
+          'Веса сигналов similarity. Сумма всех 4 ≤ 1.0. Если сигнал недоступен (нет картинки, ' +
+          'nano выключен), его вес автоматически перераспределяется на остальные.'),
+        clusterWeightSiblings.map(p => {
+          const field = p[p.length - 1];
+          return h(BudgetSlider, {
+            key: field, preset, path: p,
+            siblings: clusterWeightSiblings,
+            label: '— ' + fields[field].label,
+            desc: fields[field].desc,
+          });
+        }),
+        h(SumMeter, { preset, paths: clusterWeightSiblings, h, getEffective })
+      )
+    )
+  );
+}
+
+// SumMeter — live sum(positive weights) for a budget group. getEffective
+// is the parent's closure walker over draft + defaults, so the figure stays
+// in sync with the user's in-progress edits (not just the last server save).
+function SumMeter({ preset, paths, h, getEffective }) {
+  if (typeof getEffective !== 'function') return null;
+  const sum = paths.reduce((s, p) => s + (Number(getEffective(preset, p)) || 0), 0);
+  const cls = sum > 1.0001 ? 'over' : (sum > 0.95 ? 'full' : '');
+  return h('div', { className: 'pcfg-budget ' + cls },
+    'Σ = ' + sum.toFixed(2) + ' / 1.00');
+}
+
 // ── App Root ──────────────────────────────────────────────────────────────────
 function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('adminKey'));
@@ -4973,6 +5585,7 @@ function App() {
   const TABS = [
     {id:'stats',     icon:'📊', label:'Статистика'},
     {id:'scanners',  icon:'⚙️',  label:'Сканеры'},
+    {id:'presets',   icon:'🎛️', label:'Пресеты'},
     {id:'submit',    icon:'🧪', label:'Ручной анализ'},
     {id:'decisions', icon:'🔔', label:'Алерты'},
     {id:'examples',  icon:'🎓', label:'AI Examples'},
@@ -4981,7 +5594,7 @@ function App() {
     {id:'bot',       icon:'🤖', label:'Бот и планы'},
   ];
 
-  const PAGE = {stats:StatsPage, scanners:ScannersPage, submit:SubmitPage, decisions:DecisionsPage, examples:ExamplesPage, users:UsersPage, payments:PaymentsPage, bot:BotPage};
+  const PAGE = {stats:StatsPage, scanners:ScannersPage, presets:PresetConfigsPage, submit:SubmitPage, decisions:DecisionsPage, examples:ExamplesPage, users:UsersPage, payments:PaymentsPage, bot:BotPage};
   const CurrentPage = PAGE[tab];
 
   return React.createElement('div',{className:'layout'},

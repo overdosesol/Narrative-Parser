@@ -7,6 +7,7 @@ import {
   normalizeAlertType,
 } from './prompts.js';
 import { normalizeLifespan } from './lifespan.js';
+import { getActivePresetConfig } from './preset-config.js';
 
 /**
  * Deterministic alert-type derivation — used (a) when AI returns an invalid
@@ -85,28 +86,44 @@ export const DEFAULT_ALERT_WEIGHTS = {
 };
 
 /**
- * Pull all six alert-score knobs from the DB with fallback to defaults.
- * Called once per cycle by index.js so the current weights are snapshotted.
+ * Pull all alert-score knobs (weights + stale decay + hardJunkStop) for the
+ * active search preset. Per-preset since 2026-05-01 (PR-2 of "preset configs"):
+ * values come from settings.presetConfigs blob keyed by activePreset, falling
+ * back to DEFAULT_ALERT_WEIGHTS for any field not in the override.
+ *
+ * Called once per cycle by index.js — snapshotting is fine because activePreset
+ * changes are rare (admin clicks a tab) and within a single cycle we want
+ * stable weights across all 30 trends.
+ *
+ * Backward-compat: if `db` is omitted (legacy callers, tests), returns
+ * DEFAULT_ALERT_WEIGHTS untouched.
  */
 export function loadAlertWeights(db) {
-  const read = (k, d) => {
-    const v = db?.getSetting?.(k);
-    if (v === undefined || v === null || v === '') return d;
-    const n = Number(v);
-    return isNaN(n) ? d : n;
-  };
+  if (!db) return { ...DEFAULT_ALERT_WEIGHTS };
+  let alerts;
+  try { alerts = getActivePresetConfig(db).alerts || {}; }
+  catch (_) { alerts = {}; }
+  const W = alerts.weights || {};
+  const S = alerts.stale   || {};
+  const T = alerts.thresholds || {};
   return {
-    weightMemePotential: read('alertWeightMemePotential', DEFAULT_ALERT_WEIGHTS.weightMemePotential),
-    weightVirality:      read('alertWeightVirality',      DEFAULT_ALERT_WEIGHTS.weightVirality),
-    weightEmergence:     read('alertWeightEmergence',     DEFAULT_ALERT_WEIGHTS.weightEmergence),
-    weightTwitter:       read('alertWeightTwitter',       DEFAULT_ALERT_WEIGHTS.weightTwitter),
-    weightFeedback:      read('alertWeightFeedback',      DEFAULT_ALERT_WEIGHTS.weightFeedback),
-    weightJunk:          read('alertWeightJunk',          DEFAULT_ALERT_WEIGHTS.weightJunk),
-    staleDecayPerHour:   read('alertStaleDecayPerHour',   DEFAULT_ALERT_WEIGHTS.staleDecayPerHour),
-    staleDecayGraceHours:read('alertStaleDecayGrace',     DEFAULT_ALERT_WEIGHTS.staleDecayGraceHours),
-    staleDecayCap:       read('alertStaleDecayCap',       DEFAULT_ALERT_WEIGHTS.staleDecayCap),
-    hardJunkStop:        read('alertHardJunkStop',        DEFAULT_ALERT_WEIGHTS.hardJunkStop),
+    weightMemePotential: pickNum(W.weightMemePotential, DEFAULT_ALERT_WEIGHTS.weightMemePotential),
+    weightVirality:      pickNum(W.weightVirality,      DEFAULT_ALERT_WEIGHTS.weightVirality),
+    weightEmergence:     pickNum(W.weightEmergence,     DEFAULT_ALERT_WEIGHTS.weightEmergence),
+    weightTwitter:       pickNum(W.weightTwitter,       DEFAULT_ALERT_WEIGHTS.weightTwitter),
+    weightFeedback:      pickNum(W.weightFeedback,      DEFAULT_ALERT_WEIGHTS.weightFeedback),
+    weightJunk:          pickNum(W.weightJunk,          DEFAULT_ALERT_WEIGHTS.weightJunk),
+    staleDecayPerHour:   pickNum(S.staleDecayPerHour,   DEFAULT_ALERT_WEIGHTS.staleDecayPerHour),
+    staleDecayGraceHours:pickNum(S.staleDecayGraceHours, DEFAULT_ALERT_WEIGHTS.staleDecayGraceHours),
+    staleDecayCap:       pickNum(S.staleDecayCap,       DEFAULT_ALERT_WEIGHTS.staleDecayCap),
+    hardJunkStop:        pickNum(T.alertHardJunkStop,   DEFAULT_ALERT_WEIGHTS.hardJunkStop),
   };
+}
+
+function pickNum(v, dflt) {
+  if (v === undefined || v === null || v === '') return dflt;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : dflt;
 }
 
 /**

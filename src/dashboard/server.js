@@ -636,14 +636,13 @@ class DashboardServer {
   }
 
   _handleSettingsGet(req, res) {
-    const numDefaults = { alertThreshold: 60, minScoreToSave: 0, maxAlertsPerCycle: 0 };
+    // alertThreshold / minScoreToSave / maxAlertsPerCycle were removed in
+    // 2026-05-01 PR-2 (per-preset). They live in settings.presetConfigs now
+    // and are admin-server-only. Kept the endpoint for activePreset read.
     const stored = this.db.getAllSettings();
-    const merged = {};
-    for (const [k, v] of Object.entries(numDefaults)) {
-      merged[k] = stored[k] !== undefined ? Number(stored[k]) : v;
-    }
-    merged.activePreset = stored.activePreset || 'general';
-    return json(res, 200, merged);
+    return json(res, 200, {
+      activePreset: stored.activePreset || 'general',
+    });
   }
 
   async _handleSettingsPost(req, res) {
@@ -652,7 +651,6 @@ class DashboardServer {
     catch (e) { return json(res, 400, { error: 'Invalid JSON' }); }
 
     const saved = {};
-    const errors = [];
 
     const VALID_PRESETS = new Set(['general', 'animals', 'culture', 'celebrities', 'events']);
     if ('activePreset' in body) {
@@ -664,25 +662,10 @@ class DashboardServer {
       this.logger.info(`[Dashboard] Search preset changed to: ${body.activePreset}`);
     }
 
-    const allowed = {
-      alertThreshold:    { min: 0,  max: 100, type: 'int' },
-      minScoreToSave:    { min: 0,  max: 100, type: 'int' },
-      maxAlertsPerCycle: { min: 0,  max: 50,  type: 'int' },
-    };
-
-    for (const [key, rules] of Object.entries(allowed)) {
-      if (!(key in body)) continue;
-      const val = Number(body[key]);
-      if (isNaN(val) || val < rules.min || val > rules.max) {
-        errors.push(`${key}: must be ${rules.min}–${rules.max}`);
-        continue;
-      }
-      const finalVal = rules.type === 'int' ? Math.round(val) : val;
-      this.db.setSetting(key, finalVal);
-      saved[key] = finalVal;
-    }
-
-    if (errors.length > 0) return json(res, 400, { error: errors.join(', ') });
+    // alertThreshold / minScoreToSave / maxAlertsPerCycle removed from
+    // dashboard's allowed-list in 2026-05-01 PR-2. They became per-preset
+    // and the admin server (port 8081) is the only place to edit them now.
+    // Anything else POSTed here gets silently ignored.
 
     this.logger.info(`[Dashboard] Settings updated: ${JSON.stringify(saved)}`);
     return json(res, 200, { ok: true, saved });

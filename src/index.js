@@ -9,6 +9,7 @@ import TwitterCollector from './collectors/twitter.js';
 import TikTokCollector from './collectors/tiktok.js';
 import Aggregator from './analysis/aggregator.js';
 import Scorer, { loadAlertWeights, computeAlertScore, feedbackBoostFromStats } from './analysis/scorer.js';
+import { getActivePresetConfig } from './analysis/preset-config.js';
 import NarrativeClusterer from './analysis/clusterer.js';
 import TriggerFinder from './analysis/trigger-finder.js';
 import NanoClassifier from './analysis/nano-classifier.js';
@@ -385,8 +386,10 @@ async function runScanCycle() {
       t.category !== 'politics' && t.isGenuinelyInteresting !== false
     );
 
-    // Save all valid trends to DB
-    const minScoreToSave = db.getSetting('minScoreToSave', 0);
+    // Save all valid trends to DB. minScoreToSave is per-preset since
+    // 2026-05-01 (PR-2 of preset-configs) — pulled via the helper inline.
+    const presetCfgForSave = getActivePresetConfig(db);
+    const minScoreToSave = Number(presetCfgForSave.alerts?.thresholds?.minScoreToSave ?? 0) || 0;
     const allToSave = validTrends.filter(t =>
       (t.score || 0) >= minScoreToSave || (t.memePotential || 0) >= minScoreToSave
     );
@@ -401,8 +404,13 @@ async function runScanCycle() {
 
     // Step 5: Send notifications per-user based on their individual settings
     const activeUsers = db.getActiveUsers();
+    // Per-preset alert thresholds since 2026-05-01 (PR-2). The "global"
+    // floor is now whatever the active preset's alerts.thresholds.alertThreshold
+    // resolves to — preserving the legacy "global" naming for clarity in
+    // log messages and per-user MAX(...) gating below.
+    const presetCfgForAlerts = getActivePresetConfig(db);
     const globalAlertThreshold = normalizeThreshold(
-      db.getSetting('alertThreshold', config.alertThreshold),
+      presetCfgForAlerts.alerts?.thresholds?.alertThreshold,
       config.alertThreshold
     );
     const alertWeights = loadAlertWeights(db);
@@ -478,8 +486,9 @@ async function runScanCycle() {
       const userThreshold = normalizeThreshold(user.alert_threshold, config.alertThreshold);
       const effectiveAlertThreshold = Math.max(userThreshold, globalAlertThreshold);
 
-      // Get max alerts per cycle from global settings
-      const maxAlertsPerCycle = db.getSetting('maxAlertsPerCycle', 0);
+      // Per-preset cap on alerts/cycle since 2026-05-01 (PR-2). Same
+      // active preset config snapshot used by the threshold above.
+      const maxAlertsPerCycle = Number(presetCfgForAlerts.alerts?.thresholds?.maxAlertsPerCycle ?? 0) || 0;
 
       let alertsSentThisCycle = 0;
 

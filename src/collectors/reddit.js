@@ -1,77 +1,61 @@
 import BaseCollector from './base-collector.js';
+import { getActivePresetConfig } from '../analysis/preset-config.js';
 
 /**
  * Reddit collector — uses Reddit JSON API (no auth needed with proper User-Agent)
  *
  * Strategy:
- *  - Per active preset (see PRESET_SUBREDDITS below) fetches hot listings from
- *    a curated list of meme-shape-friendly subreddits
- *  - Filters by minimum upvotes (5 000) to surface truly viral content
- *  - NICHE_SUBS (crypto) get a lowered bar (1 000) — only triggers when a user
- *    manually overrides subreddits via env, since crypto subs are no longer in
- *    any default preset
+ *  - Per active preset, fetches hot listings from a curated subreddit list.
+ *    The list, min-upvotes bar and posts-per-sub all live in
+ *    settings.presetConfigs (see preset-config.js DEFAULT_PRESET_CONFIGS) and
+ *    are editable from the admin "Пресеты" tab.
+ *  - NICHE_SUBS (crypto) get a lowered bar (1 000) — only relevant when an
+ *    operator hand-adds crypto subs into a preset; defaults stay meme-shape.
  */
 
-const MIN_UPVOTES       = 5_000;
 const NICHE_MIN_UPVOTES = 1_000;
 const NICHE_SUBS = new Set(['cryptocurrency', 'cryptomoonshots', 'solana', 'memecoins', 'defi', 'wallstreetbets', 'dogecoin', 'pepecoin', 'shib', 'AICoins']);
-
-// Subreddits per preset — tailored to the active meta.
-// Keys MUST match filter-profiles.js PRESET_KEYS (general/animals/culture/celebrities/events).
-// Picked for MEME-SHAPE signal (viral, visual, absurd, wholesome) rather than
-// crypto-native chat. Crypto subs are intentionally NOT here — they're mostly
-// price-chat / shill noise; we want the original meme energy that degens then
-// latch onto. You can still force crypto subs via env override (config.reddit.subreddits).
-const PRESET_SUBREDDITS = {
-  // 🌐 General — broad viral net: aggregators + "interesting" subs
-  general: [
-    'all', 'popular', 'interestingasfuck', 'Damnthatsinteresting',
-    'nextfuckinglevel', 'BeAmazed',
-  ],
-
-  // 🐾 Animals — viral pets, wildlife, cute/funny creatures
-  animals: [
-    'aww', 'AnimalsBeingDerps', 'AnimalsBeingBros', 'AnimalsBeingJerks',
-    'NatureIsFuckingLit', 'Eyebleach', 'rarepuppers', 'capybara',
-  ],
-
-  // 🎭 Culture — memes, internet humor, viral moments
-  culture: [
-    'memes', 'dankmemes', 'Unexpected', 'facepalm', 'TikTokCringe',
-    'OutOfTheLoop', 'KnowYourMeme', 'therewasanattempt',
-  ],
-
-  // ⭐ Celebrities — pop culture, celeb drama, entertainment
-  celebrities: [
-    'popculturechat', 'Fauxmoi', 'entertainment', 'movies', 'television',
-    'popheads', 'hiphopheads',
-  ],
-
-  // 🌍 Events — world events, tech, space, uplifting news
-  events: [
-    'worldnews', 'news', 'UpliftingNews', 'technology', 'space',
-    'Futurology', 'science',
-  ],
-};
 
 class RedditCollector extends BaseCollector {
   constructor(config, logger, db) {
     super('Reddit', logger);
-    this.customSubs  = config.reddit.subreddits?.length ? config.reddit.subreddits : null;
-    this.minUpvotes  = config.reddit.minUpvotes  || MIN_UPVOTES;
-    this.postsPerSub = config.reddit.postsPerSubreddit || 50;
+    // Env overrides (config.reddit.*) — when set, take priority over the
+    // preset config. Operators who pin a fixed subreddit list via env keep
+    // that pin regardless of which preset is active.
+    this.envCustomSubs    = config.reddit.subreddits?.length ? config.reddit.subreddits : null;
+    this.envMinUpvotes    = Number.isFinite(+config.reddit.minUpvotes) ? +config.reddit.minUpvotes : null;
+    this.envPostsPerSub   = Number.isFinite(+config.reddit.postsPerSubreddit) ? +config.reddit.postsPerSubreddit : null;
     this.db = db;
+    // Resolved at start of every collect() call so admin "Пресеты" edits
+    // pick up on the next cycle without a restart.
+    this.minUpvotes  = this.envMinUpvotes  ?? 5000;
+    this.postsPerSub = this.envPostsPerSub ?? 50;
+  }
+
+  _resolveRedditConfig() {
+    let cfg = {};
+    try { cfg = getActivePresetConfig(this.db).sources?.reddit || {}; }
+    catch (_) { cfg = {}; }
+    return {
+      subreddits:        this.envCustomSubs   || cfg.subreddits || [],
+      minUpvotes:        this.envMinUpvotes   ?? cfg.minUpvotes ?? 5000,
+      postsPerSubreddit: this.envPostsPerSub  ?? cfg.postsPerSubreddit ?? 50,
+    };
   }
 
   _getSubreddits() {
-    if (this.customSubs) return this.customSubs;
-    const preset = this.db?.getSetting('activePreset', 'general') || 'general';
-    return PRESET_SUBREDDITS[preset] || PRESET_SUBREDDITS.general;
+    return this._resolveRedditConfig().subreddits;
   }
 
   async collect() {
+    // Refresh per-preset knobs at the start of every cycle. Within a single
+    // collect() call _filterByMinBar (line ~310) reads this.minUpvotes, so
+    // we set the instance fields once here and trust callees to use them.
+    const cfg = this._resolveRedditConfig();
+    this.minUpvotes  = cfg.minUpvotes;
+    this.postsPerSub = cfg.postsPerSubreddit;
     const allItems = [];
-    const subreddits = this._getSubreddits();
+    const subreddits = cfg.subreddits;
 
     for (const subreddit of subreddits) {
       try {

@@ -4,6 +4,9 @@ import { detectMarketSignals, resolveMarketStage } from './market-stage.js';
 // [JUNK_FILTER] optional import — remove this line + base.junkPenalty block to disable
 import { calculateJunkPenalty } from './junk-filter.js';
 
+// [PRESET_CONFIG] per-preset cluster + junk knobs (PR-2 of preset-configs)
+import { getActivePresetConfig } from './preset-config.js';
+
 // [MULTI_SIGNAL] semantic + perceptual similarity inputs. Both modules degrade
 // to null on any failure, so the clusterer keeps working even if OpenAI or
 // the image fetch is down — it just falls back to fewer signals.
@@ -45,23 +48,16 @@ class NarrativeClusterer {
     //   • Shared $TICKER bonus                      (lexical, regex)
     //   • Time-distance penalty                     (recency)
     //
-    // Each weight + the merge threshold are read from DB settings so they
-    // can be tuned via the admin panel without redeploying. Defaults below
-    // were chosen so a clean "Elon tweets X" → "Musk on X" pair lands
-    // around 0.6 (above default 0.55 threshold), while loosely related
-    // items stay under 0.4.
-    const readSetting = (k, d) => {
-      const raw = this.db?.getSetting?.(k);
-      if (raw === undefined || raw === null || raw === '') return d;
-      const n = Number(raw);
-      return Number.isFinite(n) ? n : d;
-    };
-    this.SIM_THRESHOLD     = readSetting('clusterSimThreshold',     0.55);
-    this.SIM_WEIGHT_EMBED  = readSetting('clusterWeightEmbedding',  0.40);
-    this.SIM_WEIGHT_PHASH  = readSetting('clusterWeightPhash',      0.30);
-    this.SIM_WEIGHT_ENTITY = readSetting('clusterWeightEntity',     0.20);
-    this.SIM_WEIGHT_TICKER = readSetting('clusterWeightTicker',     0.10);
-    this.SIM_TIME_PENALTY_HOURS = readSetting('clusterTimePenaltyHours', 24);
+    // Per-preset since 2026-05-01 (PR-2): weights + threshold live in
+    // settings.presetConfigs.<active>.cluster and are refreshed by
+    // _refreshClusterParams() at the start of every route() call. Defaults
+    // are baked into preset-config.js DEFAULT_PRESET_CONFIGS.
+    this.SIM_THRESHOLD          = 0.55;
+    this.SIM_WEIGHT_EMBED       = 0.40;
+    this.SIM_WEIGHT_PHASH       = 0.30;
+    this.SIM_WEIGHT_ENTITY      = 0.20;
+    this.SIM_WEIGHT_TICKER      = 0.10;
+    this.SIM_TIME_PENALTY_HOURS = 24;
 
     // Multi-signal infrastructure. Both clients can be disabled (missing
     // API key / opt-out env var) and the clusterer will fall back gracefully.
@@ -198,10 +194,36 @@ class NarrativeClusterer {
    * @param {Array} items — output of aggregator.process() (already DB-filtered)
    * @returns {{ priority: Array, toScore: Array, toSave: Array, droppedCount: number }}
    */
+  /**
+   * Snapshot the active preset's cluster knobs into instance fields. Called
+   * at the start of route() so an admin "Пресеты" edit picks up on the next
+   * cycle without restart. Safe across cycles — clusterer is a long-lived
+   * singleton, instance fields are mutated in place.
+   */
+  _refreshClusterParams() {
+    let cluster;
+    try { cluster = getActivePresetConfig(this.db).cluster || {}; }
+    catch (_) { cluster = {}; }
+    const num = (v, d) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : d;
+    };
+    this.SIM_THRESHOLD          = num(cluster.simThreshold,     0.55);
+    this.SIM_WEIGHT_EMBED       = num(cluster.weightEmbedding,  0.40);
+    this.SIM_WEIGHT_PHASH       = num(cluster.weightPhash,      0.30);
+    this.SIM_WEIGHT_ENTITY      = num(cluster.weightEntity,     0.20);
+    this.SIM_WEIGHT_TICKER      = num(cluster.weightTicker,     0.10);
+    this.SIM_TIME_PENALTY_HOURS = num(cluster.timePenaltyHours, 24);
+  }
+
   async route(items) {
     if (items.length === 0) {
       return { priority: [], toScore: [], toSave: [], droppedCount: 0 };
     }
+
+    // Refresh per-preset cluster knobs (sim threshold + weights + time penalty)
+    // before any similarity work. Cheap — just reads the cached preset blob.
+    this._refreshClusterParams();
 
     // Multi-signal pre-compute: enrich each item with `_embedding` (Float32Array
     // or null) and `_imageHash` (BigInt or null) BEFORE clustering. Both calls
@@ -668,16 +690,14 @@ class NarrativeClusterer {
                     && maxUpvotes >= 10_000;
 
     // [JUNK_FILTER] heuristic junk penalty — remove block + import above to disable
-    // Preset picks the active filter profile (animals/events/... have different weights).
-    // Admin-UI overrides live in the `filterProfiles` setting as a JSON blob.
+    // Per-preset since 2026-05-01 (PR-2). Junk profile lives in
+    // settings.presetConfigs.<active>.junk; we synthesize a legacy-shaped
+    // overrides blob `{ <preset>: { ...junk-fields } }` so junk-filter.js +
+    // filter-profiles.js resolveProfile() can keep their existing API.
     try {
-      const activePreset = this.db?.getSetting('activePreset', 'general') || 'general';
-      let overrides = null;
-      const rawOverrides = this.db?.getSetting('filterProfiles', null);
-      if (rawOverrides) {
-        try { overrides = JSON.parse(rawOverrides); }
-        catch (_) { /* malformed blob — ignore, fall back to defaults */ }
-      }
+      const cfg = getActivePresetConfig(this.db);
+      const activePreset = cfg.preset || 'general';
+      const overrides = { [activePreset]: cfg.junk || {} };
       const { junkPenalty, junkReasons, memeShapeBoost, memeShapeSignals } =
         calculateJunkPenalty(items, base, activePreset, overrides);
       base.junkPenalty       = junkPenalty;

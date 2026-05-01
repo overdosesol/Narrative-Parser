@@ -1,4 +1,5 @@
 import BaseCollector from './base-collector.js';
+import { getActivePresetConfig } from '../analysis/preset-config.js';
 
 /**
  * Twitter/X collector — uses Apify's tweet-scraper to find viral world trends.
@@ -144,9 +145,13 @@ class TwitterCollector extends BaseCollector {
 
   _getQueries() {
     if (this.customQueries) return this.customQueries; // .env override takes priority
-    const preset = this.db?.getSetting('activePreset', 'general') || 'general';
-    const queries = PRESET_QUERIES[preset] || PRESET_QUERIES.general;
-    return queries;
+    // Per-preset queries since 2026-05-01 (PR-2). Edited from admin "Пресеты"
+    // tab. Falls back to defaults baked into preset-config.js if the preset's
+    // sources.twitter.queries is missing (resolver always populates).
+    let queries = [];
+    try { queries = getActivePresetConfig(this.db).sources?.twitter?.queries || []; }
+    catch (_) { queries = []; }
+    return queries.length > 0 ? queries : (PRESET_QUERIES.general);
   }
 
   async collect() {

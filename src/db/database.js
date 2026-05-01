@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { PRESET_KEYS, validatePresetOverrides } from '../analysis/preset-config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -198,6 +199,102 @@ class TrendDatabase {
       this.setSetting('feedbackWeightFree',  '0.2');
       this.setSetting('feedbackWeightsRebalancedV2', '1');
       this.logger.info('DB migration: feedback weights rebalanced (admin=5, pro=2.5, test=0.5, free=0.2)');
+    }
+
+    // ── One-time fold of legacy globals into the per-preset config blob ─────
+    // (2026-05-01) PR-1 of "per-preset pipeline".
+    //
+    // Before this PR, alert thresholds / weights / stale decay lived as a flat
+    // set of global settings (alertThreshold, alertWeight*, alertStaleDecay*),
+    // and the only per-preset thing was filterProfiles (junk). After this PR,
+    // everything that varies by topic is consolidated under the single
+    // presetConfigs JSON setting.
+    //
+    // Strategy:
+    //   1. Read whatever non-default global values currently exist.
+    //   2. Copy them into ALL 5 presets in the new blob (so behaviour is
+    //      identical for every preset on day-zero — the operator can later
+    //      diverge them through the admin UI).
+    //   3. Fold in legacy filterProfiles (already per-preset) into the .junk
+    //      sub-tree of each preset.
+    //   4. Pass the assembled blob through validatePresetOverrides — it strips
+    //      values that equal new defaults, so the stored blob stays compact.
+    //   5. Write to presetConfigs and set the marker.
+    //
+    // Legacy global keys are NOT deleted — they're left as fallback for the
+    // brief window between PR-1 (storage) and PR-2 (consumer wiring) where
+    // collectors still read them directly. PR-2 will remove the writes; old
+    // rows can age out organically.
+    if (this.getSetting('presetConfigsMigratedV1', null) !== '1') {
+      const blob = {};
+      for (const p of PRESET_KEYS) blob[p] = { alerts: { thresholds: {}, weights: {}, stale: {} } };
+
+      const readNum = (k) => {
+        const v = this.getSetting(k);
+        if (v === undefined || v === null || v === '') return undefined;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      const setForAll = (group, sub, field, val) => {
+        if (val === undefined) return;
+        for (const p of PRESET_KEYS) blob[p][group][sub][field] = val;
+      };
+      // alerts.thresholds
+      setForAll('alerts', 'thresholds', 'alertThreshold',    readNum('alertThreshold'));
+      setForAll('alerts', 'thresholds', 'minScoreToSave',    readNum('minScoreToSave'));
+      setForAll('alerts', 'thresholds', 'maxAlertsPerCycle', readNum('maxAlertsPerCycle'));
+      setForAll('alerts', 'thresholds', 'alertHardJunkStop', readNum('alertHardJunkStop'));
+      // alerts.weights
+      setForAll('alerts', 'weights', 'weightMemePotential', readNum('alertWeightMemePotential'));
+      setForAll('alerts', 'weights', 'weightVirality',      readNum('alertWeightVirality'));
+      setForAll('alerts', 'weights', 'weightEmergence',     readNum('alertWeightEmergence'));
+      setForAll('alerts', 'weights', 'weightTwitter',       readNum('alertWeightTwitter'));
+      setForAll('alerts', 'weights', 'weightFeedback',      readNum('alertWeightFeedback'));
+      setForAll('alerts', 'weights', 'weightJunk',          readNum('alertWeightJunk'));
+      // alerts.stale
+      setForAll('alerts', 'stale', 'staleDecayPerHour',     readNum('alertStaleDecayPerHour'));
+      setForAll('alerts', 'stale', 'staleDecayGraceHours',  readNum('alertStaleDecayGrace'));
+      setForAll('alerts', 'stale', 'staleDecayCap',         readNum('alertStaleDecayCap'));
+
+      // filterProfiles → per-preset .junk
+      const fpRaw = this.getSetting('filterProfiles', null);
+      if (fpRaw) {
+        try {
+          const fp = JSON.parse(fpRaw) || {};
+          for (const [preset, junk] of Object.entries(fp)) {
+            if (PRESET_KEYS.includes(preset) && junk && typeof junk === 'object') {
+              blob[preset].junk = { ...junk };
+            }
+          }
+        } catch (_) { /* malformed legacy blob — ignore */ }
+      }
+
+      // Run through the validator: it strips fields that equal new defaults
+      // and validates positive-weight budgets per preset.
+      let cleaned;
+      try {
+        cleaned = validatePresetOverrides(blob);
+      } catch (e) {
+        // Don't block startup over a legacy-data issue. Log + skip the migration
+        // so the operator can address it later through the admin endpoint.
+        this.logger.warn('DB migration: presetConfigs fold failed — ' + e.message);
+        cleaned = null;
+      }
+
+      if (cleaned !== null) {
+        if (Object.keys(cleaned).length > 0) {
+          this.setSetting('presetConfigs', JSON.stringify(cleaned));
+        } else {
+          // All legacy values matched new defaults → store empty to make the
+          // "first-time-empty" state explicit (admin endpoint returns {}).
+          this.setSetting('presetConfigs', '');
+        }
+        this.setSetting('presetConfigsMigratedV1', '1');
+        this.logger.info(
+          'DB migration: folded legacy globals into presetConfigs (' +
+          (Object.keys(cleaned).length || 0) + ' presets with overrides)'
+        );
+      }
     }
 
     // X Analysis history — one row per actually-executed Apify call. Cached

@@ -1,4 +1,5 @@
 import BaseCollector from './base-collector.js';
+import { getActivePresetConfig } from '../analysis/preset-config.js';
 
 /**
  * TikTok collector — uses Apify's TikTok scraper to surface viral content.
@@ -13,14 +14,11 @@ const ACTOR_ID = 'clockworks~tiktok-scraper';
 const MAX_VIDEOS_PER_TAG = 15;
 const TIMEOUT_SECS = 120;
 
-// Hashtags per preset — pick 2 per cycle, rotated
-const PRESET_HASHTAGS = {
-  general:  ['memecoin', 'solana', 'cryptomeme', 'degenlife', 'memetoken', 'solanameme', 'cryptohumor'],
-  animals:  ['catcoin', 'dogcoin', 'pepecoin', 'animalmeme', 'memecoin', 'solanameme', 'cryptoanimals'],
-  ai:       ['aicoin', 'aitoken', 'aiagent', 'artificialintelligence', 'cryptoai', 'memecoin', 'solana'],
-  elon:     ['dogecoin', 'elonmusk', 'doge', 'memecoin', 'crypto', 'shibainu', 'eloncoin'],
-  sports:   ['sportscrypto', 'fantoken', 'nflcrypto', 'nbacrypto', 'memecoin', 'ufccrypto', 'sportstoken'],
-};
+// Per-preset hashtags now live in settings.presetConfigs (sources.tiktok.hashtags).
+// See preset-config.js DEFAULT_PRESET_CONFIGS for shipped defaults — note this
+// fixed a stale-keys bug where pre-PR PRESET_HASHTAGS only had general/animals/
+// ai/elon/sports keys (didn't match PRESET_KEYS), so culture/celebrities/events
+// silently fell back to general. Now every preset has tailored hashtags.
 
 class TikTokCollector extends BaseCollector {
   constructor(config, logger, db) {
@@ -40,8 +38,13 @@ class TikTokCollector extends BaseCollector {
 
   _getHashtags() {
     if (this.customHashtags) return this.customHashtags;
-    const preset = this.db?.getSetting('activePreset', 'general') || 'general';
-    return PRESET_HASHTAGS[preset] || PRESET_HASHTAGS.general;
+    let hashtags = [];
+    try { hashtags = getActivePresetConfig(this.db).sources?.tiktok?.hashtags || []; }
+    catch (_) { hashtags = []; }
+    // Last-resort fallback so collect() never gets an empty list — rare path,
+    // only triggers if the preset blob is corrupted beyond the resolver's reach.
+    if (hashtags.length === 0) hashtags = ['memecoin', 'viral', 'fyp'];
+    return hashtags;
   }
 
   _nextKey() {
