@@ -150,6 +150,24 @@ class TrendDatabase {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_hidden_trends_chat ON hidden_trends(chat_id)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_hidden_trends_at   ON hidden_trends(hidden_at)`);
 
+    // Support-bot ticket threads. Each row maps a user's private chat with
+    // the support bot to a forum topic in the admin group. Two-way relay:
+    //   user → topic    : src/support/bot.js looks up by chat_id
+    //   admin reply → user : looks up by topic_id (message_thread_id)
+    // group_id is captured per-row so a future re-config (new admin group)
+    // doesn't silently misroute old threads.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS support_threads (
+        chat_id     TEXT PRIMARY KEY,
+        topic_id    INTEGER NOT NULL,
+        group_id    TEXT NOT NULL,
+        username    TEXT,
+        created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_support_threads_topic ON support_threads(topic_id, group_id)`);
+
     // ── Stage 1 calibration examples (admin-curated, fed into SYSTEM_PROMPT) ─
     // Each row is either a calibration example (specific trend → known score)
     // or a "mistake" / anti-pattern (rule the model commonly violates).
@@ -940,6 +958,40 @@ class TrendDatabase {
     const cutoff = new Date(Date.now() - retentionDays * 86400_000).toISOString();
     return this.db.prepare(`DELETE FROM hidden_trends WHERE hidden_at < ?`)
       .run(cutoff).changes;
+  }
+
+  // ── Support threads (forum-topic relay) ──────────────────────────────────────
+
+  getSupportThreadByChat(chatId) {
+    if (!chatId) return null;
+    return this.db.prepare(
+      `SELECT chat_id, topic_id, group_id, username, created_at, updated_at
+         FROM support_threads WHERE chat_id = ?`
+    ).get(String(chatId)) || null;
+  }
+
+  getSupportThreadByTopic(topicId, groupId) {
+    if (!topicId || !groupId) return null;
+    return this.db.prepare(
+      `SELECT chat_id, topic_id, group_id, username, created_at, updated_at
+         FROM support_threads WHERE topic_id = ? AND group_id = ?`
+    ).get(Number(topicId), String(groupId)) || null;
+  }
+
+  createSupportThread(chatId, topicId, groupId, username) {
+    if (!chatId || !topicId || !groupId) return;
+    this.db.prepare(
+      `INSERT OR REPLACE INTO support_threads
+         (chat_id, topic_id, group_id, username, created_at, updated_at)
+       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+    ).run(String(chatId), Number(topicId), String(groupId), username || null);
+  }
+
+  touchSupportThread(chatId) {
+    if (!chatId) return;
+    this.db.prepare(
+      `UPDATE support_threads SET updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?`
+    ).run(String(chatId));
   }
 
   // ── Trend Management ─────────────────────────────────────────────────────────

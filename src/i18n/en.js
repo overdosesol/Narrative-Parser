@@ -5,28 +5,28 @@ import { LIFESPAN_VALUES, assertCoversLifespans } from '../analysis/lifespan.js'
 
 const en = {
   // ── Bot welcome & commands ─────────────────────────────────────────────
-  welcome: `\u{1F431} <b>Hey! Meet Catalyst</b>
+  welcome: `<b>Catalyst</b>
 
-\u{1F916} It scans Twitter, TikTok, Reddit and Google Trends - the moment something starts going viral, you get an alert.
+Narrative scanner for <b>Twitter</b>, <b>TikTok</b>, <b>Reddit</b> and <b>Google Trends</b>. Pings when a story starts breaking out.
 
-\u{1F3AF} <b>What's in the alert:</b>
-\u2022 How hot the trend is (0\u2013100)
-\u2022 The catalyst behind the hype
-\u2022 What exactly happened
-\u2022 A plain-English explanation
-\u2022 View/like numbers
+<b>Each alert includes:</b>
+\u{1F3AF}  Score \u00b7 0\u2013100
+\u{26A1}  The trigger
+\u{1F4D6}  What's happening
+\u{1F9E0}  Plain-language breakdown
+\u{1F4CA}  Live engagement (views, likes, reposts)
 
-Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
+Open the menu below to set sources, threshold, language and plan.
 
-\u{1D54F} <a href="https://x.com/Catalystparser">Follow us on X</a>`,
+<a href="https://x.com/Catalystparser">\u{1D54F} Follow</a>`,
 
-  welcomeBack: (plan) => `\u{1F44B} <b>Welcome back!</b>\n\nYour plan: <b>${plan}</b>\nUse /menu any time to tweak settings.`,
+  welcomeBack: (plan) => `<b>Catalyst</b> \u00b7 plan: <b>${plan}</b>\n\n/menu \u2014 settings\n/top \u2014 top narratives right now`,
 
   // ── Main menu ──────────────────────────────────────────────────────────
-  menuTitle: '\u{2699}\u{FE0F} <b>Settings</b>\n\nManage your Catalyst preferences:',
+  menuTitle: '\u{2699}\u{FE0F} <b>Settings</b>\n\nTap a tile to tweak it. Current values are shown next to each option.',
   btnSources: '\u{1F4E1} Sources',
   btnLanguage: '\u{1F310} Language',
-  btnThreshold: '\u{1F3AF} Alert Threshold',
+  btnThreshold: '\u{1F3AF} Threshold',
   btnSubscription: '\u{1F4B3} Subscription',
   btnAlertTypes: '\u{1F514} Alert Types',
   btnTop: '\u{1F525} Top Trends',
@@ -36,9 +36,15 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
   btnOpenMenu: '\u2699\uFE0F Open Menu',
   btnBack: '\u{25C0}\u{FE0F} Back',
   btnClose: '\u{274C} Close',
+  // Badge formatters used by the main menu to show each option's current
+  // state inline on the button itself (e.g. "\uD83D\uDCE1 Sources \u00B7 4/5").
+  badgeSources:    (enabled, total) => ` \u00B7 ${enabled}/${total}`,
+  badgeThreshold:  (val)            => ` \u00B7 ${val}`,
+  badgeLanguage:   (code)           => ` \u00B7 ${code.toUpperCase()}`,
+  badgeAlertTypes: (count, total)   => (count === 0 || count === total) ? ' \u00B7 all' : ` \u00B7 ${count}/${total}`,
 
   // ── Sources ────────────────────────────────────────────────────────────
-  sourcesTitle: '\u{1F4E1} <b>Data Sources</b>\n\nToggle which platforms to monitor.\n\u{2705} = enabled, \u{274C} = disabled',
+  sourcesTitle: '\u{1F4E1} <b>Data Sources</b>\n\nTap a platform to turn its alerts on or off.',
   sourceToggled: (name, enabled) => `${enabled ? '\u{2705}' : '\u{274C}'} <b>${name}</b> is now ${enabled ? 'enabled' : 'disabled'}`,
   sourceNames: {
     reddit: 'Reddit',
@@ -49,7 +55,7 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
   },
 
   // ── Alert types ────────────────────────────────────────────────────────
-  alertTypesTitle: '\u{1F514} <b>Alert Types</b>\n\nPick which kinds of alerts to receive.\n\n\u{1F4F0} <b>Event</b> — concrete trigger (someone did/said something specific)\n\u{1F4C8} <b>Trend</b> — narrative bubbling across platforms / many posts\n\u{1F680} <b>Post</b> — a single viral post\n\n✅ = enabled, \u{274C} = disabled. Disabling all = receive all.',
+  alertTypesTitle: '\u{1F514} <b>Alert Types</b>\n\nChoose what kinds of alerts to receive:\n\n\u{1F4F0} <b>Event</b> — concrete trigger (someone said/did something specific)\n\u{1F4C8} <b>Trend</b> — narrative bubbling across multiple posts\n\u{1F680} <b>Post</b> — a single viral post\n\n<i>Tip: turning all of them off also receives all — no silent state.</i>',
   alertTypeNameEvent: 'Event',
   alertTypeNameTrend: 'Trend',
   alertTypeNamePost:  'Post',
@@ -60,12 +66,15 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
   languageSet: (lang) => `\u{2705} Language set to <b>${lang === 'en' ? 'English' : '\u{420}\u{443}\u{441}\u{441}\u{43A}\u{438}\u{439}'}</b>`,
 
   // ── Threshold ──────────────────────────────────────────────────────────
-  thresholdTitle: (current) => `\u{1F3AF} <b>Alert Threshold</b>\n\nCurrent: <b>${current}/100</b>\n\nOnly trends with meme potential above this value will trigger alerts.\n\u2B50 Recommended: <b>75+</b>\n\nChoose a preset:`,
+  thresholdTitle: (current) => `\u{1F3AF} <b>Alert Threshold</b>\n\nCurrent: <b>${current}/100</b>\n\nOnly trends scoring above this value will reach you.\n<i>Lower = more alerts. Higher = only the loudest signals.</i>\n\nPick a preset or set your own:`,
   thresholdSet: (val) => `\u{2705} Alert threshold set to <b>${val}/100</b>`,
-  thresholdLow: '\u{1F7E2} Low (52+) \u2014 More alerts',
-  thresholdMedium: '\u{1F7E1} Medium (67+) \u2014 Balanced',
-  thresholdHigh: '\u{1F534} High (75+) \u2014 Only bangers',
+  thresholdLow: '\u{1F7E2} Low \u00B7 52+ \u2014 more alerts',
+  thresholdMedium: '\u{1F7E1} Medium \u00B7 67+ \u2014 balanced',
+  thresholdHigh: '\u{1F534} High \u00B7 75+ \u2014 only the loudest',
   thresholdCustomBtn: '\u270F\uFE0F Custom number',
+  // Marker prepended to the active preset row inside the threshold keyboard
+  // so users can tell at a glance which one matches their current value.
+  thresholdActiveMark: '\u25B8 ',
   thresholdCustomPrompt: '\u270F\uFE0F <b>Custom threshold</b>\n\nEnter a whole number from 1 to 100:',
   thresholdCustomInvalid: '\u274C Invalid value. Please enter a whole number from 1 to 100.',
 
@@ -84,8 +93,8 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
   // ── Payment ────────────────────────────────────────────────────────────
   paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🆓 <b>Free — free forever (current)</b>\n• Sources: Reddit, Google Trends\n• Unlimited alerts\n• Twitter, TikTok and X Analysis not available\n\n🧪 <b>Test — $5 / 1 day (one-time)</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis is not available\n\n🚀 <b>Pro — $100 / 30 days</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis included',
   paymentMethod: '\u{1F4B0} <b>Payment</b>\n\nChoose payment method:',
-  btnPaySOL: '\u{25C9} Pay with SOL',
-  btnPayUSDC: '\u{25C9} Pay with USDC',
+  btnPaySOL: '\u{26A1} Pay with SOL',
+  btnPayUSDC: '\u{1F4B5} Pay with USDC',
   btnPayStars: (amount) => '\u2B50 Telegram Stars (' + amount + ' \u2B50)',
   starsInvoiceTitle: (plan) => 'Catalyst \u2014 ' + plan,
   starsInvoiceDesc: (plan) => 'Access to Catalyst ' + plan + '. Payment is confirmed instantly.',
@@ -123,7 +132,7 @@ Hit "Open Menu" and tune it to your taste \u2699\u{FE0F}
   alertOpen: 'Open link',
 
   // ── Top command ────────────────────────────────────────────────────────
-  topSelectorTitle: '\u{1F525} <b>Top Narratives</b>\n\nHow many trends to show?',
+  topSelectorTitle: '\u{1F525} <b>Top Narratives · last 24h</b>\n\nHow many trends do you want to see?',
   topBtnCount: (n) => '\u{1F4CA} TOP-' + n,
   topTitle: (n) => '\u{1F525} <b>TOP-' + n + ' NARRATIVES \u00B7 24H</b>',
   topEmpty: '\u{1F937} No degen trends in the last 24 hours.',

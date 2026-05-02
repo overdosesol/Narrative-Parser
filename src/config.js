@@ -69,6 +69,16 @@ const config = {
     starsProPrice:  parseInt(process.env.STARS_PRO_PRICE  || '5000', 10), // ≈ $100
   },
 
+  // Support bot — separate bot for tickets that relays into a forum-topics
+  // group. Each user gets their own topic in the admin group; admin replies
+  // in a topic are forwarded back to that user. Disabled gracefully if any
+  // of the three vars is missing — main bot keeps working.
+  support: {
+    botToken: process.env.SUPPORT_BOT_TOKEN || '',
+    botUsername: (process.env.SUPPORT_BOT_USERNAME || '').replace(/^@/, ''),
+    groupId:  process.env.SUPPORT_GROUP_ID || '',
+  },
+
   // Solana Pay
   solanaPay: {
     merchantWallet: process.env.SOLANA_MERCHANT_WALLET || '',
@@ -104,6 +114,7 @@ if (config.twitter.enabled && !config.apify.apiKey) warnings.push('TWITTER_ENABL
 if (config.tiktok.enabled  && !config.apify.apiKey) warnings.push('TIKTOK_ENABLED=true but APIFY_API not set');
 if (config.dashboard.enabled && !config.dashboard.apiKey) warnings.push('DASHBOARD_API_KEY not set — dashboard API will reject requests');
 if (!process.env.ADMIN_API_KEY) warnings.push('ADMIN_API_KEY not set — admin API will reject requests');
+if (config.support.botToken && !config.support.groupId) warnings.push('SUPPORT_BOT_TOKEN set but SUPPORT_GROUP_ID missing — support bot will not relay tickets');
 
 if (warnings.length > 0) {
   console.warn('\u26a0\ufe0f  Configuration warnings:');

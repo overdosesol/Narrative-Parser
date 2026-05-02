@@ -173,9 +173,25 @@ class TelegramNotifier {
       const arg = (match?.[1] || '').trim();
       const user = this.db.getOrCreateUser(msg.chat.id, msg.from?.username);
       if (!arg) {
+        // Heavy-horizontal dividers (U+2501) match the alert-message style in
+        // formatter.js — same visual rhythm so manual responses don't look
+        // foreign next to autonomous alerts.
+        const DIV = '━'.repeat(20);
         const text = user.language === 'ru'
-          ? 'Использование: <code>/analyze &lt;url&gt;</code>\n\nПример: <code>/analyze https://twitter.com/user/status/123</code>'
-          : 'Usage: <code>/analyze &lt;url&gt;</code>\n\nExample: <code>/analyze https://twitter.com/user/status/123</code>';
+          ? '\u{1F50D} <b>/analyze — ручной анализ ссылки</b>\n'
+            + DIV + '\n'
+            + '\u{1F916} Кидай ссылку на пост (X, Reddit, TikTok) — прогоню её через тот же пайплайн, что и автоалерты: скор, триггер, разбор нарратива, метрики.\n'
+            + DIV + '\n'
+            + '\u{2728} <b>Пример</b>\n<code>/analyze https://x.com/user/status/123</code>\n'
+            + DIV + '\n'
+            + '\u{1F4A1} <i>Подсказка: можно просто вставить ссылку без команды — поймаю автоматически.</i>'
+          : '\u{1F50D} <b>/analyze — manual link analysis</b>\n'
+            + DIV + '\n'
+            + '\u{1F916} Drop a post link (X, Reddit, TikTok) and I’ll run it through the same pipeline as automatic alerts: score, trigger, narrative breakdown, engagement.\n'
+            + DIV + '\n'
+            + '\u{2728} <b>Example</b>\n<code>/analyze https://x.com/user/status/123</code>\n'
+            + DIV + '\n'
+            + '\u{1F4A1} <i>Tip: paste the link without the command — I’ll pick it up automatically.</i>';
         return this.bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
       }
       // Pull the first http(s) URL from the argument string. Tolerates a
@@ -398,7 +414,7 @@ class TelegramNotifier {
 
         // ── Threshold ─────────────────────────
         else if (data === 'threshold') {
-          await this._editMessage(chatId, query.message.message_id, t.thresholdTitle(user.alert_threshold), this._thresholdKeyboard(t));
+          await this._editMessage(chatId, query.message.message_id, t.thresholdTitle(user.alert_threshold), this._thresholdKeyboard(t, user.alert_threshold));
           await this.bot.answerCallbackQuery(query.id);
         }
         else if (data.startsWith('set_threshold:')) {
@@ -427,20 +443,11 @@ class TelegramNotifier {
           await this._editMessage(chatId, query.message.message_id, statusMsg + '\n\n' + t.menuTitle, this._mainMenuKeyboard(user));
         }
 
-        // ── Subscription ──────────────────────
-        else if (data === 'subscription') {
-          const expires = user.subscription_expires_at
-            ? new Date(user.subscription_expires_at).toLocaleDateString()
-            : null;
-          const statusText = user.status === 'active' ? (user.language === 'ru' ? 'Активна' : 'Active') : (user.language === 'ru' ? 'Приостановлена' : 'Paused');
-          const planDisplay = t[`plan${user.plan_name.charAt(0).toUpperCase() + user.plan_name.slice(1)}`] || user.plan_name;
-          const msg = t.subscriptionTitle(planDisplay, statusText, expires);
-          await this._editMessage(chatId, query.message.message_id, msg, this._subscriptionKeyboard(user, t));
-          await this.bot.answerCallbackQuery(query.id);
-        }
-
-        // ── Upgrade ───────────────────────────
-        else if (data === 'upgrade') {
+        // ── Subscription / Upgrade ────────────
+        // Both routes show the plans screen directly — the old intermediate
+        // "current plan / upgrade" status page was removed since users almost
+        // always wanted to pick a plan, not stare at their current one.
+        else if (data === 'subscription' || data === 'upgrade') {
           await this._editMessage(chatId, query.message.message_id, t.paymentTitle, this._plansKeyboard(t));
           await this.bot.answerCallbackQuery(query.id);
         }
@@ -643,27 +650,53 @@ class TelegramNotifier {
 
   // ── Keyboard builders ─────────────────────────────────────────────────────
 
+  // "Ask a question" deep-link. Prefers the dedicated support bot when
+  // SUPPORT_BOT_USERNAME is configured; falls back to the legacy personal
+  // DM URL so the button never points nowhere.
+  _supportUrl() {
+    const u = this.config?.support?.botUsername;
+    return u ? `https://t.me/${u}` : 'https://t.me/support-bot';
+  }
+
   _startKeyboard(user) {
     const t = getTranslations(user.language);
     return {
       inline_keyboard: [
         [{ text: t.btnOpenMenu || '⚙️ Open Menu', callback_data: 'menu' }],
-        [{ text: t.btnFollowX || '𝕏 Follow @Catalystparser', url: 'https://x.com/Catalystparser' }],
-        [{ text: t.btnAskQuestion || '💬 Ask a question', url: 'https://t.me/support-bot' }],
+        [{ text: t.btnAskQuestion || '💬 Ask a question', url: this._supportUrl() }],
       ],
     };
   }
 
   _mainMenuKeyboard(user) {
     const t = getTranslations(user.language);
+
+    // Live badges — show each setting's current value right on its tile so
+    // the menu doubles as a status screen and saves a tap to peek inside.
+    const ALL_SOURCES_COUNT = 5;
+    const disabled = (() => { try { return JSON.parse(user.disabled_sources || '[]'); } catch { return []; } })();
+    const sourcesBadge    = t.badgeSources    ? t.badgeSources(ALL_SOURCES_COUNT - disabled.length, ALL_SOURCES_COUNT) : '';
+    const thresholdBadge  = t.badgeThreshold  ? t.badgeThreshold(user.alert_threshold) : '';
+    const languageBadge   = t.badgeLanguage   ? t.badgeLanguage(user.language || 'en') : '';
+    const alertTypesList  = (this.db?.getUserAlertTypes ? this.db.getUserAlertTypes(user.telegram_chat_id) : []) || [];
+    const alertTypesBadge = t.badgeAlertTypes ? t.badgeAlertTypes(alertTypesList.length, 3) : '';
+
     return {
       inline_keyboard: [
-        [{ text: t.btnSources, callback_data: 'sources' }, { text: t.btnThreshold, callback_data: 'threshold' }],
-        [{ text: t.btnAlertTypes, callback_data: 'alert_types' }, { text: t.btnLanguage, callback_data: 'language' }],
-        [{ text: t.btnSubscription, callback_data: 'subscription' }],
-        [{ text: t.btnTop, callback_data: 'top' }],
+        [
+          { text: t.btnSources   + sourcesBadge,    callback_data: 'sources'   },
+          { text: t.btnThreshold + thresholdBadge,  callback_data: 'threshold' },
+        ],
+        [
+          { text: t.btnAlertTypes + alertTypesBadge, callback_data: 'alert_types' },
+          { text: t.btnLanguage   + languageBadge,   callback_data: 'language'    },
+        ],
+        [
+          { text: t.btnTop,          callback_data: 'top'          },
+          { text: t.btnSubscription, callback_data: 'subscription' },
+        ],
         [{ text: t.btnStartStop(user.status === 'paused'), callback_data: 'toggle_pause' }],
-        [{ text: t.btnAskQuestion || '💬 Ask a question', url: 'https://t.me/support-bot' }],
+        [{ text: t.btnAskQuestion || '💬 Ask a question', url: this._supportUrl() }],
         [{ text: t.btnClose, callback_data: 'close' }],
       ]
     };
@@ -719,23 +752,20 @@ class TelegramNotifier {
     };
   }
 
-  _thresholdKeyboard(t) {
+  _thresholdKeyboard(t, current) {
+    // Mark the row matching the user's current threshold so they can spot
+    // their active preset at a glance. Falls back to a leading space for
+    // the inactive rows so all three labels stay vertically aligned.
+    const mark = (val) => current === val ? (t.thresholdActiveMark || '\u25B8 ') : '\u2003 ';
     return {
       inline_keyboard: [
-        [{ text: t.thresholdLow,    callback_data: 'set_threshold:52' }],
-        [{ text: t.thresholdMedium, callback_data: 'set_threshold:67' }],
-        [{ text: t.thresholdHigh,   callback_data: 'set_threshold:75' }],
+        [{ text: mark(52) + t.thresholdLow,    callback_data: 'set_threshold:52' }],
+        [{ text: mark(67) + t.thresholdMedium, callback_data: 'set_threshold:67' }],
+        [{ text: mark(75) + t.thresholdHigh,   callback_data: 'set_threshold:75' }],
         [{ text: t.thresholdCustomBtn || '\u270F\uFE0F Custom', callback_data: 'threshold_custom' }],
         [{ text: t.btnBack, callback_data: 'menu' }],
       ]
     };
-  }
-
-  _subscriptionKeyboard(user, t) {
-    const buttons = [];
-    buttons.push([{ text: t.btnUpgrade, callback_data: 'upgrade' }]);
-    buttons.push([{ text: t.btnBack, callback_data: 'menu' }]);
-    return { inline_keyboard: buttons };
   }
 
   _plansKeyboard(t) {
@@ -743,7 +773,7 @@ class TelegramNotifier {
       inline_keyboard: [
         [{ text: t.planTest || 'Test Plan ($5 / 1 day)', callback_data: 'buy_plan:test' }],
         [{ text: t.planPro || 'Pro ($100 / 30 days)', callback_data: 'buy_plan:pro' }],
-        [{ text: t.btnBack, callback_data: 'subscription' }],
+        [{ text: t.btnBack, callback_data: 'menu' }],
       ]
     };
   }

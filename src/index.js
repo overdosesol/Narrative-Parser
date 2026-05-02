@@ -17,6 +17,7 @@ import NanoClassifier from './analysis/nano-classifier.js';
 import GeminiCaptioner from './analysis/gemini-captioner.js';
 import PreStage from './analysis/pre-stage.js';
 import TelegramNotifier from './notifications/telegram.js';
+import SupportBot from './support/bot.js';
 import SolanaPayMonitor from './billing/solana-pay.js';
 import DashboardServer from './dashboard/server.js';
 import AdminServer from './admin/server.js';
@@ -103,6 +104,13 @@ const solanaMonitor = new SolanaPayMonitor(
 
 // Inject monitor into bot (after both are created to avoid circular deps)
 telegram.solanaMonitor = solanaMonitor;
+
+// ── Support bot (forum-topics relay) ────────────────────────────────────────
+// Separate Telegram bot dedicated to user-support tickets. Each user gets a
+// forum topic in a private admin group; admin replies in topics are routed
+// back to the user. Disabled gracefully when env vars are missing.
+const supportBot = new SupportBot(config, logger, db);
+supportBot.start();
 
 // ── Initialize collectors ───────────────────────────────────────────────────
 const collectors = [];
