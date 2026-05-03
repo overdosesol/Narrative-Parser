@@ -28,7 +28,7 @@
  *   - Env `HOT_REFRESH_ENABLED=0` — panic kill-switch (process restart req'd)
  *   - DB setting `hotRefreshEnabled` — admin runtime toggle (no restart,
  *     read on every cycle entry — see _isAdminEnabled)
- *   - Env `HOT_REFRESH_INTERVAL_MINUTES` — cycle interval (default 120)
+ *   - Env `HOT_REFRESH_INTERVAL_MINUTES` — cycle interval (default 720 = 12h)
  *
  * Owner-decided scope (2026-05-03):
  *   - Refresh only trends ≤24h old with memePotential ≥ 50
@@ -46,7 +46,17 @@ import { recomputeAlertScores, dispatchAlerts } from '../notifications/alert-dis
 import { loadAlertWeights } from '../analysis/scorer.js';
 import { getActivePresetConfig } from '../analysis/preset-config.js';
 
-const DEFAULT_INTERVAL_MIN = 120;
+// (2026-05-04) Bumped default 120 → 720 (2h → 12h). The picker has no
+// per-trend cooldown — every cycle re-runs Stage 1 (and Stage 2 if
+// memePotential ≥ 60) on all hot trends. Trends age out of the picker
+// after 24h via the first_seen_at filter, so a 2h cycle meant ~12 LLM
+// reprocessings per trend lifetime, which was driving Grok costs up
+// noticeably. At 12h cycle, each active trend hits Hot refresh ≤ 2 times
+// before retention naturally drops it. Override via env if you want to
+// tune in either direction:
+//   HOT_REFRESH_INTERVAL_MINUTES=360   // every 6h (more reactive)
+//   HOT_REFRESH_INTERVAL_MINUTES=1440  // once a day (cheapest)
+const DEFAULT_INTERVAL_MIN = 720;
 const STARTUP_DELAY_MS = 2 * 60 * 1000;  // wait 2 min after boot before first run
 const DEFAULT_MAX_BATCH = 100;
 const DEFAULT_MIN_MEME = 50;

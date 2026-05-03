@@ -30,6 +30,15 @@
 
 import { computeAlertScore, feedbackBoostFromStats } from '../analysis/scorer.js';
 
+// PII masking for log lines. Long-term stdout (Docker / journald) shouldn't
+// retain full Telegram chat_ids - they're stable identifiers that can be
+// cross-referenced. Last 4 chars is enough to correlate two log lines about
+// the same user without exposing the whole ID.
+function maskId(id) {
+  const s = String(id ?? '');
+  return s ? '***' + s.slice(-4) : '<empty>';
+}
+
 /**
  * Refresh `alertScore` / `alertBreakdown` / `_alertHardJunk` on every trend
  * using LIVE inputs (feedback votes from DB + actual age in hours). The
@@ -117,7 +126,7 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
     if (db.isSubscriptionExpired(user)) {
       db.updateUser(user.id, 'plan_id', 1);
       db.updateUser(user.id, 'subscription_expires_at', null);
-      logger.info?.(`Subscription expired for user ${user.telegram_chat_id} — downgraded to free`);
+      logger.info?.(`Subscription expired for user ${maskId(user.telegram_chat_id)} - downgraded to free`);
     }
 
     let userDisabledSources = [];
@@ -229,7 +238,7 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
     }
 
     if (alertsSentThisCycle > 0) {
-      logger.info?.(`[Dispatch:${source}] sent ${alertsSentThisCycle} alert(s) to user ${user.telegram_chat_id}`);
+      logger.info?.(`[Dispatch:${source}] sent ${alertsSentThisCycle} alert(s) to user ${maskId(user.telegram_chat_id)}`);
     }
   }
 

@@ -195,12 +195,17 @@ class TwitterChecker {
   /** Internal: hit a specific actor once. Returns summarized result or null. */
   async _runActor({ name, def, key }, query) {
     if (!key) throw new Error(`[Twitter/X] No API key for actor '${name}'`);
-    const runUrl = `https://api.apify.com/v2/acts/${def.id}/run-sync-get-dataset-items?token=${key}&timeout=${TIMEOUT_SECS}`;
+    // Authorization: Bearer instead of ?token= so a network-error
+    // err.message can never leak the API key (see tiktok.js for rationale).
+    const runUrl = `https://api.apify.com/v2/acts/${def.id}/run-sync-get-dataset-items?timeout=${TIMEOUT_SECS}`;
     const input = def.buildInput(query, MAX_TWEETS);
 
     const response = await fetch(runUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${key}`,
+      },
       body: JSON.stringify(input),
     });
 

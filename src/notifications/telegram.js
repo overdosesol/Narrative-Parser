@@ -8,6 +8,13 @@ import { getTranslations } from '../i18n/index.js';
 import { normalizeLifespan } from '../analysis/lifespan.js';
 import TwitterChecker from '../collectors/twitter-check.js';
 import { UserRateLimiter } from '../utils/rate-limiter.js';
+
+// PII masking for log lines (last 4 chars of identifier). See dashboard
+// server.js for rationale - long-term stdout shouldn't keep full chat_ids.
+function maskId(id) {
+  const s = String(id ?? '');
+  return s ? '***' + s.slice(-4) : '<empty>';
+}
 import { runManualAnalysis, peekManualAnalysisCache } from '../analysis/manual-analysis.js';
 
 /**
@@ -292,7 +299,7 @@ class TelegramNotifier {
         }
         const ok = this.db.setFeedbackReason(state.trendId, chatId, reason);
         if (ok) {
-          this.logger.info(`Feedback reason saved (${reason.length} chars) for trend ${state.trendId} by ${chatId}`);
+          this.logger.info(`Feedback reason saved (${reason.length} chars) for trend ${state.trendId} by ${maskId(chatId)}`);
           await this.bot.sendMessage(msg.chat.id, t.feedbackReasonSaved || 'Reason saved - thank you!', {
             parse_mode: 'HTML',
           }).catch(() => {});
@@ -1040,7 +1047,7 @@ class TelegramNotifier {
       if (waitMsgId) {
         try { await this.bot.deleteMessage(chatId, waitMsgId); } catch {}
       }
-      this.logger.warn(`[Manual TG] failed for ${chatId}: ${err.message}`);
+      this.logger.warn(`[Manual TG] failed for ${maskId(chatId)}: ${err.message}`);
       const head = user.language === 'ru' ? '⚠ Ошибка анализа: ' : '⚠ Analysis failed: ';
       await this.bot.sendMessage(chatId, head + (err.message || 'unknown')).catch(() => {});
     }
@@ -1214,15 +1221,15 @@ class TelegramNotifier {
       }
 
       const msgId = sentMsg.message_id;
-      this.logger.info(`Alert sent to user ${user.telegram_chat_id}: "${trend.title}"`);
+      this.logger.info(`Alert sent to user ${maskId(user.telegram_chat_id)}: "${trend.title}"`);
       return { messageId: msgId, chatId: user.telegram_chat_id };
     } catch (error) {
       if (error.response?.statusCode === 403) {
         // User blocked the bot - mark as suspended
-        this.logger.warn(`User ${user.telegram_chat_id} blocked the bot - suspending`);
+        this.logger.warn(`User ${maskId(user.telegram_chat_id)} blocked the bot - suspending`);
         this.db.updateUser(user.id, 'status', 'suspended');
       } else {
-        this.logger.error(`Alert send failed for ${user.telegram_chat_id}: ${error.message}`);
+        this.logger.error(`Alert send failed for ${maskId(user.telegram_chat_id)}: ${error.message}`);
       }
       return false;
     }
@@ -1557,15 +1564,10 @@ class TelegramNotifier {
       if (items) lines.push(`\n${t.triggerRisksHdr}\n${items}`);
     }
 
-    if (Array.isArray(payload.sources) && payload.sources.length > 0) {
-      const links = payload.sources
-        .filter(s => typeof s === 'string' && s.trim().length > 1)
-        .map(s => {
-          const handle = s.startsWith('@') ? s.slice(1) : s;
-          return `<a href="https://x.com/${encodeURIComponent(handle)}">${this._escHtml('@' + handle)}</a>`;
-        });
-      if (links.length) lines.push(`\n${t.triggerSourcesHdr} ${links.join(', ')}`);
-    }
+    // (2026-05-04) Sources block removed from Telegram alerts (mirrored the
+    // dashboard removal): Catalyst's source list was surfacing low-signal X
+    // handles. Forecast text + drivers + risks + confidence are the useful
+    // parts. payload.sources is still populated upstream but no longer rendered.
     if (typeof payload.confidence === 'number' && payload.confidence > 0) {
       lines.push(`\n${t.triggerConfidence(payload.confidence)}`);
     }
@@ -2013,6 +2015,51 @@ class TelegramNotifier {
   /**
    * Resolve a Telegram file_id to a full CDN URL.
    * Returned links live for ~1h on Telegram's side; do not persist them.
+   */
+  /**
+   * Fetch a Telegram file by file_id and return its bytes + content-type.
+   * Keeps the bot-token-embedded URL inside this module - callers never see
+   * it, so a downstream `logger.error(e.message)` can't leak the token if
+   * fetch throws on a network/DNS error.
+   *
+   * @returns {Promise<{ buffer: Buffer, contentType: string }|null>}
+   */
+  async fetchFile(fileId) {
+    if (!this.bot || !fileId) return null;
+    let filePath;
+    try {
+      const file = await this.bot.getFile(fileId);
+      filePath = file?.file_path;
+      if (!filePath) return null;
+    } catch (e) {
+      this.logger?.warn?.(`[Avatar] getFile failed: ${e.message}`);
+      return null;
+    }
+    // URL is constructed and used purely inside this try block. Any error
+    // from fetch goes through our own catch with a scrubbed message.
+    const url = `https://api.telegram.org/file/bot${this.botToken}/${filePath}`;
+    try {
+      const r = await fetch(url);
+      if (!r.ok || !r.body) {
+        this.logger?.warn?.(`[Avatar] CDN status ${r.status} for ${filePath}`);
+        return null;
+      }
+      const buffer = Buffer.from(await r.arrayBuffer());
+      const contentType = r.headers.get('content-type') || 'image/jpeg';
+      return { buffer, contentType };
+    } catch (e) {
+      // Strip URL from message defensively - undici embeds the URL into
+      // some error messages (DNS, abort, etc.). Keep just the error code.
+      const safeMsg = String(e.code || e.name || 'fetch failed');
+      this.logger?.warn?.(`[Avatar] CDN fetch failed: ${safeMsg}`);
+      return null;
+    }
+  }
+
+  /**
+   * @deprecated since the secret-leak audit - prefer fetchFile() which keeps
+   * the token inside this module. Kept for back-compat with any external
+   * caller (none currently).
    */
   async getFileUrl(fileId) {
     if (!this.bot || !fileId) return null;

@@ -552,13 +552,36 @@ function startScheduler() {
 }
 
 // ── Graceful shutdown ───────────────────────────────────────────────────────
+// Two-phase: phase 1 stops collectors / new work, phase 2 drains HTTP servers
+// (waits up to 10s for in-flight requests). Hard-cap at 15s overall - better
+// to lose a stuck request than hang the process under systemd / Docker, where
+// an unresponsive process gets SIGKILL'd anyway.
+let _shuttingDown = false;
 async function shutdown(signal) {
-  logger.info(`Received ${signal} — shutting down gracefully...`);
-  solanaMonitor.stop();
-  await telegram.stop();
-  dashboard.stop();
-  admin.stop();
-  db.close();
+  if (_shuttingDown) return;     // re-entry guard - SIGTERM can fire twice
+  _shuttingDown = true;
+  logger.info(`Received ${signal} - shutting down gracefully...`);
+
+  // Hard cap on the whole shutdown - protects against a hung db.close() or
+  // a Telegram polling loop refusing to exit.
+  const hardCap = setTimeout(() => {
+    logger.warn('Shutdown hard cap reached (15s) - forcing exit');
+    process.exit(1);
+  }, 15_000);
+  hardCap.unref?.();
+
+  try {
+    solanaMonitor.stop();
+    await telegram.stop();
+    // Drain HTTP servers in parallel - independent so don't serialize them.
+    await Promise.allSettled([
+      dashboard.stop(10_000),
+      admin.stop(10_000),
+    ]);
+    db.close();
+  } catch (e) {
+    logger.error(`Shutdown error: ${e.message}`);
+  }
   process.exit(0);
 }
 process.on('SIGINT',  () => shutdown('SIGINT'));

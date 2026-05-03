@@ -25,6 +25,57 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const MAX_BODY_BYTES = 16 * 1024; // 16 KB limit
 
+// Security headers — applied to every response. Defaults are conservative;
+// override via env if you need to embed the dashboard in an iframe etc.
+//   - HSTS: tells browsers to only ever talk HTTPS for the next year. Safe even
+//     when terminating TLS at a reverse proxy (header is honored by the client).
+//   - X-Frame-Options DENY: blocks clickjacking via <iframe>.
+//   - X-Content-Type-Options nosniff: blocks MIME-sniff attacks.
+//   - Referrer-Policy no-referrer: don't leak the dashboard URL to outbound links.
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+};
+
+// CORS allowlist — comma-separated env var. Empty (default) = no cross-origin
+// allowed; the SPA is same-origin to the API in normal deployment. If you serve
+// the frontend from a different origin (separate CDN, dev bundler), add it
+// here, e.g. `DASHBOARD_ALLOWED_ORIGINS=https://app.example.com,http://localhost:5173`.
+const ALLOWED_ORIGINS = (process.env.DASHBOARD_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+/**
+ * Compute the value of `Access-Control-Allow-Origin` for this request.
+ * Returns null when no CORS header should be sent (= same-origin only).
+ */
+function corsOriginFor(req) {
+  const origin = String(req.headers?.origin || '');
+  if (!origin) return null;            // same-origin / non-browser request
+  if (ALLOWED_ORIGINS.includes(origin)) return origin;
+  return null;
+}
+
+/**
+ * Build response headers with security defaults + optional CORS echo.
+ * Pass extra headers as the second arg (Content-Type, Cache-Control, etc.).
+ */
+function buildHeaders(req, extra = {}) {
+  const headers = { ...SECURITY_HEADERS, ...extra };
+  const origin = corsOriginFor(req);
+  if (origin) {
+    headers['Access-Control-Allow-Origin'] = origin;
+    headers['Access-Control-Allow-Credentials'] = 'true';
+    // Browsers cache CORS results per-Origin — Vary lets shared caches hold
+    // separate entries per origin instead of mixing them up.
+    headers['Vary'] = 'Origin';
+  }
+  return headers;
+}
+
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -45,6 +96,39 @@ function parseBody(req) {
   });
 }
 
+/**
+ * Mask a Telegram chat_id (or any user identifier) for logging. Long-term
+ * stdout logs (Docker / journald) are PII surface — we want enough info to
+ * correlate two log lines for the same user, but not enough to expose the
+ * full identifier to anyone scanning logs. Last 4 chars is the standard.
+ *
+ * Examples:  6321487523 → '***7523',   '47'  → '***47'
+ */
+export function maskId(id) {
+  const s = String(id ?? '');
+  if (!s) return '<empty>';
+  return '***' + s.slice(-4);
+}
+
+/**
+ * Format a "now - msAgo" cutoff to match SQLite's stored TEXT timestamp shape
+ * ('YYYY-MM-DD HH:MM:SS') so lexicographic WHERE comparisons work correctly.
+ *
+ * Why: SQLite has no real DATETIME type — `CURRENT_TIMESTAMP` is stored as
+ * TEXT 'YYYY-MM-DD HH:MM:SS' (space separator, no Z, no millis). If we feed
+ * a JS-style ISO string ('YYYY-MM-DDTHH:MM:SS.sssZ') as a cutoff, the
+ * comparison is purely string-lex: at position 10, ' ' (0x20) < 'T' (0x54),
+ * so any same-day stored row is < cutoff string, and `WHERE col > cutoff`
+ * returns zero rows — silently. The bug is invisible at 24h windows because
+ * the cutoff lands on a different calendar day (date prefix differs first),
+ * but visible at 6h windows where cutoff and rows share the same date prefix.
+ *
+ * Symptom that revealed this: dashboard 6h window returned an empty feed.
+ */
+function sqliteCutoff(msAgo) {
+  return new Date(Date.now() - msAgo).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 /** Constant-time string comparison to prevent timing attacks */
 function safeEqual(a, b) {
   try {
@@ -62,12 +146,15 @@ function safeEqual(a, b) {
 }
 
 function json(res, status, data) {
+  // res._defaultHeaders stashed by _handle() entry — security defaults +
+  // optional CORS for the current Origin. Falls back to bare security
+  // headers if a caller forgot to pass through _handle (shouldn't happen).
+  const base = res._defaultHeaders || SECURITY_HEADERS;
   const payload = JSON.stringify(data);
   res.writeHead(status, {
+    ...base,
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key',
-    'Cache-Control': 'no-cache',
+    'Cache-Control': 'no-store',
   });
   res.end(payload);
 }
@@ -92,7 +179,15 @@ function upgradeTwimgUrl(u) {
 }
 
 function html(res, content) {
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  const base = res._defaultHeaders || SECURITY_HEADERS;
+  res.writeHead(200, {
+    ...base,
+    'Content-Type': 'text/html; charset=utf-8',
+    // SPA HTML must not be long-cached: a redeploy ships new code and we want
+    // browsers to grab the new index. Hashed sub-resources (logo, video) ship
+    // their own Cache-Control via the relevant handlers.
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+  });
   res.end(content);
 }
 
@@ -117,9 +212,33 @@ class DashboardServer {
     this.sseClients    = new Set();  // active Server-Sent Event subscribers
     this._sseKeepAlive = null;
     // In-memory rate-limit ring for /api/manual-analysis. Map<userId, number[]>
-    // — array of timestamps within the rolling window. Reset on restart, which
+    // - array of timestamps within the rolling window. Reset on restart, which
     // is fine for a soft cap (only matters for sustained abuse).
     this._manualAnalysisHits = new Map();
+
+    // Brute-force protection on /api/auth/verify. 6-digit codes have only
+    // ~20 bits of entropy; without throttling an attacker who knows the
+    // sessionId could try ~10/sec and crack a code in days. We cap to 5
+    // attempts per session_id. After that the user has to /start over.
+    // Map<sessionId, { count: number, firstAttempt: number }>. Cleaned on
+    // a 15min sliding window so memory doesn't grow unbounded.
+    this._authVerifyAttempts = new Map();
+    this._AUTH_VERIFY_MAX = 5;
+    this._AUTH_VERIFY_WINDOW_MS = 15 * 60 * 1000;
+
+    // Flood protection on /api/auth/initiate. Each call creates an
+    // auth_sessions row; without limit a script can fill the table (the
+    // 1-day housekeeping eventually prunes them, but that's a bandaid).
+    // Per-IP cap: 10 fresh sessions / 5 minutes is generous for legitimate
+    // users (multi-tab, retries) and brutal to scripts. Same Map<ip,
+    // {count, firstAttempt}> shape as verify-attempts.
+    // NB: behind a reverse proxy without TRUST_PROXY=1, every request
+    // looks like the proxy IP - cap then becomes "10/5min for the whole
+    // proxy", which is fine for a single VPS. When/if we add trust-proxy
+    // support, this Map should key on X-Forwarded-For instead.
+    this._authInitiateAttempts = new Map();
+    this._AUTH_INITIATE_MAX = 10;
+    this._AUTH_INITIATE_WINDOW_MS = 5 * 60 * 1000;
 
     // Brand logo cache-bust. Compute mtime of assets/logo.png ONCE at boot;
     // SPA embeds it as ?v=<this> on the <img> src. When you replace the
@@ -167,8 +286,37 @@ class DashboardServer {
     });
   }
 
-  stop() {
-    this.server?.close();
+  /**
+   * Graceful shutdown:
+   *   1. Stop accepting new connections (server.close)
+   *   2. End all active SSE streams cleanly so clients see a normal close
+   *      (otherwise they'd retry-loop against a 502 from the LB during deploy)
+   *   3. Drop the keep-alive interval
+   *   4. Wait up to `timeoutMs` for in-flight requests to drain, then force-exit
+   * Returns a promise that resolves when the server is fully closed.
+   */
+  stop(timeoutMs = 10000) {
+    return new Promise((resolve) => {
+      // (1) close keep-alive timer
+      if (this._sseKeepAlive) { clearInterval(this._sseKeepAlive); this._sseKeepAlive = null; }
+      // (2) drain SSE — write a 'bye' event so the SPA can show "reconnecting"
+      for (const r of this.sseClients) {
+        try {
+          r.write('event: bye\ndata: {"reason":"shutdown"}\n\n');
+          r.end();
+        } catch { /* already closed */ }
+      }
+      this.sseClients.clear();
+      // (3) close listener; existing keep-alive sockets force-closed below
+      if (!this.server) return resolve();
+      this.server.close(() => resolve());
+      // (4) hard-cap: if a slow handler is hung, don't block the whole process
+      const t = setTimeout(() => {
+        try { this.server?.closeAllConnections?.(); } catch {}
+        resolve();
+      }, timeoutMs);
+      t.unref?.();
+    });
   }
 
   // ── Router ──────────────────────────────────────────────────────────────────
@@ -178,9 +326,38 @@ class DashboardServer {
     const path   = url.pathname;
     const method = req.method;
 
-    // CORS preflight
+    // Pre-compute the security + CORS headers for this request and stash
+    // them on `res` so json()/html()/SSE all share the same baseline.
+    res._defaultHeaders = buildHeaders(req);
+
+    // Monkey-patch writeHead so EVERY response (including binary asset
+    // handlers, video proxy, error paths) automatically inherits security
+    // headers without each handler having to remember to spread them.
+    // Caller's explicit headers still win — Object spread order makes the
+    // caller's keys override our defaults when they collide.
+    const _origWriteHead = res.writeHead.bind(res);
+    res.writeHead = (status, headersOrReason, maybeHeaders) => {
+      let statusMsg, hdrs;
+      if (typeof headersOrReason === 'string') {
+        statusMsg = headersOrReason;
+        hdrs = maybeHeaders || {};
+      } else {
+        hdrs = headersOrReason || {};
+      }
+      const merged = { ...res._defaultHeaders, ...hdrs };
+      return statusMsg ? _origWriteHead(status, statusMsg, merged) : _origWriteHead(status, merged);
+    };
+
+    // CORS preflight — only succeed if origin is in the allowlist; otherwise
+    // browser will block the actual request anyway, but returning 204 with no
+    // ACAO matches the secure-by-default posture (vs old behavior that echoed *).
     if (method === 'OPTIONS') {
-      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, X-API-Key', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' });
+      res.writeHead(204, {
+        ...res._defaultHeaders,
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '600',
+      });
       return res.end();
     }
 
@@ -232,12 +409,12 @@ class DashboardServer {
     if (path.startsWith('/api/')) {
       if (!authUser) {
         res.writeHead(401, {
+          ...res._defaultHeaders,
           'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 'no-cache',
+          'Cache-Control': 'no-store',
           'WWW-Authenticate': 'Bearer realm="dashboard"',
         });
-        return res.end(JSON.stringify({ error: 'Unauthorized — please sign in via Telegram' }));
+        return res.end(JSON.stringify({ error: 'Unauthorized - please sign in via Telegram' }));
       }
       req.user = authUser;
       req.authToken = token;
@@ -289,6 +466,23 @@ class DashboardServer {
   // ── Auth handlers ───────────────────────────────────────────────────────────
 
   async _handleAuthInitiate(req, res) {
+    // Per-IP flood gate. Sweeps stale entries first (cheap O(active-IPs)
+    // per call). The connecting IP is whatever Node sees on the socket -
+    // that's the proxy IP behind nginx, the real client IP when direct.
+    const ip = String(req.socket?.remoteAddress || 'unknown');
+    const now = Date.now();
+    for (const [k, rec] of this._authInitiateAttempts) {
+      if (now - rec.firstAttempt > this._AUTH_INITIATE_WINDOW_MS) {
+        this._authInitiateAttempts.delete(k);
+      }
+    }
+    const cur = this._authInitiateAttempts.get(ip) || { count: 0, firstAttempt: now };
+    if (cur.count >= this._AUTH_INITIATE_MAX) {
+      return json(res, 429, { error: 'Too many login attempts. Try again in a few minutes.' });
+    }
+    cur.count++;
+    this._authInitiateAttempts.set(ip, cur);
+
     try {
       const userAgent = String(req.headers['user-agent'] || '').slice(0, 500);
       const sessionId = this.db.createAuthSession(userAgent);
@@ -320,8 +514,35 @@ class DashboardServer {
     if (!/^[a-f0-9]{32}$/i.test(sessionId)) return json(res, 400, { error: 'Invalid session' });
     if (!/^\d{6}$/.test(code))              return json(res, 400, { error: 'Code must be 6 digits' });
 
+    // Brute-force gate (see ctor for rationale). Sweep stale entries first so
+    // the map doesn't grow forever; cheap O(n) for n ~ active sessions.
+    const now = Date.now();
+    for (const [sid, rec] of this._authVerifyAttempts) {
+      if (now - rec.firstAttempt > this._AUTH_VERIFY_WINDOW_MS) {
+        this._authVerifyAttempts.delete(sid);
+      }
+    }
+    const rec = this._authVerifyAttempts.get(sessionId);
+    if (rec && rec.count >= this._AUTH_VERIFY_MAX) {
+      return json(res, 429, { error: 'Too many attempts. Restart login from /start in the bot.' });
+    }
+
     const result = this.db.verifyAuthCode(sessionId, code);
-    if (!result) return json(res, 401, { error: 'Invalid or expired code' });
+    if (!result) {
+      // Bump attempt counter ONLY on real-looking failures (right format,
+      // wrong code). Format errors above already short-circuited.
+      const cur = this._authVerifyAttempts.get(sessionId) || { count: 0, firstAttempt: now };
+      cur.count++;
+      this._authVerifyAttempts.set(sessionId, cur);
+      const remaining = Math.max(0, this._AUTH_VERIFY_MAX - cur.count);
+      return json(res, 401, {
+        error: 'Invalid or expired code',
+        attemptsRemaining: remaining,
+      });
+    }
+
+    // Success — clear any failed-attempt counter for this session
+    this._authVerifyAttempts.delete(sessionId);
 
     return json(res, 200, {
       token: result.token,
@@ -484,34 +705,30 @@ class DashboardServer {
       }
     } catch { /* miss — fall through to fetch */ }
 
-    // Miss: resolve file path from Telegram, download, tee to cache + response
+    // Miss: resolve + download via telegram.fetchFile() which keeps the
+    // token-embedded URL inside the telegram module. We never see (or log)
+    // the bot-token URL here, eliminating the leak vector.
     try {
-      const url = await this.telegram.getFileUrl(user.avatar_file_id);
-      if (!url) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'File not available' }));
-      }
-      const tgRes = await fetch(url);
-      if (!tgRes.ok || !tgRes.body) {
+      const file = await this.telegram.fetchFile(user.avatar_file_id);
+      if (!file) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Telegram CDN error' }));
       }
 
-      const ct = tgRes.headers.get('content-type') || 'image/jpeg';
       res.writeHead(200, {
-        'Content-Type':  ct,
+        'Content-Type':  file.contentType,
         'Cache-Control': 'private, max-age=604800, immutable',
       });
 
-      // Buffer the whole body once — small files (<200 KB), lets us write to
-      // disk AND respond without fighting stream tee semantics.
-      const buf = Buffer.from(await tgRes.arrayBuffer());
-      try { fs.writeFileSync(cachePath, buf); } catch (e) {
+      try { fs.writeFileSync(cachePath, file.buffer); } catch (e) {
         this.logger.warn(`[Avatar] cache write failed: ${e.message}`);
       }
-      res.end(buf);
+      res.end(file.buffer);
     } catch (e) {
-      this.logger.warn(`[Avatar] proxy failed: ${e.message}`);
+      // Defensive: e.message here is from our own code (not fetch), so no
+      // token leak. But we still scrub to err.code in case something below
+      // re-introduces the URL.
+      this.logger.warn(`[Avatar] proxy failed: ${e.code || e.name || 'unknown'}`);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Avatar fetch failed' }));
@@ -538,7 +755,10 @@ class DashboardServer {
       .filter(s => ['early','forming','strong','saturated'].includes(s));
     const minMeme     = parseInt(url.searchParams.get('minMeme')     || '0',   10);
     const minEmergence = parseInt(url.searchParams.get('minEmergence') || '0', 10);
-    const minPlatforms = parseInt(url.searchParams.get('minPlatforms') || '0', 10);
+    // minPlatforms was removed 2026-05-04 along with cross-platform aggregation.
+    // The clusterer's cross-source matcher is unreliable, so we no longer
+    // expose a "platforms ≥ N" filter — the param is silently ignored if older
+    // clients still send it.
 
     const sortParam = url.searchParams.get('sort') || 'rank';
 
@@ -557,8 +777,17 @@ class DashboardServer {
     const userIdEarly = String(req.user?.telegram_chat_id || '').trim() || null;
     const hiddenIds = userIdEarly ? this.db.getHiddenTrendIdsByChat(userIdEarly, 7) : [];
 
-    const cutoff = new Date(Date.now() - hours * 3_600_000).toISOString();
-    let query = `SELECT * FROM trends WHERE first_seen_at > ?`;
+    // Window filter uses last_seen_at, not first_seen_at. The clusterer keeps
+    // pulling fresh posts into an existing narrative — last_seen_at advances,
+    // first_seen_at stays pinned to when the cluster was born. Filtering on
+    // first_seen_at made small windows (esp. 6h) under-report dramatically:
+    // a narrative still hot RIGHT NOW but born 8h ago was invisible at 6h.
+    // last_seen_at answers "active in this window", which is what the slider
+    // means to a user. (Default for new rows is CURRENT_TIMESTAMP, so for
+    // brand-new trends the two columns coincide — no regression at 24h.)
+    // Cutoff is formatted to match SQLite's stored shape — see sqliteCutoff().
+    const cutoff = sqliteCutoff(hours * 3_600_000);
+    let query = `SELECT * FROM trends WHERE last_seen_at > ?`;
     const params = [cutoff];
 
     if (hiddenIds.length > 0) {
@@ -576,7 +805,6 @@ class DashboardServer {
     }
     if (minMeme > 0)      { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) >= ?`;                            params.push(minMeme); }
     if (minEmergence > 0) { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) >= ?`;                           params.push(minEmergence); }
-    if (minPlatforms > 1) { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) >= 16`; } // uniquePlatforms>=2 ≈ emergence>=16
 
     query += ` ORDER BY ${orderBy} LIMIT ? OFFSET ?`;
     params.push(limit, offset);
@@ -604,25 +832,27 @@ class DashboardServer {
 
   _handleStats(req, res, url) {
     const hours = parseInt(url.searchParams.get('hours') || '24', 10);
-    const cutoff = new Date(Date.now() - hours * 3_600_000).toISOString();
+    const cutoff = sqliteCutoff(hours * 3_600_000);
 
-    const total = this.db.db.prepare(`SELECT COUNT(*) as c FROM trends WHERE first_seen_at > ?`).get(cutoff).c;
+    // Same semantics as _handleTrends: "active in this window" via last_seen_at,
+    // not "born in this window" via first_seen_at. See _handleTrends for why.
+    const total = this.db.db.prepare(`SELECT COUNT(*) as c FROM trends WHERE last_seen_at > ?`).get(cutoff).c;
 
     const bySource = this.db.db.prepare(
-      `SELECT source, COUNT(*) as count FROM trends WHERE first_seen_at > ? GROUP BY source`
+      `SELECT source, COUNT(*) as count FROM trends WHERE last_seen_at > ? GROUP BY source`
     ).all(cutoff);
 
     const byCategory = this.db.db.prepare(
-      `SELECT category, COUNT(*) as count FROM trends WHERE first_seen_at > ? GROUP BY category ORDER BY count DESC`
+      `SELECT category, COUNT(*) as count FROM trends WHERE last_seen_at > ? GROUP BY category ORDER BY count DESC`
     ).all(cutoff);
 
     const statsUserId = String(req.user?.telegram_chat_id || '').trim() || null;
     const topTrends = this.db.db.prepare(
-      `SELECT * FROM trends WHERE first_seen_at > ? ORDER BY CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC LIMIT 10`
+      `SELECT * FROM trends WHERE last_seen_at > ? ORDER BY CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC LIMIT 10`
     ).all(cutoff).map(r => this._formatTrend(r, statsUserId));
 
     const avgScore = this.db.db.prepare(
-      `SELECT AVG(score) as avg FROM trends WHERE first_seen_at > ? AND score > 0`
+      `SELECT AVG(score) as avg FROM trends WHERE last_seen_at > ? AND score > 0`
     ).get(cutoff).avg || 0;
 
     const alerts24h = this.db.db.prepare(
@@ -643,12 +873,13 @@ class DashboardServer {
 
   _handleSources(req, res) {
     const sources = ['reddit', 'google_trends', 'twitter', 'tiktok', 'x_trends'];
-    const cutoff  = new Date(Date.now() - 60 * 60_000).toISOString();
+    const cutoff   = sqliteCutoff(60 * 60_000);              // 1h ago
+    const cutoff24 = sqliteCutoff(24 * 3_600_000);           // 24h ago
 
     const result = sources.map(source => {
       const last = this.db.db.prepare(
         `SELECT COUNT(*) as count, MAX(first_seen_at) as last FROM trends WHERE source = ? AND first_seen_at > ?`
-      ).get(source, new Date(Date.now() - 24 * 3_600_000).toISOString());
+      ).get(source, cutoff24);
 
       const lastHour = this.db.db.prepare(
         `SELECT COUNT(*) as c FROM trends WHERE source = ? AND first_seen_at > ?`
@@ -715,7 +946,7 @@ class DashboardServer {
       return json(res, 400, { error: 'threshold must be 0-100' });
     }
     this.db.updateUser(user.id, 'alert_threshold', val);
-    this.logger.info(`[Dashboard] user ${user.telegram_chat_id} alert_threshold → ${val}`);
+    this.logger.info(`[Dashboard] user ${maskId(user.telegram_chat_id)} alert_threshold -> ${val}`);
     return json(res, 200, { ok: true, threshold: val });
   }
 
@@ -736,19 +967,29 @@ class DashboardServer {
     if (arr === null) return json(res, 400, { error: 'types must be an array' });
     this.db.setUserAlertTypes(user.telegram_chat_id, arr);
     const saved = this.db.getUserAlertTypes(user.telegram_chat_id);
-    this.logger.info(`[Dashboard] user ${user.telegram_chat_id} alert_types → ${saved.join(',')}`);
+    this.logger.info(`[Dashboard] user ${maskId(user.telegram_chat_id)} alert_types -> ${saved.join(',')}`);
     return json(res, 200, { ok: true, alertTypes: saved });
   }
 
   _handleCollectorToggle(req, res, path) {
+    // System-wide toggle (affects ALL users' alert pipeline) - admin-only.
+    // Pre-fix: any logged-in Free/Pro user could disable Twitter for the
+    // entire bot. Now gated to plan_name === 'admin'. The dashboard SPA
+    // already hides this button for non-admins; this is the server-side
+    // enforcement layer.
+    const planName = req.user?.plan_name || 'free';
+    if (planName !== 'admin') {
+      return json(res, 403, { error: 'Admin only' });
+    }
+
     const name = path.split('/')[3]; // /api/collectors/:name/toggle
     const disabled = this.appState.disabledCollectors;
     if (disabled.has(name)) {
       disabled.delete(name);
-      this.logger.info(`[Dashboard] Collector enabled: ${name}`);
+      this.logger.info(`[Dashboard] Collector enabled by admin ${maskId(req.user.telegram_chat_id)}: ${name}`);
     } else {
       disabled.add(name);
-      this.logger.info(`[Dashboard] Collector disabled: ${name}`);
+      this.logger.info(`[Dashboard] Collector disabled by admin ${maskId(req.user.telegram_chat_id)}: ${name}`);
     }
     // Persist to DB so disabled state survives restarts
     try {
@@ -1071,7 +1312,6 @@ class DashboardServer {
         junkPenalty:     t.junkPenalty    ?? 0,
         junkReasons:     t.junkReasons    ?? [],
         velocity:        m.velocity       ?? 0,
-        uniquePlatforms: m.uniquePlatforms ?? 1,
         // Engagement passthrough — same shape as feed-row _formatTrend so the
         // modal's metrics row works identically for manual-analysis trends.
         engagement: {
@@ -1117,11 +1357,11 @@ class DashboardServer {
 
   _handleStream(req, res) {
     res.writeHead(200, {
+      ...(res._defaultHeaders || SECURITY_HEADERS),
       'Content-Type':        'text/event-stream',
       'Cache-Control':       'no-cache, no-transform',
       'Connection':          'keep-alive',
       'X-Accel-Buffering':   'no',           // disable proxy buffering
-      'Access-Control-Allow-Origin': '*',
     });
     // Handshake event so the client knows the stream is live
     res.write('retry: 3000\n');
@@ -1227,7 +1467,6 @@ class DashboardServer {
       junkPenalty:     metrics.junkPenalty     ?? 0,   // [JUNK_FILTER]
       junkReasons:     metrics.junkReasons     ?? [],  // [JUNK_FILTER]
       velocity:        metrics.velocity        ?? 0,
-      uniquePlatforms: metrics.uniquePlatforms ?? 1,
       // Per-source engagement counts surfaced in TrendModal's metrics grid.
       // Different platforms use different field names; this is the unified
       // shape the modal renders (👁 views · ❤️ likes · 💬 comments · 🔁 reposts).
@@ -2605,6 +2844,62 @@ class DashboardServer {
     .score-bar-sub { font-size: 10px; color: var(--dim); padding-left: 88px; margin-top: -1px; }
     .card-score-bars { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; }
 
+    /* ── Modal hero Meme Score ──
+       Promoted treatment for the Meme Score at the top of the trend modal.
+       Bigger number, thicker gradient-filled bar, soft accent card around it
+       so it visually stands above the ordinary ScoreBars further down. */
+    .meme-hero {
+      display: flex; align-items: center; gap: 10px;
+      padding: 6px 9px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, rgba(255,107,107,0.08), rgba(255,184,0,0.05));
+      border: 1px solid rgba(255,107,107,0.18);
+      box-shadow: 0 0 12px -8px rgba(255,107,107,0.25);
+    }
+    .meme-hero-left { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex-shrink: 0; }
+    .meme-hero-label {
+      font-size: 8px; font-weight: 800;
+      text-transform: uppercase; letter-spacing: 1px;
+      color: var(--dim);
+    }
+    .meme-hero-num {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 16px; font-weight: 800; line-height: 1;
+      letter-spacing: -0.3px;
+    }
+    .meme-hero-num.hot  { color: var(--red2);  text-shadow: 0 0 8px rgba(var(--red-rgb), .4); }
+    .meme-hero-num.warm { color: var(--orange); }
+    .meme-hero-num.ok   { color: var(--yellow); }
+    .meme-hero-num.cold { color: var(--dim); }
+    .meme-hero-num-sub { font-size: 9px; color: var(--dim); font-weight: 600; }
+    .meme-hero-bar {
+      flex: 1; height: 4px;
+      border-radius: 4px;
+      background: rgba(255,255,255,0.05);
+      overflow: hidden;
+      position: relative;
+    }
+    .meme-hero-fill {
+      height: 100%; border-radius: 4px;
+      transition: width .45s cubic-bezier(.2,.8,.2,1);
+      position: relative;
+      overflow: hidden;
+    }
+    .meme-hero-fill::after {
+      content: ''; position: absolute; inset: 0;
+      background: linear-gradient(90deg,
+        rgba(255,255,255,0) 0%,
+        rgba(255,255,255,.18) 50%,
+        rgba(255,255,255,0) 100%);
+      transform: translateX(-100%);
+      animation: meme-shimmer 2.4s ease-in-out infinite;
+    }
+    @keyframes meme-shimmer {
+      0%   { transform: translateX(-100%); }
+      60%  { transform: translateX(100%); }
+      100% { transform: translateX(100%); }
+    }
+
     /* ── Phase badge ── */
     .phase-badge {
       display: inline-flex; align-items: center; gap: 3px;
@@ -3319,16 +3614,20 @@ class DashboardServer {
       /* Fixed min-height keeps the frame from collapsing when the video
          element renders at its 300×150 default before metadata loads,
          or when a Twitter poster URL is an oddly cropped banner. */
-      min-height: 260px;
-      max-height: 440px;
+      min-height: 200px;
+      max-height: 260px;
     }
     .modal-image {
       display: block;
       width: 100%;
       height: auto;
-      max-height: 440px;
+      max-height: 260px;
       object-fit: contain;
     }
+    /* Lightbox cursor only on images, not on the video player. The <video>
+       shares the .modal-image class for sizing, so without this scope the
+       zoom-in cursor would also override the video's native controls cursor. */
+    img.modal-image { cursor: zoom-in; }
     /* <video> has no intrinsic size until metadata loads (default 300×150,
        i.e. 2:1). With width:100% + height:auto that produces a flat letterbox
        and the poster gets squashed to a thin strip. Force a sane 16:9 default
@@ -3349,7 +3648,53 @@ class DashboardServer {
       margin-top: 8px;
     }
     .modal-aux-gallery .img-carousel.in-modal {
-      height: 280px;
+      height: 220px;
+    }
+
+    /* ── Image lightbox ──
+       Click any image in the modal carousel / single-image wrap to open it
+       at near-full-viewport size, centered. Click anywhere outside (or on
+       the image, or hit Esc) to close. Z-index must beat .modal-overlay
+       (8000) but stay under .toasts-wrap (9999) so toast notifications
+       still render on top of the lightbox if any fire while it's open. */
+    .img-lightbox-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, .88);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      z-index: 9000;
+      display: flex; align-items: center; justify-content: center;
+      padding: 4vh 4vw;
+      cursor: zoom-out;
+      animation: lightbox-fade .15s ease-out;
+    }
+    @keyframes lightbox-fade {
+      from { opacity: 0; } to { opacity: 1; }
+    }
+    .img-lightbox-img {
+      max-width: 92vw;
+      max-height: 92vh;
+      object-fit: contain;
+      border-radius: 6px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.6);
+      display: block;
+    }
+    .img-lightbox-close {
+      position: fixed; top: 20px; right: 24px;
+      background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.18);
+      color: #fff;
+      width: 40px; height: 40px;
+      border-radius: 50%;
+      font-size: 22px; line-height: 1;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(4px);
+      transition: background .15s, transform .15s;
+    }
+    .img-lightbox-close:hover {
+      background: rgba(255,255,255,.16);
+      transform: scale(1.05);
     }
 
     /* ── Modal sections ── */
@@ -4198,26 +4543,47 @@ class DashboardServer {
        Container has a FIXED height (not max-height) so switching between
        portrait / landscape / short-landscape images doesn't collapse the
        frame. The <img> inside uses object-fit: contain — letterboxing
-       appears for narrower images, but the card layout stays stable. */
+       appears for narrower images, but the card layout stays stable.
+
+       (2026-05-04) Two prior fixes failed and the bug kept coming back:
+         1) flex+img-as-flex-item with align-items/justify-content centering
+            — the img's intrinsic dimensions leaked through width/height:100%
+            on Chromium when a low-res thumbnail loaded first, rendering a
+            tiny image inside the full-size container.
+         2) position:absolute on img — fixed (1) but pulled the img out of
+            normal flow. The carousel had no intrinsic content height, so
+            the flex column parent (.modal-body) shrank it to ~0 via the
+            default flex-shrink:1 + min-height:auto behavior, despite the
+            explicit height: 380px on the wrapper.
+       The reliable shape: NO flex on the wrapper (block layout) + img kept
+       in normal flow with explicit width:100%/height:100%. The img's flow
+       size anchors the carousel against flex-shrink, AND it fills the
+       wrapper exactly — no flex-item sizing surprises. Don't reintroduce
+       display:flex here. */
     .img-carousel {
       position: relative; width: 100%;
       border-radius: 14px; overflow: hidden;
       margin: 8px 0 10px;
       background: #0a0a12;
       border: 1px solid var(--border);
-      display: flex; align-items: center; justify-content: center;
       height: 380px;
+      /* Belt-and-suspenders: even if some future ancestor turns into a
+         shrinking flex container, refuse to collapse below the explicit
+         height. Costs nothing when the wrapper is in a block parent. */
+      flex-shrink: 0;
     }
     .img-carousel img {
-      display: block; width: 100%; height: 100%;
+      display: block;
+      width: 100%; height: 100%;
       object-fit: contain;
+      cursor: zoom-in;
     }
     body.prefs-compact .img-carousel { height: 280px; }
     /* in-modal MUST beat body.prefs-compact (which has higher specificity)
        — without the body-prefix the prefs-compact rule wins and the modal
        carousel collapses to 280px even on desktop. */
     .img-carousel.in-modal,
-    body.prefs-compact .img-carousel.in-modal { height: 440px; border-radius: 8px; }
+    body.prefs-compact .img-carousel.in-modal { height: 260px; border-radius: 8px; }
     .img-carousel-nav {
       position: absolute; top: 50%; transform: translateY(-50%);
       width: 38px; height: 38px; border-radius: 50%;
@@ -4263,14 +4629,36 @@ class DashboardServer {
       width: 18px; border-radius: 3px;
     }
 
-    /* ── Feed score strip ── */
+    /* ── Feed score strip ──
+       Three-column grid: Emergence / Meme Score / Adoption. Each column is
+       narrow (~135px on a typical card width) so the labels render in two
+       lines on the smallest cards — that's fine, score numbers stay aligned
+       on the right. Larger gap + per-column inner padding + thin vertical
+       dividers between columns so the three metrics read as distinct cells
+       instead of running together. The dividers use ::after pseudos on
+       columns 1 and 2 so they only appear between cells, not on the right
+       edge of the strip. */
     .feed-scores {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-      padding: 8px 10px; margin: 6px 0 10px;
+      display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0;
+      padding: 8px 6px; margin: 6px 0 10px;
       background: rgba(0,0,0,.18); border-radius: 8px;
       border: 1px solid var(--border);
     }
-    .feed-score { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+    .feed-score {
+      display: flex; flex-direction: column; gap: 4px; min-width: 0;
+      padding: 0 10px;
+      position: relative;
+    }
+    .feed-score + .feed-score::before {
+      content: ''; position: absolute;
+      left: 0; top: 4px; bottom: 4px;
+      width: 1px;
+      background: linear-gradient(to bottom,
+        rgba(255,255,255,0) 0%,
+        rgba(255,255,255,.12) 30%,
+        rgba(255,255,255,.12) 70%,
+        rgba(255,255,255,0) 100%);
+    }
     .feed-score-top {
       display: flex; justify-content: space-between; align-items: center;
       font-size: 10px; font-weight: 700; text-transform: uppercase;
@@ -4903,7 +5291,7 @@ const I18N = {
     'trigger.window_label':  'Window',
     'trigger.drivers_label': '📈 Growth drivers',
     'trigger.risks_label':   '⚠️ Risks',
-    'trigger.cta_hint':      'Click below to forecast what will drive further growth — phase, upcoming catalysts, risks.',
+    'trigger.cta_hint':      'Where this narrative is heading - phase, catalysts, risks.',
     'trigger.phase.early':       'Early',
     'trigger.phase.building':    'Building',
     'trigger.phase.peaking':     'Peaking',
@@ -4915,7 +5303,6 @@ const I18N = {
     'modal.lifespan': 'Lifespan',
     'modal.virality': 'Virality',
     'modal.sentiment': 'Vibe',
-    'modal.platforms': 'Platforms',
     'modal.velocity': 'Velocity',
     'modal.feedback': '💬 Your take',
     'modal.links': '🔗 Links',
@@ -5250,7 +5637,7 @@ const I18N = {
     'trigger.window_label':  'Окно',
     'trigger.drivers_label': '📈 Факторы роста',
     'trigger.risks_label':   '⚠️ Риски',
-    'trigger.cta_hint':      'Жми кнопку ниже — Каталист спрогнозирует фазу, ближайшие драйверы и риски дальнейшего роста.',
+    'trigger.cta_hint':      'Куда движется этот нарратив - фаза, каталисты, риски.',
     'trigger.phase.early':       'Зарождается',
     'trigger.phase.building':    'Набирает',
     'trigger.phase.peaking':     'На пике',
@@ -5262,7 +5649,6 @@ const I18N = {
     'modal.lifespan': 'Срок жизни',
     'modal.virality': 'Виральность',
     'modal.sentiment': 'Сентимент',
-    'modal.platforms': 'Платформ',
     'modal.velocity': 'Скорость',
     'modal.feedback': '💬 Ваша оценка',
     'modal.links': '🔗 Ссылки',
@@ -5736,11 +6122,51 @@ function videoVolumeRef(el) {
   });
 }
 
+// ── Lightbox — fullscreen image viewer ──────────────────────────────────────
+// Mounted into document.body via a portal so its z-index sits above the trend
+// modal. Closes on click anywhere (overlay or image), the close button, or Esc.
+function Lightbox({ src, onClose }) {
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
+    // Capture phase so we beat the modal's own Escape handler.
+    window.addEventListener('keydown', onKey, true);
+    // Lock body scroll while open.
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      document.body.style.overflow = prev;
+    };
+  }, [onClose]);
+  if (!src) return null;
+  const handleClick = (e) => { e.stopPropagation(); onClose(); };
+  return ReactDOM.createPortal(
+    h('div', { className: 'img-lightbox-overlay', onClick: handleClick },
+      h('button', {
+        className: 'img-lightbox-close',
+        onClick: handleClick,
+        'aria-label': 'Close',
+        type: 'button',
+      }, '×'),
+      h('img', {
+        className: 'img-lightbox-img',
+        src,
+        alt: '',
+        onClick: handleClick,
+      })
+    ),
+    document.body
+  );
+}
+
 // ── ImageCarousel — horizontal slider for 2+ photos ─────────────────────────
 // One image at a time, full width, aspect preserved. Prev/next arrow buttons,
 // a small "N/M" counter, and dot pagination. Arrow clicks stop propagation so
 // feed cards don't open their modal when the user just wants to flip photos.
-function ImageCarousel({ urls, variant = 'in-feed' }) {
+// onImageClick(url) — optional. If provided, clicking the image fires it
+// (used by TrendModal to open a lightbox). Without it, the image is inert
+// (feed-card variant — click bubbles to the card to open the modal).
+function ImageCarousel({ urls, variant = 'in-feed', onImageClick = null }) {
   const allUrls = (urls || []).filter(Boolean);
   // Track which slots failed to load — auto-skip them so a broken first
   // image doesn't leave the carousel looking empty/collapsed. Only when ALL
@@ -5759,10 +6185,14 @@ function ImageCarousel({ urls, variant = 'in-feed' }) {
   // Map filtered index back to the original index so onError marks the right slot.
   const visibleUrl = filtered[safeIdx];
   const originalIdx = allUrls.indexOf(visibleUrl);
+  const handleImgClick = onImageClick
+    ? (e) => { stop(e); onImageClick(visibleUrl); }
+    : undefined;
   const children = [
     h('img', {
       key: 'img:' + originalIdx,
       src: visibleUrl, alt: '', loading: 'lazy',
+      onClick: handleImgClick,
       onError: () => {
         setFailed(prev => {
           const next = new Set(prev);
@@ -6069,9 +6499,9 @@ function FeedCard({ trend, onOpen, onHide }) {
 
   const phase     = trend.narrativePhase || null;
   const emergence = trend.emergenceScore || 0;
+  const meme      = trend.memePotential  || 0;
   const adoption  = trend.adoptionScore  || trend.memePotential || 0;
   const velocity  = trend.velocity       || 0;
-  const platforms = trend.uniquePlatforms || 1;
 
   const handle = '@' + (trend.source === 'google_trends' ? 'google'
                     : trend.source === 'twitter' ? 'twitter_x'
@@ -6092,20 +6522,24 @@ function FeedCard({ trend, onOpen, onHide }) {
   };
 
   const emergenceColor = barColor(emergence);
+  const memeColor      = barColor(meme);
   const adoptionColor  = barColor(adoption);
 
   const avatarCls = SOURCE_ICONS[trend.source] ? (trend.source) : 'default';
 
   // meta parts for sub row
   const metaParts = [];
-  if (platforms > 1) metaParts.push(platforms + 'p');
   const vel = fmtVelocity(velocity);
   if (vel) metaParts.push(vel);
 
   // "Fresh" indicator — trends seen within the last 60 minutes get a tiny
   // pulse dot. Helps the eye lock onto what's actually new during a refresh.
+  // Use lastSeen (most recent activity) rather than firstSeen (birth) so a
+  // narrative born 8h ago but still being touched right now reads as fresh,
+  // matching the window-filter semantics (active-in-window, not born-in-window).
+  const recencyTs = trend.lastSeen || trend.firstSeen || '';
   const ageMs = (() => {
-    const ts = Date.parse(trend.firstSeen || '');
+    const ts = Date.parse(recencyTs);
     return isNaN(ts) ? Infinity : (Date.now() - ts);
   })();
   const isFresh = ageMs < 60 * 60 * 1000;
@@ -6126,7 +6560,7 @@ function FeedCard({ trend, onOpen, onHide }) {
           h('span', { className: 'feed-user' }, srcLbl),
           h('span', { className: 'feed-handle' }, handle),
           h('span', { className: 'feed-dot' }),
-          h('span', { className: 'feed-time' }, fmtTime(trend.firstSeen)),
+          h('span', { className: 'feed-time' }, fmtTime(recencyTs)),
           // Inline meta-hint (platforms / velocity) — replaced the fake-button
           // in the actions row. Lives next to time so all "factual" bits sit
           // in one place. Hidden when neither signal is interesting.
@@ -6161,7 +6595,11 @@ function FeedCard({ trend, onOpen, onHide }) {
 
     h(FeedImage, { trend }),
 
-    // Score strip
+    // Score strip — Emergence / Meme Score / Adoption.
+    // (2026-05-04) Added Meme Score as a third column between the two
+    // existing bars. Reads trend.memePotential (raw Stage 1 LLM signal) —
+    // same value the modal surfaces at the top, surfaced here at-a-glance
+    // so the feed reader does not need to open the modal to see it.
     h('div', { className: 'feed-scores' },
       h('div', { className: 'feed-score' },
         h('div', { className: 'feed-score-top' },
@@ -6170,6 +6608,15 @@ function FeedCard({ trend, onOpen, onHide }) {
         ),
         h('div', { className: 'feed-score-track' },
           h('div', { className: 'feed-score-fill', style: { width: Math.min(emergence, 100) + '%', background: emergenceColor } })
+        )
+      ),
+      h('div', { className: 'feed-score' },
+        h('div', { className: 'feed-score-top' },
+          h('span', { className: 'feed-score-label' }, t('modal.meme_score')),
+          h('span', { className: 'feed-score-num', style: { color: memeColor } }, meme)
+        ),
+        h('div', { className: 'feed-score-track' },
+          h('div', { className: 'feed-score-fill', style: { width: Math.min(meme, 100) + '%', background: memeColor } })
         )
       ),
       h('div', { className: 'feed-score' },
@@ -6416,7 +6863,10 @@ function TriggerSection({ trend, lang, me }) {
     const hasChips    = !!(data.phase || data.window);
     const hasDrivers  = Array.isArray(data.drivers) && data.drivers.length > 0;
     const hasRisks    = Array.isArray(data.risks)   && data.risks.length   > 0;
-    const hasSources  = Array.isArray(data.sources) && data.sources.length > 0;
+    // hasSources removed 2026-05-04 — Catalyst forecast was returning low-quality
+    // X handles (random low-signal accounts). The Sources block is no longer
+    // rendered. The field is still populated in the API payload for API
+    // consumers, just hidden from the UI.
     const hasConfidence = typeof data.confidence === 'number' && data.confidence > 0;
     return h('div', { className: 'modal-section' },
       h('div', { className: 'modal-section-label' }, t('trigger.label')),
@@ -6449,26 +6899,9 @@ function TriggerSection({ trend, lang, me }) {
               data.risks.map((b, i) => h('li', { key: 'r' + i }, b))),
           )
         : null,
-      hasSources
-        ? h('div', { className: 'catalyst-sources' },
-            h('div', { className: 'catalyst-sources-head' }, t('trigger.sources_head')),
-            h('div', { className: 'catalyst-sources-list' },
-              data.sources.map((s, i) => {
-                const handle = s.startsWith('@') ? s.slice(1) : s;
-                return h('a', {
-                  key: 'src' + i,
-                  className: 'catalyst-source-pill',
-                  href: 'https://x.com/' + encodeURIComponent(handle),
-                  target: '_blank', rel: 'noopener',
-                  title: '@' + handle + ' on X',
-                },
-                  h('span', { className: 'catalyst-source-x' }, '𝕏'),
-                  h('span', { className: 'catalyst-source-handle' }, '@' + handle)
-                );
-              })
-            )
-          )
-        : null,
+      // (2026-05-04) Sources block removed — Catalyst's source list was
+      // surfacing low-signal X handles. Forecast text + drivers + risks are
+      // the useful parts; sources just added noise to the modal.
       hasConfidence
         ? h('div', { className: 'catalyst-confidence' },
             h('span', { className: 'catalyst-confidence-label' }, t('trigger.confidence_label')),
@@ -6484,15 +6917,14 @@ function TriggerSection({ trend, lang, me }) {
     );
   }
 
-  // Render-state 2: no forecast yet. CTA hint + action button (or locked state
-  // for non-pro). whyNow is NOT rendered here — it has its own "🔥 Trigger"
-  // section above in the modal. This keeps semantics clean: 🔥 = past, 🔮 = future.
+  // Render-state 2: no forecast yet. Just the section label + action button
+  // (or locked state for non-pro). The hint text was removed 2026-05-04 —
+  // the "Найти Каталиста" / "Find Catalyst" button copy is self-explanatory
+  // and the empty state read better without an extra description line.
+  // whyNow is NOT rendered here — it has its own "🔥 Trigger" section
+  // above in the modal. Semantics: 🔥 = past, 🔮 = future.
   return h('div', { className: 'modal-section' },
     h('div', { className: 'modal-section-label' }, t('trigger.label')),
-    h('div', {
-      className: 'modal-section-content',
-      style: { color: 'var(--dim)', fontStyle: 'italic', fontSize: 13, opacity: 0.85 },
-    }, t('trigger.cta_hint')),
 
     h('div', { style: { marginTop: 10 } },
       isPro
@@ -6522,6 +6954,10 @@ function TrendModal({ trend, onClose, me = null }) {
   // for Twitter trends saved before the quote-media fix). Merged with
   // trend.imageUrls below so the carousel surfaces them even for old rows.
   const [extraUrls, setExtraUrls] = useState([]);
+  // Lightbox: when the user clicks an image inside the carousel / single-image
+  // wrap, we surface a fullscreen viewer above the modal. Esc closes it (and
+  // is stopPropagation'd so the modal stays open).
+  const [lightboxSrc, setLightboxSrc] = useState(null);
   const catCls = CAT_CLS[trend.category] || 'cat-other';
   const catIco = CAT_ICONS[trend.category] || '📌';
   const srcIco = SOURCE_ICONS[trend.source] || '📡';
@@ -6559,19 +6995,23 @@ function TrendModal({ trend, onClose, me = null }) {
     }
   }, []);
 
-  // Close on Escape
+  // Close on Escape — but only when lightbox is closed. The lightbox runs its
+  // own Escape listener (capture phase) and stops propagation, but we also
+  // gate here so the modal can't accidentally close from a stray event when
+  // the lightbox is on top.
   useEffect(() => {
-    const fn = e => { if (e.key === 'Escape') onClose(); };
+    const fn = e => { if (e.key === 'Escape' && !lightboxSrc) onClose(); };
     window.addEventListener('keydown', fn);
     return () => window.removeEventListener('keydown', fn);
-  }, []);
+  }, [lightboxSrc]);
 
-  const sentCls = trend.sentiment === 'positive' ? 'sentiment-pos'
-    : trend.sentiment === 'negative' ? 'sentiment-neg' : 'sentiment-neu';
-  const sentLabel = trend.sentiment === 'positive' ? t('sentiment.positive')
-    : trend.sentiment === 'negative' ? t('sentiment.negative') : t('sentiment.neutral');
+  // Sentiment removed from the modal visual (2026-05-04). The field is still
+  // populated by Stage 1 and shown elsewhere (Telegram alert, feed card chip),
+  // but the modal's metrics grid no longer surfaces it.
 
-  return h('div', { className: 'modal-overlay', onClick: e => { if (e.target === e.currentTarget) onClose(); } },
+  return h(React.Fragment, null,
+   lightboxSrc ? h(Lightbox, { src: lightboxSrc, onClose: () => setLightboxSrc(null) }) : null,
+   h('div', { className: 'modal-overlay', onClick: e => { if (e.target === e.currentTarget) onClose(); } },
     h('div', { className: 'modal-drawer' },
 
       // Head — alertType / category / manual / phase / source / time / close
@@ -6585,12 +7025,42 @@ function TrendModal({ trend, onClose, me = null }) {
         trend.manualSubmitted ? h('span', { className: 'badge badge-manual', title: t('feed.manual_tip') }, '🧪 MANUAL') : null,
         trend.narrativePhase ? h(PhaseBadge, { phase: trend.narrativePhase }) : null,
         h('div', { className: 'source-chip' }, srcIco, ' ', srcLbl),
-        h('span', { className: 'time-cell', style: { fontSize: 11 } }, fmtTime(trend.firstSeen)),
+        h('span', { className: 'time-cell', style: { fontSize: 11 } }, fmtTime(trend.lastSeen || trend.firstSeen)),
         h('button', { className: 'modal-close', onClick: onClose }, t('app.esc_close'))
       ),
 
       // Body
       h('div', { className: 'modal-body' },
+
+        // Meme Score — promoted to the very top above the media with a
+        // dedicated "hero" treatment (bigger number, thicker gradient bar,
+        // soft accent card). It's the single number users care about most,
+        // so it earns visual prominence above the ordinary ScoreBars below.
+        (() => {
+          const v = trend.memePotential || 0;
+          const tier = v >= 80 ? 'hot' : v >= 60 ? 'warm' : v >= 40 ? 'ok' : 'cold';
+          const fillColor = barColor(v);
+          return h('div', { className: 'modal-section' },
+            h('div', { className: 'meme-hero' },
+              h('div', { className: 'meme-hero-left' },
+                h('div', { className: 'meme-hero-label' }, t('modal.meme_score')),
+                h('div', { className: 'meme-hero-num ' + tier },
+                  v,
+                  h('span', { className: 'meme-hero-num-sub' }, ' / 100')
+                )
+              ),
+              h('div', { className: 'meme-hero-bar' },
+                h('div', {
+                  className: 'meme-hero-fill',
+                  style: {
+                    width: Math.min(v, 100) + '%',
+                    background: 'linear-gradient(90deg, ' + fillColor + ', ' + fillColor + 'cc)',
+                  }
+                })
+              )
+            )
+          );
+        })(),
 
         // Media — video with image poster if available, otherwise just image
         // (or a carousel when the trend has 2+ photos and no video).
@@ -6639,11 +7109,12 @@ function TrendModal({ trend, onClose, me = null }) {
               h('div', { className: 'modal-image-wrap' }, player),
               h('div', { className: 'modal-aux-gallery' },
                 auxImgs.length >= 2
-                  ? h(ImageCarousel, { urls: auxImgs, variant: 'in-modal' })
+                  ? h(ImageCarousel, { urls: auxImgs, variant: 'in-modal', onImageClick: setLightboxSrc })
                   : h('div', { className: 'modal-image-wrap' },
                       h('img', {
                         className: 'modal-image',
                         src: auxImgs[0], alt: '', loading: 'lazy',
+                        onClick: () => setLightboxSrc(auxImgs[0]),
                         onError: e => { try { e.target.style.opacity = 0; } catch {} },
                       })
                     )
@@ -6652,13 +7123,14 @@ function TrendModal({ trend, onClose, me = null }) {
           }
 
           if (gallery.length >= 2) {
-            return h(ImageCarousel, { urls: gallery, variant: 'in-modal' });
+            return h(ImageCarousel, { urls: gallery, variant: 'in-modal', onImageClick: setLightboxSrc });
           }
           if (gallery.length === 1) {
             return h('div', { className: 'modal-image-wrap' },
               h('img', {
                 className: 'modal-image',
                 src: gallery[0], alt: '',
+                onClick: () => setLightboxSrc(gallery[0]),
                 onError: () => setImgUrl(null),
                 loading: 'lazy',
               })
@@ -6744,20 +7216,18 @@ function TrendModal({ trend, onClose, me = null }) {
             : null
         ),
 
-        // Stats grid — metrics at the very bottom
+        // Stats grid — metrics at the very bottom.
+        // (2026-05-04) Layout simplified: Meme Score promoted to a top
+        // ScoreBar (above the media), Sentiment removed from the visual
+        // entirely. Three tiles remain in this fixed order:
+        //   Virality → Velocity → Lifespan
+        // Cross-platform "Platforms" tile was already removed earlier with
+        // the cross-source aggregation rip-out.
         h('div', { className: 'modal-section' },
           h('div', { className: 'modal-section-label' }, t('modal.metrics')),
           h('div', { className: 'modal-stats-grid' },
-            h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, t('modal.meme_score')),
-              h(MemeScore, { value: trend.memePotential || 0 })
-            ),
-            h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, t('modal.lifespan')),
-              h('span', { className: 'lifespan' }, lifespanLabel(trend.predictedLifespan))
-            ),
-            // Virality cell — replaced raw score with per-source engagement
-            // metrics (👁 views · ❤️ likes · 💬 comments · 🔁 reposts). Pulls
+            // Virality cell — per-source engagement metrics
+            // (👁 views · ❤️ likes · 💬 comments · 🔁 reposts). Pulls
             // from trend.engagement (server unifies twitter/tiktok/reddit).
             // Falls back to the raw score number when no metrics are available
             // (google_trends, x_trends, manual rows).
@@ -6791,28 +7261,6 @@ function TrendModal({ trend, onClose, me = null }) {
                   : h('span', { style: { fontFamily: 'JetBrains Mono', fontWeight: 700, color: 'var(--accent2)' } }, trend.score || 0)
               );
             })(),
-            h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, t('modal.sentiment')),
-              h('span', { className: sentCls }, sentLabel)
-            ),
-            // Platforms — cross-platform signal. 1 = monoplatform (muted),
-            // ≥2 = highlighted green (the trend escaped its origin niche).
-            (() => {
-              const p = trend.uniquePlatforms || 1;
-              const cross = p >= 2;
-              return h('div', { className: 'modal-stat' },
-                h('div', { className: 'modal-stat-label' }, t('modal.platforms')),
-                h('span', {
-                  style: {
-                    fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700,
-                    color: cross ? '#22c55e' : 'var(--text2)',
-                  },
-                  title: cross
-                    ? (CURRENT_LANG === 'ru' ? 'Кросс-платформа — мем вышел за пределы одного источника' : 'Cross-platform — escaped origin')
-                    : (CURRENT_LANG === 'ru' ? 'Только один источник' : 'Single source')
-                }, cross ? ('🌐 ' + p) : String(p))
-              );
-            })(),
             // Velocity — growth rate per hour. fmtVelocity returns null when
             // velocity ≤ 0; we render an em-dash so the cell stays balanced.
             (() => {
@@ -6826,11 +7274,16 @@ function TrendModal({ trend, onClose, me = null }) {
                   }
                 }, vel || '—')
               );
-            })()
+            })(),
+            h('div', { className: 'modal-stat' },
+              h('div', { className: 'modal-stat-label' }, t('modal.lifespan')),
+              h('span', { className: 'lifespan' }, lifespanLabel(trend.predictedLifespan))
+            )
           )
         )
       )
     )
+   )
   );
 }
 
@@ -8448,13 +8901,26 @@ function App() {
   // hidden_trends table, but we hide instantly so the card disappears the
   // moment the user clicks ✕ (don't wait for round-trip).
   if (localHidden.size) visibleTrends = visibleTrends.filter(t => !localHidden.has(t.id));
-  if (manualOnly) visibleTrends = visibleTrends.filter(t => t.manualSubmitted);
-  if (alertTypes) {
-    // Wildcard semantics: legacy rows without alertType still pass any
-    // filter so we don't hide the back-catalog. Multi-select: row passes
-    // if its alertType is in the selected set.
-    const sel = new Set(alertTypes.split(','));
-    visibleTrends = visibleTrends.filter(t => !t.alertType || sel.has(t.alertType));
+  // Type-axis chips (Event / Trend / Post / Manual) form a UNION, not an
+  // intersection. They sit on the same axis ("what kinds of trends do I
+  // want?"), so selecting "Manual" + "Post" should show both manual-submitted
+  // items AND alertType=post items. Earlier this was AND-combined, which made
+  // the Manual chip hide everything else as soon as it was selected — even
+  // when other type chips were also active.
+  // Wildcard semantics for legacy rows: rows without alertType still pass any
+  // type-chip filter so we don't hide the back-catalog when alertType is
+  // empty (this was the original behavior; preserved here in the OR clause).
+  if (manualOnly || alertTypes) {
+    const sel = alertTypes ? new Set(alertTypes.split(',')) : null;
+    visibleTrends = visibleTrends.filter(t => {
+      const passManual = manualOnly && t.manualSubmitted;
+      const passType   = sel && (!t.alertType || sel.has(t.alertType));
+      // If only one filter is active, that one decides. If both are active,
+      // a row passes when EITHER predicate matches (union).
+      if (manualOnly && sel) return passManual || passType;
+      if (manualOnly)        return passManual;
+      return passType;
+    });
   }
 
   // ── Auth gate ───────────────────────────────────────────────────────────

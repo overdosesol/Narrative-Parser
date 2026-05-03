@@ -510,7 +510,10 @@ class TrendDatabase {
       user = this.db.prepare(`SELECT u.*, p.name as plan_name, p.sources as plan_sources, p.alert_limit, p.history_days
         FROM users u JOIN plans p ON u.plan_id = p.id
         WHERE u.telegram_chat_id = ?`).get(String(chatId));
-      this.logger.info(`New user registered: ${chatId} (@${username || 'unknown'})`);
+      // Mask chat_id - keep last 4 digits so we can correlate logs without
+      // storing full PII in long-term stdout.
+      const masked = '***' + String(chatId).slice(-4);
+      this.logger.info(`New user registered: ${masked} (@${username || 'unknown'})`);
     } else {
       // Update last seen and username
       this.db.prepare(`UPDATE users SET last_seen_at = CURRENT_TIMESTAMP, telegram_username = COALESCE(?, telegram_username) WHERE id = ?`)

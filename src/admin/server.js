@@ -26,13 +26,47 @@ function safeEqual(a, b) {
   } catch { return false; }
 }
 
+// Security defaults — same posture as dashboard/server.js. Admin panel is
+// even more sensitive (full DB access via X-Admin-Key) so we keep the same
+// strict headers regardless of where it's deployed.
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+};
+
+// CORS allowlist via env. Default empty - admin panel binds to 127.0.0.1 by
+// default (see ctor), so cross-origin requests are unusual. If you reverse-
+// proxy admin to a public URL, set ADMIN_ALLOWED_ORIGINS.
+const ALLOWED_ORIGINS = (process.env.ADMIN_ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+function corsOriginFor(req) {
+  const origin = String(req.headers?.origin || '');
+  if (!origin) return null;
+  if (ALLOWED_ORIGINS.includes(origin)) return origin;
+  return null;
+}
+
+function buildHeaders(req) {
+  const headers = { ...SECURITY_HEADERS };
+  const origin = corsOriginFor(req);
+  if (origin) {
+    headers['Access-Control-Allow-Origin'] = origin;
+    headers['Access-Control-Allow-Credentials'] = 'true';
+    headers['Vary'] = 'Origin';
+  }
+  return headers;
+}
+
 function json(res, status, data) {
+  const base = res._defaultHeaders || SECURITY_HEADERS;
   const payload = JSON.stringify(data);
   res.writeHead(status, {
+    ...base,
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key',
-    'Cache-Control': 'no-cache',
+    'Cache-Control': 'no-store',
   });
   res.end(payload);
 }
@@ -718,8 +752,24 @@ class AdminServer {
     const path = url.pathname;
     const method = req.method;
 
+    // Stash per-request headers (security + optional CORS) and monkey-patch
+    // writeHead so every response inherits them. Same pattern as dashboard.
+    res._defaultHeaders = buildHeaders(req);
+    const _origWriteHead = res.writeHead.bind(res);
+    res.writeHead = (status, headersOrReason, maybeHeaders) => {
+      let statusMsg, hdrs;
+      if (typeof headersOrReason === 'string') { statusMsg = headersOrReason; hdrs = maybeHeaders || {}; }
+      else { hdrs = headersOrReason || {}; }
+      const merged = { ...res._defaultHeaders, ...hdrs };
+      return statusMsg ? _origWriteHead(status, statusMsg, merged) : _origWriteHead(status, merged);
+    };
+
     if (method === 'OPTIONS') {
-      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE', 'Access-Control-Allow-Headers': 'Content-Type,X-Admin-Key' });
+      res.writeHead(204, {
+        'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE',
+        'Access-Control-Allow-Headers': 'Content-Type,X-Admin-Key',
+        'Access-Control-Max-Age': '600',
+      });
       return res.end();
     }
 
@@ -728,7 +778,12 @@ class AdminServer {
 
     // Serve SPA for all non-API routes
     if (!path.startsWith('/api/')) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        // Admin SPA must not be cached - operator restarts after a config
+        // change need to see the new UI immediately, no stale redirects.
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+      });
       return res.end(this._spa());
     }
 
@@ -4247,9 +4302,9 @@ function ManualResultCard({ result, comment, setComment, onAlertSent }) {
       t.clusterMetrics &&
         React.createElement(Collapsible, { title: '🌐 Сигналы кластера', defaultOpen: false },
           React.createElement('div', { className: 'sp-metric-row', style: { fontFamily: 'inherit' } },
-            (t.metrics?.uniquePlatforms || 1) >= 2
-              ? React.createElement('span', { className: 'ok' }, '🌐 ' + t.metrics.uniquePlatforms + ' платформ')
-              : React.createElement('span', null, '🌐 1 платформа'),
+            // (2026-05-04) Removed cross-platform "🌐 N платформ" badge —
+            // unreliable signal, see clusterer.js note. Cluster size + novelty
+            // + DB recurrence below are the honest signals.
             t.clusterMetrics.isNovel === false
               ? React.createElement('span', { style: { color: 'var(--yellow)' } }, '🔁 Дубль кластера')
               : React.createElement('span', { className: 'ok' }, '🆕 Новый'),
@@ -5812,7 +5867,6 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
       junkPenalty:     metrics.junkPenalty     ?? 0,
       junkReasons:     metrics.junkReasons     ?? [],
       velocity:        metrics.velocity        ?? 0,
-      uniquePlatforms: metrics.uniquePlatforms ?? 1,
       // Stage 0 PreStage enrichment — restored from raw_metrics so the
       // /api/send-alert flow and SubmitPage display see the same context
       // Stage 1 actually saw at scoring time (no re-paying Gemini/nano).
@@ -5942,8 +5996,17 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
     this.server.on('error', e => this.logger.error('Admin server error', { error: e.message }));
   }
 
-  stop() {
-    this.server?.close();
+  /** Graceful shutdown — stop accepting + drain in-flight, hard-cap at timeoutMs. */
+  stop(timeoutMs = 10000) {
+    return new Promise((resolve) => {
+      if (!this.server) return resolve();
+      this.server.close(() => resolve());
+      const t = setTimeout(() => {
+        try { this.server?.closeAllConnections?.(); } catch {}
+        resolve();
+      }, timeoutMs);
+      t.unref?.();
+    });
   }
 }
 

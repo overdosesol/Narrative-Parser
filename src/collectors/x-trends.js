@@ -128,7 +128,9 @@ class XTrendsCollector extends BaseCollector {
 
   async _fetchFromApify() {
     if (!this.apiKey) throw new Error('No Apify key');
-    const runUrl = `https://api.apify.com/v2/acts/${this.actorId}/run-sync-get-dataset-items?token=${this.apiKey}&timeout=${APIFY_TIMEOUT_SECS}`;
+    // Authorization: Bearer instead of ?token= so a network-error
+    // err.message can never leak the API key (see tiktok.js for rationale).
+    const runUrl = `https://api.apify.com/v2/acts/${this.actorId}/run-sync-get-dataset-items?timeout=${APIFY_TIMEOUT_SECS}`;
 
     const input = {
       country: this.country,
@@ -140,7 +142,10 @@ class XTrendsCollector extends BaseCollector {
 
     const response = await fetch(runUrl, {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${this.apiKey}`,
+      },
       body:    JSON.stringify(input),
     });
     if (!response.ok) {

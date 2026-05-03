@@ -4,7 +4,8 @@
       "Bash(node --check \"F:\\\\.VibeCoding\\\\Projects\\\\Antigravity\\\\Narrative Parser\\\\src\\\\i18n\\\\en.js\")",
       "Bash(node --check \"F:\\\\.VibeCoding\\\\Projects\\\\Antigravity\\\\Narrative Parser\\\\src\\\\i18n\\\\ru.js\")",
       "Bash(node -e \"const en=require\\('F:\\\\\\\\\\\\\\\\.VibeCoding\\\\\\\\\\\\\\\\Projects\\\\\\\\\\\\\\\\Antigravity\\\\\\\\\\\\\\\\Narrative Parser\\\\\\\\\\\\\\\\src\\\\\\\\\\\\\\\\i18n\\\\\\\\\\\\\\\\en.js'\\); const ru=require\\('F:\\\\\\\\\\\\\\\\.VibeCoding\\\\\\\\\\\\\\\\Projects\\\\\\\\\\\\\\\\Antigravity\\\\\\\\\\\\\\\\Narrative Parser\\\\\\\\\\\\\\\\src\\\\\\\\\\\\\\\\i18n\\\\\\\\\\\\\\\\ru.js'\\); console.log\\('---EN---'\\); console.log\\(en.paymentInstructions\\(5, 'USDC', 'CcWrvTJAGc8vSRj2K9kSD92eHzBvDgXMTnVQhJoL3cKk', 'ref123'\\)\\); console.log\\('---RU---'\\); console.log\\(ru.paymentInstructions\\(5, 'USDC', 'CcWrvTJAGc8vSRj2K9kSD92eHzBvDgXMTnVQhJoL3cKk', 'ref123'\\)\\);\")",
-      "Bash(node --check \"F:\\\\.VibeCoding\\\\Projects\\\\Antigravity\\\\Narrative Parser\\\\src\\\\notifications\\\\telegram.js\")"
+      "Bash(node --check \"F:\\\\.VibeCoding\\\\Projects\\\\Antigravity\\\\Narrative Parser\\\\src\\\\notifications\\\\telegram.js\")",
+      "Bash(node --check \"F:/.VibeCoding/Projects/Antigravity/Narrative Parser/src/dashboard/server.js\")"
     ]
   }
 }

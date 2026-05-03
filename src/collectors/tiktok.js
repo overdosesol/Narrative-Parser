@@ -95,7 +95,11 @@ class TikTokCollector extends BaseCollector {
 
   async _fetchHashtag(hashtag) {
     const apiKey = this._nextKey();
-    const runUrl = `https://api.apify.com/v2/acts/${ACTOR_ID}/run-sync-get-dataset-items?token=${apiKey}&timeout=${TIMEOUT_SECS}`;
+    // Token via Authorization: Bearer (not ?token= query): if fetch() throws
+    // a network/DNS error, the URL is embedded in err.message and a token
+    // would leak through any upstream `logger.error(e.message)`. Bearer
+    // keeps it out of the URL entirely.
+    const runUrl = `https://api.apify.com/v2/acts/${ACTOR_ID}/run-sync-get-dataset-items?timeout=${TIMEOUT_SECS}`;
 
     const input = {
       hashtags: [hashtag],
@@ -106,7 +110,10 @@ class TikTokCollector extends BaseCollector {
 
     const response = await fetch(runUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
       body: JSON.stringify(input),
     });
 

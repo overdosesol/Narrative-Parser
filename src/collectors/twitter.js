@@ -204,14 +204,19 @@ class TwitterCollector extends BaseCollector {
     if (!apiKey) {
       throw new Error(`[Twitter] No API key configured for actor '${actorName}'`);
     }
-    const runUrl = `https://api.apify.com/v2/acts/${actor.id}/run-sync-get-dataset-items?token=${apiKey}&timeout=${TIMEOUT_SECS}`;
+    // Authorization: Bearer instead of ?token= so a network-error
+    // err.message can never leak the API key (see tiktok.js for the same fix).
+    const runUrl = `https://api.apify.com/v2/acts/${actor.id}/run-sync-get-dataset-items?timeout=${TIMEOUT_SECS}`;
 
     // Per-actor input shape. Both return identical engagement fields.
     const input = actor.buildInput(query, this.maxItemsPerQuery);
 
     const response = await fetch(runUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
       body: JSON.stringify(input),
     });
 

@@ -180,10 +180,13 @@ export default class SupportBot {
           disable_notification: true,
         }).catch(() => {});
 
-        this.logger.info(`Support: created topic ${topicId} for chat ${chatId} (@${username})`);
+        // Mask chat_id - long-term stdout shouldn't store full PII.
+        const masked = '***' + String(chatId).slice(-4);
+        this.logger.info(`Support: created topic ${topicId} for chat ${masked} (@${username})`);
         return topicId;
       } catch (e) {
-        this.logger.error(`createForumTopic failed for chat ${chatId}: ${e.message}`);
+        const masked = '***' + String(chatId).slice(-4);
+        this.logger.error(`createForumTopic failed for chat ${masked}: ${e.message}`);
         return null;
       } finally {
         this._creatingTopic.delete(chatId);

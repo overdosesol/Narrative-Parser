@@ -12,20 +12,23 @@ import { getActivePresetConfig } from './preset-config.js';
 /**
  * Deterministic alert-type derivation — used (a) when AI returns an invalid
  * value, (b) for the heuristic / fallback paths where AI never ran.
+ *
  * Rule:
- *   non-empty whyNow                                 → 'event'
- *   uniquePlatforms ≥ 2 OR cluster items ≥ 3        → 'trend'
- *   otherwise                                        → 'post'
+ *   non-empty whyNow → 'event'
+ *   cluster items ≥ 3 → 'trend'
+ *   otherwise         → 'post'
+ *
+ * (2026-05-04) Dropped the `uniquePlatforms ≥ 2` branch — the cross-source
+ * matcher in the clusterer is unreliable, so the platform count was a noisy
+ * signal. Cluster size on its own captures the same intent (multi-post
+ * narrative vs single viral post) without the false negatives.
  */
 export function deriveAlertType(trend) {
   const why = String(trend?.whyNow || trend?.why_now || '').trim();
   if (why.length > 0) return 'event';
-  const platforms = trend?.clusterMetrics?.uniquePlatforms
-    ?? trend?.metrics?.uniquePlatforms
-    ?? 0;
   const clusterSize = trend?.clusterMetrics?.itemCount
     ?? (Array.isArray(trend?.items) ? trend.items.length : 0);
-  if (platforms >= 2 || clusterSize >= 3) return 'trend';
+  if (clusterSize >= 3) return 'trend';
   return 'post';
 }
 // [MARKET_STAGE] optional import — remove this line + applyStage2MarketPatch call to disable

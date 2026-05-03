@@ -640,9 +640,8 @@ class NarrativeClusterer {
     const items = cluster.items;
 
     // Batch-level
-    const batchSize      = items.length;
-    const batchPlatforms = new Set(items.map(i => i.source));
-    const batchAuthors   = new Set(items.map(i => i.externalId)).size;
+    const batchSize    = items.length;
+    const batchAuthors = new Set(items.map(i => i.externalId)).size;
 
     // Text variation: ratio of distinct word-sets to cluster size.
     // High variation = people rephrase = organic spread of a real narrative.
@@ -650,10 +649,17 @@ class NarrativeClusterer {
     const textVariation  = batchSize > 1 ? uniqueWordSets.size / batchSize : 0;
 
     // DB history
-    const dbRecentCount  = history.length;
-    const dbPlatforms    = new Set(history.map(r => r.source));
-    const uniquePlatforms = new Set([...batchPlatforms, ...dbPlatforms]).size;
-    const isNovel        = dbRecentCount === 0;
+    const dbRecentCount = history.length;
+    const isNovel       = dbRecentCount === 0;
+
+    // NOTE (2026-05-04): cross-platform aggregation removed. The clusterer's
+    // similarity matcher reliably groups within a single source but routinely
+    // fails to merge identical content across sources (e.g. the same TikTok
+    // video re-posted to Twitter and Reddit ends up as two separate trends).
+    // Rather than reward an unreliable signal, we no longer compute
+    // uniquePlatforms or use it in scoring/routing/UI. Single-platform
+    // breakouts are still caught via _computeBreakoutScore, which is
+    // platform-agnostic and based on raw engagement.
 
     // Velocity: DB appearances per hour since first seen
     let velocity = 0;
@@ -667,7 +673,6 @@ class NarrativeClusterer {
 
     const base = {
       batchSize,
-      uniquePlatforms,
       batchAuthors,
       textVariation,
       dbRecentCount,
@@ -735,14 +740,13 @@ class NarrativeClusterer {
    *
    * Three independent paths, final score = Math.max(spread, breakout) + ideaBoost:
    *
-   * Spread-based (multi-post / multi-platform clusters):
-   *   Platform spread (0–30)
-   *   Velocity        (0–25)
-   *   Organic spread  (0–20)
-   *   Novelty stage   (0–15)
-   *   Author diversity(0–10)
+   * Spread-based (multi-post clusters within a single source):
+   *   Velocity         (0–35)
+   *   Organic spread   (0–30)
+   *   Novelty stage    (0–20)
+   *   Author diversity (0–15)
    *
-   * Breakout-based (single extremely viral post):
+   * Breakout-based (single extremely viral post — platform-agnostic):
    *   Views / Plays    (0–35)
    *   Likes / Upvotes  (0–30)
    *   Retweets / Shares(0–20)
@@ -752,6 +756,12 @@ class NarrativeClusterer {
    *   Upvote tiers: >=10k→+5, >=15k→+8, >=30k→+10, >=60k→+12
    *   Applied on top of max(spread, breakout), capped at 100.
    *
+   * (2026-05-04) Removed the "Platform spread" component (was 0–30) — the
+   * clusterer's cross-source matching is unreliable, so we don't reward it.
+   * The 30 points were redistributed across the four remaining spread
+   * components: velocity +10, organic +10, novelty +5, author diversity +5.
+   * Single-source viral posts still get caught via the breakout path.
+   *
    * @param {object} m       — cluster-level metrics (spread signals)
    * @param {Array}  items   — raw cluster items (for breakout + ideaBoost signals)
    */
@@ -759,31 +769,26 @@ class NarrativeClusterer {
     // ── Path 1: spread-based ──────────────────────────────────────────────
     let spreadScore = 0;
 
-    // Platform spread (0–30)
-    spreadScore += m.uniquePlatforms >= 3 ? 30
-                 : m.uniquePlatforms === 2 ? 16
+    // Velocity (0–35) — DB appearances per hour since first seen
+    spreadScore += m.velocity > 2.0 ? 35
+                 : m.velocity > 1.0 ? 26
+                 : m.velocity > 0.5 ? 17
+                 : m.velocity > 0.2 ? 9
                  : 0;
 
-    // Velocity (0–25)
-    spreadScore += m.velocity > 2.0 ? 25
-                 : m.velocity > 1.0 ? 18
-                 : m.velocity > 0.5 ? 12
-                 : m.velocity > 0.2 ? 6
-                 : 0;
+    // Organic spread (0–30) — distinct word-sets / cluster size
+    spreadScore += Math.min(Math.round(Math.min(m.batchSize, 10) * m.textVariation * 3), 30);
 
-    // Organic spread (0–20)
-    spreadScore += Math.min(Math.round(Math.min(m.batchSize, 10) * m.textVariation * 2), 20);
+    // Novelty stage (0–20)
+    spreadScore += m.isNovel            ? 20
+                 : m.dbRecentCount <= 3 ? 13
+                 : m.dbRecentCount <= 8 ? 7
+                 : 3;
 
-    // Novelty stage (0–15)
-    spreadScore += m.isNovel            ? 15
-                 : m.dbRecentCount <= 3 ? 10
-                 : m.dbRecentCount <= 8 ? 5
-                 : 2;
-
-    // Author diversity (0–10)
-    spreadScore += m.batchAuthors >= 5 ? 10
-                 : m.batchAuthors >= 3 ? 7
-                 : m.batchAuthors >= 2 ? 4
+    // Author diversity (0–15)
+    spreadScore += m.batchAuthors >= 5 ? 15
+                 : m.batchAuthors >= 3 ? 10
+                 : m.batchAuthors >= 2 ? 6
                  : 0;
 
     // ── Path 2: breakout-based ────────────────────────────────────────────
@@ -963,17 +968,21 @@ class NarrativeClusterer {
    *
    * Key change vs old logic: high dbRecentCount alone does NOT trigger drop.
    * A narrative appearing repeatedly CAN be a genuine spreading signal —
-   * we only drop if emergence is also weak (no growth, no new platforms).
+   * we only drop if emergence is also weak (no growth in DB count + flat velocity).
+   *
+   * (2026-05-04) Removed the `uniquePlatforms <= 1` guard from this gate. The
+   * cross-source matcher is unreliable, so a "1 platform" reading was just as
+   * likely a clustering miss as a genuine mono-platform narrative. Velocity +
+   * emergence are sufficient to identify stale noise without it.
    */
   _decide(m) {
     const e = m.emergenceScore;
 
-    // DROP — stale noise: seen many times but NOT growing (no new platforms, velocity flat)
+    // DROP — stale noise: seen many times but NOT growing (velocity flat + emergence weak)
     if (
       m.dbRecentCount >= this.DROP_DB_MIN &&
       e < this.DROP_EMERGENCE_MAX &&
-      m.velocity < this.DROP_VELOCITY_MAX &&
-      m.uniquePlatforms <= 1
+      m.velocity < this.DROP_VELOCITY_MAX
     ) {
       return 'drop';
     }
