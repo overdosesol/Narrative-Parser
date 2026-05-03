@@ -23,8 +23,8 @@ function buildGrokUrl(trend, lang = 'en') {
   if (!title && !url) return null;
 
   const prompt = lang === 'ru'
-    ? `\u041D\u0430\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0432\u0438\u0440\u0443\u0441\u0438\u0442\u0441\u044F \u044D\u0442\u043E\u0442 \u043D\u0430\u0440\u0440\u0430\u0442\u0438\u0432 \u043F\u0440\u044F\u043C\u043E \u0441\u0435\u0439\u0447\u0430\u0441? ${title}${url ? ' \u2014 ' + url : ''}`
-    : `How viral is this narrative right now? ${title}${url ? ' \u2014 ' + url : ''}`;
+    ? `\u041D\u0430\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0432\u0438\u0440\u0443\u0441\u0438\u0442\u0441\u044F \u044D\u0442\u043E\u0442 \u043D\u0430\u0440\u0440\u0430\u0442\u0438\u0432 \u043F\u0440\u044F\u043C\u043E \u0441\u0435\u0439\u0447\u0430\u0441? ${title}${url ? ' - ' + url : ''}`
+    : `How viral is this narrative right now? ${title}${url ? ' - ' + url : ''}`;
 
   return `https://grok.com/?q=${encodeURIComponent(prompt)}`;
 }
@@ -40,7 +40,7 @@ class TelegramNotifier {
     this.db = db;
     this.config = config;
     this.solanaMonitor = solanaMonitor; // injected after creation, or passed directly
-    this.triggerFinder = triggerFinder; // optional — pro-only trigger search via Grok reasoning
+    this.triggerFinder = triggerFinder; // optional - pro-only trigger search via Grok reasoning
     // Scorer for the pro/admin manual-analysis URL handler. Without it the
     // /analyze command and bare-URL handler reply with "feature unavailable".
     this.scorer = scorer;
@@ -51,12 +51,12 @@ class TelegramNotifier {
     // State: users awaiting a text input (e.g. custom threshold)
     // Map<chatId, { type: 'threshold' }>
     this._awaitingInput = new Map();
-    // Manual analysis cooldown — Map<chatId, number[]> of timestamps within
+    // Manual analysis cooldown - Map<chatId, number[]> of timestamps within
     // the rolling window. Reset on restart (in-memory only).
     this._manualAnalysisHits = new Map();
 
     if (!this.botToken) {
-      this.logger.warn('Telegram bot token not set — Telegram alerts disabled');
+      this.logger.warn('Telegram bot token not set - Telegram alerts disabled');
       return;
     }
 
@@ -64,7 +64,7 @@ class TelegramNotifier {
       this.bot = new TelegramBot(this.botToken, {
         polling: {
           params: {
-            allowed_updates: ['message', 'callback_query', 'message_reaction', 'pre_checkout_query'],
+            allowed_updates: ['message', 'callback_query', 'message_reaction'],
           }
         }
       });
@@ -73,7 +73,6 @@ class TelegramNotifier {
       this._setupCommands();
       this._setupCallbacks();
       this._setupReactions();
-      this._setupStarsPayments();
       this._setupPollingErrorHandler();
     } catch (e) {
       this.logger.error(`Failed to start Telegram Bot: ${e.message}`);
@@ -94,7 +93,7 @@ class TelegramNotifier {
     // Keep command descriptions in English for all locales
     const ruCommands = enCommands;
 
-    // Fire-and-forget — errors are non-critical
+    // Fire-and-forget - errors are non-critical
     Promise.all([
       this.bot.setMyCommands(enCommands, { language_code: '' }),   // default (EN)
       this.bot.setMyCommands(enCommands, { language_code: 'en' }),
@@ -107,7 +106,7 @@ class TelegramNotifier {
   // ── Command handlers ──────────────────────────────────────────────────────
 
   _setupCommands() {
-    // /start — register user & show welcome (optional auth deep-link payload)
+    // /start - register user & show welcome (optional auth deep-link payload)
     this.bot.onText(/^\/start(?:\s+(.+))?/, (msg, match) => {
       const chatId = msg.chat.id;
       const username = msg.from?.username || null;
@@ -115,7 +114,7 @@ class TelegramNotifier {
       const t = getTranslations(user.language);
       const payload = (match && match[1] || '').trim();
 
-      // Fire-and-forget avatar refresh — cosmetic, must not block /start
+      // Fire-and-forget avatar refresh - cosmetic, must not block /start
       this.refreshUserAvatar(chatId, user.id).catch(() => {});
 
       // ── Dashboard login deep-link: /start auth_<sessionId> ───────────
@@ -140,7 +139,7 @@ class TelegramNotifier {
         const mins = Math.max(1, Math.round((result.expiresAt - Date.now()) / 60000));
         const title = user.language === 'ru' ? '\u{1F510} Код для входа на сайт' : '\u{1F510} Website login code';
         const prompt = user.language === 'ru'
-          ? `Введите этот код на сайте, чтобы войти:\n\n<code>${result.code}</code>\n\n\u23F1 Код действителен ${mins} мин.\nЕсли вы не запрашивали вход — просто проигнорируйте это сообщение.`
+          ? `Введите этот код на сайте, чтобы войти:\n\n<code>${result.code}</code>\n\n\u23F1 Код действителен ${mins} мин.\nЕсли вы не запрашивали вход - просто проигнорируйте это сообщение.`
           : `Enter this code on the site to sign in:\n\n<code>${result.code}</code>\n\n\u23F1 Code expires in ${mins} min.\nIf you didn't request a login, you can ignore this message.`;
         this.bot.sendMessage(chatId, `<b>${title}</b>\n\n${prompt}`, { parse_mode: 'HTML' });
         return;
@@ -152,7 +151,7 @@ class TelegramNotifier {
       });
     });
 
-    // /menu — show settings menu
+    // /menu - show settings menu
     this.bot.onText(/^\/menu/, (msg) => {
       const chatId = msg.chat.id;
       const user = this.db.getOrCreateUser(chatId, msg.from?.username);
@@ -164,7 +163,7 @@ class TelegramNotifier {
       });
     });
 
-    // /analyze <url> — pro/admin only. Resolves the URL, runs the full
+    // /analyze <url> - pro/admin only. Resolves the URL, runs the full
     // scorer pipeline, and replies with a regular alert message (same
     // rendering as autonomous alerts). Bare URLs from the same plans are
     // also auto-detected by the message handler below.
@@ -174,28 +173,28 @@ class TelegramNotifier {
       const user = this.db.getOrCreateUser(msg.chat.id, msg.from?.username);
       if (!arg) {
         // Heavy-horizontal dividers (U+2501) match the alert-message style in
-        // formatter.js — same visual rhythm so manual responses don't look
+        // formatter.js - same visual rhythm so manual responses don't look
         // foreign next to autonomous alerts.
         const DIV = '━'.repeat(20);
         const text = user.language === 'ru'
-          ? '\u{1F50D} <b>/analyze — ручной анализ ссылки</b>\n'
+          ? '\u{1F50D} <b>/analyze - ручной анализ ссылки</b>\n'
             + DIV + '\n'
-            + '\u{1F916} Кидай ссылку на пост (X, Reddit, TikTok) — прогоню её через тот же пайплайн, что и автоалерты: скор, триггер, разбор нарратива, метрики.\n'
+            + '\u{1F916} Кидай ссылку на пост (X, Reddit, TikTok) - прогоню её через тот же пайплайн, что и автоалерты: скор, триггер, разбор нарратива, метрики.\n'
             + DIV + '\n'
             + '\u{2728} <b>Пример</b>\n<code>/analyze https://x.com/user/status/123</code>\n'
             + DIV + '\n'
-            + '\u{1F4A1} <i>Подсказка: можно просто вставить ссылку без команды — поймаю автоматически.</i>'
-          : '\u{1F50D} <b>/analyze — manual link analysis</b>\n'
+            + '\u{1F4A1} <i>Подсказка: можно просто вставить ссылку без команды - поймаю автоматически.</i>'
+          : '\u{1F50D} <b>/analyze - manual link analysis</b>\n'
             + DIV + '\n'
             + '\u{1F916} Drop a post link (X, Reddit, TikTok) and I’ll run it through the same pipeline as automatic alerts: score, trigger, narrative breakdown, engagement.\n'
             + DIV + '\n'
             + '\u{2728} <b>Example</b>\n<code>/analyze https://x.com/user/status/123</code>\n'
             + DIV + '\n'
-            + '\u{1F4A1} <i>Tip: paste the link without the command — I’ll pick it up automatically.</i>';
+            + '\u{1F4A1} <i>Tip: paste the link without the command - I’ll pick it up automatically.</i>';
         return this.bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
       }
       // Pull the first http(s) URL from the argument string. Tolerates a
-      // trailing comment like "/analyze https://x.com/... — посмотри это".
+      // trailing comment like "/analyze https://x.com/... - посмотри это".
       const m = arg.match(/(https?:\/\/\S+)/i);
       if (!m) {
         const txt = user.language === 'ru' ? '⚠ Не нашёл URL в сообщении' : '⚠ No URL found in message';
@@ -206,7 +205,7 @@ class TelegramNotifier {
       );
     });
 
-    // Bare-URL handler — pro/admin can paste a URL with no command prefix
+    // Bare-URL handler - pro/admin can paste a URL with no command prefix
     // and we run analysis automatically. Other plans are silently ignored
     // (we don't want to nag every free user who shares a link in chat).
     // Registered BEFORE the wizard handler so wizard inputs that happen to
@@ -216,13 +215,13 @@ class TelegramNotifier {
       const text = msg.text || '';
       if (!text || text.startsWith('/')) return;
       // If the user is in a multi-step wizard (threshold input, feedback
-      // reason, etc.), the wizard handler claims this message — skip URL
+      // reason, etc.), the wizard handler claims this message - skip URL
       // detection so we don't double-handle.
       if (this._awaitingInput.has(chatId)) return;
       const m = text.match(/(https?:\/\/\S+)/i);
       if (!m) return;
       const user = this.db.getOrCreateUser(msg.chat.id, msg.from?.username);
-      // Plan gate — silently ignore for free/test (no spam). Pro/admin get
+      // Plan gate - silently ignore for free/test (no spam). Pro/admin get
       // automatic analysis on bare URL paste; that's the whole feature.
       if (user.plan_name !== 'pro' && user.plan_name !== 'admin') return;
       this._runManualAnalysisForUser(msg, user, m[1]).catch(e =>
@@ -230,7 +229,7 @@ class TelegramNotifier {
       );
     });
 
-    // Free-text handler — processes awaited inputs (e.g. custom threshold)
+    // Free-text handler - processes awaited inputs (e.g. custom threshold)
     // Must be registered before /top so it fires on plain number messages
     this.bot.on('message', async (msg) => {
       const chatId = String(msg.chat.id);
@@ -257,7 +256,7 @@ class TelegramNotifier {
       const user = this.db.getOrCreateUser(msg.chat.id, msg.from?.username);
       const t = getTranslations(user.language);
 
-      // 5-minute timeout — drop stale states so a user who clicks the button
+      // 5-minute timeout - drop stale states so a user who clicks the button
       // but never replies isn't surprised days later when they say something.
       if (state.startedAt && Date.now() - state.startedAt > 5 * 60 * 1000) {
         this._awaitingInput.delete(chatId);
@@ -283,7 +282,7 @@ class TelegramNotifier {
       else if (state.type === 'feedback_reason') {
         this._awaitingInput.delete(chatId);
         const reason = text.trim();
-        // Hard cap mirrors db.setFeedbackReason — message would be silently
+        // Hard cap mirrors db.setFeedbackReason - message would be silently
         // truncated otherwise; tell the user instead so they can retry.
         if (reason.length > 240) {
           await this.bot.sendMessage(msg.chat.id, t.feedbackReasonTooLong || 'Too long (240 chars max). Tap the button again to retry.', {
@@ -294,7 +293,7 @@ class TelegramNotifier {
         const ok = this.db.setFeedbackReason(state.trendId, chatId, reason);
         if (ok) {
           this.logger.info(`Feedback reason saved (${reason.length} chars) for trend ${state.trendId} by ${chatId}`);
-          await this.bot.sendMessage(msg.chat.id, t.feedbackReasonSaved || 'Reason saved — thank you!', {
+          await this.bot.sendMessage(msg.chat.id, t.feedbackReasonSaved || 'Reason saved - thank you!', {
             parse_mode: 'HTML',
           }).catch(() => {});
         } else {
@@ -306,7 +305,7 @@ class TelegramNotifier {
       }
     });
 
-    // /top — show count selector first, then top trends
+    // /top - show count selector first, then top trends
     this.bot.onText(/^\/top/, async (msg) => {
       const chatId = msg.chat.id;
       const user = this.db.getOrCreateUser(chatId, msg.from?.username);
@@ -384,7 +383,7 @@ class TelegramNotifier {
           }
           const current = this.db.getUserAlertTypes(user.telegram_chat_id);
           // Toggle: if present → remove; if absent → add. Empty resulting
-          // array means "all" by handler contract — never silently mute.
+          // array means "all" by handler contract - never silently mute.
           const next = current.includes(key)
             ? current.filter(k => k !== key)
             : [...current, key];
@@ -444,7 +443,7 @@ class TelegramNotifier {
         }
 
         // ── Subscription / Upgrade ────────────
-        // Both routes show the plans screen directly — the old intermediate
+        // Both routes show the plans screen directly - the old intermediate
         // "current plan / upgrade" status page was removed since users almost
         // always wanted to pick a plan, not stare at their current one.
         else if (data === 'subscription' || data === 'upgrade') {
@@ -472,13 +471,8 @@ class TelegramNotifier {
         }
         else if (data.startsWith('pay:')) {
           const [, planName, currency] = data.split(':');
-          if (currency === 'STARS') {
-            await this.bot.answerCallbackQuery(query.id);
-            await this._handleStarsPayment(chatId, query.message.message_id, user, planName, t);
-          } else {
-            await this._handlePayment(chatId, query.message.message_id, user, planName, currency, t);
-            await this.bot.answerCallbackQuery(query.id);
-          }
+          await this._handlePayment(chatId, query.message.message_id, user, planName, currency, t);
+          await this.bot.answerCallbackQuery(query.id);
         }
 
         // ── Top trends ────────────────────────
@@ -523,7 +517,7 @@ class TelegramNotifier {
           });
         }
         else if (data.startsWith('trigger:')) {
-          // Plan gate — pro and admin only
+          // Plan gate - pro and admin only
           if (user.plan_name !== 'pro' && user.plan_name !== 'admin') {
             await this.bot.answerCallbackQuery(query.id, {
               text: t.triggerLocked || 'Trigger search is for Pro plan',
@@ -601,7 +595,7 @@ class TelegramNotifier {
                 { chat_id: chatId, message_id: query.message.message_id }
               ).catch(() => {});
             } catch (err) {
-              // Non-fatal — the vote was already recorded above
+              // Non-fatal - the vote was already recorded above
               this.logger.warn(`Could not toggle reason button: ${err.message}`);
             }
           }
@@ -609,7 +603,7 @@ class TelegramNotifier {
 
         // ── Reason-for-rating button (FSM entry) ──────────────────────────
         // Pressing this puts the user into `_awaitingInput` for `feedback_reason`
-        // — the next non-command text message they send is captured as the
+        // - the next non-command text message they send is captured as the
         // reason for their existing vote. /skip or 5-min timeout cancels.
         else if (data.startsWith('fb_reason:')) {
           const trendId = parseInt(data.split(':')[1], 10);
@@ -663,7 +657,6 @@ class TelegramNotifier {
     return {
       inline_keyboard: [
         [{ text: t.btnOpenMenu || '⚙️ Open Menu', callback_data: 'menu' }],
-        [{ text: t.btnAskQuestion || '💬 Ask a question', url: this._supportUrl() }],
       ],
     };
   }
@@ -671,7 +664,7 @@ class TelegramNotifier {
   _mainMenuKeyboard(user) {
     const t = getTranslations(user.language);
 
-    // Live badges — show each setting's current value right on its tile so
+    // Live badges - show each setting's current value right on its tile so
     // the menu doubles as a status screen and saves a tap to peek inside.
     const ALL_SOURCES_COUNT = 5;
     const disabled = (() => { try { return JSON.parse(user.disabled_sources || '[]'); } catch { return []; } })();
@@ -705,7 +698,7 @@ class TelegramNotifier {
   /**
    * Inline keyboard for the alert-types submenu. Three rows, one per type,
    * showing ✅ when subscribed and ❌ when muted. Toggling a single button
-   * rewrites the user's CSV — empty = treated as "all" by the alert gate
+   * rewrites the user's CSV - empty = treated as "all" by the alert gate
    * (handler in src/index.js).
    */
   _alertTypesKeyboard(user) {
@@ -746,8 +739,8 @@ class TelegramNotifier {
   _languageKeyboard() {
     return {
       inline_keyboard: [
-        [{ text: '\u{1F1EC}\u{1F1E7} English', callback_data: 'set_lang:en' }, { text: '\u{1F1F7}\u{1F1FA} \u{0420}\u{0443}\u{0441}\u{0441}\u{043A}\u{0438}\u{0439}', callback_data: 'set_lang:ru' }],
-        [{ text: '\u{25C0}\u{FE0F} Back / \u{041D}\u{0430}\u{0437}\u{0430}\u{0434}', callback_data: 'menu' }],
+        [{ text: '\u{1F1EC}\u{1F1E7} English', callback_data: 'set_lang:en' }, { text: '\u{1F1F7}\u{1F1FA} Russian', callback_data: 'set_lang:ru' }],
+        [{ text: '\u{25C0}\u{FE0F} Back', callback_data: 'menu' }],
       ]
     };
   }
@@ -779,12 +772,8 @@ class TelegramNotifier {
   }
 
   _paymentMethodKeyboard(planName, t) {
-    const starsAmount = planName === 'test'
-      ? (this.config.telegram?.starsTestPrice || 250)
-      : (this.config.telegram?.starsProPrice  || 5000);
     return {
       inline_keyboard: [
-        [{ text: t.btnPayStars(starsAmount), callback_data: `pay:${planName}:STARS` }],
         [{ text: t.btnPaySOL,  callback_data: `pay:${planName}:SOL`   }],
         [{ text: t.btnPayUSDC, callback_data: `pay:${planName}:USDC`  }],
         [{ text: t.btnBack, callback_data: 'upgrade' }],
@@ -852,95 +841,6 @@ class TelegramNotifier {
     }
   }
 
-  // ── Telegram Stars payment ────────────────────────────────────────────────
-
-  async _handleStarsPayment(chatId, messageId, user, planName, t) {
-    const starsAmount = planName === 'test'
-      ? (this.config.telegram?.starsTestPrice || 250)
-      : (this.config.telegram?.starsProPrice  || 5000);
-
-    const planLabel   = planName === 'test' ? 'Test Plan' : 'Pro Plan';
-    const durationDays = planName === 'test' ? 1 : 30;
-
-    const reference = this._generateReference();
-    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-    this.db.createPayment(user.id, planName, starsAmount, 'STARS', reference, expiresAt);
-
-    const title = t.starsInvoiceTitle ? t.starsInvoiceTitle(planLabel) : 'Catalyst — ' + planLabel;
-    const desc  = t.starsInvoiceDesc  ? t.starsInvoiceDesc(planLabel)  : planLabel + ' access';
-
-    try {
-      await this.bot.sendInvoice(
-        chatId,
-        title,
-        desc,
-        reference,          // payload — used to match payment on success
-        '',                 // provider_token: empty string for Stars (no external provider)
-        'XTR',              // currency for Telegram Stars
-        [{ label: planLabel, amount: starsAmount }]
-      );
-    } catch (err) {
-      this.logger.error(`Stars invoice failed for user ${chatId}: ${err.message}`);
-      await this.bot.sendMessage(chatId, '\u274C Failed to create Stars invoice. Please try SOL/USDC.', {
-        parse_mode: 'HTML',
-      }).catch(() => {});
-    }
-  }
-
-  /**
-   * Handle Telegram Stars pre_checkout_query and successful_payment.
-   * pre_checkout_query must be answered within 10 seconds.
-   * successful_payment arrives as a message with message.successful_payment.
-   */
-  _setupStarsPayments() {
-    // Step 1: approve every pre-checkout (validation happens at invoice creation time)
-    this.bot.on('pre_checkout_query', async (query) => {
-      try {
-        await this.bot.answerPreCheckoutQuery(query.id, true);
-        this.logger.info(`[Stars] pre_checkout approved: payload=${query.invoice_payload}`);
-      } catch (err) {
-        this.logger.error(`[Stars] pre_checkout answer failed: ${err.message}`);
-      }
-    });
-
-    // Step 2: on successful payment → confirm in DB and upgrade plan
-    this.bot.on('message', async (msg) => {
-      if (!msg.successful_payment) return;
-
-      const payment    = msg.successful_payment;
-      const reference  = payment.invoice_payload;
-      const chargeId   = payment.telegram_payment_charge_id;
-      const chatId     = msg.chat.id;
-
-      try {
-        // Look up pending payment to determine plan and duration
-        const pending = this.db.db.prepare(
-          `SELECT plan_name FROM payments WHERE reference = ? AND status = 'pending'`
-        ).get(reference);
-        const durationDays = pending?.plan_name === 'test' ? 1 : 30;
-
-        const confirmed = this.db.confirmPaymentAndUpgrade(reference, chargeId, durationDays);
-        if (!confirmed) {
-          this.logger.warn(`[Stars] Payment ${reference} not found or already confirmed`);
-          return;
-        }
-
-        const user = this.db.getOrCreateUser(chatId, msg.from?.username);
-        const t    = getTranslations(user.language);
-        const planDisplay = t[`plan${confirmed.plan_name.charAt(0).toUpperCase() + confirmed.plan_name.slice(1)}`] || confirmed.plan_name;
-
-        await this.bot.sendMessage(chatId, t.paymentConfirmed(planDisplay), {
-          parse_mode: 'HTML',
-          reply_markup: this._mainMenuKeyboard(user),
-        });
-
-        this.logger.info(`[Stars] Plan ${confirmed.plan_name} activated for user ${chatId} (charge: ${chargeId})`);
-      } catch (err) {
-        this.logger.error(`[Stars] successful_payment processing error: ${err.message}`);
-      }
-    });
-  }
-
   _generateReference() {
     return randomBytes(24).toString('base64url').slice(0, 32);
   }
@@ -982,7 +882,7 @@ class TelegramNotifier {
         url:           row.url,
         memePotential: metrics.memePotential || 0,
         predictedLifespan: metrics.predictedLifespan || null,
-        // Optional pitch line — only show on the /top card if a pro user
+        // Optional pitch line - only show on the /top card if a pro user
         // already ran a deep trigger search for this trend. No fallback to the
         // legacy whyItWillPump, no auto-generation, no Stage-1 hint.
         triggerText:   row.trigger_text || null,
@@ -1031,7 +931,7 @@ class TelegramNotifier {
       report += `<code>${scoreBar(tr.memePotential)}</code>  ${catIco}`;
       if (lifeLbl) report += '  ' + lifeLbl;
       report += '\n';
-      // Pitch line — only shown if a Pro user has already searched the trigger
+      // Pitch line - only shown if a Pro user has already searched the trigger
       // (deep Grok-reasoning catalyst summary). Truncated for the /top card so
       // the report stays compact; full text is available in the alert thread.
       if (tr.triggerText) {
@@ -1055,7 +955,7 @@ class TelegramNotifier {
   //
   // Triggered by /analyze <url> or bare URL paste from a pro/admin user.
   // Resolves the URL → runs scorer → replies with the regular alert format
-  // via sendAlertToUser. Result is NOT saved to the trends table — analyses
+  // via sendAlertToUser. Result is NOT saved to the trends table - analyses
   // are private to the requesting user's chat. Caller is expected to have
   // already verified the user's plan; this method enforces it again as a
   // defence in depth.
@@ -1073,7 +973,7 @@ class TelegramNotifier {
     }
 
     // Rate limit only when scorer will actually run. Cache hits are free
-    // and instant — letting them bypass means a pro user can re-paste a
+    // and instant - letting them bypass means a pro user can re-paste a
     // URL someone else just analysed without burning their daily quota.
     const cacheAge = peekManualAnalysisCache(url);
     if (cacheAge === null && user.plan_name !== 'admin') {
@@ -1085,8 +985,8 @@ class TelegramNotifier {
       if (hits.length && now - hits[hits.length - 1] < cooldownMs) {
         const sec = Math.max(1, Math.ceil((cooldownMs - (now - hits[hits.length - 1])) / 1000));
         const txt = user.language === 'ru'
-          ? `⏳ Подожди ${sec}с — анализ занимает 10-30 секунд.`
-          : `⏳ Wait ${sec}s — each analysis takes 10-30 seconds.`;
+          ? `⏳ Подожди ${sec}с - анализ занимает 10-30 секунд.`
+          : `⏳ Wait ${sec}s - each analysis takes 10-30 seconds.`;
         return this.bot.sendMessage(chatId, txt).catch(() => {});
       }
       if (hits.length >= dailyCap) {
@@ -1099,7 +999,7 @@ class TelegramNotifier {
       this._manualAnalysisHits.set(chatId, hits);
     }
 
-    // Acknowledge — analysis can take 10-30s, the user needs to know we
+    // Acknowledge - analysis can take 10-30s, the user needs to know we
     // received the request. Skip it on cache hits (instant) and delete
     // this placeholder once the real result is ready.
     let waitMsgId = null;
@@ -1118,7 +1018,7 @@ class TelegramNotifier {
         scorer: this.scorer,
         db: this.db,
         url,
-        save: false,                          // private — don't pollute global feed
+        save: false,                          // private - don't pollute global feed
         logger: this.logger,
         actorId: chatId,
       });
@@ -1127,9 +1027,9 @@ class TelegramNotifier {
       if (waitMsgId) {
         try { await this.bot.deleteMessage(chatId, waitMsgId); } catch {}
       }
-      // Send the result via the standard alert renderer — same media
+      // Send the result via the standard alert renderer - same media
       // handling, same buttons, same caption logic. We don't record this
-      // as a notification (no DB row) and don't increment alert_count —
+      // as a notification (no DB row) and don't increment alert_count -
       // it's a private analysis, not a broadcast.
       const sent = await this.sendAlertToUser(result.trend, user);
       if (!sent) {
@@ -1155,7 +1055,7 @@ class TelegramNotifier {
       const t = getTranslations(user.language);
       let message = formatTelegramAlert(trend, user.language);
       // Optional admin comment prepended to the alert body. Used by the
-      // "📨 Отправить алерт" button on SubmitPage — lets the operator add
+      // "📨 Отправить алерт" button on SubmitPage - lets the operator add
       // context (e.g. "смотрите реплаи под этим постом") without editing
       // the formatter. HTML-escaped to match parse_mode: 'HTML'.
       const rawComment = typeof opts.comment === 'string' ? opts.comment.trim() : '';
@@ -1189,7 +1089,7 @@ class TelegramNotifier {
       let sentMsg;
 
       // Prefer video over stills when present. If it's a pure gallery (>=2
-      // photos and no single video), images win — multi-image posts aren't
+      // photos and no single video), images win - multi-image posts aren't
       // videos anyway, and media groups can't mix here without the video
       // likely exceeding 50MB by URL.
       if (videoUrl && imageUrls.length < 2) {
@@ -1220,7 +1120,7 @@ class TelegramNotifier {
         } catch (err) {
           // Common causes: >50MB, bad codec, Telegram can't fetch URL. Fall
           // back to the still-frame path.
-          this.logger.warn(`sendVideo failed (${err.message}) — falling back to image`);
+          this.logger.warn(`sendVideo failed (${err.message}) - falling back to image`);
           const fallbackImg = imageUrls[0] || trend.metrics?.thumbnailUrl || null;
           if (fallbackImg) {
             try {
@@ -1251,13 +1151,13 @@ class TelegramNotifier {
       } else if (imageUrls.length >= 2) {
         try {
           // Media groups (albums) do NOT support inline_keyboard on their
-          // items — Telegram Bot API limitation. So we send the album WITHOUT
+          // items - Telegram Bot API limitation. So we send the album WITHOUT
           // a caption and post the full body as a follow-up text message that
           // CAN host buttons. We return the follow-up's message_id as the
           // anchor so attachAlertButtons wires X Analysis / Ask Grok / 👍👎
           // to a message that accepts them.
           const media = imageUrls.map((u) => ({ type: 'photo', media: u }));
-          // Send the album silently — the follow-up text message is what
+          // Send the album silently - the follow-up text message is what
           // triggers the single notification ping (with buttons attached).
           const group = await this.bot.sendMediaGroup(chatId, media, { disable_notification: true });
           const albumAnchor = Array.isArray(group) ? group[0] : group;
@@ -1267,7 +1167,7 @@ class TelegramNotifier {
             reply_to_message_id: albumAnchor?.message_id,
           });
         } catch (err) {
-          this.logger.warn(`sendMediaGroup failed (${err.message}) — falling back to sendPhoto`);
+          this.logger.warn(`sendMediaGroup failed (${err.message}) - falling back to sendPhoto`);
           try {
             sentMsg = await this.bot.sendPhoto(chatId, imageUrls[0], {
               caption: fitsInCaption ? message : undefined,
@@ -1318,8 +1218,8 @@ class TelegramNotifier {
       return { messageId: msgId, chatId: user.telegram_chat_id };
     } catch (error) {
       if (error.response?.statusCode === 403) {
-        // User blocked the bot — mark as suspended
-        this.logger.warn(`User ${user.telegram_chat_id} blocked the bot — suspending`);
+        // User blocked the bot - mark as suspended
+        this.logger.warn(`User ${user.telegram_chat_id} blocked the bot - suspending`);
         this.db.updateUser(user.id, 'status', 'suspended');
       } else {
         this.logger.error(`Alert send failed for ${user.telegram_chat_id}: ${error.message}`);
@@ -1330,7 +1230,7 @@ class TelegramNotifier {
 
   /**
    * Attach all alert buttons: X Analysis + Trigger + Ask Grok + 👍/👎 feedback.
-   * `trend` is optional — when provided, we add a deep-link button that opens
+   * `trend` is optional - when provided, we add a deep-link button that opens
    * grok.com with a pre-filled prompt asking about the narrative's virality.
    *
    * Layout (3 rows max for mobile readability):
@@ -1352,14 +1252,14 @@ class TelegramNotifier {
     const xText = isLocked ? (t.xAnalysisLockedBtn || '\u{1F512} X Analysis') : t.xAnalysisBtn;
     const xData = isLocked ? 'x_locked' : `x_analysis:${dbId}`;
 
-    // Trigger button — three states reflect plan + cache
+    // Trigger button - three states reflect plan + cache
     const isPro = plan === 'pro' || plan === 'admin';
     let triggerText, triggerData;
     if (!isPro) {
       triggerText = t.triggerLockedBtn || '\u{1F512} Trigger';
       triggerData = 'trigger_locked';
     } else {
-      // Cheap DB peek — no Grok call. Tells us if we should show 💡 (cached) or 🔍 (new).
+      // Cheap DB peek - no Grok call. Tells us if we should show 💡 (cached) or 🔍 (new).
       const cached = this.db?.getTrendTrigger ? this.db.getTrendTrigger(dbId) : null;
       triggerText = cached ? (t.triggerCachedBtn || '\u{1F4A1} Trigger') : (t.triggerBtn || '\u{1F50D} Trigger');
       triggerData = `trigger:${dbId}`;
@@ -1390,7 +1290,7 @@ class TelegramNotifier {
     }
   }
 
-  /** Backward-compat alias — forwards trend so the Grok button appears. */
+  /** Backward-compat alias - forwards trend so the Grok button appears. */
   async attachXButton(chatId, messageId, dbId, userOrLang = 'en', trend = null) {
     return this.attachAlertButtons(chatId, messageId, dbId, userOrLang, trend);
   }
@@ -1413,13 +1313,13 @@ class TelegramNotifier {
         }
       }
     } catch {
-      // ignore parse errors — buildQuery just falls back to title heuristics
+      // ignore parse errors - buildQuery just falls back to title heuristics
     }
     return null;
   }
 
   /**
-   * Build extras dict for formatTwitterResult — previous virality + Grok snapshot.
+   * Build extras dict for formatTwitterResult - previous virality + Grok snapshot.
    * Called once per X Analysis render (both initial and refresh paths).
    */
   _xAnalysisExtras(trendId) {
@@ -1479,7 +1379,7 @@ class TelegramNotifier {
       }
 
       // Extras (prev virality + Grok snapshot) captured BEFORE saving the fresh
-      // run — so `prevViralityScore` reflects the previous fetch, not the one
+      // run - so `prevViralityScore` reflects the previous fetch, not the one
       // we're about to record.
       const extras = this._xAnalysisExtras(trendId);
 
@@ -1522,7 +1422,7 @@ class TelegramNotifier {
   }
 
   /**
-   * Refresh button handler. Enforces a 1-hour cooldown — if the last live fetch
+   * Refresh button handler. Enforces a 1-hour cooldown - if the last live fetch
    * for this trend happened <60 min ago, we show a toast and bail. Otherwise
    * we force a fresh Apify run, edit the existing result message in place, and
    * record the new snapshot to history.
@@ -1532,7 +1432,7 @@ class TelegramNotifier {
     const cbId = query.id;
     const messageId = query.message?.message_id;
 
-    // Cooldown check — uses in-memory cache age as the "last fresh fetch" marker.
+    // Cooldown check - uses in-memory cache age as the "last fresh fetch" marker.
     // cache entry is written only on actual Apify calls, so its age == last-run age.
     const ageMs = this.twitterChecker.cacheAgeMs(trendId);
     const COOLDOWN_MS = 60 * 60 * 1000;
@@ -1594,7 +1494,7 @@ class TelegramNotifier {
         disable_web_page_preview: true,
         reply_markup: keyboard,
       }).catch((e) => {
-        // Common: "message is not modified" — ignore, means same numbers
+        // Common: "message is not modified" - ignore, means same numbers
         if (!/not modified/i.test(e?.message || '')) {
           this.logger?.warn?.(`X refresh editMessageText failed: ${e.message}`);
         }
@@ -1608,14 +1508,55 @@ class TelegramNotifier {
   // ── Trigger search (on-demand Grok reasoning) ─────────────────────────────
 
   /**
-   * Render a trigger payload (text + sources + confidence) into an HTML message
-   * matching the project's alert style. Used both for cached hits and fresh
-   * Grok results, so they always look the same to the user.
+   * Render a Catalyst forecast payload into an HTML message matching the
+   * project's alert style. Forward-looking - what will drive further growth
+   * of the narrative. Used both for cached hits and fresh Grok results, so
+   * they always look the same to the user.
+   *
+   * Fields:
+   *   text       - 2-3 sentence forecast (required)
+   *   phase      - early|building|peaking|saturated|fading (optional)
+   *   window     - short upside-window phrase (optional)
+   *   drivers    - 1-3 forward-catalyst bullets (optional)
+   *   risks      - 0-2 growth-killer bullets (optional)
+   *   sources    - @handles referenced (optional)
+   *   confidence - 0-100 (optional)
    */
   _renderTriggerMessage(payload, lang) {
     const t = getTranslations(lang);
     const lines = [];
+
+    // Forecast body (header + 2-3 sentence text)
     lines.push(`${t.triggerHeader}\n${this._escHtml(payload.text)}`);
+
+    // Phase + window - single combined line when both present, individually
+    // when only one is filled. Keeps the Telegram message compact.
+    const phaseLabel = payload.phase
+      ? (t.triggerPhaseValues?.[payload.phase] || payload.phase)
+      : '';
+    const chips = [];
+    if (phaseLabel)    chips.push(`${t.triggerPhaseHdr} <b>${this._escHtml(phaseLabel)}</b>`);
+    if (payload.window) chips.push(`${t.triggerWindowHdr} <b>${this._escHtml(payload.window)}</b>`);
+    if (chips.length)  lines.push(`\n${chips.join(' · ')}`);
+
+    // Drivers - 📈 list. Skip the header if empty (don't render an empty section).
+    if (Array.isArray(payload.drivers) && payload.drivers.length > 0) {
+      const items = payload.drivers
+        .filter(b => typeof b === 'string' && b.trim().length > 0)
+        .map(b => `• ${this._escHtml(b.trim())}`)
+        .join('\n');
+      if (items) lines.push(`\n${t.triggerDriversHdr}\n${items}`);
+    }
+
+    // Risks - ⚠️ list. Same skip-if-empty rule.
+    if (Array.isArray(payload.risks) && payload.risks.length > 0) {
+      const items = payload.risks
+        .filter(b => typeof b === 'string' && b.trim().length > 0)
+        .map(b => `• ${this._escHtml(b.trim())}`)
+        .join('\n');
+      if (items) lines.push(`\n${t.triggerRisksHdr}\n${items}`);
+    }
+
     if (Array.isArray(payload.sources) && payload.sources.length > 0) {
       const links = payload.sources
         .filter(s => typeof s === 'string' && s.trim().length > 1)
@@ -1636,9 +1577,9 @@ class TelegramNotifier {
    *
    * Flow:
    *   1. If trigger already in DB → render & return (no Grok call, no cooldown).
-   *   2. Plan gate is enforced upstream (callback dispatcher) — by the time we
+   *   2. Plan gate is enforced upstream (callback dispatcher) - by the time we
    *      get here the user is pro/admin.
-   *   3. Per-user 15min cooldown (admin bypasses) — checked against the last
+   *   3. Per-user 15min cooldown (admin bypasses) - checked against the last
    *      time THIS user actually triggered a Grok call (cached reads don't count).
    *   4. DB-level claim via `db.claimTriggerSearch` to dedupe parallel clicks.
    *   5. Call Grok → save result → render. On failure release the lock so a
@@ -1699,8 +1640,10 @@ class TelegramNotifier {
     if (!claim.claimed) {
       if (claim.state === 'cached' && claim.trend?.trigger_text) {
         // Race: another caller filled it between our check and the claim.
-        // Reuse the already-loaded row — saves one SELECT.
-        const payload = {
+        // Re-read through getTrendTrigger so the rendered message includes
+        // the full forecast shape (phase/window/drivers/risks) instead of
+        // only the legacy text+sources+confidence triplet.
+        const payload = this.db.getTrendTrigger(trendId) || {
           text:       claim.trend.trigger_text,
           sources:    (() => { try { return JSON.parse(claim.trend.trigger_sources || '[]'); } catch { return []; } })(),
           confidence: claim.trend.trigger_confidence | 0,
@@ -1713,7 +1656,7 @@ class TelegramNotifier {
         });
         return;
       }
-      // Another user is currently calling Grok — show toast and bail
+      // Another user is currently calling Grok - show toast and bail
       await this.bot.answerCallbackQuery(cbId, {
         text: t.triggerInFlight || 'Another user is searching this trigger',
         show_alert: true,
@@ -1732,7 +1675,17 @@ class TelegramNotifier {
       const result = await this.triggerFinder.findTrigger(trend);
       this.db.saveTrendTrigger(trendId, result);
 
-      const payload = { text: result.text, sources: result.sources, confidence: result.confidence };
+      // Pass the full forecast shape - _renderTriggerMessage will skip any
+      // empty phase/window/drivers/risks fields gracefully.
+      const payload = {
+        text:       result.text,
+        sources:    result.sources,
+        confidence: result.confidence,
+        phase:      result.phase,
+        window:     result.window,
+        drivers:    result.drivers,
+        risks:      result.risks,
+      };
       await this.bot.sendMessage(chatId, this._renderTriggerMessage(payload, user.language), {
         parse_mode: 'HTML',
         reply_to_message_id: messageId,
@@ -1766,9 +1719,9 @@ class TelegramNotifier {
         const newReactions = update.new_reaction || [];
         const oldReactions = update.old_reaction || [];
 
-        // Identify the reactor — available in private chats / non-anon group reactions
+        // Identify the reactor - available in private chats / non-anon group reactions
         const reactorChatId = String(update.user?.id || update.actor_chat?.id || '');
-        if (!reactorChatId) return; // anonymous reaction — skip
+        if (!reactorChatId) return; // anonymous reaction - skip
 
         const added   = newReactions.filter(r => !oldReactions.find(o => o.emoji === r.emoji));
         const removed = oldReactions.filter(r => !newReactions.find(n => n.emoji === r.emoji));
@@ -1822,7 +1775,7 @@ class TelegramNotifier {
     try {
       const user = this.db?.getUserByChatId(chatId);
       if (user?.plan_name) planName = user.plan_name;
-    } catch (_) { /* user not found — default to free */ }
+    } catch (_) { /* user not found - default to free */ }
 
     // Weighting off → only admin votes count (weight=1), all others are ignored (weight=0)
     if (!enabled) return { weight: planName === 'admin' ? 1 : 0, planName };
@@ -1846,7 +1799,7 @@ class TelegramNotifier {
 
   /**
    * Fetch the user's latest Telegram profile photo and persist its file_id.
-   * Silent on error — avatars are cosmetic and must never break login.
+   * Silent on error - avatars are cosmetic and must never break login.
    *
    * @param {string|number} chatId   Telegram chat id / user id
    * @param {number}        userId   internal users.id (for UPDATE)
@@ -1867,7 +1820,7 @@ class TelegramNotifier {
       ).get(userId);
       const prevUid = prevRow?.avatar_file_unique_id || null;
 
-      // Freshness guard — refresh at most once every 6h unless forced
+      // Freshness guard - refresh at most once every 6h unless forced
       if (!opts.force && prevRow?.avatar_checked_at) {
         const age = Date.now() - new Date(prevRow.avatar_checked_at).getTime();
         if (age < 6 * 3_600_000) {
@@ -1880,7 +1833,7 @@ class TelegramNotifier {
       const res = await this.bot.getUserProfilePhotos(chatId, { limit: 1 });
       const count = res?.total_count || 0;
       if (!count || !res?.photos?.[0]?.length) {
-        this.logger?.info?.(`[Avatar] no photo for chat=${chatId} (total_count=${count}) — privacy or none`);
+        this.logger?.info?.(`[Avatar] no photo for chat=${chatId} (total_count=${count}) - privacy or none`);
         this.db.setUserAvatar(userId, null, null);
         this._deleteAvatarFile(prevUid);
         return false;
@@ -1966,7 +1919,7 @@ class TelegramNotifier {
         tried.push(`${u.split('/').pop()}=ERR`);
       }
     }
-    this.logger?.warn?.(`[Video] no reddit audio found — tried [${tried.join(', ')}]`);
+    this.logger?.warn?.(`[Video] no reddit audio found - tried [${tried.join(', ')}]`);
     return null;
   }
 
@@ -1983,14 +1936,14 @@ class TelegramNotifier {
     try { fs.mkdirSync(cacheDir, { recursive: true }); } catch {}
     const outPath = path.join(cacheDir, `${id}.mp4`);
 
-    // Cache hit — reuse
+    // Cache hit - reuse
     if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
       return outPath;
     }
 
     const audioUrl = await this._findRedditAudioUrl(videoUrl);
     if (!audioUrl) {
-      this.logger?.warn?.(`[Video] no audio track for reddit ${id} — silent fallback`);
+      this.logger?.warn?.(`[Video] no audio track for reddit ${id} - silent fallback`);
       return null;
     }
 
@@ -2015,7 +1968,7 @@ class TelegramNotifier {
       proc.stderr?.on('data', d => { stderr += d.toString(); });
       proc.on('error', (e) => {
         if (e.code === 'ENOENT') {
-          this.logger?.warn?.(`[Video] ffmpeg not found in PATH — install it to enable Reddit audio`);
+          this.logger?.warn?.(`[Video] ffmpeg not found in PATH - install it to enable Reddit audio`);
         } else {
           this.logger?.warn?.(`[Video] ffmpeg error: ${e.message}`);
         }

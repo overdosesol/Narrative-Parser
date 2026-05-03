@@ -5,22 +5,21 @@ import { LIFESPAN_VALUES, assertCoversLifespans } from '../analysis/lifespan.js'
 
 const en = {
   // ── Bot welcome & commands ─────────────────────────────────────────────
-  welcome: `<b>Catalyst</b>
+  welcome: `<b>Catalyst</b> - narrative scanner
 
-Narrative scanner for <b>Twitter</b>, <b>TikTok</b>, <b>Reddit</b> and <b>Google Trends</b>. Pings when a story starts breaking out.
+We watch <b>Twitter</b>, <b>TikTok</b>, <b>Reddit</b> and <b>Google Trends</b> in real time and ping you when a story is starting to break out - before it's everywhere.
 
-<b>Each alert includes:</b>
-\u{1F3AF}  Score \u00b7 0\u2013100
-\u{26A1}  The trigger
-\u{1F4D6}  What's happening
-\u{1F9E0}  Plain-language breakdown
-\u{1F4CA}  Live engagement (views, likes, reposts)
+<b>Every alert tells you:</b>
+\u{1F3AF}  How big it is (0-100 score)
+\u{26A1}  What set it off
+\u{1F4D6}  Why it's spreading
+\u{1F4CA}  Live engagement (views \u00b7 likes \u00b7 reposts)
 
-Open the menu below to set sources, threshold, language and plan.
+Tap the menu below to pick your sources, set the alert volume, and grab a plan.
 
-<a href="https://x.com/Catalystparser">\u{1D54F} Follow</a>`,
+<a href="https://x.com/Catalystparser">\u{1D54F} Follow updates</a>`,
 
-  welcomeBack: (plan) => `<b>Catalyst</b> \u00b7 plan: <b>${plan}</b>\n\n/menu \u2014 settings\n/top \u2014 top narratives right now`,
+  welcomeBack: (plan) => `<b>Catalyst</b> \u00b7 plan: <b>${plan}</b>\n\n/menu - settings\n/top - top narratives right now`,
 
   // ── Main menu ──────────────────────────────────────────────────────────
   menuTitle: '\u{2699}\u{FE0F} <b>Settings</b>\n\nTap a tile to tweak it. Current values are shown next to each option.',
@@ -55,7 +54,7 @@ Open the menu below to set sources, threshold, language and plan.
   },
 
   // ── Alert types ────────────────────────────────────────────────────────
-  alertTypesTitle: '\u{1F514} <b>Alert Types</b>\n\nChoose what kinds of alerts to receive:\n\n\u{1F4F0} <b>Event</b> — concrete trigger (someone said/did something specific)\n\u{1F4C8} <b>Trend</b> — narrative bubbling across multiple posts\n\u{1F680} <b>Post</b> — a single viral post\n\n<i>Tip: turning all of them off also receives all — no silent state.</i>',
+  alertTypesTitle: '\u{1F514} <b>Alert Types</b>\n\nChoose what kinds of alerts to receive:\n\n\u{1F4F0} <b>Event</b> - concrete trigger (someone said/did something specific)\n\u{1F4C8} <b>Trend</b> - narrative bubbling across multiple posts\n\u{1F680} <b>Post</b> - a single viral post\n\n<i>Tip: turning all of them off also receives all - no silent state.</i>',
   alertTypeNameEvent: 'Event',
   alertTypeNameTrend: 'Trend',
   alertTypeNamePost:  'Post',
@@ -66,12 +65,12 @@ Open the menu below to set sources, threshold, language and plan.
   languageSet: (lang) => `\u{2705} Language set to <b>${lang === 'en' ? 'English' : '\u{420}\u{443}\u{441}\u{441}\u{43A}\u{438}\u{439}'}</b>`,
 
   // ── Threshold ──────────────────────────────────────────────────────────
-  thresholdTitle: (current) => `\u{1F3AF} <b>Alert Threshold</b>\n\nCurrent: <b>${current}/100</b>\n\nOnly trends scoring above this value will reach you.\n<i>Lower = more alerts. Higher = only the loudest signals.</i>\n\nPick a preset or set your own:`,
+  thresholdTitle: (current) => `\u{1F3AF} <b>Alert Threshold</b>\n\nNow: <b>${current}/100</b>\n\nYou'll be pinged only when a trend scores above this number.\n<i>Lower \u2192 more alerts.  Higher \u2192 fewer, only the loudest.</i>\n\nPick a preset, or tap Custom for your own:`,
   thresholdSet: (val) => `\u{2705} Alert threshold set to <b>${val}/100</b>`,
-  thresholdLow: '\u{1F7E2} Low \u00B7 52+ \u2014 more alerts',
-  thresholdMedium: '\u{1F7E1} Medium \u00B7 67+ \u2014 balanced',
-  thresholdHigh: '\u{1F534} High \u00B7 75+ \u2014 only the loudest',
-  thresholdCustomBtn: '\u270F\uFE0F Custom number',
+  thresholdLow: '\u{1F7E2} Low (52+) \u00B7 more alerts',
+  thresholdMedium: '\u{1F7E1} Medium (67+) \u00B7 balanced',
+  thresholdHigh: '\u{1F534} High (75+) \u00B7 loudest only',
+  thresholdCustomBtn: '\u270F\uFE0F Custom',
   // Marker prepended to the active preset row inside the threshold keyboard
   // so users can tell at a glance which one matches their current value.
   thresholdActiveMark: '\u25B8 ',
@@ -91,18 +90,18 @@ Open the menu below to set sources, threshold, language and plan.
   planPro: 'Pro ($100 / 30 days)',
 
   // ── Payment ────────────────────────────────────────────────────────────
-  paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🆓 <b>Free — free forever (current)</b>\n• Sources: Reddit, Google Trends\n• Unlimited alerts\n• Twitter, TikTok and X Analysis not available\n\n🧪 <b>Test — $5 / 1 day (one-time)</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis is not available\n\n🚀 <b>Pro — $100 / 30 days</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis included',
+  paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🆓 <b>Free - free forever (current)</b>\n• Sources: Reddit, Google Trends\n• Unlimited alerts\n• Twitter, TikTok and X Analysis not available\n\n🧪 <b>Test - $5 / 1 day (one-time)</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis is not available\n\n🚀 <b>Pro - $100 / 30 days</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis included',
   paymentMethod: '\u{1F4B0} <b>Payment</b>\n\nChoose payment method:',
   btnPaySOL: '\u{26A1} Pay with SOL',
   btnPayUSDC: '\u{1F4B5} Pay with USDC',
-  btnPayStars: (amount) => '\u2B50 Telegram Stars (' + amount + ' \u2B50)',
-  starsInvoiceTitle: (plan) => 'Catalyst \u2014 ' + plan,
-  starsInvoiceDesc: (plan) => 'Access to Catalyst ' + plan + '. Payment is confirmed instantly.',
   paymentInstructions: (amount, currency, address, reference) =>
-    `\u{1F4B0} <b>Payment Instructions</b>\n\n` +
-    `<b>Option 1 (Recommended):</b>\nScan the QR code below using your wallet (Phantom / Solflare). Amount and details will be filled automatically.\n\n` +
-    `<b>Option 2 (Manual):</b>\nSend exactly <code>${amount} ${currency}</code> to this address:\n<code>${address}</code>\n\n` +
-    `Payment will be confirmed automatically within 1-5 minutes.`,
+    `\u{1F4B0} <b>Pay ${amount} ${currency}</b>\n\n` +
+    `\u{1F4F2} <b>Easy way</b>\n` +
+    `Scan the QR below in your SOL wallet - amount and address fill in automatically.\n\n` +
+    `✍️ <b>Manual</b>\n` +
+    `Send exactly:\n<code>${amount} ${currency}</code>\n\n` +
+    `To this SOL address:\n<code>${address}</code>\n\n` +
+    `⏱ Confirms automatically in 1-5 minutes after the transaction.`,
   btnOpenWallet: '\u{1F4F1} Open in Wallet',
   paymentConfirmed: (plan) => `\u{2705} <b>Payment confirmed!</b>\n\nYour plan has been upgraded to <b>${plan}</b>.\nEnjoy your premium features!`,
   paymentExpired: '\u{274C} Payment session expired. Please try again.',
@@ -111,7 +110,7 @@ Open the menu below to set sources, threshold, language and plan.
   // ── Alerts ─────────────────────────────────────────────────────────────
   alertHeader: (score) => `${scoreEmoji(score)} <b>${score}/100</b> \u00B7 TREND ALERT`,
   alertTrigger: 'Trigger',
-  // Alert-type labels (orthogonal to category \u2014 describes the SHAPE of the
+  // Alert-type labels (orthogonal to category - describes the SHAPE of the
   // signal). Rendered as a chip on the first line of every alert.
   alertTypeEvent: 'EVENT',
   alertTypeTrend: 'TREND',
@@ -144,7 +143,7 @@ Open the menu below to set sources, threshold, language and plan.
     sports_degen: '\u{1F3C6}', ai_drama: '\u{1F916}', other: '\u{1F4CC}', boring: '\u{1F634}',
   },
   topLifeIcons: {
-    // Keys derive from LIFESPAN_VALUES — see src/analysis/lifespan.js.
+    // Keys derive from LIFESPAN_VALUES - see src/analysis/lifespan.js.
     // Legacy descriptive forms are normalized away at scorer/dashboard
     // read sites via normalizeLifespan(), so we don't carry them here.
     flash: '\u26A1', short: '\u{1F552}', medium: '\u{1F4C5}', long: '\u{1F4C6}',
@@ -197,20 +196,31 @@ Open the menu below to set sources, threshold, language and plan.
   xAnalysisGrokLine:   (buzz, momentum, organicity) =>
     `buzz=${buzz} \u00B7 momentum=${momentum} \u00B7 organicity=${organicity}`,
 
-  // ── Trigger search (on-demand Grok reasoning catalyst lookup) ──────────
-  triggerBtn:        '\u{1F50D} Trigger',
-  triggerCachedBtn:  '\u{1F4A1} Trigger',
-  triggerLockedBtn:  '\u{1F512} Trigger (Pro)',
-  triggerLocked:     '\u{1F512} Trigger search is a Pro-plan feature. Upgrade to unlock.',
-  triggerLoading:    '\u{1F50D} Searching trigger... (~30-60s, reasoning mode)',
-  triggerInFlight:   '\u{1F50D} Another user is already searching this trend’s trigger. Try again in ~30s.',
-  triggerCooldown:   (min) => `\u{23F3} You can run another trigger search in ${min} min`,
-  triggerHeader:     '\u{1F4A1} <b>Trigger:</b>',
+  // ── Catalyst forecast (on-demand Grok reasoning, forward-looking) ──────
+  triggerBtn:        '\u{1F52E} Catalyst',
+  triggerCachedBtn:  '\u{2728} Catalyst',
+  triggerLockedBtn:  '\u{1F512} Catalyst (Pro)',
+  triggerLocked:     '\u{1F512} Catalyst forecast is a Pro-plan feature. Upgrade to unlock.',
+  triggerLoading:    '\u{1F52E} Forecasting catalyst... (~30-60s, reasoning mode)',
+  triggerInFlight:   '\u{1F52E} Another user is already forecasting this catalyst. Try again in ~30s.',
+  triggerCooldown:   (min) => `\u{23F3} You can run another catalyst forecast in ${min} min`,
+  triggerHeader:     '\u{1F52E} <b>Catalyst forecast:</b>',
+  triggerPhaseHdr:   '\u{1F300} <b>Phase:</b>',
+  triggerWindowHdr:  '\u{23F1} <b>Window:</b>',
+  triggerDriversHdr: '\u{1F4C8} <b>Growth drivers:</b>',
+  triggerRisksHdr:   '\u{26A0}\u{FE0F} <b>Risks:</b>',
   triggerSourcesHdr: '\u{1F4E1} <b>Sources:</b>',
   triggerConfidence: (pct) => `<i>Confidence: ${pct}%</i>`,
-  triggerNotFound:   'No specific catalyst found — narrative appears to be ongoing chatter without a clear trigger event.',
-  triggerError:      (err) => `\u{274C} Trigger search failed: ${err}`,
-  triggerDisabled:   '\u{274C} Trigger search is currently unavailable (XAI_API_KEY not configured).',
+  triggerPhaseValues: {
+    early:     'Early',
+    building:  'Building',
+    peaking:   'Peaking',
+    saturated: 'Saturated',
+    fading:    'Fading',
+  },
+  triggerNotFound:   'No clear forward catalyst - narrative looks saturated, no fresh growth driver in sight.',
+  triggerError:      (err) => `\u{274C} Catalyst forecast failed: ${err}`,
+  triggerDisabled:   '\u{274C} Catalyst forecast is currently unavailable (XAI_API_KEY not configured).',
 
   // ── Errors ─────────────────────────────────────────────────────────────
   dbUnavailable: '\u{274C} Database unavailable',
@@ -241,7 +251,7 @@ Open the menu below to set sources, threshold, language and plan.
   },
 
   lifespans: {
-    // Keys derive from LIFESPAN_VALUES — see src/analysis/lifespan.js.
+    // Keys derive from LIFESPAN_VALUES - see src/analysis/lifespan.js.
     flash:  '\u{26A1} Flash (hours)',
     short:  '\u{1F550} Short (1-2 days)',
     medium: '\u{1F4C5} Medium (3-7 days)',
@@ -250,12 +260,12 @@ Open the menu below to set sources, threshold, language and plan.
   },
 
   // ── Feedback "Reason for rating" wizard ────────────────────────────────
-  // Surfaced after the user taps 👍 / 👎 — they get a "Reason" button which
+  // Surfaced after the user taps 👍 / 👎 - they get a "Reason" button which
   // captures one short text message via _awaitingInput FSM.
   btnFeedbackReason: '\u{270F}\u{FE0F} Reason for rating',
   feedbackReasonPrompt: '\u{1F4DD} <b>Why this rating?</b>\n\nReply with one short sentence (any language). Send /skip to cancel. Max 240 characters.',
   feedbackReasonSaved: '\u{2705} <b>Reason saved.</b> The AI will use it for similar trends next cycle.',
-  feedbackReasonSkipped: '\u{1F44C} Cancelled — your vote stays as is.',
+  feedbackReasonSkipped: '\u{1F44C} Cancelled - your vote stays as is.',
   feedbackReasonNoVote: '\u{26A0}\u{FE0F} You haven’t voted on this trend, or your vote was removed. Vote again first.',
   feedbackReasonTooLong: '\u{26A0}\u{FE0F} Too long (max 240 chars). Tap the Reason button again to retry.',
 };

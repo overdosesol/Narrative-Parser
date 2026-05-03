@@ -896,15 +896,11 @@ class DashboardServer {
     const claim = this.db.claimTriggerSearch(trendId, userId);
     if (!claim.claimed) {
       if (claim.state === 'cached' && claim.trend?.trigger_text) {
-        let sources = [];
-        try { sources = JSON.parse(claim.trend.trigger_sources || '[]'); } catch { /* ignore */ }
-        return json(res, 200, {
-          text:        claim.trend.trigger_text,
-          sources,
-          confidence:  claim.trend.trigger_confidence | 0,
-          searchedAt:  claim.trend.trigger_searched_at,
-          fromCache:   true,
-        });
+        // Re-read through getTrendTrigger so cached-race responses include
+        // the full forecast shape (phase/window/drivers/risks) instead of
+        // only the legacy fields hand-picked from the row.
+        const saved = this.db.getTrendTrigger(trendId);
+        return json(res, 200, { ...saved, fromCache: true });
       }
       return json(res, 202, { state: 'in-flight' });
     }
@@ -1247,12 +1243,17 @@ class DashboardServer {
       // Trigger event — empty string when the AI found no explicit cause.
       // UI only renders the row when non-empty.
       whyNow:          row.why_now || '',
-      // On-demand trigger search (filled by Pro click). When null/empty, the
-      // dashboard renders a "Search Trigger" button instead.
+      // On-demand Catalyst forecast (filled by Pro click). Forward-looking
+      // growth forecast, NOT a recap of the past trigger (`whyNow` covers that).
+      // When null/empty, the dashboard renders a "Catalyst" search button.
       trigger: row.trigger_text ? {
         text:        row.trigger_text,
-        sources:     (() => { try { return JSON.parse(row.trigger_sources || '[]'); } catch { return []; } })(),
+        sources:     (() => { try { const v = JSON.parse(row.trigger_sources || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } })(),
         confidence:  row.trigger_confidence | 0,
+        phase:       row.trigger_phase  || '',
+        window:      row.trigger_window || '',
+        drivers:     (() => { try { const v = JSON.parse(row.trigger_drivers || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } })(),
+        risks:       (() => { try { const v = JSON.parse(row.trigger_risks   || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } })(),
         searchedAt:  row.trigger_searched_at,
       } : null,
       // Normalize legacy descriptive form ("flash (hours)") from rows scored
@@ -1270,10 +1271,27 @@ class DashboardServer {
         // Reddit's b.thumbs.redditmedia.com is a 140×140 thumbnail — drop it so the
         // client falls back to /api/preview (og:image is source-quality).
         if (/b\.thumbs\.redditmedia\.com/i.test(raw)) return null;
+        // Same avatar/profile-image filter as imageUrls below — see comment there.
+        if (/\/profile_images\//i.test(raw)) return null;
+        if (/_(normal|bigger|mini|400x400)\.(jpe?g|png|webp)(\?|$)/i.test(raw)) return null;
         return raw;
       })(),
+      // Reject:
+      //   - reddit b.thumbs CDN (low-quality 70x70 cards, useless for modal)
+      //   - Twitter profile-image URLs (avatars). Legacy DB rows from older
+      //     collector versions sometimes have @user pfp leaked into imageUrls;
+      //     they render as a tiny round portrait inside the 440px carousel
+      //     and look like a layout bug. Filter at the boundary so neither
+      //     feed nor modal sees them. Pattern matches both pbs.twimg.com
+      //     /profile_images/ path AND any URL ending with _normal/_bigger/
+      //     _400x400 size suffix that's only used for avatars.
       imageUrls:       Array.isArray(metrics.imageUrls)
-        ? metrics.imageUrls.filter(u => u && !/b\.thumbs\.redditmedia\.com/i.test(u)).slice(0, 10)
+        ? metrics.imageUrls.filter(u =>
+            u
+            && !/b\.thumbs\.redditmedia\.com/i.test(u)
+            && !/\/profile_images\//i.test(u)
+            && !/_(normal|bigger|mini|400x400)\.(jpe?g|png|webp)(\?|$)/i.test(u)
+          ).slice(0, 10)
         : [],
       videoUrl:        (() => {
         const v = metrics.videoUrl;
@@ -1335,7 +1353,13 @@ class DashboardServer {
                 ? (m.url || m.thumbnail_url)
                 : (m?.thumbnail_url || m?.url);
               const u = raw ? upgradeTwimgUrl(raw) : null;
-              if (u && !bucket.includes(u)) bucket.push(u);
+              if (!u || bucket.includes(u)) continue;
+              // Avatar / profile-image guard — fxtwitter shouldn't return
+              // these in media.all, but defensive filter prevents legacy
+              // payload variants leaking pfp URLs into the carousel.
+              if (/\/profile_images\//i.test(u)) continue;
+              if (/_(normal|bigger|mini|400x400)\.(jpe?g|png|webp)(\?|$)/i.test(u)) continue;
+              bucket.push(u);
             }
           };
           const urls = [];
@@ -2607,6 +2631,15 @@ class DashboardServer {
     .badge-atype-event { background: rgba(255,107,107,.12); color: #ff8a65; border: 1px solid rgba(255,107,107,.3); font-weight: 600; }
     .badge-atype-trend { background: rgba(46,213,115,.12); color: #2ed573; border: 1px solid rgba(46,213,115,.3); font-weight: 600; }
     .badge-atype-post  { background: rgba(116,185,255,.12); color: #74b9ff; border: 1px solid rgba(116,185,255,.3); font-weight: 600; }
+    /* Catalyst-found indicator: accent-tinted (matches the modal's Catalyst
+       section). Subtle pulse so the eye picks it up while scanning the feed. */
+    .badge-catalyst {
+      background: rgba(var(--accent-rgb), .14);
+      color: var(--accent);
+      border: 1px solid rgba(var(--accent-rgb), .38);
+      font-weight: 700;
+      box-shadow: var(--gloss-top);
+    }
     /* Sidebar chip variants — paint phase-chip same colours when filtering. */
     .phase-chip.atype-chip-event.active { border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.10); color: #ff8a65; }
     .phase-chip.atype-chip-trend.active { border-color: rgba(46,213,115,.5);  background: rgba(46,213,115,.10);  color: #2ed573; }
@@ -3303,7 +3336,11 @@ class DashboardServer {
        dimensions and aspect-ratio is overridden by the natural ratio. */
     video.modal-image { aspect-ratio: 16 / 9; height: 100%; }
     .modal-image-loading {
-      height: 220px; border-radius: 8px;
+      /* Match the in-modal carousel height (440px) so when preview returns
+         multiple images, the layout doesn't jump by 220px. Single-image
+         render also uses min-height 260px on .modal-image-wrap, so 440px
+         here is a slight upper bound — fine for shimmer. */
+      height: 440px; border-radius: 8px;
       background: linear-gradient(90deg, var(--card2) 25%, var(--card3) 50%, var(--card2) 75%);
       background-size: 200% 100%; animation: shimmer 1.5s linear infinite; border: 1px solid var(--border);
     }
@@ -3375,6 +3412,153 @@ class DashboardServer {
     .story-hook-mark.right { transform: translateY(8px); }
     .story-hook-text { flex: 1; }
 
+    /* ── Catalyst forecast (TriggerSection) ── */
+    /* Forecast body — neutral accent-tinted, NOT red (red is reserved for the
+       past-event block, see why-now). Slightly larger leading and a soft
+       accent border for a "forecast / forward" feel. */
+    .modal-section-content.catalyst-forecast {
+      color: var(--text);
+      border-color: rgba(var(--accent-rgb), .14);
+      background: rgba(var(--accent-rgb), .04);
+      font-weight: 400;
+      line-height: 1.6;
+      font-size: 12.5px;
+    }
+
+    /* Phase + window chips. Use the same tinted-gradient pattern as story-hook
+       but with phase-specific accent so the curve state is glanceable. */
+    .catalyst-chips {
+      display: flex; flex-wrap: wrap; gap: 7px;
+      margin-top: 12px;
+    }
+    .catalyst-chip {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 5px 11px;
+      border-radius: 999px;
+      font-size: 11px; font-weight: 600;
+      background: rgba(255,255,255,.04);
+      border: 1px solid rgba(255,255,255,.08);
+      color: var(--text2);
+      box-shadow: var(--gloss-top);
+    }
+    .catalyst-chip-label {
+      font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+      color: var(--dim); font-weight: 700;
+    }
+    .catalyst-chip-val { color: var(--text); }
+
+    /* Phase tints — semantic colors stay constant across themes. */
+    .phase-early     { background: rgba(34,197,94,.10);  border-color: rgba(34,197,94,.28); }
+    .phase-building  { background: rgba(29,155,240,.12); border-color: rgba(29,155,240,.32); }
+    .phase-peaking   { background: rgba(255,176,32,.12); border-color: rgba(255,176,32,.36); }
+    .phase-saturated { background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.12); }
+    .phase-fading    { background: rgba(239,68,68,.10);  border-color: rgba(239,68,68,.28); }
+    .phase-early     .catalyst-chip-val { color: var(--green2, #22c55e); }
+    .phase-building  .catalyst-chip-val { color: var(--accent); }
+    .phase-peaking   .catalyst-chip-val { color: var(--orange, #ffb020); }
+    .phase-fading    .catalyst-chip-val { color: var(--red2,   #ef4444); }
+
+    /* Drivers / Risks bullet lists — compact, accent-tinted left edge. */
+    .catalyst-bullets {
+      margin-top: 10px;
+      padding: 8px 10px 8px 12px;
+      border-left: 2px solid rgba(255,255,255,.10);
+      border-radius: 4px;
+      background: rgba(255,255,255,.02);
+    }
+    .catalyst-drivers { border-left-color: rgba(var(--accent-rgb), .55); }
+    .catalyst-risks   { border-left-color: rgba(239,68,68,.45); background: rgba(239,68,68,.04); }
+    .catalyst-bullets-head {
+      font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+      color: var(--dim); font-weight: 700;
+      margin-bottom: 4px;
+    }
+    .catalyst-drivers .catalyst-bullets-head { color: var(--accent); }
+    .catalyst-risks   .catalyst-bullets-head { color: var(--red2, #ef4444); }
+    .catalyst-bullets-list {
+      margin: 0; padding-left: 16px;
+      font-size: 12.5px; line-height: 1.55;
+      color: var(--text);
+    }
+    .catalyst-bullets-list li { margin: 2px 0; }
+
+    /* Sources — X handle pills with brand-blue tint and hover lift. */
+    .catalyst-sources {
+      margin-top: 14px;
+      padding: 10px 12px 11px;
+      border-radius: 8px;
+      background: rgba(255,255,255,.02);
+      border: 1px solid rgba(255,255,255,.06);
+    }
+    .catalyst-sources-head {
+      font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+      color: var(--dim); font-weight: 700;
+      margin-bottom: 7px;
+    }
+    .catalyst-sources-list {
+      display: flex; flex-wrap: wrap; gap: 6px;
+    }
+    .catalyst-source-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px 4px 8px;
+      border-radius: 999px;
+      background: rgba(29,155,240,.08);
+      border: 1px solid rgba(29,155,240,.22);
+      color: var(--text);
+      font-size: 11.5px; font-weight: 500;
+      text-decoration: none;
+      transition: background .15s ease, border-color .15s ease, transform .15s ease;
+      box-shadow: var(--gloss-top);
+    }
+    .catalyst-source-pill:hover {
+      background: rgba(29,155,240,.18);
+      border-color: rgba(29,155,240,.42);
+      transform: translateY(-1px);
+    }
+    .catalyst-source-x {
+      font-size: 12px;
+      color: rgb(29,155,240);
+      font-weight: 700;
+      line-height: 1;
+    }
+    .catalyst-source-handle { color: var(--text); }
+
+    /* Confidence — gradient progress bar (red→orange→green) instead of plain text.
+       Color of the fill is bucketed so low confidence reads red, high reads green. */
+    .catalyst-confidence {
+      display: flex; align-items: center; gap: 10px;
+      margin-top: 12px;
+      padding: 0 2px;
+    }
+    .catalyst-confidence-label {
+      font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+      color: var(--dim); font-weight: 700;
+      flex-shrink: 0;
+    }
+    .catalyst-confidence-bar {
+      flex: 1;
+      height: 5px;
+      border-radius: 3px;
+      background: rgba(255,255,255,.06);
+      overflow: hidden;
+    }
+    .catalyst-confidence-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width .4s ease;
+    }
+    .conf-low  { background: linear-gradient(90deg, rgba(239,68,68,.7),  rgba(239,68,68,1));  }
+    .conf-mid  { background: linear-gradient(90deg, rgba(255,176,32,.7), rgba(255,176,32,1)); }
+    .conf-high { background: linear-gradient(90deg, rgba(34,197,94,.7),  rgba(34,197,94,1));  }
+    .catalyst-confidence-val {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 11.5px;
+      color: var(--text);
+      font-weight: 600;
+      min-width: 36px; text-align: right;
+    }
+
     /* ── Sentiment ── */
     .sentiment-pos { color: var(--green2); font-weight: 600; }
     .sentiment-neg { color: var(--red2);   font-weight: 600; }
@@ -3440,6 +3624,12 @@ class DashboardServer {
       position: static !important;
       height: 100%;
       width: auto;
+      /* Critical: base .sidebar sets min-width: 240px which would force the
+         sidebar to bleed into the feed track when the user drags the resizer
+         below 240px (the resizer clamps to 180px min). Reset min-width here
+         so the grid track is the authoritative width — same trick as the
+         min-width:0 on .main-feed below. */
+      min-width: 0;
       /* overflow-y: auto when content can grow past the viewport (e.g. lots
          of sources); scrollbar-gutter prevents the scrollbar from causing a
          layout shift when it does appear. */
@@ -4588,7 +4778,9 @@ const I18N = {
     'feed.category_tip': 'Category',
     'feed.manual_tip': 'Manually submitted via admin panel',
     'feed.fresh_tip':  'First seen within the last hour',
+    'feed.catalyst_tip': 'Catalyst forecast available — open the card to read it',
     'badge.fresh':     'NEW',
+    'badge.catalyst':  '🔮 Catalyst',
     'feedback.like': 'Smash that like',
     'feedback.unlike': 'Undo like',
     'feedback.dislike': 'Dislike',
@@ -4692,18 +4884,31 @@ const I18N = {
     // Trend modal
     'modal.why_now': '🔥 Trigger',
     'modal.why_now_empty': 'No clear trigger — organic slow-burn',
+    'modal.trigger': '🔥 Trigger',
     'modal.ai_explanation': '🤖 AI alpha',
     // Trigger search (on-demand Grok reasoning)
-    'trigger.label':         '🔥 Trigger',
-    'trigger.btn':           '🔍 Search Trigger',
-    'trigger.btn_pro_only':  '🔒 Search Trigger (Pro)',
-    'trigger.btn_loading':   '🔍 Searching… (~30-60s)',
+    'trigger.label':         '🔮 Catalyst',
+    'trigger.btn':           '🔮 Forecast Catalyst',
+    'trigger.btn_pro_only':  '🔒 Forecast Catalyst (Pro)',
+    'trigger.btn_loading':   '🔮 Forecasting… (~30-60s)',
     'trigger.confidence':    'Confidence: {pct}%',
+    'trigger.confidence_label': 'Confidence',
     'trigger.sources':       '📡 Sources:',
-    'trigger.in_flight':     '🔍 Another user is already searching this trigger. Try again in ~30s.',
-    'trigger.cooldown':      '⏳ You can run another trigger search in {min} min',
-    'trigger.error':         '❌ Trigger search failed: {err}',
-    'trigger.disabled':      '❌ Trigger search is currently unavailable.',
+    'trigger.sources_head':  '𝕏 Sources',
+    'trigger.in_flight':     '🔮 Another user is already forecasting this catalyst. Try again in ~30s.',
+    'trigger.cooldown':      '⏳ You can run another catalyst forecast in {min} min',
+    'trigger.error':         '❌ Catalyst forecast failed: {err}',
+    'trigger.disabled':      '❌ Catalyst forecast is currently unavailable.',
+    'trigger.phase_label':   'Phase',
+    'trigger.window_label':  'Window',
+    'trigger.drivers_label': '📈 Growth drivers',
+    'trigger.risks_label':   '⚠️ Risks',
+    'trigger.cta_hint':      'Click below to forecast what will drive further growth — phase, upcoming catalysts, risks.',
+    'trigger.phase.early':       'Early',
+    'trigger.phase.building':    'Building',
+    'trigger.phase.peaking':     'Peaking',
+    'trigger.phase.saturated':   'Saturated',
+    'trigger.phase.fading':      'Fading',
     'modal.market_stage': '💹 Market Stage',
     'modal.metrics': '📊 Stats',
     'modal.meme_score': 'Meme Score',
@@ -4922,7 +5127,9 @@ const I18N = {
     'feed.category_tip': 'Категория',
     'feed.manual_tip': 'Ручная отправка через админку',
     'feed.fresh_tip':  'Появился в последний час',
+    'feed.catalyst_tip': 'Каталист найден — открой карточку чтобы прочитать прогноз',
     'badge.fresh':     'NEW',
+    'badge.catalyst':  '🔮 Каталист',
     'feedback.like': 'Лайк',
     'feedback.unlike': 'Убрать лайк',
     'feedback.dislike': 'Дизлайк',
@@ -5024,18 +5231,31 @@ const I18N = {
     // Trend modal
     'modal.why_now': '🔥 Триггер',
     'modal.why_now_empty': 'Нет явного триггера — органический рост',
+    'modal.trigger': '🔥 Триггер',
     'modal.ai_explanation': '🤖 AI-объяснение',
     // Trigger search (on-demand Grok reasoning)
-    'trigger.label':         '🔥 Триггер',
-    'trigger.btn':           '🔍 Найти триггер',
-    'trigger.btn_pro_only':  '🔒 Найти триггер (Pro)',
-    'trigger.btn_loading':   '🔍 Ищу… (~30-60с)',
+    'trigger.label':         '🔮 Каталист',
+    'trigger.btn':           '🔮 Найти Каталиста',
+    'trigger.btn_pro_only':  '🔒 Найти Каталиста (Pro)',
+    'trigger.btn_loading':   '🔮 Ищу Каталиста… (~30-60с)',
     'trigger.confidence':    'Уверенность: {pct}%',
+    'trigger.confidence_label': 'Уверенность',
     'trigger.sources':       '📡 Источники:',
-    'trigger.in_flight':     '🔍 Другой юзер уже ищет триггер. Попробуй через ~30с.',
-    'trigger.cooldown':      '⏳ Следующий поиск через {min} мин',
-    'trigger.error':         '❌ Ошибка поиска триггера: {err}',
-    'trigger.disabled':      '❌ Поиск триггера недоступен.',
+    'trigger.sources_head':  '𝕏 Источники',
+    'trigger.in_flight':     '🔮 Другой юзер уже ищет Каталиста. Попробуй через ~30с.',
+    'trigger.cooldown':      '⏳ Следующий поиск Каталиста через {min} мин',
+    'trigger.error':         '❌ Ошибка поиска Каталиста: {err}',
+    'trigger.disabled':      '❌ Поиск Каталиста недоступен.',
+    'trigger.phase_label':   'Фаза',
+    'trigger.window_label':  'Окно',
+    'trigger.drivers_label': '📈 Факторы роста',
+    'trigger.risks_label':   '⚠️ Риски',
+    'trigger.cta_hint':      'Жми кнопку ниже — Каталист спрогнозирует фазу, ближайшие драйверы и риски дальнейшего роста.',
+    'trigger.phase.early':       'Зарождается',
+    'trigger.phase.building':    'Набирает',
+    'trigger.phase.peaking':     'На пике',
+    'trigger.phase.saturated':   'Насыщен',
+    'trigger.phase.fading':      'Угасает',
     'modal.market_stage': '💹 Стадия рынка',
     'modal.metrics': '📊 Метрики',
     'modal.meme_score': 'Meme Score',
@@ -5521,19 +5741,35 @@ function videoVolumeRef(el) {
 // a small "N/M" counter, and dot pagination. Arrow clicks stop propagation so
 // feed cards don't open their modal when the user just wants to flip photos.
 function ImageCarousel({ urls, variant = 'in-feed' }) {
-  const filtered = (urls || []).filter(Boolean);
+  const allUrls = (urls || []).filter(Boolean);
+  // Track which slots failed to load — auto-skip them so a broken first
+  // image doesn't leave the carousel looking empty/collapsed. Only when ALL
+  // images failed do we show nothing.
+  const [failed, setFailed] = useState(() => new Set());
+  const filtered = allUrls.filter((_, i) => !failed.has(i));
   const [idx, setIdx] = useState(0);
+  // Clamp idx if entries got removed (e.g. several errors fired)
+  const safeIdx = filtered.length > 0 ? Math.min(idx, filtered.length - 1) : 0;
   if (filtered.length === 0) return null;
   const stop = (e) => { if (e) { e.stopPropagation(); e.preventDefault(); } };
   const go = (delta) => (e) => {
     stop(e);
     setIdx((i) => (i + delta + filtered.length) % filtered.length);
   };
+  // Map filtered index back to the original index so onError marks the right slot.
+  const visibleUrl = filtered[safeIdx];
+  const originalIdx = allUrls.indexOf(visibleUrl);
   const children = [
     h('img', {
-      key: 'img:' + idx,
-      src: filtered[idx], alt: '', loading: 'lazy',
-      onError: (e) => { try { e.target.style.opacity = 0; } catch {} },
+      key: 'img:' + originalIdx,
+      src: visibleUrl, alt: '', loading: 'lazy',
+      onError: () => {
+        setFailed(prev => {
+          const next = new Set(prev);
+          next.add(originalIdx);
+          return next;
+        });
+      },
     }),
   ];
   if (filtered.length > 1) {
@@ -5553,13 +5789,13 @@ function ImageCarousel({ urls, variant = 'in-feed' }) {
         type: 'button',
       }, '\u203A'),
       h('div', { key: 'counter', className: 'img-carousel-counter' },
-        (idx + 1) + ' / ' + filtered.length
+        (safeIdx + 1) + ' / ' + filtered.length
       ),
       h('div', { key: 'dots', className: 'img-carousel-dots' },
         filtered.map((_, i) =>
           h('div', {
             key: 'dot' + i,
-            className: 'img-carousel-dot' + (i === idx ? ' active' : ''),
+            className: 'img-carousel-dot' + (i === safeIdx ? ' active' : ''),
           })
         )
       )
@@ -5842,12 +6078,13 @@ function FeedCard({ trend, onOpen, onHide }) {
                     : trend.source === 'x_trends' ? 'x_trends'
                     : trend.source || 'source');
 
-  // Feed-card description: prefer the deep trigger summary (cached Grok result)
-  // when a Pro user has searched it; otherwise fall back to the Stage-1
-  // AI explanation. The legacy whyItWillPump pitch field has been removed —
-  // see WORKLOG entry "Trigger search: replace whyItWillPump".
-  const descText = (trend.trigger?.text) || trend.aiExplanation || '';
-  const isPump = !!(trend.trigger?.text);
+  // The trigger / AI-explanation text used to render as a long block under
+  // the title (.feed-desc). Owner moved it inside the modal — feed cards now
+  // surface a compact "🔮 Каталист" badge in the .feed-badges row instead,
+  // visible only when a deep Catalyst forecast has been searched (Pro click).
+  // Glance-reading the feed is faster and the long forecast text is one click
+  // away in the modal's Catalyst section.
+  const hasCatalyst = !!(trend.trigger && trend.trigger.text);
 
   const handleClick = (e) => {
     if (e.target.closest('a') || e.target.closest('button')) return;
@@ -5906,19 +6143,21 @@ function FeedCard({ trend, onOpen, onHide }) {
               : null,
             phase ? h(PhaseBadge, { phase }) : null,
             h(MarketStageBadge, { stage: trend.marketStage }),
+            // Catalyst-found indicator: shown when a deep forward forecast has
+            // been searched for this trend (data lives in trend.trigger). One
+            // click on the card opens the modal where the full forecast renders.
+            hasCatalyst
+              ? h('span', { className: 'badge badge-catalyst', title: t('feed.catalyst_tip') }, t('badge.catalyst'))
+              : null,
             h('span', { className: 'badge ' + catCls, title: t('feed.category_tip') }, catIco + ' ' + (trend.category || 'other'))
           )
         ),
-        h('div', { className: 'feed-title' }, trend.title),
-        trend.originalTitle && trend.originalTitle !== trend.title
-          ? h('div', { className: 'feed-orig' }, trend.originalTitle)
-          : null
+        h('div', { className: 'feed-title' }, trend.title)
+        // originalTitle (raw post text in source language) used to render here
+        // as a dim italic sub-line. Owner removed it — feed stays compact, the
+        // original text is still visible in the modal under the title.
       )
     ),
-
-    descText
-      ? h('div', { className: 'feed-desc' + (isPump ? ' pump' : '') }, isPump ? '⚡ ' + descText : descText)
-      : null,
 
     h(FeedImage, { trend }),
 
@@ -6087,25 +6326,40 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
 
 // ── TriggerSection (TrendModal child) ──────────────────────────────────────
 //
-// Renders the "Trigger" block inside the trend modal. Three render states:
+// Renders the "Catalyst" forecast block inside the trend modal. Forward-looking
+// forecast: what will drive FURTHER growth of the narrative. Two render
+// states:
 //
 //   1. trend.trigger.text present
-//      → render the deep Grok-reasoning result: text + sources + confidence.
-//        This is the post-search state and is shared across all users.
+//      → render the forecast: text + phase/window chips + drivers/risks
+//        bullets + sources + confidence. Shared across all users.
 //
-//   2. trend.whyNow present (and no trigger.text yet)
-//      → render the stage-1 short hint as a fallback, with a small note
-//        suggesting a deep search. Pro users still see the search button.
-//
-//   3. neither
-//      → render an action: "🔍 Search Trigger" button (pro/admin only) or
-//        a locked-state hint for free/test plans.
+//   2. nothing yet
+//      → render a CTA hint + action button. Pro/admin → fetch on click;
+//        free/test → locked. The past-event anchor (whyNow) lives in a
+//        separate "🔥 Trigger" block above this section, NOT inside it,
+//        so the Catalyst section is purely about the forward forecast.
 //
 // Local state holds the optimistic-update path: clicking the button sets
 // loading=true, fires POST /api/trends/:id/trigger, and on success replaces
 // the whole section with the returned payload without remounting the modal.
+//
+// Module-level CATALYST_CACHE: survives modal close/re-open without waiting
+// for the next /api/trends poll. After a successful fetch we mirror the
+// payload here, and on every TriggerSection mount we prefer trend.trigger
+// from server (authoritative) but fall back to the cache for the current
+// session. Cleared on full page reload (acceptable — server already has it).
+const CATALYST_CACHE = new Map();
+
 function TriggerSection({ trend, lang, me }) {
-  const [data, setData] = useState(trend.trigger || null);
+  // Initial state priority:
+  //   1. trend.trigger from server-side _formatTrend (authoritative, freshest
+  //      after the next feed poll completes)
+  //   2. CATALYST_CACHE (covers the gap between "click → save → re-open modal"
+  //      before the next poll has shipped the field down)
+  //   3. null → CTA state
+  const initial = trend.trigger || (trend.id != null ? CATALYST_CACHE.get(trend.id) : null) || null;
+  const [data, setData] = useState(initial);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
@@ -6126,7 +6380,20 @@ function TriggerSection({ trend, lang, me }) {
       const body = await res.json().catch(() => ({}));
 
       if (res.status === 200 && body && body.text) {
-        setData({ text: body.text, sources: body.sources || [], confidence: body.confidence | 0 });
+        const payload = {
+          text:       body.text,
+          sources:    Array.isArray(body.sources) ? body.sources : [],
+          confidence: body.confidence | 0,
+          phase:      body.phase  || '',
+          window:     body.window || '',
+          drivers:    Array.isArray(body.drivers) ? body.drivers : [],
+          risks:      Array.isArray(body.risks)   ? body.risks   : [],
+        };
+        setData(payload);
+        // Mirror in module cache so closing+reopening the modal before the next
+        // feed poll still shows the forecast. Server is authoritative — once
+        // the next /api/trends poll runs, trend.trigger will overwrite this.
+        if (trend.id != null) CATALYST_CACHE.set(trend.id, payload);
       } else if (res.status === 202) {
         setError(t('trigger.in_flight'));
       } else if (res.status === 403 && body.reason === 'cooldown') {
@@ -6143,43 +6410,89 @@ function TriggerSection({ trend, lang, me }) {
     }
   };
 
-  // Render-state 1: we have a trigger payload (either pre-loaded from API or
-  // just fetched). Always wins over fallback.
+  // Render-state 1: we have a forecast payload (either pre-loaded from API
+  // or just fetched). Always wins over the past-trigger fallback.
   if (data && data.text) {
+    const hasChips    = !!(data.phase || data.window);
+    const hasDrivers  = Array.isArray(data.drivers) && data.drivers.length > 0;
+    const hasRisks    = Array.isArray(data.risks)   && data.risks.length   > 0;
+    const hasSources  = Array.isArray(data.sources) && data.sources.length > 0;
+    const hasConfidence = typeof data.confidence === 'number' && data.confidence > 0;
     return h('div', { className: 'modal-section' },
       h('div', { className: 'modal-section-label' }, t('trigger.label')),
-      h('div', { className: 'modal-section-content why-now' }, data.text),
-      Array.isArray(data.sources) && data.sources.length > 0
-        ? h('div', { className: 'modal-section-content', style: { marginTop: 6, fontSize: 12 } },
-            h('span', { style: { color: 'var(--dim)' } }, t('trigger.sources') + ' '),
-            data.sources.map((s, i) => {
-              const handle = s.startsWith('@') ? s.slice(1) : s;
-              return h('a', {
-                key: 'src' + i,
-                href: 'https://x.com/' + encodeURIComponent(handle),
-                target: '_blank', rel: 'noopener',
-                style: { marginRight: 8 },
-              }, '@' + handle);
-            })
+      h('div', { className: 'modal-section-content catalyst-forecast' }, data.text),
+      hasChips
+        ? h('div', { className: 'catalyst-chips' },
+            data.phase
+              ? h('span', { className: 'catalyst-chip catalyst-chip-phase phase-' + data.phase },
+                  h('span', { className: 'catalyst-chip-label' }, t('trigger.phase_label')),
+                  h('span', { className: 'catalyst-chip-val' }, t('trigger.phase.' + data.phase) || data.phase))
+              : null,
+            data.window
+              ? h('span', { className: 'catalyst-chip catalyst-chip-window' },
+                  h('span', { className: 'catalyst-chip-label' }, t('trigger.window_label')),
+                  h('span', { className: 'catalyst-chip-val' }, data.window))
+              : null,
           )
         : null,
-      typeof data.confidence === 'number' && data.confidence > 0
-        ? h('div', { style: { marginTop: 4, fontSize: 11, color: 'var(--dim)', fontStyle: 'italic' } },
-            t('trigger.confidence', { pct: data.confidence }))
+      hasDrivers
+        ? h('div', { className: 'catalyst-bullets catalyst-drivers' },
+            h('div', { className: 'catalyst-bullets-head' }, t('trigger.drivers_label')),
+            h('ul', { className: 'catalyst-bullets-list' },
+              data.drivers.map((b, i) => h('li', { key: 'd' + i }, b))),
+          )
+        : null,
+      hasRisks
+        ? h('div', { className: 'catalyst-bullets catalyst-risks' },
+            h('div', { className: 'catalyst-bullets-head' }, t('trigger.risks_label')),
+            h('ul', { className: 'catalyst-bullets-list' },
+              data.risks.map((b, i) => h('li', { key: 'r' + i }, b))),
+          )
+        : null,
+      hasSources
+        ? h('div', { className: 'catalyst-sources' },
+            h('div', { className: 'catalyst-sources-head' }, t('trigger.sources_head')),
+            h('div', { className: 'catalyst-sources-list' },
+              data.sources.map((s, i) => {
+                const handle = s.startsWith('@') ? s.slice(1) : s;
+                return h('a', {
+                  key: 'src' + i,
+                  className: 'catalyst-source-pill',
+                  href: 'https://x.com/' + encodeURIComponent(handle),
+                  target: '_blank', rel: 'noopener',
+                  title: '@' + handle + ' on X',
+                },
+                  h('span', { className: 'catalyst-source-x' }, '𝕏'),
+                  h('span', { className: 'catalyst-source-handle' }, '@' + handle)
+                );
+              })
+            )
+          )
+        : null,
+      hasConfidence
+        ? h('div', { className: 'catalyst-confidence' },
+            h('span', { className: 'catalyst-confidence-label' }, t('trigger.confidence_label')),
+            h('div', { className: 'catalyst-confidence-bar' },
+              h('div', {
+                className: 'catalyst-confidence-fill conf-' + (data.confidence >= 70 ? 'high' : data.confidence >= 40 ? 'mid' : 'low'),
+                style: { width: data.confidence + '%' },
+              })
+            ),
+            h('span', { className: 'catalyst-confidence-val' }, data.confidence + '%'),
+          )
         : null,
     );
   }
 
-  // Render-state 2/3: no deep trigger yet. Show whyNow as fallback if any,
-  // plus the action button (or locked state for non-pro).
+  // Render-state 2: no forecast yet. CTA hint + action button (or locked state
+  // for non-pro). whyNow is NOT rendered here — it has its own "🔥 Trigger"
+  // section above in the modal. This keeps semantics clean: 🔥 = past, 🔮 = future.
   return h('div', { className: 'modal-section' },
     h('div', { className: 'modal-section-label' }, t('trigger.label')),
-    trend.whyNow
-      ? h('div', { className: 'modal-section-content why-now' }, trend.whyNow)
-      : h('div', {
-          className: 'modal-section-content why-now why-now-empty',
-          style: { color: 'var(--dim)', fontStyle: 'italic', opacity: 0.75 },
-        }, t('modal.why_now_empty')),
+    h('div', {
+      className: 'modal-section-content',
+      style: { color: 'var(--dim)', fontStyle: 'italic', fontSize: 13, opacity: 0.85 },
+    }, t('trigger.cta_hint')),
 
     h('div', { style: { marginTop: 10 } },
       isPro
@@ -6288,13 +6601,21 @@ function TrendModal({ trend, onClose, me = null }) {
         // the scalar field. We need the full list even on the video branch
         // so we can surface non-poster images underneath the player.
         (() => {
-          if (imgLoading) return h('div', { className: 'modal-image-loading' });
-
           const gallery = [];
           const pushUnique = (u) => { if (u && !gallery.includes(u)) gallery.push(u); };
           if (imgUrl) pushUnique(imgUrl);
           if (Array.isArray(trend.imageUrls)) trend.imageUrls.forEach(pushUnique);
           extraUrls.forEach(pushUnique);
+
+          // Loading skeleton: ONLY when nothing is populated yet AND a preview
+          // fetch is in flight AND there's no video to render. If the trend
+          // already has imageUrls in the DB or extras have arrived, we render
+          // them immediately — waiting on preview is pointless and was the
+          // source of "images disappear in modal" reports for multi-photo
+          // posts where the preview hadn't returned yet on first paint.
+          if (imgLoading && gallery.length === 0 && !trend.videoUrl) {
+            return h('div', { className: 'modal-image-loading' });
+          }
 
           if (trend.videoUrl) {
             // Video branch — show player primary, then any non-poster images
@@ -6354,19 +6675,20 @@ function TrendModal({ trend, onClose, me = null }) {
           ? h('div', { style: { fontSize: 12, color: 'var(--dim)', fontStyle: 'italic' } }, trend.originalTitle)
           : null,
 
-        // Trigger — the catalyst behind the trend. Three states:
-        //   1. trigger.text present  → render the deep Grok-reasoning answer
-        //                              (sourced, confidence-scored)
-        //   2. whyNow present        → render the stage-1 short hint as fallback
-        //   3. neither               → render an action button (pro/admin only)
-        //                              that fires the on-demand Grok search
-        h(TriggerSection, { trend, lang, me }),
-
-        // AI explanation
-        trend.aiExplanation ? h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.ai_explanation')),
-          h('div', { className: 'modal-section-content' }, trend.aiExplanation)
+        // 🔥 Trigger — concrete past-event "what happened" from Stage 1 (auto-
+        // populated on every trend by the scoring pipeline, no Grok call). This
+        // is the factual anchor; replaced the old "AI-объяснение" block which
+        // was a vague rationale text. Rendered first so the user reads "what
+        // happened" before the forward-looking Catalyst forecast below.
+        trend.whyNow ? h('div', { className: 'modal-section' },
+          h('div', { className: 'modal-section-label' }, t('modal.trigger')),
+          h('div', { className: 'modal-section-content why-now' }, trend.whyNow)
         ) : null,
+
+        // 🔮 Catalyst — forward-looking forecast from Grok reasoning + x_search.
+        // On-demand: pro/admin click the button to fetch, result shared cache.
+        // Empty/CTA state when not yet searched.
+        h(TriggerSection, { trend, lang, me }),
 
         // Actions — moved up for quick access to source/TG/Grok
         h('div', { className: 'modal-section' },
@@ -6404,17 +6726,16 @@ function TrendModal({ trend, onClose, me = null }) {
         ) : null,
 
         // Score bars \u2014 phase label and its hint moved out to the header chip.
-        // Story hook (when present) renders below the bars as a styled pull-
-        // quote so it reads as a narrative one-liner, not a slider sub-label.
+        // Story bar always renders even when Stage 2 didn't run (value=0),
+        // so the user sees a complete metric set on every card. The story
+        // pull-quote below only renders when there's an actual hook text.
         h('div', { className: 'modal-section' },
           h(ScoreBar, { label: t('bar.emergence'), value: trend.emergenceScore || 0 }),
           h('div', { style: { height: 4 } }),
           h(ScoreBar, { label: t('bar.adoption'),  value: trend.adoptionScore || trend.memePotential || 0 }),
-          (trend.storyScore || 0) > 0 ? h('div', { style: { height: 4 } }) : null,
-          (trend.storyScore || 0) > 0
-            ? h(ScoreBar, { label: t('bar.story'), value: trend.storyScore || 0 })
-            : null,
-          (trend.storyScore || 0) > 0 && trend.storyHook
+          h('div', { style: { height: 4 } }),
+          h(ScoreBar, { label: t('bar.story'), value: trend.storyScore || 0 }),
+          trend.storyHook
             ? h('div', { className: 'story-hook' },
                 h('span', { className: 'story-hook-mark' }, '\u201C'),
                 h('span', { className: 'story-hook-text' }, trend.storyHook),

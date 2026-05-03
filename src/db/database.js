@@ -93,6 +93,13 @@ class TrendDatabase {
     addIfMissing('trends', 'trigger_sources',      'TEXT');     // JSON array of @handles
     addIfMissing('trends', 'trigger_confidence',   'INTEGER NOT NULL DEFAULT 0');
     addIfMissing('trends', 'trigger_in_flight',    'INTEGER NOT NULL DEFAULT 0');
+    // Forward-looking growth forecast fields (added 2026-05-03 — Catalyst rework).
+    // Old rows scored before this migration have NULL/empty values; UI treats
+    // those exactly like missing (no chip / no bullet renders).
+    addIfMissing('trends', 'trigger_phase',        'TEXT');     // early|building|peaking|saturated|fading
+    addIfMissing('trends', 'trigger_window',       'TEXT');     // free-form short phrase
+    addIfMissing('trends', 'trigger_drivers',      'TEXT');     // JSON array of ≤80-char bullets
+    addIfMissing('trends', 'trigger_risks',        'TEXT');     // JSON array of ≤80-char bullets
 
     // Crash recovery: clear any lock left over from a previous process. Safe
     // because no in-flight Grok call could have survived the restart.
@@ -902,6 +909,106 @@ class TrendDatabase {
     return Object.fromEntries(rows.map(r => [r.key, r.value]));
   }
 
+  // ── Hot trends refresh selector ─────────────────────────────────────────
+  /**
+   * Pick "hot" trends eligible for the periodic re-fetch + re-score loop.
+   * Returns DB rows with raw_metrics already parsed into the camelCase shape
+   * scorer.scoreTrends() expects, so the caller can drop the result almost
+   * directly into the scorer after merging in fresh metrics from a resolver.
+   *
+   * Eligibility:
+   *  - first_seen_at within `maxAgeHours` (default 24h)
+   *  - meme_potential >= `minMeme` (read from raw_metrics JSON since the
+   *    `score` column is the alert weight, not memePotential per se)
+   *  - source in `sources` (default reddit + twitter — sources that have
+   *    free per-URL refreshers via fxtwitter / reddit json)
+   *  - url NOT NULL (we can't refresh without a permalink)
+   *
+   * Sort: meme_potential desc — when `limit` clips the pool, the highest-
+   * scoring trends get refreshed first (more business value per cycle).
+   */
+  getHotTrendsForRefresh({ minMeme = 50, maxAgeHours = 24, sources = ['reddit', 'twitter'], limit = 100 } = {}) {
+    if (!Array.isArray(sources) || sources.length === 0) return [];
+    const placeholders = sources.map(() => '?').join(',');
+    const rows = this.db.prepare(`
+      SELECT id, external_id, source, title, original_title, description, url,
+             score, category, sentiment, ai_explanation, predicted_lifespan,
+             raw_metrics, why_now, alert_type, first_seen_at, last_seen_at
+      FROM trends
+      WHERE first_seen_at > datetime('now', '-' || ? || ' hours')
+        AND source IN (${placeholders})
+        AND url IS NOT NULL
+        AND url != ''
+      ORDER BY first_seen_at DESC
+    `).all(maxAgeHours, ...sources);
+
+    const out = [];
+    for (const row of rows) {
+      let meta = {};
+      try { meta = row.raw_metrics ? JSON.parse(row.raw_metrics) : {}; }
+      catch { /* corrupt JSON — skip metrics, but still consider the row */ }
+
+      const memePotential = Number(meta.memePotential ?? 0);
+      if (memePotential < minMeme) continue;
+
+      // Reconstruct the trend object in scorer-compatible camelCase shape.
+      // Strip the score/phase/etc fields back out of metrics — they live as
+      // top-level fields on the trend object. Saves the scorer a re-derivation.
+      const { memePotential: _m, adoptionScore, emergenceScore, narrativePhase, rankScore,
+              marketStage, junkPenalty, junkReasons, alertScore, alertBreakdown,
+              alertType: _at, storyScore, storyHook, preStage, ...rawMetricsOnly } = meta;
+
+      out.push({
+        _dbId:           row.id,
+        externalId:      row.external_id,
+        source:          row.source,
+        title:           row.title,
+        originalTitle:   row.original_title || row.title,
+        description:     row.description || '',
+        url:             row.url,
+        score:           row.score || 0,
+        category:        row.category,
+        sentiment:       row.sentiment,
+        aiExplanation:   row.ai_explanation || '',
+        predictedLifespan: row.predicted_lifespan,
+        whyNow:          row.why_now || '',
+        alertType:       row.alert_type,
+        memePotential,
+        adoptionScore:   adoptionScore   ?? memePotential,
+        emergenceScore:  emergenceScore  ?? 0,
+        narrativePhase,
+        marketStage,
+        junkPenalty:     junkPenalty     ?? 0,
+        // clusterMetrics MUST mirror the cluster-domain fields here, not just
+        // junkReasons. The scorer's _analyzeBatchStage1 reads emergence
+        // exclusively from trend.clusterMetrics?.emergenceScore (NOT the
+        // top-level field), so if we only stash it on top, every re-score
+        // pass through Hot refresh writes emerg=0 back to DB. Same for
+        // marketStage (scorer line 656). HotMetricsRefresher._merge carries
+        // these through on the fetch-success path, but on fetch failure it
+        // falls back to this raw object — populating clusterMetrics here
+        // makes that fallback safe too. (Found 2026-05-03: emerg=0 on every
+        // Hot-refreshed row when fxtwitter timed out, which is most of them.)
+        clusterMetrics: {
+          emergenceScore: emergenceScore ?? 0,
+          junkPenalty:    junkPenalty    ?? 0,
+          junkReasons:    junkReasons    || [],
+          marketStage:    marketStage    ?? null,
+          narrativePhase: narrativePhase ?? null,
+          // Force re-score eligibility for Stage 2 — original isNovel was a
+          // one-time check at first scoring; on re-score we want a fresh
+          // x_search dive if the new memePotential clears stage2Threshold.
+          isNovel: true,
+        },
+        preStage:        preStage || null,
+        metrics:         rawMetricsOnly,
+        firstSeen:       row.first_seen_at,
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
   // ── Hidden trends (per-user dashboard archive) ───────────────────────────
   // Cleanup runs from index.js maintenance loop — drops rows older than the
   // configured retention (default 7 days). Visible feed query in dashboard
@@ -1361,11 +1468,19 @@ class TrendDatabase {
   }
 
   /**
-   * Persist a successful trigger search result and release the lock.
+   * Persist a successful Catalyst-forecast result and release the lock.
+   *
+   * The data shape is the forward-looking forecast (see TriggerFinder):
+   * `text` = 2-3 sentence forecast, `phase` = curve-phase enum, `window` =
+   * upside horizon phrase, `drivers` / `risks` = short bullet arrays.
    *
    * @param {number} trendId
    * @param {Object} data
-   * @param {string}   data.text         Trigger summary (2-3 sentences)
+   * @param {string}   data.text         Forecast text (2-3 sentences)
+   * @param {string}   [data.phase]      One of early|building|peaking|saturated|fading
+   * @param {string}   [data.window]     Short upside-window phrase
+   * @param {string[]} [data.drivers]    1-3 forward catalyst bullets
+   * @param {string[]} [data.risks]      0-2 growth-killer bullets
    * @param {string[]} [data.sources]    Array of @handles
    * @param {number}   [data.confidence] 0-100
    */
@@ -1373,16 +1488,24 @@ class TrendDatabase {
     if (!trendId || !data || typeof data.text !== 'string') return;
     try {
       const sourcesJson = JSON.stringify(Array.isArray(data.sources) ? data.sources.slice(0, 10) : []);
+      const driversJson = JSON.stringify(Array.isArray(data.drivers) ? data.drivers.slice(0, 5)  : []);
+      const risksJson   = JSON.stringify(Array.isArray(data.risks)   ? data.risks.slice(0, 5)    : []);
       const confidence  = Math.max(0, Math.min(100, Number(data.confidence) || 0));
+      const phase       = typeof data.phase  === 'string' ? data.phase  : '';
+      const window      = typeof data.window === 'string' ? data.window : '';
       this.db.prepare(`
         UPDATE trends SET
           trigger_text         = ?,
           trigger_sources      = ?,
           trigger_confidence   = ?,
+          trigger_phase        = ?,
+          trigger_window       = ?,
+          trigger_drivers      = ?,
+          trigger_risks        = ?,
           trigger_searched_at  = CURRENT_TIMESTAMP,
           trigger_in_flight    = 0
         WHERE id = ?
-      `).run(data.text, sourcesJson, confidence, trendId);
+      `).run(data.text, sourcesJson, confidence, phase, window, driversJson, risksJson, trendId);
     } catch (e) {
       this.logger?.warn?.(`saveTrendTrigger failed for trend #${trendId}: ${e.message}`);
     }
@@ -1409,16 +1532,23 @@ class TrendDatabase {
     if (!trendId) return null;
     const row = this.db.prepare(`
       SELECT trigger_text, trigger_sources, trigger_confidence,
+             trigger_phase, trigger_window, trigger_drivers, trigger_risks,
              trigger_searched_at, trigger_searched_by, trigger_in_flight
       FROM trends WHERE id = ?
     `).get(trendId);
     if (!row || !row.trigger_text) return null;
-    let sources = [];
-    try { sources = JSON.parse(row.trigger_sources || '[]'); } catch { /* corrupt JSON, ignore */ }
+    const safeJson = (s, fallback) => {
+      try { const v = JSON.parse(s || ''); return Array.isArray(v) ? v : fallback; }
+      catch { return fallback; }
+    };
     return {
       text:        row.trigger_text,
-      sources:     Array.isArray(sources) ? sources : [],
+      sources:     safeJson(row.trigger_sources, []),
       confidence:  row.trigger_confidence | 0,
+      phase:       row.trigger_phase  || '',
+      window:      row.trigger_window || '',
+      drivers:     safeJson(row.trigger_drivers, []),
+      risks:       safeJson(row.trigger_risks,   []),
       searchedAt:  row.trigger_searched_at,
       searchedBy:  row.trigger_searched_by,
       inFlight:    row.trigger_in_flight === 1,

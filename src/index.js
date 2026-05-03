@@ -17,7 +17,9 @@ import NanoClassifier from './analysis/nano-classifier.js';
 import GeminiCaptioner from './analysis/gemini-captioner.js';
 import PreStage from './analysis/pre-stage.js';
 import TelegramNotifier from './notifications/telegram.js';
+import { recomputeAlertScores, dispatchAlerts } from './notifications/alert-dispatcher.js';
 import SupportBot from './support/bot.js';
+import HotMetricsRefresher from './refresh/hot-metrics.js';
 import SolanaPayMonitor from './billing/solana-pay.js';
 import DashboardServer from './dashboard/server.js';
 import AdminServer from './admin/server.js';
@@ -111,6 +113,20 @@ telegram.solanaMonitor = solanaMonitor;
 // back to the user. Disabled gracefully when env vars are missing.
 const supportBot = new SupportBot(config, logger, db);
 supportBot.start();
+
+// Periodic refresh + re-score of "hot" trends (≤24h, memePotential≥50). Re-fetches
+// live metrics from source (free: fxtwitter / reddit json) every 2h, runs them
+// back through Stage 1 + Stage 2, then dispatches alerts for any trend whose
+// alertScore just crossed the threshold (dedup gate prevents double-alerting).
+// Toggle: db setting hotRefreshEnabled (admin).
+const hotRefresher = new HotMetricsRefresher({
+  db, scorer, logger,
+  telegram,                                     // shared notifier — same path as scan-cycle
+  config,                                       // for alertThreshold fallback
+  recordDecision: recordAlertDecision,          // append to the same admin ring buffer
+  normalizeThreshold,                           // [0..100] integer clamp
+});
+hotRefresher.start();
 
 // ── Initialize collectors ───────────────────────────────────────────────────
 const collectors = [];
@@ -256,6 +272,7 @@ const admin = new AdminServer(config, logger, db, telegram.bot, appState, () => 
   scorer,
   telegram,       // full wrapper — needed for sendAlertToUser + attachXButton
   triggerFinder,  // optional Grok deep-search; SubmitPage button → /api/trends/:id/trigger
+  hotRefresher,   // status reads + manual trigger from admin /api/hot-refresh/*
 });
 admin.start();
 
@@ -453,28 +470,7 @@ async function runScanCycle() {
     //  - actual age in hours from first_seen_at (drives staleDecay)
     // The alertScore baked in by the scorer is only a coarse estimate — we
     // trust the live probe here, right before the gate.
-    const nowMs = Date.now();
-    for (const t of validTrends) {
-      // Feedback: pull stats if trend is persisted; neutral (50) otherwise.
-      let feedbackBoost = 50;
-      if (t._dbId && typeof db.getFeedbackStats === 'function') {
-        try {
-          const fb = db.getFeedbackStats(t._dbId);
-          feedbackBoost = feedbackBoostFromStats(fb?.likes, fb?.dislikes);
-        } catch (e) { /* keep neutral */ }
-      }
-      // Age: use firstSeenAt if present, else treat as fresh (0h).
-      const firstSeen = t.firstSeenAt || t.first_seen_at || null;
-      const ageHours = firstSeen ? Math.max(0, (nowMs - new Date(firstSeen).getTime()) / 3_600_000) : 0;
-
-      t._feedbackBoost = feedbackBoost;
-      t._ageHours = ageHours;
-
-      const probe = computeAlertScore(t, alertWeights);
-      t.alertScore = probe.alertScore;
-      t.alertBreakdown = probe.breakdown;
-      t._alertHardJunk = probe.hardJunk;
-    }
+    recomputeAlertScores(validTrends, alertWeights, db);
 
     logger.info(
       `Alert gate: alertScore>=${globalAlertThreshold} (weights: ` +
@@ -485,162 +481,22 @@ async function runScanCycle() {
     setPipelineStage('alerts');
     logger.info(`Sending alerts to ${activeUsers.length} active user(s)`);
 
-    // Sort by alertScore descending (fallback chain for legacy rows)
-    const alertCandidates = validTrends
-      .filter(t => t._dbId)
-      .sort((a, b) =>
-        (b.alertScore ?? b.rankScore ?? b.memePotential ?? 0) -
-        (a.alertScore ?? a.rankScore ?? a.memePotential ?? 0)
-      );
+    // Hand off to the shared dispatcher — same logic the hot-refresh loop
+    // uses, so a trend that ripens past the threshold during refresh still
+    // alerts via the exact same gate cascade.
+    const dispatchResult = await dispatchAlerts({
+      trends: validTrends,
+      source: 'scan',
+      deps: {
+        db, telegram, logger, config,
+        alertWeights, presetCfg: presetCfgForAlerts, globalAlertThreshold,
+        normalizeThreshold,
+        recordDecision: recordAlertDecision,
+      },
+    });
 
-    for (const user of activeUsers) {
-      // Skip suspended users
-      if (user.status === 'suspended') continue;
-
-      // Check if subscription is expired → downgrade to free
-      if (db.isSubscriptionExpired(user)) {
-        db.updateUser(user.id, 'plan_id', 1); // free plan
-        db.updateUser(user.id, 'subscription_expires_at', null);
-        logger.info(`Subscription expired for user ${user.telegram_chat_id} — downgraded to free`);
-      }
-
-      // Get this user's disabled sources
-      let userDisabledSources = [];
-      try { userDisabledSources = JSON.parse(user.disabled_sources || '[]'); } catch(e) {}
-
-      // Per-user alert-type subscription. CSV in users.alert_types_filter,
-      // helper normalises empty/legacy/garbage to "all 3 types". Wildcard
-      // semantics: an empty resulting array is treated as "no filter" by the
-      // gate below (matches db helper contract).
-      const userAlertTypes = db.getUserAlertTypes(user.telegram_chat_id);
-
-      // Get this user's threshold (per-user or fallback to global). This now
-      // gates the unified alertScore — higher value = stricter.
-      const userThreshold = normalizeThreshold(user.alert_threshold, config.alertThreshold);
-      const effectiveAlertThreshold = Math.max(userThreshold, globalAlertThreshold);
-
-      // Per-preset cap on alerts/cycle since 2026-05-01 (PR-2). Same
-      // active preset config snapshot used by the threshold above.
-      const maxAlertsPerCycle = Number(presetCfgForAlerts.alerts?.thresholds?.maxAlertsPerCycle ?? 0) || 0;
-
-      let alertsSentThisCycle = 0;
-
-      for (const trend of alertCandidates) {
-        // Common snapshot for the decisions log — every gate evaluation below
-        // decorates this before storing. `url` is what the UI renders as a
-        // clickable source link.
-        // Engagement — for Twitter clusters these are sums across the cluster.
-        // Present at top level on collector output; survive clusterer.
-        const em = trend.metrics || trend.clusterMetrics?.metrics || {};
-        const decisionBase = {
-          trendId:    trend._dbId,
-          title:      (trend.title || '').slice(0, 160),
-          source:     trend.source,
-          category:   trend.category || null,
-          alertType:  trend.alertType || null,
-          alertScore: trend.alertScore ?? null,
-          threshold:  effectiveAlertThreshold,
-          breakdown:  trend.alertBreakdown || null,
-          url:        trend.url || null,
-          userChatId: String(user.telegram_chat_id || ''),
-          engagement: {
-            views:    em.views    ?? null,
-            likes:    em.likes    ?? null,
-            retweets: em.retweets ?? null,
-            replies:  em.replies  ?? null,
-            upvotes:  em.upvotes  ?? null, // reddit
-          },
-        };
-
-        // Evaluate every gate in order and record pass/fail for ALL of them.
-        // Some gates short-circuit the loop (cap / daily limit → `break`), but
-        // we still want to know which specific gate failed, so the full list
-        // is always written to the decisions buffer.
-        const gates = [];
-        const alertScore = trend.alertScore ?? 0;
-        const junkVal    = trend.junkPenalty ?? trend.clusterMetrics?.junkPenalty ?? 0;
-        const junkReasons = trend.clusterMetrics?.junkReasons?.join(',') || '';
-        const sourceLc   = (trend.source || '').toLowerCase();
-
-        const capPass       = !(maxAlertsPerCycle > 0 && alertsSentThisCycle >= maxAlertsPerCycle);
-        const dailyPass     = db.canUserReceiveAlert(user);
-        const thresholdPass = alertScore >= effectiveAlertThreshold;
-        const hardJunkPass  = !trend._alertHardJunk;
-        const sourcePass    = !userDisabledSources.includes(sourceLc);
-        const dedupPass     = !db.wasNotificationSentToUser(trend._dbId, user.id);
-
-        // alert_type filter: NULL alertType (legacy / pre-rollout trends)
-        // counts as wildcard so we don't silently mute back-catalog. Same
-        // wildcard logic when the user array is empty (handled by db helper:
-        // it can't return empty without us special-casing here).
-        const trendAlertType = trend.alertType || null;
-        const alertTypePass = !trendAlertType || userAlertTypes.includes(trendAlertType);
-
-        gates.push({ name: 'threshold', passed: thresholdPass, detail: `${alertScore} / ${effectiveAlertThreshold}` });
-        gates.push({ name: 'hard_junk', passed: hardJunkPass,  detail: `junk=${junkVal}${junkReasons ? ' (' + junkReasons + ')' : ''} < ${alertWeights.hardJunkStop}` });
-        gates.push({ name: 'source',    passed: sourcePass,    detail: trend.source + (sourcePass ? '' : ' (muted)') });
-        gates.push({ name: 'alert_type', passed: alertTypePass, detail: trendAlertType ? `${trendAlertType} ∈ [${userAlertTypes.join(',')}]` : 'no type (wildcard)' });
-        gates.push({ name: 'dedup',     passed: dedupPass,     detail: dedupPass ? 'new trend' : `already sent`  });
-        gates.push({ name: 'daily',     passed: dailyPass,     detail: dailyPass ? `ok` : `limit=${user.alert_limit}` });
-        gates.push({ name: 'cap',       passed: capPass,       detail: maxAlertsPerCycle > 0 ? `${alertsSentThisCycle}/${maxAlertsPerCycle}` : '∞' });
-
-        const firstFail = gates.find(g => !g.passed);
-        const allPassed = !firstFail;
-
-        // Apply short-circuit semantics (same as before):
-        //  - cycle cap / daily limit → stop looking at more trends for this user
-        //  - anything else → skip just this trend
-        if (!capPass || !dailyPass) {
-          recordAlertDecision({ ...decisionBase, decision: 'skipped', reason: firstFail.name, gates });
-          break;
-        }
-        if (!allPassed) {
-          if (firstFail.name === 'hard_junk') {
-            logger.debug(`[HardJunk] SKIP "${trend.title?.substring(0, 50)}" junk=${junkVal} (${junkReasons})`);
-          }
-          recordAlertDecision({ ...decisionBase, decision: 'skipped', reason: firstFail.name, gates });
-          continue;
-        }
-
-        // All gates passed — send it.
-        const sent = await telegram.sendAlertToUser(trend, user);
-        if (sent) {
-          db.recordNotification(trend._dbId, 'telegram', user.id);
-          db.incrementAlertCount(user.id);
-          alertsSentThisCycle++;
-          gates.push({ name: 'send', passed: true, detail: `msg ${sent.messageId || '—'}` });
-          recordAlertDecision({ ...decisionBase, decision: 'sent', reason: 'sent', gates });
-        } else {
-          gates.push({ name: 'send', passed: false, detail: 'telegram returned no result' });
-          recordAlertDecision({ ...decisionBase, decision: 'skipped', reason: 'send_failed', gates });
-        }
-
-        // (Close old `if (sent) {` — legacy body below runs inside that block.)
-        if (sent) {
-
-          // Attach X Analysis button (only for the first user's message — use their chat as anchor)
-          if (sent.messageId) {
-            await telegram.attachXButton(sent.chatId, sent.messageId, trend._dbId, user, trend);
-
-            // Save tg_message_id to trend for reaction tracking (use first message sent)
-            const existing = db.getTrendById(trend._dbId);
-            if (existing && !existing.tg_message_id) {
-              let msgUrl = '';
-              if (String(sent.chatId).startsWith('-100')) {
-                msgUrl = `https://t.me/c/${String(sent.chatId).slice(4)}/${sent.messageId}`;
-              }
-              db.updateTgUrl(trend._dbId, msgUrl, sent.messageId);
-            }
-          }
-
-          await new Promise(r => setTimeout(r, 300)); // small delay between sends
-        }
-      }
-
-      if (alertsSentThisCycle > 0) {
-        appState.cycleInProgress.alerts += alertsSentThisCycle;
-        logger.info(`Sent ${alertsSentThisCycle} alert(s) to user ${user.telegram_chat_id}`);
-      }
+    if (dispatchResult.sent > 0 && appState.cycleInProgress) {
+      appState.cycleInProgress.alerts = (appState.cycleInProgress.alerts || 0) + dispatchResult.sent;
     }
 
     const elapsed = ((Date.now() - cycleStart) / 1000).toFixed(1);

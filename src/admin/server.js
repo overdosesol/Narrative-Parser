@@ -73,6 +73,7 @@ class AdminServer {
     this.scorer = extras.scorer || null;
     this.telegram = extras.telegram || null;
     this.triggerFinder = extras.triggerFinder || null;  // Grok deep-search for SubmitPage trigger button
+    this.hotRefresher = extras.hotRefresher || null;    // periodic re-fetch + re-score loop (status + manual trigger)
     this.port = parseInt(process.env.ADMIN_PORT || '8080');
     this.host = process.env.ADMIN_HOST || '127.0.0.1';
     this.adminKey = process.env.ADMIN_API_KEY || '';
@@ -1243,6 +1244,48 @@ class AdminServer {
         return json(res, 200, { enabled });
       }
 
+      // Hot trends refresh — periodic re-fetch + re-score loop in index.js.
+      // Read on every cycle entry by HotMetricsRefresher._isAdminEnabled, so
+      // toggling here takes effect on the NEXT scheduled cycle (no restart).
+      //
+      // GET returns full status (enabled flag + last-run summary + running
+      // bool) so the admin UI can show "last run X min ago" without polling
+      // multiple endpoints.
+      if (path === '/api/hot-refresh' && method === 'GET') {
+        const enabled = String(this.db.getSetting?.('hotRefreshEnabled', '1')) !== '0';
+        const status = this.hotRefresher?.getStatus?.() || null;
+        return json(res, 200, { enabled, status });
+      }
+      if (path === '/api/hot-refresh/toggle' && method === 'POST') {
+        const cur = this.db.getSetting?.('hotRefreshEnabled', '1');
+        const next = String(cur) === '0' ? '1' : '0';
+        try {
+          this.db.setSetting('hotRefreshEnabled', next);
+        } catch (e) {
+          this.logger.error(`[Admin] Failed to persist hotRefreshEnabled: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+        const enabled = next !== '0';
+        this.logger.info(`[Admin] Hot trends refresh ${enabled ? 'ENABLED' : 'DISABLED'}`);
+        return json(res, 200, { enabled });
+      }
+      // Manual trigger — fires the same cycle that runs on schedule. Mostly
+      // for verifying the loop after deploy ("did it actually fetch tweets?")
+      // and for forcing a refresh after manually editing thresholds. Returns
+      // the cycle's result summary so the UI can update inline without polling.
+      // 409 if already running — admin should wait, not pile up calls.
+      if (path === '/api/hot-refresh/run' && method === 'POST') {
+        if (!this.hotRefresher) return json(res, 503, { error: 'hot-refresher not wired' });
+        if (this.hotRefresher.running) return json(res, 409, { error: 'already-running' });
+        try {
+          const result = await this.hotRefresher.runCycle({ trigger: 'manual' });
+          return json(res, 200, { ok: true, result });
+        } catch (e) {
+          this.logger.error(`[Admin] manual hot-refresh failed: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+      }
+
       return json(res, 404, { error: 'Not found' });
     } catch (e) {
       this.logger.error('Admin API error', { path, error: e.message });
@@ -2283,6 +2326,10 @@ function ScannersPage() {
     // the gpt-5.4-nano text enrichment, A/B-tested against value vs latency.
     React.createElement(PreStageSection, null),
 
+    // Hot trends refresh loop — periodic re-fetch + re-score of recent
+    // borderline trends so they can ripen into Stage 2 as engagement grows.
+    React.createElement(HotRefreshSection, null),
+
     // Rolling stats on what junk-filter is actually filtering out.
     // (Per-preset junk weights moved to the "🎛️ Пресеты" tab in PR-2.)
     React.createElement(JunkStatsSection, null),
@@ -2632,6 +2679,229 @@ function PreStageSection() {
   );
 }
 
+
+// ── Hot trends refresh toggle ───────────────────────────────────────────────
+// Periodic re-fetch + re-score loop for recent borderline trends. Lives in
+// src/refresh/hot-metrics.js and runs every HOT_REFRESH_INTERVAL_MINUTES (env,
+// default 120). Re-fetches live engagement metrics from source (free — fxtwitter
+// for Twitter, reddit json for Reddit), then re-runs Stage 1 + Stage 2 so a
+// borderline trend that's accumulating views can "ripen" past stage2Threshold.
+//
+// Toggle reads the DB setting hotRefreshEnabled on every cycle entry, so
+// flipping this here applies on the very next scheduled cycle without restart.
+function HotRefreshSection() {
+  const h = React.createElement;
+  const [enabled, setEnabled] = useState(null); // null = loading
+  const [status, setStatus]   = useState(null); // last-run summary + running flag
+  const [busy, setBusy]       = useState(false);
+  const [running, setRunning] = useState(false);
+  const [err, setErr]         = useState('');
+  const [msg, setMsg]         = useState('');
+  // Tick state forces re-render every 30s so the "last run X min ago" stamp
+  // stays current without re-fetching the API.
+  const [, tick] = useState(0);
+
+  const refresh = () => {
+    api('/api/hot-refresh')
+      .then(d => {
+        setEnabled(!!d.enabled);
+        setStatus(d.status || null);
+      })
+      .catch(e => setErr('Не удалось загрузить статус: ' + e.message));
+  };
+
+  useEffect(() => {
+    // Bare fetch() drops the X-Admin-Key header → 401 → toggle stuck. Use
+    // the api() helper. Same trap as PreStageSection.
+    refresh();
+    // Poll status every 60s — covers the case where the scheduled cycle
+    // fires while the admin tab is open.
+    const poll = setInterval(refresh, 60000);
+    // Force re-render every 30s so the relative "X min ago" updates.
+    const tickTimer = setInterval(() => tick(t => t + 1), 30000);
+    return () => { clearInterval(poll); clearInterval(tickTimer); };
+  }, []);
+
+  const toggle = async () => {
+    if (busy) return;
+    setBusy(true); setErr('');
+    try {
+      const d = await api('/api/hot-refresh/toggle', 'POST');
+      setEnabled(!!d.enabled);
+    } catch (e) {
+      setErr('Не удалось переключить: ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runNow = async () => {
+    if (running) return;
+    setRunning(true); setErr(''); setMsg('');
+    try {
+      const d = await api('/api/hot-refresh/run', 'POST');
+      const r = d.result || {};
+      if (r.eligible === 0) {
+        setMsg('Цикл прошёл, но eligible-трендов нет (≤24ч + memePotential≥50).');
+      } else {
+        setMsg('Готово: обработано ' + r.fetchOk + '/' + r.eligible
+             + ', Stage 2: ' + (r.stage2Hits || 0)
+             + ', сохранено: ' + r.saved
+             + ', алертов отправлено: ' + (r.alertsSent || 0)
+             + ', ' + r.tookSec + 'с');
+      }
+      refresh();
+    } catch (e) {
+      // 409 → уже бежит, 503 → не подключён, остальное → реальная ошибка
+      const msg = e.message || String(e);
+      if (/already-running/.test(msg))      setErr('Цикл уже выполняется — подожди завершения');
+      else if (/not wired/.test(msg))       setErr('hot-refresher не подключён к админке (рестарт нужен)');
+      else                                  setErr('Не удалось запустить цикл: ' + msg);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  // ── Format helpers ────────────────────────────────────────────────────────
+  const fmtAgo = (iso) => {
+    if (!iso) return '—';
+    const t = new Date(iso.endsWith('Z') ? iso : iso + 'Z').getTime();
+    if (!Number.isFinite(t)) return '—';
+    const diff = Date.now() - t;
+    if (diff < 0)               return 'через секунду';
+    if (diff < 60_000)          return Math.floor(diff / 1000) + 'с назад';
+    if (diff < 3_600_000)       return Math.floor(diff / 60_000) + 'м назад';
+    if (diff < 86_400_000)      return Math.floor(diff / 3_600_000) + 'ч ' + Math.floor((diff % 3_600_000) / 60_000) + 'м назад';
+    return Math.floor(diff / 86_400_000) + 'д назад';
+  };
+  const fmtDue = (iso) => {
+    if (!iso) return '—';
+    const t = new Date(iso.endsWith('Z') ? iso : iso + 'Z').getTime();
+    if (!Number.isFinite(t)) return '—';
+    const diff = t - Date.now();
+    if (diff <= 0)              return 'в любой момент';
+    if (diff < 60_000)          return 'через ' + Math.floor(diff / 1000) + 'с';
+    if (diff < 3_600_000)       return 'через ' + Math.floor(diff / 60_000) + 'м';
+    return 'через ' + Math.floor(diff / 3_600_000) + 'ч ' + Math.floor((diff % 3_600_000) / 60_000) + 'м';
+  };
+
+  const lastRunAt = status?.lastRunAt || null;
+  const lastResult = status?.lastResult || null;
+  const nextRunAt = status?.nextRunAt || null;
+  const intervalMin = status?.intervalMin || 120;
+  const isRunning = !!status?.running;
+
+  return h('div', { className: 'adm-card', style: { marginTop: 16 } },
+    h('h3', { style: { marginBottom: 6 } }, '🔁 Обновление горячих трендов'),
+    h('p', {
+      style: { fontSize: 12, color: 'var(--text3)', marginBottom: 16, lineHeight: 1.5 }
+    },
+      'Каждые ', intervalMin, ' минут пере-фетчит метрики (views/likes/...) свежих трендов (≤24ч, memePotential≥50, Reddit + Twitter), ',
+      'затем заново прогоняет Stage 1 + Stage 2. Бордерлайн-тренды, которые набирают виральность после первого скоринга, могут «дозреть» до Stage 2 и стать алертом. ',
+      'Источники бесплатные (fxtwitter / reddit json) — главная статья cost — Stage 1 LLM (~$3/мес) + редкие Stage 2 (cap уже стоит).'
+    ),
+
+    h('div', {
+      className: 'collector-grid',
+      style: { gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))' }
+    },
+      h('div', {
+        className: 'collector-card ' + (enabled ? 'enabled' : 'disabled')
+      },
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' } },
+          h('div', null,
+            h('div', { className: 'collector-icon' }, '🔁'),
+            h('div', { className: 'collector-name', style: { marginTop: 8 } }, 'Hot refresh loop')
+          ),
+          enabled !== null && h('label', { className: 'toggle' },
+            h('input', {
+              type: 'checkbox',
+              checked: enabled,
+              disabled: busy,
+              onChange: toggle
+            }),
+            h('span', { className: 'toggle-slider' })
+          )
+        ),
+        h('div', {
+          className: 'collector-status ' + (enabled ? 'on' : 'off'),
+          style: { marginTop: 12 }
+        },
+          enabled === null ? '○ Загрузка...'
+            : enabled       ? '● Активен — каждые ' + intervalMin + 'мин пере-скорит до 100 трендов'
+                            : '○ Отключён — тренды скорятся только один раз при сборе'
+        ),
+
+        // Last run + next run rows. Shown only when we have a status payload.
+        // If lastRunAt is null (process just started, never ran yet) we say so
+        // honestly rather than misleading "0 минут назад".
+        status && h('div', {
+          style: { marginTop: 14, padding: '10px 12px', background: 'rgba(255,255,255,.02)', borderRadius: 6, border: '1px solid var(--border)' }
+        },
+          h('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 } },
+            h('span', { style: { color: 'var(--text3)' } }, 'Последний цикл'),
+            h('span', { style: { color: 'var(--text)', fontWeight: 600 } },
+              isRunning ? '⏳ выполняется...' : (lastRunAt ? fmtAgo(lastRunAt) : 'ещё не запускался')
+            )
+          ),
+          enabled && nextRunAt && !isRunning && h('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 } },
+            h('span', { style: { color: 'var(--text3)' } }, 'Следующий по расписанию'),
+            h('span', { style: { color: 'var(--text2)' } }, fmtDue(nextRunAt))
+          ),
+
+          // Last cycle stats — only render if we have a meaningful result.
+          lastResult && h('div', { style: { marginTop: 8, paddingTop: 8, borderTop: '1px dashed var(--border)' } },
+            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px', fontSize: 11 } },
+              h('span', { style: { color: 'var(--text3)' } }, 'Eligible'),
+              h('span', { style: { color: 'var(--text)' } }, String(lastResult.eligible || 0)),
+              h('span', { style: { color: 'var(--text3)' } }, 'Подгружено'),
+              h('span', { style: { color: 'var(--text)' } },
+                (lastResult.fetchOk || 0) + '/' + (lastResult.eligible || 0)
+                + (lastResult.fetchFail ? ' (fail: ' + lastResult.fetchFail + ')' : '')
+              ),
+              h('span', { style: { color: 'var(--text3)' } }, 'Stage 2'),
+              h('span', { style: { color: 'var(--text)' } }, String(lastResult.stage2Hits || 0)),
+              h('span', { style: { color: 'var(--text3)' } }, 'Сохранено'),
+              h('span', { style: { color: 'var(--text)' } }, String(lastResult.saved || 0)),
+              h('span', { style: { color: 'var(--text3)' } }, 'Алертов отправлено'),
+              h('span', { style: { color: lastResult.alertsSent > 0 ? 'var(--green2, #22c55e)' : 'var(--text)', fontWeight: lastResult.alertsSent > 0 ? 600 : 400 } }, String(lastResult.alertsSent || 0)),
+              h('span', { style: { color: 'var(--text3)' } }, 'Длительность'),
+              h('span', { style: { color: 'var(--text)' } }, (lastResult.tookSec || 0) + 'с'),
+              h('span', { style: { color: 'var(--text3)' } }, 'Триггер'),
+              h('span', { style: { color: 'var(--text2)' } }, lastResult.trigger === 'manual' ? '🖐 ручной' : '⏰ по расписанию'),
+            ),
+            lastResult.error && h('div', {
+              style: { marginTop: 6, padding: '6px 8px', background: 'rgba(239,68,68,.1)', border: '1px solid rgba(239,68,68,.3)', borderRadius: 4, color: '#f87171', fontSize: 11 }
+            }, '⚠ ' + lastResult.error)
+          )
+        ),
+
+        h('button', {
+          className: 'btn btn-primary',
+          style: { marginTop: 12, width: '100%', padding: '8px 12px', fontSize: 13 },
+          disabled: running || isRunning || enabled === false,
+          onClick: runNow,
+        },
+          running || isRunning ? '⏳ Цикл выполняется...' : '▶ Запустить цикл сейчас'
+        ),
+
+        msg && h('div', {
+          style: { marginTop: 8, padding: '8px 10px', background: 'rgba(16,185,129,.08)', border: '1px solid rgba(16,185,129,.25)', borderRadius: 6, fontSize: 11, color: '#34d399' }
+        }, msg),
+
+        h('div', {
+          style: { fontSize: 11, color: 'var(--text3)', marginTop: 10, lineHeight: 1.5 }
+        },
+          'Eligibility: ≤24ч + memePotential≥50 + source ∈ {reddit, twitter}. ',
+          'Cap: 100 трендов на цикл. ',
+          'Если после re-score alertScore пробил порог — алерт уйдёт через обычный alert-loop.'
+        )
+      )
+    ),
+
+    err && h('div', { className: 'error', style: { marginTop: 12 } }, err)
+  );
+}
 
 // ── Junk-filter observation panel ────────────────────────────────────────────
 // "What is junk-filter actually filtering out?" Shows top reasons over last N

@@ -203,7 +203,19 @@ For EACH trend, return a JSON object with these exact fields:
 - "alertType"         : one of [event, trend, post] — see ALERT TYPE rubric above. NOT the same as category.
 - "sentiment"         : one of [positive, negative, neutral, mixed]
 - "explanation"       : ONE short sentence (≤200 chars) WHY this is (or isn't) a great memecoin narrative — IN ENGLISH. Be terse: skip filler words like "this trend" / "is interesting because". State the reason directly.
-- "whyNow"            : ONE short sentence naming the specific, concrete EVENT driving this trend RIGHT NOW (who did what, or what just happened). Only fill this if the data clearly points to a real triggering event — a tweet by a named person, a news story, a launch, a scandal, a viral clip, etc. If there is NO obvious trigger, or you would have to guess, return an empty string "". Do NOT speculate. Do NOT restate the title. IN ENGLISH.
+- "whyNow"            : 1-2 sentences (≤280 chars) naming the concrete trigger event behind this trend RIGHT NOW. Cover, in this order: WHAT happened, WHO is involved (real names / @handles when the data shows them), and any timing or scale anchor visible in the input (engagement velocity, duration, response volume). Be specific and factual — if a viral post is the trigger, name the author; if a public figure is involved, name them; if a clip is going around, describe what it shows in one beat. Do NOT speculate. Do NOT restate the title. If you would have to guess WHO or WHAT, return an empty string "" instead.
+
+  Good examples (1-2 sentences, concrete):
+  • "@giri_giri0117 posted an 18-second clip of a biker-gang chase ending in a comedic police plea; it's now ricocheting through reaction threads on X with 40K+ replies in 6h."
+  • "@elonmusk dropped a one-liner about Mars colony staffing; reply guys turned it into a meme template that's spreading to TikTok."
+  • "Premier League final ended in a brawl during stoppage time; raw clip on @sportscentre cleared 12M views overnight and Reddit threads are climbing."
+
+  Bad (don't do this):
+  • Restating the title
+  • Vague summaries like "Story about a biker gang" or "Someone's tweet"
+  • Speculation: "people might be talking because..."
+
+  IN ENGLISH.
 - "predictedLifespan" : one of [${LIFESPAN_VALUES.join(', ')}]   (${LIFESPAN_HINT})
 - "isGenuinelyInteresting": boolean — false ONLY for spam/bot/gibberish (also set memePotential to 0 in that case)
 
@@ -278,7 +290,12 @@ export const STAGE1_RESPONSE_SCHEMA = {
           // Originally "1-2 sentences" → models returned 300-500 chars,
           // ballooning Stage 1 output cost AND polluting Stage 2's input.
           explanation:            { type: 'string', maxLength: 220, description: 'ONE short sentence (≤200 chars) explaining memecoin potential — terse, no filler' },
-          whyNow:                 { type: 'string', description: 'Concrete trigger event in one short sentence, or empty string' },
+          // Hard cap at 280 chars (matches the prompt rule of 1-2 sentences,
+          // plus a small buffer for output tokenizer rounding). Strict json_schema
+          // enforces this on the model side. Originally "one short sentence"
+          // → models returned 60-90 chars of bare facts; widened to 280 so
+          // whyNow can carry WHO+WHAT+timing in two readable lines.
+          whyNow:                 { type: 'string', maxLength: 280, description: '1-2 sentences (≤280 chars) naming the concrete trigger event (who/what/timing), or empty string' },
           predictedLifespan: {
             type: 'string',
             // Schema enum derived from LIFESPAN_VALUES so renaming breaks
@@ -360,48 +377,64 @@ Return JSON ONLY (no markdown):
 }`;
 }
 
-// ─── Trigger search (on-demand, replaces whyItWillPump) ──────────────────────
+// ─── Catalyst forecast (on-demand, forward-looking) ──────────────────────────
 //
 // Run on user click only — NOT in the automatic scoring pipeline. Uses Grok
-// reasoning (grok-4-1-fast-reasoning) + x_search to identify the SPECIFIC
-// catalyst that's driving a trend RIGHT NOW. Result is cached in DB and
-// shared across all users (first click triggers Grok, the rest read from DB).
+// reasoning (grok-4-1-fast-reasoning) + x_search to FORECAST what will drive
+// further growth of the narrative. Forward-looking, NOT a recap of what made
+// it viral so far (the in-pipeline `whyNow` field already covers the past).
 //
-// This is intentionally factual (not a degen pitch) — names, dates, source
-// accounts. Reasoning mode is justified because we want Grok to:
-//   1. read multiple X search results
-//   2. cross-reference timestamps to find the actual trigger event
-//   3. identify amplifier accounts vs originator
-//   4. distinguish "ongoing chatter" from "just-broke catalyst"
+// Result is cached in DB and shared across all users (first click pays for
+// Grok, the rest read from DB).
+//
+// Reasoning mode is justified because we want Grok to:
+//   1. read live X discussion to gauge current curve phase
+//   2. surface scheduled / upcoming catalysts (premieres, releases, deadlines, anniversaries)
+//   3. identify untapped angles that could spread the narrative further
+//   4. flag risks that could kill momentum before more growth happens
 
-export const TRIGGER_SYSTEM_PROMPT = `You are a narrative-catalyst analyst. Given a trending topic, your job is to find the SPECIFIC EVENT happening RIGHT NOW that's driving the conversation on X.
+export const TRIGGER_SYSTEM_PROMPT = `You are a narrative-growth forecaster. Given a trending topic, your job is to predict WHAT WILL DRIVE FURTHER GROWTH of this narrative — not to recap what made it viral so far. Forward-looking only.
 
 Your tools:
-- x_search: read actual top tweets about the trend in the last 24-48 hours
-- reasoning: cross-reference timestamps, identify originator vs amplifiers, distinguish "the catalyst" from "ongoing chatter"
+- x_search: read live X discussion (last 24-48 hours) to gauge current curve phase, mention velocity, account-mix, and any scheduled events being referenced
+- reasoning: combine signals to estimate where the story is on its growth curve and what catalysts could push it further
 
-OUTPUT REQUIREMENTS:
-- 2-3 plain-English sentences naming: WHAT happened, WHO is involved (real names/handles), WHEN it broke
-- Cite specific X accounts that posted the most amplified content
-- Confidence score reflecting how certain you are this is THE driver (vs noise)
+━━━ WHAT TO LOOK FOR ━━━
+Forward-looking growth catalysts only. Examples:
+- Scheduled events on the horizon: premieres, releases, drops, deadlines, court hearings, sports matches, debates, anniversaries, product reveals, sequels, concert tours, awards shows
+- Untapped surfaces / angles: narrative not yet on TikTok, no major media coverage yet, no celebrity has weighed in, no remix-format formed yet, only one platform involved so far, no shareable visual yet
+- Curve dynamics: mention velocity still rising, fresh accounts joining (not the same amplifier loop), spinoff formats / parodies starting to appear, regional / language spread beginning
+- External pressure points: upcoming public statements, follow-up posts the originator implied, expected reactions from people named in the story
 
-WHAT COUNTS AS A TRIGGER:
-- A specific viral post (with author + approximate time)
-- A celebrity / authority quote-tweet or reply
-- A breaking news event (launch, leak, arrest, death, scandal)
-- A meme-format moment that just took off (and you can name the originator)
-- A coordinated drop (NFT mint, token launch, product reveal)
+━━━ WHAT NEVER TO MENTION ━━━
+ZERO references to crypto / coins / tokens / tickers / launches in the financial sense / pump.fun / DEX / contract addresses / "this will moon" / market caps. We forecast NARRATIVE popularity only, not asset prices. If a coin already exists for this narrative, do NOT mention it.
 
-WHAT DOES NOT COUNT (return confidence < 40 + acknowledge the absence):
-- Generic ongoing chatter without a clear inciting moment
-- Vague "people are talking about X" without a named trigger event
-- Speculation about why something MIGHT be trending
+━━━ CURVE PHASE (pick exactly one) ━━━
+- "early"     — narrative just forming, low overall mention volume but rising, plenty of headroom
+- "building"  — clear upward velocity, multiple accounts contributing, format is replicating
+- "peaking"   — at or near the local high, still strong but new-account rate has flattened
+- "saturated" — high volume but no new angles, mostly recycled posts, audience nearly tapped
+- "fading"    — mention rate declining, conversation moving on, growth window closing
 
-RULES:
-- NO degen pitch. NO "this will pump because..." NO ticker promotion. Pure factual catalyst summary.
-- Names, dates, numbers ONLY if x_search confirms them. No invented attribution.
-- If you searched and found nothing concrete, set confidence < 40 and trigger to "No specific catalyst found — narrative appears to be ongoing chatter without a clear trigger event."
-- ENGLISH output.
+━━━ WINDOW (pick a short phrase) ━━━
+A short, factual time horizon for the next growth wave. Examples: "next 24-48h", "next 1-2 weeks", "after [named event] on [date]", "depends on whether [person] responds", "uncertain — needs external trigger". Empty string if no horizon is supportable.
+
+━━━ DRIVERS (1-3 short bullets) ━━━
+Each bullet = ONE concrete forward catalyst, ≤80 chars, plain English, no hedge filler. Drop a bullet rather than pad it. If you can name a date / person / event, do it. Examples:
+- "Sequel premiere on Nov 14 — fanbase priming for fresh memes"
+- "Hasn't reached TikTok yet — visual hook will replicate fast"
+- "Originator hinted at a follow-up post"
+
+━━━ RISKS (0-2 short bullets) ━━━
+Things that could kill growth before the window closes. Each ≤80 chars. Skip if nothing sharp comes up. Examples:
+- "Backlash forming — three large accounts pushing back"
+- "Format already overdone — saturation likely within 24h"
+
+━━━ FORECAST TEXT (2-3 sentences) ━━━
+Plain English. State current phase + the single biggest forward catalyst + the realistic upside window. No filler. No degen pitch. No price talk. Names, dates, numbers ONLY if x_search confirms them — never invent.
+
+━━━ NO-SIGNAL CASE ━━━
+If x_search returned nothing concrete or you see no realistic forward driver, set confidence < 40, phase to your best guess (often "saturated" or "fading"), drivers to [] or one cautious item, and write a forecast that honestly says no clear catalyst ahead. Do NOT manufacture a forecast.
 
 Always respond with ONLY valid JSON. No markdown, no preamble.`;
 
@@ -410,6 +443,10 @@ export function buildTriggerPrompt(trend) {
   detail += `\nSource: ${trend.source || 'unknown'}`;
   if (trend.aiExplanation || trend.ai_explanation) {
     detail += `\nInitial pipeline analysis: ${trend.aiExplanation || trend.ai_explanation}`;
+  }
+  // Past-trigger anchor for context only — DO NOT recap this in the forecast.
+  if (trend.why_now || trend.whyNow) {
+    detail += `\nPast trigger (context only, don't recap): ${trend.why_now || trend.whyNow}`;
   }
 
   // Pull subject name from xSearchData if available — gives Grok a high-signal
@@ -421,16 +458,22 @@ export function buildTriggerPrompt(trend) {
   } catch { /* corrupt JSON, ignore */ }
   if (subjectName) detail += `\nKnown subject: ${subjectName}`;
 
-  return `Find the current narrative trigger for this trend using x_search + reasoning.
+  return `Forecast what will drive further growth of this narrative using x_search + reasoning.
 
 ${detail}
 
-Search X/Twitter for the most viral discussion in the last 24-48 hours about this trend. Identify the ONE specific event/post/news that's driving it RIGHT NOW.
+Use x_search to read live X discussion (last 24-48h) — gauge how busy the conversation is, who's still arriving, and whether any specific upcoming events are being referenced. Then forecast the NEXT growth wave (forward-looking only — do NOT recap the past trigger).
+
+Reminder: ZERO references to crypto / coins / tokens / tickers / pumps / market caps. Narrative popularity only.
 
 Return ONLY this JSON shape:
 {
-  "trigger":    "<2-3 sentences naming what/who/when, in English>",
-  "confidence": <0-100 integer — how certain you are this is THE driver vs noise>,
-  "sources":    ["@handle1", "@handle2", ...]   // up to 5 X accounts that amplified the trigger
+  "forecast":   "<2-3 sentences: phase + biggest forward catalyst + window, in English>",
+  "phase":      "early" | "building" | "peaking" | "saturated" | "fading",
+  "window":     "<short phrase, e.g. 'next 24-48h' or 'after premiere on Nov 14', or '' if uncertain>",
+  "drivers":    ["<≤80 char concrete forward catalyst>", ...]   // 1-3 bullets, can be []
+  "risks":      ["<≤80 char growth-killer>", ...]               // 0-2 bullets, can be []
+  "confidence": <0-100 integer — how certain you are about the forecast>,
+  "sources":    ["@handle1", "@handle2", ...]                   // up to 5 X accounts referenced
 }`;
 }

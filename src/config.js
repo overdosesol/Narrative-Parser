@@ -64,9 +64,6 @@ const config = {
     // Bot username (without @) used to build login deep-links.
     // If empty, the dashboard will try to resolve it via bot.getMe() at runtime.
     botUsername: (process.env.TELEGRAM_BOT_USERNAME || '').replace(/^@/, ''),
-    // Telegram Stars prices (XTR). 1 XTR ≈ $0.02. Override via env.
-    starsTestPrice: parseInt(process.env.STARS_TEST_PRICE || '250', 10),  // ≈ $5
-    starsProPrice:  parseInt(process.env.STARS_PRO_PRICE  || '5000', 10), // ≈ $100
   },
 
   // Support bot — separate bot for tickets that relays into a forum-topics

@@ -85,8 +85,12 @@ class TriggerFinder {
     }
 
     // Sanitize + validate
-    const text = typeof parsed.trigger === 'string' ? parsed.trigger.trim() : '';
-    if (!text) throw new Error('TriggerFinder: empty trigger text from Grok');
+    // Forecast text: prefer the new `forecast` field, fall back to `trigger`
+    // for older Grok outputs / cached prompts that haven't refreshed yet.
+    const text = typeof parsed.forecast === 'string' && parsed.forecast.trim()
+      ? parsed.forecast.trim()
+      : (typeof parsed.trigger === 'string' ? parsed.trigger.trim() : '');
+    if (!text) throw new Error('TriggerFinder: empty forecast text from Grok');
 
     const confidence = Math.max(0, Math.min(100, Number(parsed.confidence) || 0));
     const rawSources = Array.isArray(parsed.sources) ? parsed.sources : [];
@@ -98,13 +102,32 @@ class TriggerFinder {
       })
       .slice(0, 5);
 
+    // Curve phase — strict enum, anything else collapses to '' (UI hides chip).
+    const PHASES = ['early', 'building', 'peaking', 'saturated', 'fading'];
+    const phaseRaw = String(parsed.phase || '').trim().toLowerCase();
+    const phase = PHASES.includes(phaseRaw) ? phaseRaw : '';
+
+    // Window — free-form short phrase, hard cap 80 chars to keep UI tidy.
+    const window = typeof parsed.window === 'string'
+      ? parsed.window.trim().slice(0, 80)
+      : '';
+
+    // Drivers / risks — bullet arrays. 80-char cap mirrors the prompt rule.
+    const cleanBullets = (arr, max) => (Array.isArray(arr) ? arr : [])
+      .filter(b => typeof b === 'string' && b.trim().length > 0)
+      .map(b => b.trim().slice(0, 100))   // 100 = soft cap (prompt asks ≤80)
+      .slice(0, max);
+    const drivers = cleanBullets(parsed.drivers, 3);
+    const risks   = cleanBullets(parsed.risks,   2);
+
     this.logger?.info?.(
       `[TriggerFinder] "${trend.title || trend.original_title || 'unknown'}" → ` +
+      `phase=${phase || 'n/a'}, drivers=${drivers.length}, risks=${risks.length}, ` +
       `confidence=${confidence}, sources=${sources.length}, ` +
       `tokens in=${inputTokens}/out=${outputTokens}, ${elapsedMs}ms`
     );
 
-    return { text, sources, confidence, inputTokens, outputTokens };
+    return { text, phase, window, drivers, risks, sources, confidence, inputTokens, outputTokens };
   }
 
   // ── Private: Responses API call ────────────────────────────────────────────
