@@ -1533,8 +1533,12 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .dec-page-head{margin-bottom:14px}
 .dec-page-head h2{font-size:22px;font-weight:800;letter-spacing:-.4px;margin-bottom:6px}
 .dec-page-head p{color:var(--muted);font-size:13px;line-height:1.5}
-.dec-filter-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.dec-filter-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
 .dec-reason-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;font-size:12px}
+.dec-search{flex:1;min-width:200px;max-width:420px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:13px;outline:none}
+.dec-search:focus{border-color:var(--accent)}
+.dec-search-clear{background:transparent;border:none;color:var(--text2);cursor:pointer;font-size:12px;padding:4px 8px}
+.dec-search-clear:hover{color:var(--text)}
 .dec-list{display:flex;flex-direction:column;gap:10px}
 .dec-card{background:var(--bg2);border:1px solid var(--border);border-left:3px solid var(--text3);border-radius:10px;padding:12px 14px;transition:border-color .15s}
 .dec-card.sent{border-left-color:var(--green)}
@@ -3124,6 +3128,7 @@ function DecisionsPage() {
   const [data, setData] = useState(null);
   const [filter, setFilter] = useState('all'); // all | sent | skipped
   const [reason, setReason] = useState('');
+  const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
 
   const load = () => {
@@ -3142,8 +3147,22 @@ function DecisionsPage() {
   if (loading && !data) return h('div', { className: 'loading' }, 'Загрузка решений...');
   if (!data) return h('div', { className: 'empty' }, 'Нет данных');
 
-  const items = data.items || [];
+  const allItems = data.items || [];
   const counts = data.counts || {};
+
+  // Client-side search across title / source / category / alertType / chatId.
+  // Server-side не делаем потому что буфер in-memory всего 500 решений —
+  // фильтрация массива из 500 элементов на каждый keystroke стоит микросекунды.
+  const q = search.trim().toLowerCase();
+  const items = q
+    ? allItems.filter(d => {
+        const hay = [
+          d.title, d.source, d.category, d.alertType,
+          d.userChatId, d.url, d.reason,
+        ].filter(Boolean).join(' ').toLowerCase();
+        return hay.includes(q);
+      })
+    : allItems;
 
   const fmtTime = (iso) => {
     try { return new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
@@ -3184,7 +3203,22 @@ function DecisionsPage() {
         key: f,
         className: 'btn ' + (filter === f ? 'btn-primary' : 'btn-ghost') + ' btn-sm',
         onClick: () => { setFilter(f); setReason(''); }
-      }, f === 'all' ? 'Все' : f === 'sent' ? '✓ Отправлены' : '✗ Отсеяны'))
+      }, f === 'all' ? 'Все' : f === 'sent' ? '✓ Отправлены' : '✗ Отсеяны')),
+      h('input', {
+        type: 'text',
+        className: 'dec-search',
+        placeholder: '🔍 Поиск по заголовку, источнику, категории, chat_id...',
+        value: search,
+        onChange: e => setSearch(e.target.value),
+      }),
+      search && h('button', {
+        className: 'dec-search-clear',
+        onClick: () => setSearch(''),
+        title: 'Очистить поиск',
+      }, '✕'),
+      search && h('span', {
+        style: { fontSize: 12, color: 'var(--text2)' },
+      }, 'найдено: ' + items.length + ' / ' + allItems.length)
     ),
     h('div', { className: 'dec-reason-row' },
       Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([r, n]) => {
@@ -3201,7 +3235,9 @@ function DecisionsPage() {
     // List
     items.length === 0
       ? h('div', { className: 'empty', style: { padding: 40 } },
-          'Пока нет решений — сканер ещё ни разу не гонял алерт-гейт.')
+          q
+            ? 'По запросу «' + search + '» ничего не найдено в ' + allItems.length + ' решениях.'
+            : 'Пока нет решений — сканер ещё ни разу не гонял алерт-гейт.')
       : h('div', { className: 'dec-list' },
           items.map((d, i) => {
             const lbl = DECISION_LABELS[d.reason] || { color: 'var(--text2)', text: d.reason };
