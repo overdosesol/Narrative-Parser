@@ -203,37 +203,67 @@ export const PRESET_FIELD_RANGES = Object.freeze({
 export const DEFAULT_PRESET_CONFIGS = Object.freeze({
   general: {
     sources: {
+      // ── Sources are a CURATED MIX from animals/culture/celebrities/events
+      // — 2-3 picks per theme — instead of the previous broad-firehose model
+      // (r/all + r/popular + word-soup queries + generic fyp hashtags). The
+      // firehose approach drowned the feed in low-quality junk; themed
+      // presets work well because their inputs are pre-filtered by topic.
+      // General now inherits that curation from all 4, evenly distributed.
       reddit: {
-        // Dropped: interestingasfuck (overlap with Damnthatsinteresting), BeAmazed (low activity).
-        // Added: funny (largest comedy hub), mildlyinteresting (deep variety),
-        //        wholesomememes (positive viral, broad appeal).
+        // 11 subs total: 2 animals + 3 culture + 2 celebrities + 2 events +
+        // 2 broad universal (Damnthatsinteresting / nextfuckinglevel —
+        // surprise/awe content that fits no theme but reliably goes viral).
         subreddits: [
-          'all', 'popular', 'Damnthatsinteresting', 'nextfuckinglevel',
-          'funny', 'mildlyinteresting', 'wholesomememes',
+          // animals (broadest from animals preset)
+          'aww', 'NatureIsFuckingLit',
+          // culture (largest, most universal meme hubs)
+          'memes', 'dankmemes', 'Unexpected',
+          // celebrities (broadest pop-culture hubs)
+          'popculturechat', 'movies',
+          // events (breaking news + weird-real)
+          'worldnews', 'nottheonion',
+          // universal awe/surprise — kept from old General
+          'Damnthatsinteresting', 'nextfuckinglevel',
         ],
-        minUpvotes:        10000,  // r/all/popular have massive volume — bar must be high
+        // Mid-bar — themed subs are smaller-volume than r/all's 10K hurdle,
+        // but bigger than animals' 3K floor. 5K balances quality vs miss-rate.
+        minUpvotes:        5000,
         postsPerSubreddit: 50,
       },
       twitter: {
-        // Word-soup queries left intact — they catch ANY viral content via
-        // common particles across 6 language families. Adding theme keywords
-        // would narrow the broad-net intent.
+        // 6 queries — 1-2 per theme. Themed keywords replaced the previous
+        // word-soup ("a OR the OR is OR to") that pulled ANY viral tweet
+        // regardless of topic. Each query lifted from its respective preset.
         queries: [
-          '(a OR the OR is OR to OR in) min_faves:10000 -is:retweet',
-          '(de OR la OR el OR que OR en OR и OR я OR на OR не OR что) min_faves:10000 -is:retweet',
-          '(when OR where OR why OR how OR who) min_faves:10000 -is:retweet',
-          '(you OR me OR my OR we OR our) min_faves:10000 -is:retweet',
-          '(this OR that OR it OR was OR has) min_faves:10000 -is:retweet',
-          '(の OR は OR を OR が OR に OR で OR 이 OR 가 OR 는 OR 的 OR 是 OR 了) min_faves:10000 -is:retweet',
+          // animals — combined dog/cat/pet net (single query saves 1 slot)
+          '(dog OR puppy OR cat OR kitten OR pet OR animal) min_faves:10000 -is:retweet',
+          // culture — generic meme + 2025-2026 slang (both proven in culture preset)
+          '(meme OR memes OR viral OR trend) min_faves:10000 -is:retweet',
+          '(skibidi OR delulu OR rizz OR aura OR brainrot OR mewing) min_faves:10000 -is:retweet',
+          // celebrities — entertainment + music (combined for breadth)
+          '(movie OR film OR series OR netflix OR album OR music OR celebrity) min_faves:10000 -is:retweet',
+          // events — breaking + AI/tech (highest signal categories)
+          '(breaking OR "breaking news" OR happening OR urgent OR alert) min_faves:10000 -is:retweet',
+          '(AI OR ChatGPT OR robot OR artificial intelligence) min_faves:10000 -is:retweet',
         ],
       },
       tiktok: {
-        // FULL REPLACEMENT (was 100% crypto-only): now generic viral discovery.
-        // memecoin/solana/cryptomeme were a leftover from a crypto-focused
-        // earlier era — they fit nowhere in the 5 thematic presets.
-        hashtags: ['fyp', 'viral', 'trending', 'foryou', 'foryoupage', 'funny', 'tiktok', 'explore', 'comedy', 'relatable'],
+        // 10 hashtags — 2-3 per theme. Replaced the generic fyp/viral/trending
+        // bag that's basically TikTok's whole platform with curated themed tags.
+        hashtags: [
+          // animals
+          'cuteanimals', 'funnyanimals',
+          // culture
+          'meme', 'viral', 'brainrot',
+          // celebrities
+          'celebnews', 'popculture',
+          // events
+          'news', 'breakingnews', 'tech',
+        ],
       },
-      // X Trends — broad cast, take top 20 (covers most of US live trends)
+      // X Trends — broad cast, take top 20 (covers most of US live trends).
+      // Note: per-preset topN is currently informational only; X Trends rework
+      // 2026-05-05 hardcoded top-3 via env. Kept here for forward-compat.
       xtrends:      { enabled: 1, topN: 20 },
       googletrends: {},
     },

@@ -2378,49 +2378,95 @@ function ScannersPage() {
 
     // Pipeline flow moved to the global topbar (StatusBar) — visible from every page.
 
-    // Scanner tuning config (presets, thresholds, storage floor)
-    React.createElement(ScannerConfigSection, null),
+    // ── Collapsible accordions ──────────────────────────────────────────────
+    // Each big section is wrapped in details with the same pcfg-accordion
+    // styling as the Пресеты tab — gives the Сканеры tab matching compact /
+    // collapsible feel. open defaults are tuned by access frequency:
+    //   - Площадки + Конфиг сканера: open (most common ops)
+    //   - PreStage / HotRefresh / JunkStats: closed by default
 
-    // PreStage (Stage 0) sub-stage toggles — currently a kill-switch for
-    // the gpt-5.4-nano text enrichment, A/B-tested against value vs latency.
-    React.createElement(PreStageSection, null),
-
-    // Hot trends refresh loop — periodic re-fetch + re-score of recent
-    // borderline trends so they can ripen into Stage 2 as engagement grows.
-    React.createElement(HotRefreshSection, null),
-
-    // Rolling stats on what junk-filter is actually filtering out.
-    // (Per-preset junk weights moved to the "🎛️ Пресеты" tab in PR-2.)
-    React.createElement(JunkStatsSection, null),
-
-    // Per-platform collector cards
-    React.createElement('div', { className: 'adm-card' },
-      React.createElement('h3', { style: { marginBottom: 16 } }, '📡 Площадки'),
-      React.createElement('div', { className: 'collector-grid' },
-        (state?.collectors || []).map(c =>
-          React.createElement('div', {
-            key: c.name,
-            className: 'collector-card ' + (c.enabled ? 'enabled' : 'disabled')
-          },
-            React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' } },
-              React.createElement('div', null,
-                React.createElement('div', { className: 'collector-icon' }, c.icon),
-                React.createElement('div', { className: 'collector-name', style: { marginTop: 8 } }, c.label)
+    // Per-platform collector cards (open — primary toggle surface)
+    React.createElement('details', { className: 'pcfg-accordion', open: true },
+      React.createElement('summary', { className: 'pcfg-accordion-summary' },
+        React.createElement('span', null, '📡 Площадки'),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+          enabledCount + ' / ' + collectors.length + ' активны')
+      ),
+      React.createElement('div', { className: 'pcfg-accordion-body' },
+        React.createElement('div', { className: 'collector-grid' },
+          (state?.collectors || []).map(c =>
+            React.createElement('div', {
+              key: c.name,
+              className: 'collector-card ' + (c.enabled ? 'enabled' : 'disabled')
+            },
+              React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' } },
+                React.createElement('div', null,
+                  React.createElement('div', { className: 'collector-icon' }, c.icon),
+                  React.createElement('div', { className: 'collector-name', style: { marginTop: 8 } }, c.label)
+                ),
+                React.createElement('label', { className: 'toggle' },
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    checked: c.enabled,
+                    onChange: () => toggleCollector(c.name)
+                  }),
+                  React.createElement('span', { className: 'toggle-slider' })
+                )
               ),
-              React.createElement('label', { className: 'toggle' },
-                React.createElement('input', {
-                  type: 'checkbox',
-                  checked: c.enabled,
-                  onChange: () => toggleCollector(c.name)
-                }),
-                React.createElement('span', { className: 'toggle-slider' })
+              React.createElement('div', { className: 'collector-status ' + (c.enabled ? 'on' : 'off') },
+                c.enabled ? '● Активен' : '○ Отключён'
               )
-            ),
-            React.createElement('div', { className: 'collector-status ' + (c.enabled ? 'on' : 'off') },
-              c.enabled ? '● Активен' : '○ Отключён'
             )
           )
         )
+      )
+    ),
+
+    // Scanner tuning config (presets, twitter actor, thresholds) — open: most-tweaked
+    React.createElement('details', { className: 'pcfg-accordion', open: true },
+      React.createElement('summary', { className: 'pcfg-accordion-summary' },
+        React.createElement('span', null, '🎯 Конфиг сканера'),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+          'Пресет · Twitter actor · Stage 2 · Twitter-возраст')
+      ),
+      React.createElement('div', { className: 'pcfg-accordion-body' },
+        React.createElement(ScannerConfigSection, null)
+      )
+    ),
+
+    // PreStage (Stage 0) — closed: A/B test, rarely flipped
+    React.createElement('details', { className: 'pcfg-accordion' },
+      React.createElement('summary', { className: 'pcfg-accordion-summary' },
+        React.createElement('span', null, '🎨 Stage 0 — PreStage'),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+          'Nano + Gemini обогащение')
+      ),
+      React.createElement('div', { className: 'pcfg-accordion-body' },
+        React.createElement(PreStageSection, null)
+      )
+    ),
+
+    // Hot trends refresh — closed: status display + trigger button
+    React.createElement('details', { className: 'pcfg-accordion' },
+      React.createElement('summary', { className: 'pcfg-accordion-summary' },
+        React.createElement('span', null, '🔁 Обновление горячих трендов'),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+          'Heavy + light циклы')
+      ),
+      React.createElement('div', { className: 'pcfg-accordion-body' },
+        React.createElement(HotRefreshSection, null)
+      )
+    ),
+
+    // Junk-filter stats — closed: read-only observability
+    React.createElement('details', { className: 'pcfg-accordion' },
+      React.createElement('summary', { className: 'pcfg-accordion-summary' },
+        React.createElement('span', null, '📊 Junk-filter наблюдение'),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+          'Что фильтруется и почему')
+      ),
+      React.createElement('div', { className: 'pcfg-accordion-body' },
+        React.createElement(JunkStatsSection, null)
       )
     )
   );
@@ -2450,9 +2496,7 @@ function ScannerConfigSection() {
     setSaving(false);
   };
 
-  if (!cfg) return h('div', { className: 'adm-card', style: { marginBottom: 20 } },
-    h('div', { className: 'loading' }, 'Загрузка конфига сканера...')
-  );
+  if (!cfg) return h('div', { className: 'loading' }, 'Загрузка конфига сканера...');
 
   const PRESETS = [
     { id: 'general',     icon: '🌐', label: 'Общий',        hint: 'Ультра-широкий поиск на всех языках' },
@@ -2494,8 +2538,10 @@ function ScannerConfigSection() {
     })
   );
 
-  return h('div', { className: 'adm-card', style: { marginBottom: 20 } },
-    h('h3', { style: { marginBottom: 6 } }, '🎯 Конфиг сканера'),
+  // Body content only — outer wrapper + h3 title are rendered by the
+  // accordion <summary> in ScannersPage to keep the Сканеры tab compact and
+  // collapsible (matching the Пресеты tab pattern).
+  return h('div', null,
     h('p', { style: { color: 'var(--muted)', fontSize: 13, marginBottom: 18 } },
       'Пресет поиска + пороги для алертов/хранения. Применяется со следующего цикла сканера.'),
 
@@ -2655,8 +2701,8 @@ function PreStageSection() {
     }
   };
 
-  return h('div', { className: 'adm-card', style: { marginTop: 16 } },
-    h('h3', { style: { marginBottom: 6 } }, '🎨 Stage 0 — PreStage'),
+  // Body content only — wrapper + title rendered by the accordion summary.
+  return h('div', null,
     h('p', {
       style: { fontSize: 12, color: 'var(--text3)', marginBottom: 16, lineHeight: 1.5 }
     }, 'Подготовка контекста перед скорингом. Текущий A/B: проверяем нужен ли nano-классификатор или Stage 1 (gpt-5.4-mini) справляется сам.'),
@@ -2850,8 +2896,8 @@ function HotRefreshSection() {
   const intervalMin = status?.intervalMin || 120;
   const isRunning = !!status?.running;
 
-  return h('div', { className: 'adm-card', style: { marginTop: 16 } },
-    h('h3', { style: { marginBottom: 6 } }, '🔁 Обновление горячих трендов'),
+  // Body content only — wrapper + title rendered by the accordion summary.
+  return h('div', null,
     h('p', {
       style: { fontSize: 12, color: 'var(--text3)', marginBottom: 16, lineHeight: 1.5 }
     },
@@ -2992,11 +3038,12 @@ function JunkStatsSection() {
     // eslint-disable-next-line
   }, [hours]);
 
-  return h('div', { className: 'adm-card', style: { marginBottom: 20 } },
+  // Body content only — wrapper + title rendered by the accordion summary.
+  // The hour-range picker stays here (it's an inline control, not a header).
+  return h('div', null,
     h('div', {
-      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 8 }
+      style: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 8 }
     },
-      h('h3', { style: { margin: 0 } }, '📊 Junk-filter наблюдение'),
       h('div', { style: { display: 'flex', gap: 4 } },
         [6, 24, 72, 168].map(hrs =>
           h('button', {
