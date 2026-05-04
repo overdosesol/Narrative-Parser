@@ -61,17 +61,33 @@ export function formatTelegramAlert(trend, lang = 'en') {
 
   if (trend.metrics) {
     const m = trend.metrics;
-    const hasEngagement = m.upvotes || m.comments || m.formattedTraffic;
+    const src = (trend.source || '').toLowerCase();
+    // X Trends carry tweet-aggregated engagement (views/likes/retweets) instead
+    // of upvotes. Render the rich row (views + likes + retweets) inline like
+    // the X-analysis section below — single number is misleading because the
+    // trend's signal is the *combination*.
+    const isXTrend = src === 'x_trends' && (m.views || m.likes || m.retweets);
+    const hasEngagement = isXTrend || m.upvotes || m.comments || m.formattedTraffic;
     if (hasEngagement) msg += DIV + '\n';
-    if (m.upvotes) {
-      const src = (trend.source || '').toLowerCase();
+
+    if (isXTrend) {
+      const parts = [];
+      if (m.views    > 0) parts.push(`\u{1F441} <b>${formatNumber(m.views)}</b>`);
+      if (m.likes    > 0) parts.push(`\u{2764}\u{FE0F} <b>${formatNumber(m.likes)}</b>`);
+      if (m.retweets > 0) parts.push(`\u{1F501} <b>${formatNumber(m.retweets)}</b>`);
+      if (m.replies  > 0) parts.push(`\u{1F4AC} <b>${formatNumber(m.replies)}</b>`);
+      if (parts.length) {
+        const tw = m.tweetsCount || (m.topTweets ? m.topTweets.length : 0);
+        msg += parts.join('  ') + (tw > 0 ? `  ·  ${tw} tweets\n` : '\n');
+      }
+    } else if (m.upvotes) {
       const count = formatNumber(m.upvotes);
       const vel   = formatNumber(m.velocity || 0);
       if (src === 'twitter')      msg += t.alertLikes(count, vel) + '\n';
       else if (src === 'tiktok')  msg += t.alertPlays(count, vel) + '\n';
       else                        msg += t.alertUpvotes(count, vel) + '\n';
     }
-    if (m.comments) msg += t.alertComments(formatNumber(m.comments)) + '\n';
+    if (m.comments && !isXTrend) msg += t.alertComments(formatNumber(m.comments)) + '\n';
     if (m.formattedTraffic) msg += t.alertGoogleTraffic(escHtml(m.formattedTraffic)) + '\n';
 
     if (m.twitter && m.twitter.tweetCount > 0) {

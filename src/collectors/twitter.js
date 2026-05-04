@@ -199,7 +199,22 @@ class TwitterCollector extends BaseCollector {
     return picked;
   }
 
-  async _searchQuery(query) {
+  /**
+   * Public single-query helper for external callers (e.g. XTrendsCollector
+   * ingesting top X-trends and pulling real tweets per trend). Internal
+   * `collect()` always uses `_searchQuery` directly with the per-instance cap.
+   *
+   * `opts.relaxedFloor=true` — softens the 500K-views / 10K-likes floor in
+   * `_normalize` to 10K-views / 500-likes. Use case: X Trends top-tweet pulls,
+   * where the trending status is itself a quality signal and tweets needn't
+   * clear the firehose-grade bar.
+   */
+  async searchByQuery(query, maxItems, opts = {}) {
+    if (!this.enabled) return [];
+    return this._searchQuery(query, maxItems, opts);
+  }
+
+  async _searchQuery(query, maxItems, opts = {}) {
     const { name: actorName, def: actor, key: apiKey } = this._activeActor();
     if (!apiKey) {
       throw new Error(`[Twitter] No API key configured for actor '${actorName}'`);
@@ -208,8 +223,10 @@ class TwitterCollector extends BaseCollector {
     // err.message can never leak the API key (see tiktok.js for the same fix).
     const runUrl = `https://api.apify.com/v2/acts/${actor.id}/run-sync-get-dataset-items?timeout=${TIMEOUT_SECS}`;
 
-    // Per-actor input shape. Both return identical engagement fields.
-    const input = actor.buildInput(query, this.maxItemsPerQuery);
+    // Per-actor input shape. Both return identical engagement fields. The
+    // optional maxItems arg lets callers (X Trends discovery) ask for a smaller
+    // batch than the default cycle cap.
+    const input = actor.buildInput(query, maxItems || this.maxItemsPerQuery);
 
     const response = await fetch(runUrl, {
       method: 'POST',
@@ -230,10 +247,10 @@ class TwitterCollector extends BaseCollector {
     const tweets = await response.json();
     if (!Array.isArray(tweets)) return [];
 
-    return tweets.map(t => this._normalize(t, query)).filter(Boolean);
+    return tweets.map(t => this._normalize(t, query, opts)).filter(Boolean);
   }
 
-  _normalize(tweet, query) {
+  _normalize(tweet, query, opts = {}) {
     if (!tweet) return null;
 
     const id   = tweet.id || tweet.tweet_id || tweet.rest_id;
@@ -286,8 +303,11 @@ class TwitterCollector extends BaseCollector {
     //     genuinely on-trend (idol launches, anime/game IP)
     const cjkScript = _detectCjkScript(text);
     const cjkMult   = cjkScript === 'zh' ? 4 : cjkScript ? 2 : 1;
-    const viewsBar  = 500_000 * cjkMult;
-    const likesBar  = 10_000  * cjkMult;
+    // Relaxed floor: X-Trends top-tweet pulls bypass the firehose-grade bar
+    // (the trending position already certifies quality). Soft bar still applied
+    // so total noise (zero-engagement bots, etc.) doesn't slip through.
+    const viewsBar  = (opts.relaxedFloor ? 10_000 : 500_000) * cjkMult;
+    const likesBar  = (opts.relaxedFloor ? 500    : 10_000)  * cjkMult;
     const meetsBar  = views > 0 ? views >= viewsBar : likes >= likesBar;
     if (!meetsBar) return null;
 

@@ -135,10 +135,14 @@ if (config.googleTrends.enabled) collectors.push(new GoogleTrendsCollector(confi
 if (config.twitter.enabled)      collectors.push(new TwitterCollector(config, logger, db));
 if (config.tiktok.enabled)       collectors.push(new TikTokCollector(config, logger, db));
 
-// X Trends — separate refresh cadence (30 min) decoupled from main cycle.
-// Internally fetches Apify on its own timer + caches the result; collect()
-// returns a diff. Kill switch: env X_TRENDS_ENABLED=0 OR per-preset xtrends.enabled=0.
-const xTrendsCollector = new XTrendsCollector(config, logger, db);
+// X Trends — discovery layer (daily): pulls top-3 trending hashtags via Apify
+// `karamelo/twitter-trends-scraper`, then for each calls TwitterCollector's
+// scraper actor to fetch the top 7 real tweets — those flow into the pipeline
+// as regular twitter items with real engagement. Needs a TwitterCollector ref
+// for searchByQuery(); if Twitter is disabled, X Trends self-disables.
+// Kill switches: env X_TRENDS_ENABLED=0 OR per-preset xtrends.enabled=0.
+const twitterInstance = collectors.find(c => c.name === 'Twitter') || null;
+const xTrendsCollector = new XTrendsCollector(config, logger, db, twitterInstance);
 if (xTrendsCollector.enabled) {
   collectors.push(xTrendsCollector);
   xTrendsCollector.startRefreshTimer();

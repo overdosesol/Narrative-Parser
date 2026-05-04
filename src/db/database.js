@@ -1321,6 +1321,215 @@ class TrendDatabase {
     return true;
   }
 
+  /**
+   * Update Twitter engagement metrics (views/likes/retweets/replies) on the
+   * trend row(s) whose URL points to the given tweet ID. Used by the
+   * dashboard hover-preview: when fxtwitter returns fresh numbers, we cache
+   * them back to the DB so the next feed render shows current data instead
+   * of the stale snapshot taken at scrape time.
+   *
+   * Why URL-based lookup (not external_id): different collectors normalize
+   * tweet identifiers differently (some store the bare numeric ID, others
+   * include the user prefix), but every Twitter row has the canonical
+   * /status/<id> URL — that's the most reliable join key.
+   *
+   * Returns the number of rows actually updated. Multiple rows can match
+   * (rare — e.g. if the same tweet was re-clustered), all get the fresh
+   * numbers.
+   *
+   * Each individual field is null-safe: if fxtwitter doesn't surface a
+   * particular metric, we leave the existing one untouched (don't overwrite
+   * with null and lose data).
+   */
+  updateTwitterEngagement(tweetId, fresh) {
+    if (!tweetId || typeof tweetId !== 'string' || !/^\d+$/.test(tweetId)) {
+      return 0;
+    }
+    if (!fresh || typeof fresh !== 'object') return 0;
+
+    // LIKE pattern is robust: matches both twitter.com/u/status/<id> and
+    // x.com/u/status/<id>, with or without trailing query/fragment.
+    // Also pull first_seen_at — it's the natural baseline timestamp when
+    // we don't yet have a prior _engSnapshot (first-ever hover refresh).
+    const rows = this.db.prepare(
+      `SELECT id, raw_metrics, first_seen_at FROM trends WHERE url LIKE ?`
+    ).all('%/status/' + tweetId + '%');
+
+    if (!rows.length) return 0;
+
+    const updateStmt = this.db.prepare(
+      `UPDATE trends SET raw_metrics = ? WHERE id = ?`
+    );
+
+    const nowMs   = Date.now();
+    const nowIso  = new Date(nowMs).toISOString();
+    const result = { rows: 0, velocity: null };
+
+    for (const row of rows) {
+      let metrics = {};
+      try { metrics = JSON.parse(row.raw_metrics || '{}'); } catch { continue; }
+
+      // ── Velocity: Δviews / Δhours since the last sample we have ──────
+      // Sample order of preference:
+      //   1) Previous _engSnapshot (set on a prior refresh) — most accurate
+      //      because it represents the actual rate between hovers.
+      //   2) Original metrics.views captured at scrape time + first_seen_at.
+      //      Less precise (views weren't always sampled exactly at scrape
+      //      time, and sometimes scraper sets views=0), but lets us derive
+      //      a useful number on the FIRST hover after scrape.
+      // Skip update if Δviews is non-positive (scraper rounding / cached
+      // higher value) or gap < 5 min (too noisy).
+      let computedVelocity = null;
+      const freshViews = (typeof fresh.views === 'number' && fresh.views >= 0) ? fresh.views : null;
+      if (freshViews !== null) {
+        const prevSnap = metrics._engSnapshot;
+        let baselineViews = null, baselineMs = null;
+        if (prevSnap && typeof prevSnap.views === 'number' && typeof prevSnap.ts === 'number') {
+          baselineViews = prevSnap.views;
+          baselineMs    = prevSnap.ts;
+        } else if (typeof metrics.views === 'number' && row.first_seen_at) {
+          baselineViews = metrics.views;
+          baselineMs    = Date.parse(row.first_seen_at) || null;
+        }
+        if (baselineMs && baselineViews !== null) {
+          const gapMs = nowMs - baselineMs;
+          const dV    = freshViews - baselineViews;
+          // 5-min minimum gap filters out hover-spam producing wildly
+          // variable per-hour numbers; positive Δ guards against view
+          // counter rollback.
+          if (gapMs >= 5 * 60_000 && dV > 0) {
+            const gapHours = gapMs / 3_600_000;
+            computedVelocity = dV / gapHours;
+          }
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────
+
+      // Patch primary metrics — only when fxtwitter returned a valid number.
+      const patch = (key, val) => {
+        if (typeof val !== 'number' || !Number.isFinite(val) || val < 0) return;
+        metrics[key] = val;
+      };
+      patch('views',    fresh.views);
+      patch('likes',    fresh.likes);
+      patch('retweets', fresh.retweets);
+      patch('replies',  fresh.replies);
+
+      if (computedVelocity !== null) {
+        // Round to 1 decimal — the dashboard's fmtVelocity already does this
+        // for display, but persisted values stay tidy.
+        metrics.velocity = Math.round(computedVelocity * 10) / 10;
+        result.velocity = metrics.velocity;
+      }
+
+      // Snapshot for the NEXT velocity computation (window-style sampling).
+      // Always advance, even when we didn't compute a new velocity this time
+      // (e.g. gap too short) — otherwise the snapshot would never refresh.
+      if (freshViews !== null) {
+        metrics._engSnapshot = { views: freshViews, likes: fresh.likes ?? null, ts: nowMs };
+      }
+      // Tag the freshness so we can later distinguish "from collector" vs
+      // "refreshed via hover" if anyone audits the data.
+      metrics.engagementRefreshedAt = nowIso;
+
+      updateStmt.run(JSON.stringify(metrics), row.id);
+      result.rows++;
+    }
+    // Return both row count and the freshly computed velocity (or null if
+    // we kept the old one) — the caller forwards it to the SSE/event so
+    // clients can update their UI without a full refetch.
+    return result;
+  }
+
+  /**
+   * Reddit equivalent of updateTwitterEngagement. Match by post_id (extracted
+   * from /comments/<post_id>/ in the URL). Patches upvotes/comments and
+   * computes velocity (Δupvotes / Δhours) using the same snapshot strategy.
+   *
+   * Reddit URL shapes we accept:
+   *   https://reddit.com/r/Sub/comments/abc123/...
+   *   https://www.reddit.com/r/Sub/comments/abc123
+   *   https://old.reddit.com/r/Sub/comments/abc123/...
+   * Post IDs are base36 (alphanumeric), typically 6-7 chars.
+   */
+  updateRedditEngagement(postId, fresh) {
+    if (!postId || typeof postId !== 'string' || !/^[a-z0-9]{4,12}$/i.test(postId)) {
+      return { rows: 0, velocity: null };
+    }
+    if (!fresh || typeof fresh !== 'object') return { rows: 0, velocity: null };
+
+    const rows = this.db.prepare(
+      `SELECT id, raw_metrics, first_seen_at FROM trends WHERE url LIKE ?`
+    ).all('%/comments/' + postId + '%');
+
+    if (!rows.length) return { rows: 0, velocity: null };
+
+    const updateStmt = this.db.prepare(
+      `UPDATE trends SET raw_metrics = ? WHERE id = ?`
+    );
+
+    const nowMs  = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const result = { rows: 0, velocity: null };
+
+    for (const row of rows) {
+      let metrics = {};
+      try { metrics = JSON.parse(row.raw_metrics || '{}'); } catch { continue; }
+
+      // Velocity: Δupvotes / Δhours since last sample. Reddit's primary
+      // engagement signal is the score (upvotes minus downvotes), exposed
+      // as `metrics.upvotes` in our shape. Same windowing as Twitter:
+      // baseline = previous _engSnapshot OR (metrics.upvotes + first_seen_at)
+      // on the very first refresh.
+      let computedVelocity = null;
+      const freshUp = (typeof fresh.upvotes === 'number' && fresh.upvotes >= 0) ? fresh.upvotes : null;
+      if (freshUp !== null) {
+        const prevSnap = metrics._engSnapshot;
+        let baseUp = null, baseMs = null;
+        if (prevSnap && typeof prevSnap.upvotes === 'number' && typeof prevSnap.ts === 'number') {
+          baseUp = prevSnap.upvotes;
+          baseMs = prevSnap.ts;
+        } else if (typeof metrics.upvotes === 'number' && row.first_seen_at) {
+          baseUp = metrics.upvotes;
+          baseMs = Date.parse(row.first_seen_at) || null;
+        }
+        if (baseMs && baseUp !== null) {
+          const gapMs = nowMs - baseMs;
+          const dU    = freshUp - baseUp;
+          if (gapMs >= 5 * 60_000 && dU > 0) {
+            const gapHours = gapMs / 3_600_000;
+            computedVelocity = dU / gapHours;
+          }
+        }
+      }
+
+      const patch = (key, val) => {
+        if (typeof val !== 'number' || !Number.isFinite(val) || val < 0) return;
+        metrics[key] = val;
+      };
+      patch('upvotes',  fresh.upvotes);
+      patch('comments', fresh.comments);
+
+      if (computedVelocity !== null) {
+        metrics.velocity = Math.round(computedVelocity * 10) / 10;
+        result.velocity = metrics.velocity;
+      }
+
+      // Snapshot stores upvotes (Reddit) — we keep the field names
+      // platform-specific so a tweet refresh and a reddit refresh on the
+      // same row (shouldn't happen but defensively) don't mix Twitter
+      // views with Reddit upvotes.
+      if (freshUp !== null) {
+        metrics._engSnapshot = { upvotes: freshUp, comments: fresh.comments ?? null, ts: nowMs };
+      }
+      metrics.engagementRefreshedAt = nowIso;
+
+      updateStmt.run(JSON.stringify(metrics), row.id);
+      result.rows++;
+    }
+    return result;
+  }
+
   cleanup(daysOld = 30) {
     const alertResult = this.cleanupAlerts(daysOld);
     const cutoff = alertResult.cutoff;

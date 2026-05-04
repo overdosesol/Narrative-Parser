@@ -129,6 +129,217 @@ function sqliteCutoff(msAgo) {
   return new Date(Date.now() - msAgo).toISOString().slice(0, 19).replace('T', ' ');
 }
 
+// ─── Tweet preview (hover popups) ─────────────────────────────────────────────
+// Lightweight in-memory cache keyed by tweet ID. The dashboard's hover-preview
+// feature (added 2026-05-04) shows a card when the user hovers a tweet link.
+// Source of truth: api.fxtwitter.com — open, no auth, returns clean JSON with
+// text/author/media/metrics. Same backend Discord and Telegram use to render
+// tweet cards, so the format is well-tested.
+//
+// LRU is overkill for ≤500 entries; a Map + age check + simple eviction does
+// the job. TTL is short (5 min) because tweet metrics drift, but author/text
+// don't, so even a stale read is "fine enough" for hover UX. Cache survives
+// only in-memory (process restart loses it) — that's intentional, no DB write
+// pressure for ephemeral hover data.
+const tweetPreviewCache = new Map();          // id → { data, ts, status }
+const TWEET_PREVIEW_TTL_MS  = 5 * 60_000;
+const TWEET_PREVIEW_NEG_TTL_MS = 30_000;       // 404/error: re-try sooner
+const TWEET_PREVIEW_MAX     = 500;
+
+function tweetPreviewCacheSet(id, status, data) {
+  if (tweetPreviewCache.size >= TWEET_PREVIEW_MAX) {
+    // Evict oldest 10% — cheaper than per-insert LRU bookkeeping for this size
+    const drop = Math.ceil(TWEET_PREVIEW_MAX * 0.1);
+    let i = 0;
+    for (const k of tweetPreviewCache.keys()) {
+      tweetPreviewCache.delete(k);
+      if (++i >= drop) break;
+    }
+  }
+  tweetPreviewCache.set(id, { status, data, ts: Date.now() });
+}
+
+function extractTweetId(url) {
+  if (!url) return null;
+  const m = String(url).match(/(?:twitter\.com|x\.com)\/[^/]+\/status\/(\d+)/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Normalize fxtwitter response to a stable shape the frontend can render
+ * without knowing about provider quirks. We pick only what the hover card
+ * shows; everything else (entities, polls, quoted_tweet) gets dropped.
+ */
+function normalizeFxTweet(t) {
+  if (!t || typeof t !== 'object') return null;
+  const author = t.author || {};
+  const media  = t.media || {};
+  // fxtwitter exposes photos/videos arrays; flatten into a single ordered list.
+  const photos = Array.isArray(media.photos) ? media.photos.map(p => ({
+    type: 'photo', url: p.url, width: p.width || null, height: p.height || null,
+  })) : [];
+  const videos = Array.isArray(media.videos) ? media.videos.map(v => ({
+    type: 'video', url: v.url, thumbnail: v.thumbnail_url || null,
+    width: v.width || null, height: v.height || null,
+  })) : [];
+  return {
+    id: String(t.id || ''),
+    url: t.url || '',
+    text: String(t.text || '').slice(0, 1000),
+    createdAt: t.created_timestamp ? t.created_timestamp * 1000 : null,
+    author: {
+      name: author.name || '',
+      screenName: author.screen_name || '',
+      avatarUrl: author.avatar_url || null,
+      followers: typeof author.followers === 'number' ? author.followers : null,
+    },
+    media: [...photos, ...videos],
+    metrics: {
+      likes:    typeof t.likes    === 'number' ? t.likes    : null,
+      retweets: typeof t.retweets === 'number' ? t.retweets : null,
+      replies: typeof t.replies   === 'number' ? t.replies  : null,
+      views:    typeof t.views    === 'number' ? t.views    : null,
+    },
+  };
+}
+
+// ─── Reddit preview (parallel pipeline to Twitter) ────────────────────────────
+// Same idea as the Twitter cache above, but for Reddit posts. Uses Reddit's
+// free public JSON API (https://reddit.com/comments/<id>.json) — no auth, no
+// rate-limit auth header needed for moderate read traffic with a polite UA.
+const redditPreviewCache = new Map();
+const REDDIT_PREVIEW_TTL_MS     = 5 * 60_000;
+const REDDIT_PREVIEW_NEG_TTL_MS = 30_000;
+const REDDIT_PREVIEW_MAX        = 500;
+
+function redditPreviewCacheSet(id, status, data) {
+  if (redditPreviewCache.size >= REDDIT_PREVIEW_MAX) {
+    const drop = Math.ceil(REDDIT_PREVIEW_MAX * 0.1);
+    let i = 0;
+    for (const k of redditPreviewCache.keys()) {
+      redditPreviewCache.delete(k);
+      if (++i >= drop) break;
+    }
+  }
+  redditPreviewCache.set(id, { status, data, ts: Date.now() });
+}
+
+function extractRedditPostId(url) {
+  if (!url) return null;
+  const m = String(url).match(/\/comments\/([a-z0-9]{4,12})(?:[/?#]|$)/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Normalize Reddit JSON response into the same shape the hover-preview
+ * frontend understands. Mirrors normalizeFxTweet — author/text/media/metrics
+ * with platform-appropriate field names.
+ */
+function normalizeRedditPost(post) {
+  if (!post || typeof post !== 'object') return null;
+  // Pick first preview image if available (Reddit serves multiple sizes;
+  // .source is full-res). Galleries we collapse to first item — hover card
+  // shouldn't have a carousel.
+  let imageUrl = null;
+  const direct = post.url_overridden_by_dest || post.url || '';
+  if (/\.(jpe?g|png|gif|webp)(\?|$)/i.test(direct)) imageUrl = direct;
+  else if (post.preview?.images?.[0]?.source?.url) imageUrl = post.preview.images[0].source.url;
+  else if (post.is_gallery && post.media_metadata && post.gallery_data?.items?.length) {
+    const firstId = post.gallery_data.items[0].media_id;
+    const item = firstId && post.media_metadata[firstId];
+    imageUrl = item?.s?.u || item?.s?.gif || null;
+  }
+
+  // Reddit awards: post.total_awards_received or post.all_awardings (length).
+  // We collapse into a single number for the hover card.
+  const awards = typeof post.total_awards_received === 'number'
+    ? post.total_awards_received
+    : (Array.isArray(post.all_awardings) ? post.all_awardings.length : 0);
+
+  return {
+    id: String(post.id || ''),
+    permalink: post.permalink ? ('https://reddit.com' + post.permalink) : '',
+    title: String(post.title || '').slice(0, 400),
+    text: String(post.selftext || '').slice(0, 1500),
+    createdAt: post.created_utc ? post.created_utc * 1000 : null,
+    author: {
+      name: post.author || '',
+      subreddit: post.subreddit || '',
+      // Reddit doesn't expose author avatar in the post JSON cheaply (would
+      // need a second fetch to /user/<u>/about.json). Skip for now — the
+      // hover card falls back to a letter avatar like Twitter does.
+      avatarUrl: null,
+    },
+    media: imageUrl ? [{ type: 'photo', url: imageUrl, width: null, height: null }] : [],
+    metrics: {
+      upvotes:   typeof post.score        === 'number' ? post.score        : (post.ups || null),
+      comments:  typeof post.num_comments === 'number' ? post.num_comments : null,
+      // Reddit doesn't expose per-post views in the public JSON. Leave null.
+      views:     null,
+      awards,
+      ratio:     typeof post.upvote_ratio === 'number' ? post.upvote_ratio : null,
+    },
+    nsfw: !!post.over_18,
+  };
+}
+
+/**
+ * Fetch reddit post by id (base36) using the public .json endpoint. No auth
+ * needed but a polite User-Agent is good citizenship — Reddit explicitly
+ * asks for descriptive UAs in their API guidelines.
+ */
+async function fetchRedditPreview(id) {
+  try {
+    const ctl = new AbortController();
+    const tm  = setTimeout(() => ctl.abort(), 3000);
+    const r = await fetch(`https://www.reddit.com/comments/${id}.json?raw_json=1`, {
+      headers: {
+        'User-Agent': 'CatalystBot/1.0 (+hover-preview)',
+        'Accept': 'application/json',
+      },
+      signal: ctl.signal,
+    });
+    clearTimeout(tm);
+    if (!r.ok) return { ok: false, status: r.status };
+    const j = await r.json();
+    // Response is [post_listing, comments_listing]. We only need the post.
+    const post = j?.[0]?.data?.children?.[0]?.data;
+    if (!post) return { ok: false, status: 502 };
+    const data = normalizeRedditPost(post);
+    if (!data) return { ok: false, status: 502 };
+    return { ok: true, status: 200, data };
+  } catch (e) {
+    return { ok: false, status: 599, error: String(e?.message || e) };
+  }
+}
+
+/**
+ * Fetch tweet preview from fxtwitter (with timeout). Returns
+ * { ok, data, status }. Never throws — always resolves so caller can cache
+ * negative results. ~200-500ms typical latency; 3s timeout is generous.
+ */
+async function fetchTweetPreview(id) {
+  try {
+    const ctl = new AbortController();
+    const tm  = setTimeout(() => ctl.abort(), 3000);
+    const r = await fetch(`https://api.fxtwitter.com/i/status/${id}`, {
+      headers: { 'User-Agent': 'CatalystBot/1.0 (+hover-preview)' },
+      signal: ctl.signal,
+    });
+    clearTimeout(tm);
+    if (!r.ok) return { ok: false, status: r.status };
+    const j = await r.json();
+    if (!j || j.code !== 200 || !j.tweet) {
+      return { ok: false, status: j?.code || 502 };
+    }
+    const data = normalizeFxTweet(j.tweet);
+    if (!data) return { ok: false, status: 502 };
+    return { ok: true, status: 200, data };
+  } catch (e) {
+    return { ok: false, status: 599, error: String(e?.message || e) };
+  }
+}
+
 /** Constant-time string comparison to prevent timing attacks */
 function safeEqual(a, b) {
   try {
@@ -436,6 +647,8 @@ class DashboardServer {
       if (path.match(/^\/api\/trends\/\d+$/) && method === 'GET') return this._handleTrend(req, res, path);
       if (path === '/api/stats'    && method === 'GET')  return this._handleStats(req, res, url);
       if (path === '/api/sources'  && method === 'GET')  return this._handleSources(req, res);
+      if (path === '/api/tweet-preview'  && method === 'GET') return this._handleTweetPreview(req, res, url);
+      if (path === '/api/reddit-preview' && method === 'GET') return this._handleRedditPreview(req, res, url);
       if (path === '/api/scan'     && method === 'POST') return this._handleScan(req, res);
       if (path === '/api/preview'   && method === 'GET')  return this._handlePreview(req, res, url);
       if (path === '/api/config'    && method === 'GET')  return this._handleConfig(req, res);
@@ -891,6 +1104,112 @@ class DashboardServer {
     });
 
     return json(res, 200, { sources: result });
+  }
+
+  /**
+   * GET /api/tweet-preview?id=<tweet_id>  OR  ?url=<full_tweet_url>
+   *
+   * Returns a normalized tweet card for the dashboard hover-preview popup.
+   * Cache-first: in-memory LRU with 5-min TTL (positive) / 30s TTL (negative).
+   * On miss → fxtwitter.com fetch (no API key, no auth).
+   *
+   * Auth: requires the same session cookie as the rest of /api/*. We rely on
+   * the global auth gate that wraps these routes (see _handle entry); no extra
+   * check here.
+   */
+  async _handleTweetPreview(req, res, url) {
+    const idParam  = url.searchParams.get('id') || '';
+    const urlParam = url.searchParams.get('url') || '';
+    const id = /^\d{5,25}$/.test(idParam) ? idParam : extractTweetId(urlParam);
+
+    if (!id) return json(res, 400, { error: 'Missing or invalid tweet id' });
+
+    // Cache hit
+    const cached = tweetPreviewCache.get(id);
+    if (cached) {
+      const ttl = cached.status === 200 ? TWEET_PREVIEW_TTL_MS : TWEET_PREVIEW_NEG_TTL_MS;
+      if (Date.now() - cached.ts < ttl) {
+        if (cached.status === 200) {
+          return json(res, 200, { ok: true, cached: true, tweet: cached.data });
+        }
+        return json(res, cached.status, { ok: false, cached: true });
+      }
+      tweetPreviewCache.delete(id);
+    }
+
+    const r = await fetchTweetPreview(id);
+    tweetPreviewCacheSet(id, r.status, r.ok ? r.data : null);
+
+    if (r.ok) {
+      // Persist fresh engagement back into the trend(s) with this tweet URL
+      // so the next /api/trends fetch shows current views/likes/RT/replies.
+      // Fire-and-forget — failure here must not break the preview response.
+      // The DB call is sync (better-sqlite3) so we don't even await; just
+      // try/catch so a malformed row doesn't 500 the user-facing endpoint.
+      //
+      // updateTwitterEngagement also computes velocity (Δviews / Δhours)
+      // from the previous snapshot and returns it so the client can patch
+      // its trend state without a full refetch.
+      let derivedVelocity = null;
+      try {
+        const upd = this.db.updateTwitterEngagement(id, r.data.metrics || {});
+        if (upd && typeof upd.velocity === 'number') derivedVelocity = upd.velocity;
+      } catch (e) {
+        this.logger.warn?.(`[TweetPreview] DB update failed for ${id}: ${e.message}`);
+      }
+      return json(res, 200, {
+        ok: true, cached: false, tweet: r.data, velocity: derivedVelocity,
+      });
+    }
+    return json(res, r.status >= 400 && r.status < 600 ? r.status : 502, {
+      ok: false, cached: false,
+    });
+  }
+
+  /**
+   * GET /api/reddit-preview?id=<post_id>  OR  ?url=<full_reddit_url>
+   *
+   * Reddit equivalent of /api/tweet-preview. Fetches from reddit.com's free
+   * .json endpoint, caches with the same LRU/TTL pattern, and pushes fresh
+   * upvotes/comments back to the trend row via db.updateRedditEngagement.
+   */
+  async _handleRedditPreview(req, res, url) {
+    const idParam  = url.searchParams.get('id') || '';
+    const urlParam = url.searchParams.get('url') || '';
+    const id = /^[a-z0-9]{4,12}$/i.test(idParam) ? idParam : extractRedditPostId(urlParam);
+
+    if (!id) return json(res, 400, { error: 'Missing or invalid reddit post id' });
+
+    const cached = redditPreviewCache.get(id);
+    if (cached) {
+      const ttl = cached.status === 200 ? REDDIT_PREVIEW_TTL_MS : REDDIT_PREVIEW_NEG_TTL_MS;
+      if (Date.now() - cached.ts < ttl) {
+        if (cached.status === 200) {
+          return json(res, 200, { ok: true, cached: true, post: cached.data });
+        }
+        return json(res, cached.status, { ok: false, cached: true });
+      }
+      redditPreviewCache.delete(id);
+    }
+
+    const r = await fetchRedditPreview(id);
+    redditPreviewCacheSet(id, r.status, r.ok ? r.data : null);
+
+    if (r.ok) {
+      let derivedVelocity = null;
+      try {
+        const upd = this.db.updateRedditEngagement(id, r.data.metrics || {});
+        if (upd && typeof upd.velocity === 'number') derivedVelocity = upd.velocity;
+      } catch (e) {
+        this.logger.warn?.(`[RedditPreview] DB update failed for ${id}: ${e.message}`);
+      }
+      return json(res, 200, {
+        ok: true, cached: false, post: r.data, velocity: derivedVelocity,
+      });
+    }
+    return json(res, r.status >= 400 && r.status < 600 ? r.status : 502, {
+      ok: false, cached: false,
+    });
   }
 
   _handleSettingsGet(req, res) {
@@ -1549,6 +1868,21 @@ class DashboardServer {
         }
         return v;
       })(),
+      // X Trends only: source tweets that fed this trend's aggregated metrics.
+      // Rendered in TrendModal as a clickable list. Trimmed to the fields the
+      // UI needs (no avatars / hashtags) — keeps the row payload small.
+      topTweets: Array.isArray(metrics.topTweets)
+        ? metrics.topTweets.slice(0, 10).map(t => ({
+            id:       t.id || null,
+            url:      t.url || null,
+            author:   t.author || null,
+            text:     (t.text || '').substring(0, 280),
+            views:    t.views    || 0,
+            likes:    t.likes    || 0,
+            retweets: t.retweets || 0,
+            replies:  t.replies  || 0,
+          }))
+        : null,
       feedback,
     };
   }
@@ -3469,27 +3803,78 @@ class DashboardServer {
     .search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-glow); }
     .search-input::placeholder { color: var(--dim); }
 
-    /* ── Toast notifications ── */
-    @keyframes toastIn  { from { opacity:0; transform: translateX(30px); } to { opacity:1; transform: translateX(0); } }
-    @keyframes toastOut { from { opacity:1; transform: translateX(0); }    to { opacity:0; transform: translateX(30px); } }
-    .toasts-wrap { position: fixed; top: 60px; right: 14px; z-index: 9999; display: flex; flex-direction: column; gap: 7px; pointer-events: none; }
-    .toast {
-      display: flex; align-items: center; gap: 9px;
-      background: var(--card3); border: 1px solid var(--border2);
-      border-radius: 8px; padding: 10px 14px;
-      font-size: 12px; font-weight: 500; color: var(--text);
-      box-shadow: var(--shadow-lg); animation: toastIn .2s ease;
-      pointer-events: auto; min-width: 230px; max-width: 320px;
-      backdrop-filter: blur(10px);
+    /* ── Toast notifications ── slides down from top, dashboard-styled */
+    @keyframes toastIn  {
+      from { opacity: 0; transform: translateY(-18px) scale(.96); }
+      to   { opacity: 1; transform: translateY(0)     scale(1);   }
     }
-    .toast.success { border-color: rgba(var(--green-rgb), .25); }
-    .toast.success .toast-icon { color: var(--green2); }
-    .toast.error   { border-color: rgba(var(--red-rgb), .25); }
-    .toast.error   .toast-icon { color: var(--red2); }
-    .toast.info    { border-color: rgba(var(--accent-rgb), .25); }
-    .toast.info    .toast-icon { color: var(--accent2); }
-    .toast-icon { font-size: 13px; flex-shrink: 0; }
-    .toast-msg  { flex: 1; line-height: 1.4; }
+    @keyframes toastOut {
+      from { opacity: 1; transform: translateY(0)     scale(1);   }
+      to   { opacity: 0; transform: translateY(-12px) scale(.97); }
+    }
+    .toasts-wrap {
+      position: fixed;
+      /* top: small offset below the nav bar, horizontally centered */
+      top: 64px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 9999;
+      display: flex; flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+      max-width: calc(100vw - 24px);
+    }
+    .toast {
+      position: relative;
+      display: flex; align-items: center; gap: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 16px 11px 14px;
+      font-size: 12.5px; font-weight: 500; color: var(--text);
+      letter-spacing: .1px;
+      /* layered glass: subtle top highlight + edge inset, accent-tinted shadow
+         that picks up the active theme's accent. */
+      box-shadow:
+        var(--gloss-top, inset 0 1px 0 rgba(255,255,255,.04)),
+        var(--gloss-edge, inset 0 0 0 1px rgba(255,255,255,.02)),
+        0 12px 32px -10px rgba(0,0,0,.55),
+        0 4px 12px -4px rgba(0,0,0,.45);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      animation: toastIn .22s cubic-bezier(.21,.62,.32,1.06);
+      pointer-events: auto;
+      min-width: 260px; max-width: 380px;
+      overflow: hidden;
+    }
+    /* Left accent bar — color shifts per type. Constant 3px wide, full height. */
+    .toast::before {
+      content: '';
+      position: absolute; left: 0; top: 0; bottom: 0;
+      width: 3px;
+      background: var(--accent);
+      opacity: .85;
+    }
+    .toast.success::before { background: var(--green, #22c55e); }
+    .toast.error::before   { background: var(--red, #ef4444); }
+    .toast.success { border-color: rgba(var(--green-rgb), .28); }
+    .toast.success .toast-icon { color: var(--green2, var(--green)); }
+    .toast.error   { border-color: rgba(var(--red-rgb), .28); }
+    .toast.error   .toast-icon { color: var(--red2, var(--red)); }
+    .toast.info    { border-color: rgba(var(--accent-rgb), .28); }
+    .toast.info    .toast-icon { color: var(--accent2, var(--accent)); }
+    .toast-icon {
+      font-size: 14px;
+      flex-shrink: 0;
+      width: 18px; height: 18px;
+      display: inline-flex; align-items: center; justify-content: center;
+      filter: drop-shadow(0 1px 2px rgba(0,0,0,.4));
+    }
+    .toast-msg  { flex: 1; line-height: 1.45; }
+    @media (max-width: 540px) {
+      .toasts-wrap { top: 56px; }
+      .toast { min-width: 0; max-width: calc(100vw - 24px); }
+    }
 
     /* ── Refresh badge + keyboard hints ── */
     .refresh-badge {
@@ -3697,6 +4082,174 @@ class DashboardServer {
       transform: scale(1.05);
     }
 
+    /* ── Tweet hover preview ──
+       Floating card that appears next to tweet links inside .feed and
+       .modal-overlay. Renders via portal to document.body, so positioning is
+       fixed-coords (parent stacking context doesn't apply). z-index 7500 sits
+       above the modal overlay (8000... wait, actually below). Re-checking:
+       modal-overlay z-index ~8000, lightbox 9000. We want the hover card to
+       appear ON TOP of feed (no z-index needed) AND on top of modal. So 8500.
+       Toasts (9999) still win — that's correct, errors should always be on top. */
+    .tw-prev-card {
+      position: fixed;
+      z-index: 8500;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      box-shadow: 0 12px 36px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.02);
+      font-size: 13px;
+      color: var(--text);
+      display: flex; flex-direction: column; gap: 9px;
+      pointer-events: auto;          /* card itself is hoverable (keeps card alive) */
+      animation: tw-prev-fade .12s ease-out;
+      user-select: text;             /* let user copy tweet text */
+    }
+    @keyframes tw-prev-fade {
+      from { opacity: 0; transform: translateY(-2px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .tw-prev-card.above {
+      animation: tw-prev-fade-up .12s ease-out;
+    }
+    @keyframes tw-prev-fade-up {
+      from { opacity: 0; transform: translateY(2px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .tw-prev-loading, .tw-prev-error {
+      padding: 8px 4px;
+      color: var(--text2);
+      font-size: 12px;
+      text-align: center;
+    }
+    .tw-prev-error { color: #ff8585; }
+    .tw-prev-head { display: flex; align-items: center; gap: 9px; }
+    .tw-prev-avatar {
+      width: 38px; height: 38px;
+      border-radius: 50%;
+      background: var(--bg2);
+      object-fit: cover;
+      flex-shrink: 0;
+    }
+    .tw-prev-avatar-fb {
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; color: var(--text2); font-size: 16px;
+    }
+    .tw-prev-author { flex: 1; min-width: 0; }
+    .tw-prev-name {
+      font-weight: 700; font-size: 13px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .tw-prev-handle {
+      font-size: 12px; color: var(--text2);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    /* Profile-link styling for name/handle/avatar — anchor tags inside the
+       hover card. Inherit color so they don't paint as default-blue and
+       break the dark theme; underline only on hover for affordance. */
+    a.tw-prev-link {
+      color: inherit;
+      text-decoration: none;
+      cursor: pointer;
+      display: block;
+    }
+    a.tw-prev-link:hover {
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    a.tw-prev-link.tw-prev-name:hover { color: var(--accent, #1d9bf0); }
+    /* Avatar wrapped in <a> — keep avatar's own dimensions, just inherit
+       the cursor + hover affordance from the parent anchor. */
+    .tw-prev-head > a { flex-shrink: 0; line-height: 0; }
+    .tw-prev-head > a > .tw-prev-avatar {
+      transition: transform .12s ease, opacity .12s ease;
+    }
+    .tw-prev-head > a:hover > .tw-prev-avatar {
+      transform: scale(1.05);
+      opacity: .9;
+    }
+    .tw-prev-x {
+      color: var(--text2);
+      font-size: 16px;
+      flex-shrink: 0;
+    }
+    /* Reddit-flavored variants — same chrome, different brand mark */
+    .tw-prev-x-reddit {
+      color: #ff4500;
+      font-weight: 700;
+    }
+    .tw-prev-avatar-reddit {
+      background: #ff4500;
+      color: #fff;
+      font-weight: 800;
+    }
+    /* Reddit posts have a real title (separate from body text); show it
+       above the selftext so the hover card reads naturally. */
+    .tw-prev-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.35;
+      letter-spacing: -.2px;
+    }
+    .tw-prev-text {
+      font-size: 13px;
+      line-height: 1.45;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+      /* Most tweets ≤ 280 chars (~6-8 lines) fit unconstrained. For long-form
+         X premium posts (up to ~25k chars) the card stays bounded by viewport
+         and the user can scroll within. Padding-right reserves space for the
+         scrollbar so emoji-rich text doesn't shift when overflow kicks in. */
+      max-height: 380px;
+      overflow-y: auto;
+      padding-right: 4px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,.18) transparent;
+    }
+    .tw-prev-text::-webkit-scrollbar { width: 6px; }
+    .tw-prev-text::-webkit-scrollbar-track { background: transparent; }
+    .tw-prev-text::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,.18);
+      border-radius: 3px;
+    }
+    .tw-prev-text::-webkit-scrollbar-thumb:hover {
+      background: rgba(255,255,255,.28);
+    }
+    .tw-prev-media {
+      position: relative;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0a0a12;
+      border: 1px solid var(--border);
+      max-height: 240px;
+    }
+    .tw-prev-media img {
+      display: block;
+      width: 100%;
+      max-height: 240px;
+      object-fit: cover;
+    }
+    .tw-prev-play {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 36px;
+      color: rgba(255,255,255,.92);
+      text-shadow: 0 2px 8px rgba(0,0,0,.65);
+      pointer-events: none;
+    }
+    .tw-prev-meta {
+      display: flex; flex-wrap: wrap; gap: 10px;
+      font-size: 12px; color: var(--text2);
+    }
+    .tw-prev-meta span { display: inline-flex; align-items: center; gap: 3px; }
+    .tw-prev-date {
+      margin-left: auto;
+      color: var(--dim);
+      font-size: 11px;
+    }
+
     /* ── Modal sections ── */
     .modal-title { font-size: 15px; font-weight: 800; color: var(--text); line-height: 1.35; letter-spacing: -.25px; }
     .modal-section { display: flex; flex-direction: column; gap: 7px; }
@@ -3728,6 +4281,50 @@ class DashboardServer {
     }
     .modal-engagement-ico { font-size: 11px; opacity: .85; }
     .modal-engagement-num { font-variant-numeric: tabular-nums; }
+
+    /* X Trends source-tweets list — clickable rows with text + per-tweet
+       engagement. Each row is an anchor so hover-preview (data-tweet-id)
+       works as on any other Twitter link. */
+    .xtrends-toptweets { display: flex; flex-direction: column; gap: 6px; }
+    .xtrends-toptweet {
+      display: block;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 11px;
+      text-decoration: none;
+      color: var(--text);
+      transition: border-color .12s, background .12s;
+    }
+    .xtrends-toptweet:hover {
+      border-color: rgba(var(--accent-rgb), .45);
+      background: rgba(var(--accent-rgb), .04);
+    }
+    .xtrends-toptweet-head {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 4px;
+    }
+    .xtrends-toptweet-author {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--accent);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .xtrends-toptweet-text {
+      font-size: 12.5px;
+      line-height: 1.45;
+      color: var(--text);
+      margin-bottom: 6px;
+      word-wrap: break-word;
+      overflow-wrap: anywhere;
+    }
+    .xtrends-toptweet-engage {
+      display: flex; flex-wrap: wrap; gap: 10px;
+      font-size: 11px;
+      color: var(--dim);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .xtrends-toptweet-engage span { display: inline-flex; align-items: center; gap: 4px; }
 
     /* Story hook — pull-quote rendered after the score bars. Accent left
        border + slight surface lift, italic body, big quote marks. Not a
@@ -4576,8 +5173,13 @@ class DashboardServer {
       display: block;
       width: 100%; height: 100%;
       object-fit: contain;
-      cursor: zoom-in;
+      /* Default = pointer (carousel inside feed card — click opens modal,
+         not a zoomed lightbox, so the magnifier cursor was misleading). */
+      cursor: pointer;
     }
+    /* Lightbox-aware cursor only inside the modal carousel, where image click
+       actually opens a fullscreen zoomed view via setLightboxSrc. */
+    .img-carousel.in-modal img { cursor: zoom-in; }
     body.prefs-compact .img-carousel { height: 280px; }
     /* in-modal MUST beat body.prefs-compact (which has higher specificity)
        — without the body-prefix the prefs-compact rule wins and the modal
@@ -5309,6 +5911,7 @@ const I18N = {
     'modal.source_link': '{ico} Source →',
     'modal.tg_link': '📨 Telegram',
     'modal.ask_grok': '🧠 Ask Grok',
+    'modal.xtrends_top_tweets': '🔥 Top tweets ({n})',
 
     // Control panel
     'control.title': '⚙️ Controls',
@@ -5348,6 +5951,8 @@ const I18N = {
     'settings.images_desc': 'Turn off to save bandwidth and declutter the feed.',
     'settings.animations': 'UI animations',
     'settings.animations_desc': 'Turn off to reduce load on slower devices.',
+    'settings.hover_preview': 'Hover preview',
+    'settings.hover_preview_desc': 'Show tweet/post content card when hovering over a source link.',
     'settings.font_size': 'Font size',
     'settings.font_size_desc': 'Base text size across the dashboard.',
     'settings.col_left':  'Left column width',
@@ -5655,6 +6260,7 @@ const I18N = {
     'modal.source_link': '{ico} Источник →',
     'modal.tg_link': '📨 Telegram',
     'modal.ask_grok': '🧠 Спросить Grok',
+    'modal.xtrends_top_tweets': '🔥 Топовые твиты ({n})',
 
     // Control panel
     'control.title': '⚙️ Управление',
@@ -5694,6 +6300,8 @@ const I18N = {
     'settings.images_desc': 'Отключи чтобы экономить трафик и разгрузить фид.',
     'settings.animations': 'Анимации интерфейса',
     'settings.animations_desc': 'Отключи для снижения нагрузки на слабых устройствах.',
+    'settings.hover_preview': 'Превью при наведении',
+    'settings.hover_preview_desc': 'Показывать карточку с содержимым твита/поста при наведении на ссылку источника.',
     'settings.font_size': 'Размер шрифта',
     'settings.font_size_desc': 'Базовый размер текста на дашборде.',
     'settings.col_left':  'Ширина левой колонки',
@@ -6081,8 +6689,8 @@ function ImageThumb({ trend, size = 80 }) {
   useEffect(() => {
     if (!tried && !imgUrl && trend.url) {
       setTried(true);
-      fetch('/api/preview?url=' + encodeURIComponent(trend.url))
-        .then(r => r.json())
+      // api() attaches Bearer auth — raw fetch 401's against the auth gate.
+      api('/preview?url=' + encodeURIComponent(trend.url))
         .then(d => { if (d.imageUrl) setImgUrl(d.imageUrl); })
         .catch(() => {});
     }
@@ -6157,6 +6765,351 @@ function Lightbox({ src, onClose }) {
     ),
     document.body
   );
+}
+
+// ── TweetHoverPreview — inline tweet card on link hover ─────────────────────
+// Trading-terminal style: hovering a tweet link shows the tweet inline so the
+// user doesn't context-switch to X. Backed by /api/tweet-preview which fetches
+// from fxtwitter (5-min cache).
+//
+// Lifecycle owned by useTweetHover hook below — this is a dumb renderer.
+// Positioning: anchored to the source link's getBoundingClientRect via fixed
+// coords, with overflow-flip (if the card would clip the viewport bottom, it
+// flips above the link). Width clamped to avoid clipping at the right edge.
+function TweetHoverPreview({ state, onMouseEnter, onMouseLeave }) {
+  if (!state || !state.anchor) return null;
+  const { anchor, data, status } = state;
+
+  // Position: prefer below-and-right of link. If there isn't enough room
+  // below, flip ABOVE — and there we use CSS bottom instead of top, so the
+  // card grows upward from PAD-px-above the link regardless of its actual
+  // rendered height. (Earlier attempt used top = anchor.top - ESTIMATED_H
+  // which floated the card too high when the real card was much shorter
+  // than the estimate.)
+  const PAD = 8;
+  const W   = 360;
+  // Generous estimate used only to DECIDE which side; positioning itself
+  // doesn't depend on this (we use CSS bottom for above-flip).
+  const ESTIMATED_H = 600;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let left = anchor.left;
+  if (left + W + PAD > vw) left = Math.max(PAD, vw - W - PAD);
+  if (left < PAD) left = PAD;
+
+  // Decide side: prefer below if it fits; otherwise flip above when there's
+  // any room there at all (anchor.top > PAD). If neither side has full room
+  // (very small viewports), still pick the side with more space.
+  const spaceBelow = vh - anchor.bottom;
+  const spaceAbove = anchor.top;
+  const showAbove = spaceBelow < ESTIMATED_H && spaceAbove > spaceBelow;
+
+  // Build positioning style. Below = CSS top from the link's bottom.
+  // Above = CSS bottom from the viewport bottom = vh - link.top + PAD.
+  // Using CSS bottom makes the card's bottom edge sit PAD above the link,
+  // and the card's intrinsic height grows upward from there — no estimate
+  // needed (which was the previous bug: estimated height way larger than
+  // actual put the card too high).
+  //
+  // maxHeight clamps the card to the available space on its chosen side so
+  // a tall preview doesn't overflow the viewport (the inner .tw-prev-text
+  // already has overflow-y: auto, so internal scroll handles long tweets).
+  const availableH = (showAbove ? spaceAbove : spaceBelow) - PAD * 2;
+  const posStyle = showAbove
+    ? {
+        left: left + 'px', bottom: (vh - anchor.top + PAD) + 'px',
+        width: W + 'px', maxHeight: availableH + 'px',
+      }
+    : {
+        left: left + 'px', top: (anchor.bottom + PAD) + 'px',
+        width: W + 'px', maxHeight: availableH + 'px',
+      };
+
+  const fmtNum = (n) => {
+    if (n == null) return null;
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + 'M';
+    if (n >= 1_000)     return (n / 1_000).toFixed(n >= 10_000 ? 0 : 1) + 'K';
+    return String(n);
+  };
+
+  // Body switcher — Twitter and Reddit have different fields. They share
+  // the wrapper card chrome (positioning, border, scroll), but the inner
+  // header / metrics row look different enough that we render two distinct
+  // body shapes routed by state.kind.
+  const kind = state.kind || 'tweet';
+  let body;
+  if (status === 'loading') {
+    body = h('div', { className: 'tw-prev-loading' },
+      kind === 'reddit' ? '⏳ Загрузка поста...' : '⏳ Загрузка...');
+  } else if (status === 'error' || !data) {
+    body = h('div', { className: 'tw-prev-error' },
+      kind === 'reddit' ? '⚠ Не удалось загрузить пост' : '⚠ Не удалось загрузить твит');
+  } else if (kind === 'reddit') {
+    const a = data.author || {};
+    const m = data.metrics || {};
+    const date = data.createdAt
+      ? new Date(data.createdAt).toLocaleString('ru-RU', {
+          day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+        })
+      : null;
+    const photo = (data.media || []).find(x => x.type === 'photo');
+    const stopProp = (e) => e.stopPropagation();
+    const subUrl  = a.subreddit ? 'https://reddit.com/r/' + a.subreddit : null;
+    const userUrl = a.name      ? 'https://reddit.com/u/' + a.name      : null;
+    body = [
+      h('div', { className: 'tw-prev-head', key: 'head' },
+        // Reddit doesn't give us avatars cheaply — use letter-mark fallback
+        // showing "r/" prefix to make the platform obvious.
+        h('div', { className: 'tw-prev-avatar tw-prev-avatar-fb tw-prev-avatar-reddit' },
+          (a.subreddit || '?').charAt(0).toUpperCase()),
+        h('div', { className: 'tw-prev-author' },
+          subUrl
+            ? h('a', {
+                className: 'tw-prev-name tw-prev-link',
+                href: subUrl, target: '_blank', rel: 'noopener noreferrer',
+                onClick: stopProp,
+              }, 'r/' + a.subreddit)
+            : h('div', { className: 'tw-prev-name' }, 'reddit'),
+          userUrl
+            ? h('a', {
+                className: 'tw-prev-handle tw-prev-link',
+                href: userUrl, target: '_blank', rel: 'noopener noreferrer',
+                onClick: stopProp,
+              }, 'u/' + a.name)
+            : h('div', { className: 'tw-prev-handle' }, 'u/' + (a.name || 'unknown'))
+        ),
+        h('div', { className: 'tw-prev-x tw-prev-x-reddit' }, '🅡')
+      ),
+      data.title && h('div', { className: 'tw-prev-title', key: 'title' }, data.title),
+      data.text && h('div', { className: 'tw-prev-text', key: 'text' }, data.text),
+      photo && h('div', { className: 'tw-prev-media', key: 'media' },
+        h('img', { src: photo.url, alt: '', loading: 'lazy' })
+      ),
+      h('div', { className: 'tw-prev-meta', key: 'meta' },
+        m.upvotes != null && h('span', null, '⬆ ', fmtNum(m.upvotes)),
+        m.comments != null && h('span', null, '💬 ', fmtNum(m.comments)),
+        m.awards   ? h('span', null, '🏅 ', fmtNum(m.awards)) : null,
+        typeof m.ratio === 'number' && h('span', null, Math.round(m.ratio * 100) + '% ↑'),
+        date && h('span', { className: 'tw-prev-date' }, date)
+      ),
+    ];
+  } else {
+    // Twitter (kind === 'tweet') — original body, unchanged
+    const a = data.author || {};
+    const m = data.metrics || {};
+    const date = data.createdAt
+      ? new Date(data.createdAt).toLocaleString('ru-RU', {
+          day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+        })
+      : null;
+    const photo = (data.media || []).find(x => x.type === 'photo');
+    const video = (data.media || []).find(x => x.type === 'video');
+    const profileUrl = a.screenName ? 'https://x.com/' + a.screenName : null;
+    const stopProp = (e) => e.stopPropagation();
+    body = [
+      h('div', { className: 'tw-prev-head', key: 'head' },
+        profileUrl
+          ? h('a', {
+              href: profileUrl, target: '_blank', rel: 'noopener noreferrer',
+              onClick: stopProp,
+              title: '@' + a.screenName,
+            },
+              a.avatarUrl
+                ? h('img', { className: 'tw-prev-avatar', src: a.avatarUrl, alt: '' })
+                : h('div', { className: 'tw-prev-avatar tw-prev-avatar-fb' }, (a.name || '?').charAt(0))
+            )
+          : (a.avatarUrl
+              ? h('img', { className: 'tw-prev-avatar', src: a.avatarUrl, alt: '' })
+              : h('div', { className: 'tw-prev-avatar tw-prev-avatar-fb' }, (a.name || '?').charAt(0))),
+        h('div', { className: 'tw-prev-author' },
+          profileUrl
+            ? h('a', {
+                className: 'tw-prev-name tw-prev-link',
+                href: profileUrl, target: '_blank', rel: 'noopener noreferrer',
+                onClick: stopProp,
+              }, a.name || '—')
+            : h('div', { className: 'tw-prev-name' }, a.name || '—'),
+          profileUrl
+            ? h('a', {
+                className: 'tw-prev-handle tw-prev-link',
+                href: profileUrl, target: '_blank', rel: 'noopener noreferrer',
+                onClick: stopProp,
+              }, '@' + a.screenName)
+            : h('div', { className: 'tw-prev-handle' }, '@' + (a.screenName || ''))
+        ),
+        h('div', { className: 'tw-prev-x' }, '𝕏')
+      ),
+      data.text && h('div', { className: 'tw-prev-text', key: 'text' }, data.text),
+      (photo || video) && h('div', { className: 'tw-prev-media', key: 'media' },
+        photo
+          ? h('img', { src: photo.url, alt: '', loading: 'lazy' })
+          : h('img', { src: video.thumbnail || '', alt: '', loading: 'lazy' }),
+        video && h('div', { className: 'tw-prev-play' }, '▶')
+      ),
+      h('div', { className: 'tw-prev-meta', key: 'meta' },
+        m.views    != null && h('span', null, '👁 ', fmtNum(m.views)),
+        m.likes    != null && h('span', null, '❤️ ', fmtNum(m.likes)),
+        m.retweets != null && h('span', null, '🔁 ', fmtNum(m.retweets)),
+        m.replies  != null && h('span', null, '💬 ', fmtNum(m.replies)),
+        date && h('span', { className: 'tw-prev-date' }, date)
+      ),
+    ];
+  }
+
+  return ReactDOM.createPortal(
+    h('div', {
+      className: 'tw-prev-card' + (showAbove ? ' above' : ''),
+      style: posStyle,
+      onMouseEnter, onMouseLeave,
+    }, body),
+    document.body
+  );
+}
+
+// ── useTweetHover — global delegate for tweet-link hover preview ─────────────
+// Listens at the document level (single listener, not per-card) and matches
+// any anchor whose href has a /status/NNN segment. Debounce = 350ms so
+// brushing past links does not fire API calls; grace = 200ms on mouseleave
+// so the user can move the cursor INTO the card to interact (links inside
+// text, scrolling). The card itself reports onMouseEnter/Leave to keep
+// itself open.
+//
+// Selector tightening: we only care about tweet links inside the feed (.feed)
+// and the open modal (.modal-overlay), per spec. Hovers on, e.g., navigation
+// links elsewhere in the SPA are ignored.
+function useTweetHover() {
+  const [state, setState] = useState(null);
+  const enterTimerRef = useRef(null);
+  const leaveTimerRef = useRef(null);
+  const cacheRef      = useRef(new Map());
+
+  const clearLeave = () => {
+    if (leaveTimerRef.current) {
+      clearTimeout(leaveTimerRef.current);
+      leaveTimerRef.current = null;
+    }
+  };
+  const clearEnter = () => {
+    if (enterTimerRef.current) {
+      clearTimeout(enterTimerRef.current);
+      enterTimerRef.current = null;
+    }
+  };
+
+  // Track the currently-hovered tweet-id container so we don't pre-fetch on
+  // every internal mousemove. mouseover/mouseout bubble through every nested
+  // element, but we only care about transitions between different tagged
+  // containers (or between tagged ↔ non-tagged).
+  const activeIdRef = useRef(null);
+
+  useEffect(() => {
+    // Trigger element = anything with [data-tweet-id] OR [data-reddit-id].
+    // FeedCard / TrendModal tag the actual link buttons; we read whichever
+    // attribute is present and route to the matching endpoint.
+    //
+    // kind: 'tweet' or 'reddit' — drives endpoint, event name, and which
+    // body the hover-card renders.
+    const findHost = (target) => {
+      if (!target || !target.closest) return null;
+      const el = target.closest('[data-tweet-id], [data-reddit-id]');
+      if (!el) return null;
+      const tweetId  = el.getAttribute('data-tweet-id')  || '';
+      const redditId = el.getAttribute('data-reddit-id') || '';
+      if (/^\\d+$/.test(tweetId)) {
+        return { el, kind: 'tweet', id: tweetId };
+      }
+      if (/^[a-z0-9]{4,12}$/i.test(redditId)) {
+        return { el, kind: 'reddit', id: redditId };
+      }
+      return null;
+    };
+
+    const onOver = (e) => {
+      // Per-user toggle (SettingsPanel → Appearance → Hover preview). Read
+      // fresh from localStorage so changes apply on the next mouseover with
+      // no hook re-mount. Default true preserves existing UX.
+      if (readPref('hoverPreview', true) === false) return;
+      const hit = findHost(e.target);
+      if (!hit) return;
+      // Same target as currently active — ignore (mousemove inside the same
+      // link would otherwise reset the debounce timer endlessly). Use a
+      // composite key so different kinds with same id (impossible in practice
+      // but defensive) don't collide.
+      const key = hit.kind + ':' + hit.id;
+      if (activeIdRef.current === key && state) return;
+
+      activeIdRef.current = key;
+      clearLeave();
+      clearEnter();
+      enterTimerRef.current = setTimeout(async () => {
+        const rect = hit.el.getBoundingClientRect();
+        const id   = hit.id;
+        const kind = hit.kind;
+
+        const cacheKey = kind + ':' + id;
+        if (cacheRef.current.has(cacheKey)) {
+          setState({ anchor: rect, status: 'ok', data: cacheRef.current.get(cacheKey), kind });
+          return;
+        }
+        setState({ anchor: rect, status: 'loading', data: null, kind });
+        try {
+          const endpoint = kind === 'reddit' ? '/reddit-preview' : '/tweet-preview';
+          const j = await api(endpoint + '?id=' + encodeURIComponent(id));
+          // Twitter returns j.tweet, Reddit returns j.post — normalize.
+          const payload = kind === 'reddit' ? j?.post : j?.tweet;
+          if (j && j.ok && payload) {
+            cacheRef.current.set(cacheKey, payload);
+            setState({ anchor: rect, status: 'ok', data: payload, kind });
+            // Broadcast fresh metrics. Single event name, kind in detail —
+            // the App listener routes by kind.
+            window.dispatchEvent(new CustomEvent('link-metrics-update', {
+              detail: {
+                kind, id,
+                metrics: payload.metrics || {},
+                velocity: typeof j.velocity === 'number' ? j.velocity : null,
+              },
+            }));
+          } else {
+            setState({ anchor: rect, status: 'error', data: null, kind });
+          }
+        } catch {
+          setState({ anchor: rect, status: 'error', data: null, kind });
+        }
+      }, 350);
+    };
+
+    const onOut = (e) => {
+      const hit = findHost(e.target);
+      if (!hit) return;
+      const next = e.relatedTarget;
+      if (next && hit.el.contains(next)) return;
+      activeIdRef.current = null;
+      clearEnter();
+      leaveTimerRef.current = setTimeout(() => setState(null), 200);
+    };
+
+    document.addEventListener('mouseover', onOver);
+    document.addEventListener('mouseout',  onOut);
+    return () => {
+      document.removeEventListener('mouseover', onOver);
+      document.removeEventListener('mouseout',  onOut);
+      clearEnter();
+      clearLeave();
+    };
+    // state is intentionally NOT a dep — re-binding listeners on every state
+    // tick would defeat the single-handler design. We read state via the
+    // closure captured at mount; the active-id optimization uses a ref.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Card-side handlers passed back so the card can keep itself alive while
+  // the cursor hovers over it (e.g. user wants to read full text).
+  const onCardEnter = () => clearLeave();
+  const onCardLeave = () => {
+    leaveTimerRef.current = setTimeout(() => setState(null), 150);
+  };
+
+  return { state, onCardEnter, onCardLeave };
 }
 
 // ── ImageCarousel — horizontal slider for 2+ photos ─────────────────────────
@@ -6250,8 +7203,7 @@ function FeedImage({ trend }) {
   useEffect(() => {
     if (!tried && !imgUrl && trend.url) {
       setTried(true);
-      fetch('/api/preview?url=' + encodeURIComponent(trend.url))
-        .then(r => r.json())
+      api('/preview?url=' + encodeURIComponent(trend.url))
         .then(d => { if (d.imageUrl) setImgUrl(d.imageUrl); else setFailed(true); })
         .catch(() => setFailed(true));
     }
@@ -6544,7 +7496,32 @@ function FeedCard({ trend, onOpen, onHide }) {
   })();
   const isFresh = ageMs < 60 * 60 * 1000;
 
-  return h('div', { className: 'feed-card' + (isFresh ? ' is-fresh' : ''), onClick: handleClick },
+  // Hover-preview tags — only the "↗" link itself triggers the popup, not
+  // the whole card body (revert per UX request).
+  //
+  // Source-of-truth: URL pattern, NOT trend.source — collector can vary the
+  // source field ('twitter' / 'x' / 'x_trends'). If URL matches the canonical
+  // shape, that's the platform.
+  //
+  // FOUR backslashes — see useTweetHover note. Outer template literal AND
+  // browser JS string literal both eat one pair each.
+  const _twPreviewId = (() => {
+    const re = new RegExp(
+      '(?:twitter\\\\.com|x\\\\.com)/[^/]+/status/(\\\\d+)', 'i'
+    );
+    const m = String(trend.url || '').match(re);
+    return m ? m[1] : null;
+  })();
+  const _redditPreviewId = (() => {
+    const re = new RegExp('reddit\\\\.com/.*?/comments/([a-z0-9]{4,12})', 'i');
+    const m = String(trend.url || '').match(re);
+    return m ? m[1] : null;
+  })();
+
+  return h('div', {
+    className: 'feed-card' + (isFresh ? ' is-fresh' : ''),
+    onClick: handleClick,
+  },
     onHide ? h('button', {
       className: 'feed-hide-btn',
       title: t('feed.hide_btn_tip'),
@@ -6641,7 +7618,12 @@ function FeedCard({ trend, onOpen, onHide }) {
       trend.url ? h('a', {
         className: 'feed-action-btn',
         href: trend.url, target: '_blank', rel: 'noopener',
-        onClick: e => e.stopPropagation()
+        onClick: e => e.stopPropagation(),
+        // Hover-preview tags: only one of these is set (the URL pattern
+        // determines which), and only on Twitter/Reddit URLs. TikTok and
+        // others have no tag → no preview popup.
+        'data-tweet-id':  _twPreviewId,
+        'data-reddit-id': _redditPreviewId,
       }, '↗ ' + linkLabel) : null,
       trend.tgMessageUrl ? h('a', {
         className: 'feed-action-btn tg',
@@ -6969,8 +7951,7 @@ function TrendModal({ trend, onClose, me = null }) {
   useEffect(() => {
     // Missing main image → fetch preview for the og:image / fxtwitter media.
     if (!imgUrl && trend.url) {
-      fetch('/api/preview?url=' + encodeURIComponent(trend.url))
-        .then(r => r.json())
+      api('/preview?url=' + encodeURIComponent(trend.url))
         .then(d => {
           setImgUrl(d.imageUrl || null);
           if (Array.isArray(d.imageUrls) && d.imageUrls.length) setExtraUrls(d.imageUrls);
@@ -6985,8 +7966,7 @@ function TrendModal({ trend, onClose, me = null }) {
     if (trend.source === 'twitter' && trend.url) {
       const existing = Array.isArray(trend.imageUrls) ? trend.imageUrls.filter(Boolean) : [];
       if (existing.length < 2) {
-        fetch('/api/preview?url=' + encodeURIComponent(trend.url))
-          .then(r => r.json())
+        api('/preview?url=' + encodeURIComponent(trend.url))
           .then(d => {
             if (Array.isArray(d.imageUrls) && d.imageUrls.length) setExtraUrls(d.imageUrls);
           })
@@ -7008,6 +7988,21 @@ function TrendModal({ trend, onClose, me = null }) {
   // Sentiment removed from the modal visual (2026-05-04). The field is still
   // populated by Stage 1 and shown elsewhere (Telegram alert, feed card chip),
   // but the modal's metrics grid no longer surfaces it.
+
+  // Hover-preview tags — see FeedCard for rationale. URL-pattern based.
+  // Each platform has its own; only one will be set per trend.
+  const _twModalPreviewId = (() => {
+    const re = new RegExp(
+      '(?:twitter\\\\.com|x\\\\.com)/[^/]+/status/(\\\\d+)', 'i'
+    );
+    const m = String(trend.url || '').match(re);
+    return m ? m[1] : null;
+  })();
+  const _redditModalPreviewId = (() => {
+    const re = new RegExp('reddit\\\\.com/.*?/comments/([a-z0-9]{4,12})', 'i');
+    const m = String(trend.url || '').match(re);
+    return m ? m[1] : null;
+  })();
 
   return h(React.Fragment, null,
    lightboxSrc ? h(Lightbox, { src: lightboxSrc, onClose: () => setLightboxSrc(null) }) : null,
@@ -7166,19 +8161,112 @@ function TrendModal({ trend, onClose, me = null }) {
         h('div', { className: 'modal-section' },
           h('div', { className: 'modal-section-label' }, t('modal.links')),
           h('div', { className: 'modal-actions' },
-            trend.url ? h('a', { className: 'trend-link' + srcLinkCls, href: trend.url, target: '_blank', rel: 'noopener' }, t('modal.source_link', { ico: srcIco })) : null,
+            trend.url ? h('a', {
+              className: 'trend-link' + srcLinkCls,
+              href: trend.url, target: '_blank', rel: 'noopener',
+              // Hover-preview tags — only one is set per trend (Twitter or
+              // Reddit URLs match their respective regex; other sources
+              // skip both).
+              'data-tweet-id':  _twModalPreviewId,
+              'data-reddit-id': _redditModalPreviewId,
+            }, t('modal.source_link', { ico: srcIco })) : null,
             trend.tgMessageUrl ? h('a', { className: 'trend-link trend-link-tg', href: trend.tgMessageUrl, target: '_blank', rel: 'noopener' }, t('modal.tg_link')) : null,
             (() => {
               const title = trend.titleEn || trend.original_title || trend.originalTitle || trend.title || '';
               if (!title && !trend.url) return null;
-              const prompt = lang === 'ru'
-                ? 'Насколько вирусится этот нарратив прямо сейчас? ' + title + (trend.url ? ' — ' + trend.url : '')
-                : 'How viral is this narrative right now? ' + title + (trend.url ? ' — ' + trend.url : '');
+              // Structured prompt — narrative-name + virality reasons + growth
+              // catalysts + potential + risks + audience. Each point is a
+              // separate question so Grok answers in sections instead of one
+              // hand-wave paragraph. Newlines via String.fromCharCode(10) —
+              // backslash-n inside the SPA template literal would be eaten by
+              // the outer backtick before it reaches the browser (see Trap #2
+              // in SESSION_CONTEXT, "Ловушка server.js").
+              const NL = String.fromCharCode(10);
+              const sourceLine = trend.url
+                ? (lang === 'ru' ? 'Источник: ' : 'Source: ') + trend.url
+                : '';
+              const promptLines = lang === 'ru'
+                ? [
+                    'Проанализируй этот нарратив, используя свежие данные из X (твиты, треды, аккаунты последних 24-48 часов).',
+                    '',
+                    'Тема: "' + title + '"',
+                    sourceLine,
+                    '',
+                    'Дай ответ строго по пунктам, кратко (1-3 предложения на пункт):',
+                    '1. Название нарратива — предложи 2-3 варианта, каждый короткий и ёмкий (2-5 слов). Маркируй буллетами.',
+                    '2. Почему сейчас вирален — что зажгло, кто пушит (имена аккаунтов / комьюнити), сколько примерно постов/просмотров.',
+                    '3. Почему может вырасти дальше — катализаторы на 24-72 часа (события, релизы, виральные хуки).',
+                    '4. Потенциал роста — оценка 1-10 и обоснование одной строкой.',
+                    '5. Риски — что может убить тренд раньше времени.',
+                    '6. Релевантная аудитория — какие комьюнити/типы аккаунтов это разносят.',
+                    '',
+                    'Если данных недостаточно — честно скажи "слабый сигнал" по конкретному пункту, не выдумывай.',
+                  ]
+                : [
+                    'Analyse this narrative using fresh X data (tweets, threads, accounts from the last 24-48 hours).',
+                    '',
+                    'Topic: "' + title + '"',
+                    sourceLine,
+                    '',
+                    'Answer strictly point-by-point, concise (1-3 sentences each):',
+                    '1. Narrative name — propose 2-3 options, each short and punchy (2-5 words). Bullet them.',
+                    '2. Why it\\u2019s viral right now — what ignited it, who pushes it (account names / communities), rough post/view counts.',
+                    '3. Why it could grow further — 24-72h catalysts (events, releases, viral hooks).',
+                    '4. Growth potential — 1-10 score with one-line rationale.',
+                    '5. Risks — what could kill the trend prematurely.',
+                    '6. Relevant audience — which communities/account types are spreading it.',
+                    '',
+                    'If a point lacks data, honestly say "weak signal" — don\\u2019t fabricate.',
+                  ];
+              const prompt = promptLines.filter(Boolean).join(NL);
               const grokUrl = 'https://grok.com/?q=' + encodeURIComponent(prompt);
               return h('a', { className: 'trend-link trend-link-grok', href: grokUrl, target: '_blank', rel: 'noopener' }, t('modal.ask_grok'));
             })()
           )
         ),
+
+        // X Trends only — show the source tweets that fed this trend's
+        // aggregated engagement signal. Each row is a clickable link with
+        // hover-preview (data-tweet-id wires into the global useTweetHover).
+        (trend.source === 'x_trends' && Array.isArray(trend.topTweets) && trend.topTweets.length > 0)
+          ? h('div', { className: 'modal-section' },
+              h('div', { className: 'modal-section-label' },
+                t('modal.xtrends_top_tweets', { n: trend.topTweets.length })
+              ),
+              h('div', { className: 'xtrends-toptweets' },
+                trend.topTweets.map((tw, i) => {
+                  const fmt = (n) => {
+                    if (typeof n !== 'number' || n <= 0) return null;
+                    if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + 'M';
+                    if (n >= 1_000)     return (n / 1_000).toFixed(n >= 10_000 ? 0 : 1) + 'K';
+                    return String(n);
+                  };
+                  const chips = [
+                    { ico: '\u{1F441}',   v: fmt(tw.views) },
+                    { ico: '❤️', v: fmt(tw.likes) },
+                    { ico: '\u{1F501}',   v: fmt(tw.retweets) },
+                    { ico: '\u{1F4AC}',   v: fmt(tw.replies) },
+                  ].filter(c => c.v !== null);
+                  return h('a', {
+                    key: i,
+                    className: 'xtrends-toptweet',
+                    href: tw.url || '#',
+                    target: '_blank',
+                    rel: 'noopener',
+                    'data-tweet-id': tw.id || null,
+                  },
+                    h('div', { className: 'xtrends-toptweet-head' },
+                      h('span', { className: 'xtrends-toptweet-author' }, tw.author || '@unknown')
+                    ),
+                    tw.text ? h('div', { className: 'xtrends-toptweet-text' }, tw.text) : null,
+                    chips.length ? h('div', { className: 'xtrends-toptweet-engage' },
+                      chips.map((c, j) => h('span', { key: j }, c.ico, ' ', c.v))
+                    ) : null
+                  );
+                })
+              )
+            )
+          : null,
 
         // Feedback
         h('div', { className: 'modal-section' },
@@ -7641,6 +8729,7 @@ const DEFAULT_PREFS = {
   density:       'comfortable', // 'compact' | 'comfortable'
   showImages:    true,
   animations:    true,
+  hoverPreview:  true,  // hover-card with tweet/reddit content on link hover
   fontSize:      14,   // 12..16
   colLeft:       240,  // left sidebar width in px (180..360)
   colRight:      300,  // right panel width in px (240..420)
@@ -7656,6 +8745,19 @@ function savePrefs(p) {
   try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch (e) {}
   try { window.dispatchEvent(new CustomEvent('ts:prefs', { detail: p })); } catch (e) {}
   applyPrefsToDOM(p);
+}
+
+// Snapshot accessor for non-React code paths (e.g. document-level event
+// handlers in useTweetHover) that need the freshest pref WITHOUT subscribing
+// to ts:prefs. Reads localStorage directly so toggle changes apply on the
+// very next mouseover with no re-mount needed.
+function readPref(key, fallback) {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    if (!raw) return fallback;
+    const v = JSON.parse(raw)[key];
+    return typeof v === 'undefined' ? fallback : v;
+  } catch (e) { return fallback; }
 }
 function applyPrefsToDOM(p) {
   const b = document.body;
@@ -7847,6 +8949,11 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
         icon: '✨', title: t('settings.animations'),
         desc: t('settings.animations_desc'),
         control: h(Toggle, { on: prefs.animations, onChange: v => update({ animations: v }) })
+      }),
+      h(Row, {
+        icon: '\u{1F441}', title: t('settings.hover_preview'),
+        desc: t('settings.hover_preview_desc'),
+        control: h(Toggle, { on: prefs.hoverPreview, onChange: v => update({ hoverPreview: v }) })
       }),
       h(Row, {
         icon: '🔠', title: t('settings.font_size'),
@@ -8841,6 +9948,97 @@ function App() {
     return () => window.removeEventListener('dashboard:navigate', handleNavigate);
   }, []);
 
+  // useLinkHover emits 'link-metrics-update' when a hover preview returns
+  // fresh engagement numbers (Twitter via fxtwitter, Reddit via reddit.com
+  // public JSON). Patch matching trend in local state so feed card +
+  // open modal update instantly, without waiting for /api/trends refresh.
+  // Backend already wrote the same data to DB.
+  useEffect(() => {
+    const reTweet  = new RegExp(
+      '(?:twitter\\\\.com|x\\\\.com)/[^/]+/status/(\\\\d+)', 'i'
+    );
+    const reReddit = new RegExp('reddit\\\\.com/.*?/comments/([a-z0-9]{4,12})', 'i');
+
+    const numOr = (val, prev) =>
+      typeof val === 'number' && Number.isFinite(val) && val >= 0 ? val : prev;
+
+    // Build the new engagement shape based on platform. We map provider
+    // field names → unified trend.engagement keys:
+    //   Twitter: views/likes/retweets/replies → views/likes/reposts/comments
+    //   Reddit:  upvotes/comments             → views/likes/comments
+    //            (Reddit has no separate "likes" or "reposts" — we put the
+    //            score under views so the existing card UI's first slot is
+    //            populated, and likes/reposts stay null to read as "n/a")
+    const mergeEngagement = (kind, m, e) => {
+      if (kind === 'reddit') {
+        return {
+          ...e,
+          // For Reddit we leave .views/.likes/.reposts as-is; upvotes goes
+          // into views (Reddit's display convention; matches the modal's
+          // existing fallback metrics.upvotes ?? metrics.views ?? null).
+          views:    numOr(m.upvotes,  e.views),
+          comments: numOr(m.comments, e.comments),
+        };
+      }
+      return {
+        ...e,
+        views:    numOr(m.views,    e.views),
+        likes:    numOr(m.likes,    e.likes),
+        comments: numOr(m.replies,  e.comments),
+        reposts:  numOr(m.retweets, e.reposts),
+      };
+    };
+
+    const handle = (event) => {
+      const det = event?.detail || {};
+      const kind = det.kind === 'reddit' ? 'reddit' : 'tweet';
+      const id   = det.id;
+      const m    = det.metrics || {};
+      const velocity = typeof det.velocity === 'number' && det.velocity >= 0
+        ? det.velocity : null;
+      if (!id) return;
+
+      const re = kind === 'reddit' ? reReddit : reTweet;
+
+      setTrends(prev => {
+        let changed = false;
+        const next = prev.map(t => {
+          const urlMatch = String(t.url || '').match(re);
+          if (!urlMatch || urlMatch[1] !== id) return t;
+          const e = t.engagement || {};
+          const newEng = mergeEngagement(kind, m, e);
+          const newVelocity = velocity !== null ? velocity : t.velocity;
+          // Cheap shallow-equal: skip render when nothing actually changed.
+          const same =
+            newEng.views    === e.views &&
+            newEng.likes    === e.likes &&
+            newEng.comments === e.comments &&
+            newEng.reposts  === e.reposts &&
+            newVelocity     === t.velocity;
+          if (same) return t;
+          changed = true;
+          return { ...t, engagement: newEng, velocity: newVelocity };
+        });
+        return changed ? next : prev;
+      });
+
+      setModalTrend(prev => {
+        if (!prev) return prev;
+        const urlMatch = String(prev.url || '').match(re);
+        if (!urlMatch || urlMatch[1] !== id) return prev;
+        const e = prev.engagement || {};
+        return {
+          ...prev,
+          engagement: mergeEngagement(kind, m, e),
+          velocity: velocity !== null ? velocity : prev.velocity,
+        };
+      });
+    };
+
+    window.addEventListener('link-metrics-update', handle);
+    return () => window.removeEventListener('link-metrics-update', handle);
+  }, []);
+
   // Keyboard shortcuts: R=refresh, Esc=close modal → else return to feed
   useEffect(() => {
     const fn = e => {
@@ -8923,6 +10121,19 @@ function App() {
     });
   }
 
+  // Tweet hover-preview — global delegate, single instance for the whole app.
+  // Hook itself attaches mouseover/mouseout listeners at the document level
+  // and only matches anchors inside .feed or .modal-overlay (per spec —
+  // dashboard only, no nav/sidebar links).
+  //
+  // MUST sit ABOVE the auth-gate early-return below — Rules of Hooks: the
+  // hook order has to be stable across renders, and the early returns here
+  // would skip this hook when not logged in. Putting it above keeps the
+  // count consistent. The hook's effect attaches a no-op listener on the
+  // login screen — harmless, since none of LoginScreen's anchors match the
+  // tweet-link selector.
+  const tweetHover = useTweetHover();
+
   // ── Auth gate ───────────────────────────────────────────────────────────
   if (me === false) return h(LoginScreen, { onLoggedIn: handleLoggedIn });
   if (me === null)  return h('div', {
@@ -8932,6 +10143,14 @@ function App() {
   return h('div', null,
     // Toast notifications (fixed top-right)
     h(Toasts, { toasts }),
+
+    // Tweet hover-preview portal — renders into document.body via a portal in
+    // the component itself, so it sits above modal/lightbox like a tooltip.
+    h(TweetHoverPreview, {
+      state: tweetHover.state,
+      onMouseEnter: tweetHover.onCardEnter,
+      onMouseLeave: tweetHover.onCardLeave,
+    }),
 
     // Bottom undo toast for "hide alert" — fades out after 5s
     pendingUndo ? h('div', { className: 'undo-toast' },

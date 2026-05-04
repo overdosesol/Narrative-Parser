@@ -97,6 +97,9 @@ export const PRESET_FIELD_RANGES = Object.freeze({
                            label: 'Celeb-noise',  desc: 'Рутинный celeb-шум (интервью, red carpet).' },
     noMemeShapePenalty:  { type: 'int',   min: 0, max: 100, step: 5,
                            label: 'Нет meme-shape', desc: 'Штраф если нет животных/абсурда/мемов.' },
+    noContentPenalty:    { type: 'int',   min: 0, max: 50,  step: 1,
+                           label: 'Нет контента (text-only)',
+                           desc: 'Штраф за пост без картинок/видео. Чисто текстовые посты получают -X к качеству. Не применяется к google_trends (там медиа нет by design).' },
     safeOverrideDivisor: { type: 'int',   min: 1, max: 10,  step: 1,
                            label: 'Safe-override ÷', desc: 'Делитель при наличии meme-сигнала (меньше = сильнее override).' },
     memeShapeBoost:      { type: 'int',   min: 0, max: 30,  step: 1,
@@ -236,7 +239,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 40, kpopPenalty: 30, celebNoisePenalty: 20,
-      noMemeShapePenalty: 15, safeOverrideDivisor: 3, memeShapeBoost: 10,
+      noMemeShapePenalty: 15, noContentPenalty: 5, safeOverrideDivisor: 3, memeShapeBoost: 10,
     },
     alerts: {
       thresholds: { alertThreshold: 60, minScoreToSave: 0,  maxAlertsPerCycle: 0,  alertHardJunkStop: 70 },
@@ -283,7 +286,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 60, kpopPenalty: 40, celebNoisePenalty: 30,
-      noMemeShapePenalty: 10, safeOverrideDivisor: 3, memeShapeBoost: 14,
+      noMemeShapePenalty: 10, noContentPenalty: 8, safeOverrideDivisor: 3, memeShapeBoost: 14,
     },
     alerts: {
       thresholds: { alertThreshold: 55, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 65 },
@@ -338,7 +341,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 30, kpopPenalty: 10, celebNoisePenalty: 20,
-      noMemeShapePenalty: 25, safeOverrideDivisor: 3, memeShapeBoost: 12,
+      noMemeShapePenalty: 25, noContentPenalty: 6, safeOverrideDivisor: 3, memeShapeBoost: 12,
     },
     alerts: {
       thresholds: { alertThreshold: 65, minScoreToSave: 10, maxAlertsPerCycle: 8, alertHardJunkStop: 75 },
@@ -388,7 +391,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 40, kpopPenalty: 15, celebNoisePenalty: 0,
-      noMemeShapePenalty: 20, safeOverrideDivisor: 3, memeShapeBoost: 6,
+      noMemeShapePenalty: 20, noContentPenalty: 5, safeOverrideDivisor: 3, memeShapeBoost: 6,
     },
     alerts: {
       thresholds: { alertThreshold: 70, minScoreToSave: 0, maxAlertsPerCycle: 6, alertHardJunkStop: 65 },
@@ -435,7 +438,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 15, kpopPenalty: 30, celebNoisePenalty: 20,
-      noMemeShapePenalty: 10, safeOverrideDivisor: 2, memeShapeBoost: 4,
+      noMemeShapePenalty: 10, noContentPenalty: 0, safeOverrideDivisor: 2, memeShapeBoost: 4,
     },
     alerts: {
       thresholds: { alertThreshold: 50, minScoreToSave: 0, maxAlertsPerCycle: 10, alertHardJunkStop: 85 },

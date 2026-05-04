@@ -31,6 +31,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         30,
     celebNoisePenalty:   20,
     noMemeShapePenalty:  15,
+    noContentPenalty:     5,  // small nudge against text-only posts
     safeOverrideDivisor: 3,
     memeShapeBoost:      10,
   },
@@ -41,6 +42,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         40,
     celebNoisePenalty:   30,
     noMemeShapePenalty:  10,  // animals are already a meme-shape signal
+    noContentPenalty:     8,  // animal posts without media = stock-text noise
     safeOverrideDivisor: 3,
     memeShapeBoost:      14,  // animal/absurd match → strong promotion to LLM
   },
@@ -51,6 +53,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         10,  // stan culture IS part of internet culture
     celebNoisePenalty:   20,
     noMemeShapePenalty:  25,  // meme-shape is required here
+    noContentPenalty:     6,
     safeOverrideDivisor: 3,
     memeShapeBoost:      12,
   },
@@ -61,6 +64,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         15,
     celebNoisePenalty:    0,  // ← celeb noise is the whole point
     noMemeShapePenalty:  20,
+    noContentPenalty:     5,
     safeOverrideDivisor: 3,
     memeShapeBoost:       6,  // celeb content rarely needs meme-shape promotion
   },
@@ -71,6 +75,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         30,
     celebNoisePenalty:   20,
     noMemeShapePenalty:  10,  // real events don't need meme-shape
+    noContentPenalty:     0,  // events often break as text-first news, no penalty
     safeOverrideDivisor: 2,   // easier override (2+ signals → ÷3)
     memeShapeBoost:       4,  // events preset focuses on news, not memes
   },
@@ -88,6 +93,7 @@ export const PROFILE_FIELD_RANGES = Object.freeze({
   kpopPenalty:         { min: 0, max: 100, step: 5, label: 'K-pop / фандом',   desc: 'Штраф за стан-культуру' },
   celebNoisePenalty:   { min: 0, max: 100, step: 5, label: 'Celeb-noise',      desc: 'Рутинный celeb-шум (интервью, red carpet)' },
   noMemeShapePenalty:  { min: 0, max: 100, step: 5, label: 'Нет meme-shape',   desc: 'Штраф если нет животных/абсурда/мемов' },
+  noContentPenalty:    { min: 0, max: 50,  step: 1, label: 'Нет контента (text-only)', desc: 'Штраф за пост без картинок/видео. Не применяется к google_trends' },
   safeOverrideDivisor: { min: 1, max: 10,  step: 1, label: 'Safe-override ÷',  desc: 'Делитель при наличии meme-сигнала (меньше = сильнее override)' },
   memeShapeBoost:      { min: 0, max: 30,  step: 1, label: 'Meme-shape буст',  desc: 'Прибавка к emergenceScore при mem-сигнале (животное/абсурд/мем). 2+ сигнала → ×1.5. 0 = отключено' },
 });

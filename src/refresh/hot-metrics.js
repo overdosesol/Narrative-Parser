@@ -63,6 +63,23 @@ const DEFAULT_MIN_MEME = 50;
 const DEFAULT_MAX_AGE_HOURS = 24;
 const FETCH_CONCURRENCY = 5;             // polite to fxtwitter / reddit
 
+// ── Light-tier refresh constants (2026-05-04) ───────────────────────────────
+// Two-tier model: heavy 12h cycle (above) does Stage 1 + Stage 2 LLM rescore;
+// LIGHT cycle just refreshes raw engagement metrics (views/likes/upvotes/
+// comments) via the same free fxtwitter / reddit.json fetchers, no LLM.
+// fxtwitter and reddit are both free, so this is essentially zero-cost; we
+// run it more aggressively than the heavy cycle so the dashboard always has
+// reasonably fresh numbers across ALL recent trends, not just the ones
+// users hover over.
+//
+// Eligibility: same source filter (twitter, reddit), broader age (24h is
+// fine — trends older than that already aged out of the dashboard window
+// for most users), NO minMeme — even low-quality trends should show fresh
+// numbers if they're visible in the feed.
+const DEFAULT_LIGHT_INTERVAL_MIN = 60;
+const DEFAULT_LIGHT_MAX_BATCH    = 200;
+const DEFAULT_LIGHT_MIN_MEME     = 0;
+
 export default class HotMetricsRefresher {
   constructor({ db, scorer, logger, telegram = null, config = null, recordDecision = null, normalizeThreshold = null }) {
     if (!db) throw new Error('HotMetricsRefresher: db is required');
@@ -85,6 +102,11 @@ export default class HotMetricsRefresher {
     this.intervalHandle = null;
     this.startupTimer = null;
     this.intervalMin = DEFAULT_INTERVAL_MIN;
+    // Light-tier (metrics-only) cycle state
+    this.lightRunning = false;
+    this.lightIntervalHandle = null;
+    this.lightStartupTimer = null;
+    this.lightIntervalMin = DEFAULT_LIGHT_INTERVAL_MIN;
   }
 
   /**
@@ -136,13 +158,39 @@ export default class HotMetricsRefresher {
     this.intervalHandle = setInterval(() => {
       this.runCycle().catch(e => this.logger.error?.(`[HotRefresh] cycle failed: ${e.message}`));
     }, intervalMs);
+
+    // ── Light-tier: metrics-only refresh ───────────────────────────────────
+    // Independent schedule from the heavy cycle. Both run on this same
+    // process; if they happen to fire close together (e.g. light at minute
+    // 60, heavy at minute 720), the light cycle just no-ops if the heavy
+    // is in flight (avoid double-fetching the same URLs).
+    const lightDisabled = process.env.HOT_REFRESH_LIGHT_ENABLED === '0';
+    if (lightDisabled) {
+      this.logger.info?.('[HotRefresh:light] disabled via HOT_REFRESH_LIGHT_ENABLED=0');
+    } else {
+      const lightIntervalMin = Number(process.env.HOT_REFRESH_LIGHT_INTERVAL_MINUTES) || DEFAULT_LIGHT_INTERVAL_MIN;
+      const lightIntervalMs = Math.max(60_000, lightIntervalMin * 60_000);
+      this.lightIntervalMin = lightIntervalMin;
+      this.logger.info?.(`[HotRefresh:light] enabled — every ${lightIntervalMin}min (metrics-only, no LLM)`);
+      // Stagger startup separately so light + heavy don't both fire on boot.
+      this.lightStartupTimer = setTimeout(() => {
+        this.runLightCycle().catch(e => this.logger.error?.(`[HotRefresh:light] startup failed: ${e.message}`));
+      }, STARTUP_DELAY_MS + 30_000);
+      this.lightIntervalHandle = setInterval(() => {
+        this.runLightCycle().catch(e => this.logger.error?.(`[HotRefresh:light] cycle failed: ${e.message}`));
+      }, lightIntervalMs);
+    }
   }
 
   stop() {
     if (this.intervalHandle) clearInterval(this.intervalHandle);
     if (this.startupTimer)   clearTimeout(this.startupTimer);
+    if (this.lightIntervalHandle) clearInterval(this.lightIntervalHandle);
+    if (this.lightStartupTimer)   clearTimeout(this.lightStartupTimer);
     this.intervalHandle = null;
     this.startupTimer = null;
+    this.lightIntervalHandle = null;
+    this.lightStartupTimer = null;
   }
 
   /** Read the admin runtime toggle. Default ON (string '1'). */
@@ -396,5 +444,122 @@ export default class HotMetricsRefresher {
       // _dbId is informational so we can log it on errors.
       _dbId: originalTrend._dbId,
     };
+  }
+
+  /**
+   * Light-tier refresh — metrics only, no LLM rescore.
+   *
+   * For each eligible trend (twitter or reddit, ≤24h old, regardless of
+   * memePotential), pull fresh engagement via the FREE endpoints we
+   * already use (api.fxtwitter.com / reddit.com/<permalink>.json) and
+   * persist directly through db.updateTwitterEngagement /
+   * db.updateRedditEngagement. These methods also recompute velocity
+   * (Δviews / Δhours) using snapshot-based sampling.
+   *
+   * What this does NOT do (intentionally):
+   *   - No Stage 1 LLM rescore (memePotential / sentiment / etc stay frozen
+   *     until the heavy cycle next runs).
+   *   - No Stage 2 LLM (no x_search).
+   *   - No alert dispatch (alerts are tied to alertScore which depends on
+   *     memePotential, which we don't touch).
+   *   - No SSE broadcast (clients pick up fresh numbers on their next
+   *     /api/trends auto-refresh, which fires ~every 90s in the dashboard).
+   *
+   * Skips entirely if the heavy cycle is currently running — no point
+   * double-fetching the same URLs that the heavy cycle is already pulling.
+   */
+  async runLightCycle({ trigger = 'schedule' } = {}) {
+    if (this.lightRunning) {
+      this.logger.warn?.('[HotRefresh:light] previous light cycle still running — skipping');
+      return { skipped: true, reason: 'already-running' };
+    }
+    if (this.running) {
+      this.logger.info?.('[HotRefresh:light] heavy cycle in flight — skipping light tick');
+      return { skipped: true, reason: 'heavy-running' };
+    }
+    if (!this._isAdminEnabled()) {
+      // Same admin toggle controls both tiers — if operator turned off Hot
+      // refresh entirely, light stays off too.
+      return { skipped: true, reason: 'admin-disabled' };
+    }
+    this.lightRunning = true;
+    const startedAt = Date.now();
+    const result = {
+      trigger, eligible: 0, fetchOk: 0, fetchFail: 0,
+      twitterUpdated: 0, redditUpdated: 0,
+      tookSec: 0, error: null,
+    };
+
+    try {
+      const eligible = this.db.getHotTrendsForRefresh({
+        minMeme:     DEFAULT_LIGHT_MIN_MEME,   // no quality gate for metrics-only
+        maxAgeHours: DEFAULT_MAX_AGE_HOURS,
+        sources:     ['reddit', 'twitter'],
+        limit:       DEFAULT_LIGHT_MAX_BATCH,
+      });
+      result.eligible = eligible.length;
+
+      if (eligible.length === 0) {
+        this.logger.info?.('[HotRefresh:light] no eligible trends — done');
+        result.tookSec = Number(((Date.now() - startedAt) / 1000).toFixed(1));
+        return result;
+      }
+
+      this.logger.info?.(`[HotRefresh:light] cycle start — ${eligible.length} eligible`);
+
+      // Reuse the worker-pool pattern. _fetchFresh returns a synthetic trend
+      // shape with .metrics; we pass the metrics into the platform-specific
+      // DB updater instead of calling saveTrend (which would re-run scoring).
+      let cursor = 0;
+      const work = async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= eligible.length) break;
+          const trend = eligible[i];
+          try {
+            const fresh = await this._fetchFresh(trend);
+            if (!fresh || !fresh.metrics) {
+              result.fetchFail++;
+              continue;
+            }
+            result.fetchOk++;
+
+            if (trend.source === 'twitter') {
+              // Extract tweet ID from URL — db method needs it as the lookup key.
+              const m = String(trend.url || '').match(/\/status\/(\d+)/i);
+              const tweetId = m ? m[1] : null;
+              if (tweetId) {
+                const upd = this.db.updateTwitterEngagement(tweetId, fresh.metrics);
+                if (upd && upd.rows > 0) result.twitterUpdated++;
+              }
+            } else if (trend.source === 'reddit') {
+              const m = String(trend.url || '').match(/\/comments\/([a-z0-9]{4,12})/i);
+              const postId = m ? m[1] : null;
+              if (postId) {
+                const upd = this.db.updateRedditEngagement(postId, fresh.metrics);
+                if (upd && upd.rows > 0) result.redditUpdated++;
+              }
+            }
+          } catch (e) {
+            result.fetchFail++;
+            this.logger.warn?.(`[HotRefresh:light] ${trend.source}#${trend._dbId}: ${e.message}`);
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: FETCH_CONCURRENCY }, work));
+
+      result.tookSec = Number(((Date.now() - startedAt) / 1000).toFixed(1));
+      this.logger.info?.(
+        `[HotRefresh:light] done — fetched ${result.fetchOk}/${eligible.length}, ` +
+        `updated tw=${result.twitterUpdated}, rd=${result.redditUpdated}, ${result.tookSec}s`
+      );
+      return result;
+    } catch (e) {
+      result.error = e.message;
+      this.logger.error?.(`[HotRefresh:light] cycle threw: ${e.message}`);
+      return result;
+    } finally {
+      this.lightRunning = false;
+    }
   }
 }

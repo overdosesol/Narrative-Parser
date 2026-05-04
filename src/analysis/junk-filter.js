@@ -108,6 +108,40 @@ export function calculateJunkPenalty(items, clusterMetrics = {}, preset = null, 
     reasons.push('no-meme-shape');
   }
 
+  // ── Penalty: text-only (no visual content) ────────────────────────
+  // Small nudge against posts that arrived without picture/video. The
+  // assumption: visual posts spread further on social media; pure-text
+  // posts in the modern feed are usually news copypasta or low-effort
+  // shower-thought tweets. Penalty stacks with others before safe-override.
+  //
+  // Skipped when ALL items in the cluster are from sources that don't carry
+  // media by design (google_trends — search-interest signal, no post body).
+  // That keeps the penalty surgical: it targets twitter/reddit/tiktok where
+  // a missing image IS a quality signal, not platform shape.
+  if (profile.noContentPenalty > 0) {
+    const textlessSource = (s) => s === 'google_trends';
+    const allTextlessByDesign = items.length > 0 && items.every(i => textlessSource(i.source));
+    if (!allTextlessByDesign) {
+      const hasVisual = items.some(i => {
+        const m = i.metrics || {};
+        return Boolean(
+          m.thumbnailUrl
+          || m.imageUrl
+          || m.videoUrl
+          || (Array.isArray(m.imageUrls) && m.imageUrls.length > 0)
+          // Some collectors put image refs at the item root too — defensive.
+          || i.imageUrl
+          || i.videoUrl
+          || (Array.isArray(i.imageUrls) && i.imageUrls.length > 0)
+        );
+      });
+      if (!hasVisual) {
+        raw += profile.noContentPenalty;
+        reasons.push('text-only');
+      }
+    }
+  }
+
   // ── Meme-shape boost (applied regardless of penalty state) ─────────
   // Even a "clean" cluster (no penalties at all) benefits from the boost —
   // this is what gives lonely single-source meme titles a chance to reach

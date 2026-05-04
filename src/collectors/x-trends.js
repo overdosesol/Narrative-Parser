@@ -2,105 +2,172 @@ import BaseCollector from './base-collector.js';
 import { getActivePresetConfig } from '../analysis/preset-config.js';
 
 /**
- * X Trends collector — pulls live trending topics from X via the Apify actor
- * `karamelo/twitter-trends-scraper`.
+ * X Trends collector — TREND-LEVEL with tweet-backed engagement signal.
  *
- * Different from src/collectors/twitter.js: that one does TWEET SEARCH, this
- * one does the TRENDS LIST (the hashtags/topics shown in X's "Trending" tab).
+ * Two-stage daily flow:
+ *  1. Pulls the live X trending list via Apify actor `karamelo/twitter-trends-scraper`
+ *     — gives us hashtags / topics like "#SkibidiToilet", "Taylor Swift", with rank.
+ *  2. Takes the top-N (default 3) and FOR EACH calls TwitterCollector.searchByQuery
+ *     to fetch the top K real tweets matching that trend (default 7). Aggregates
+ *     their engagement (sum of views / likes / retweets / replies) and emits ONE
+ *     item per trend — a source='x_trends' card with REAL engagement numbers
+ *     instead of the previous text-only "Trending #N" stub that forced Stage 1
+ *     LLM to hallucinate virality.
  *
- * Pipeline shape: each emitted item represents one trending topic, e.g.
- *   { source: 'x_trends', title: '#SkibidiToilet',
- *     description: 'Trending #3 on X (United States, live)',
- *     metrics: { rank: 3, country: 'United States', timePeriod: 'Live' },
- *     url: 'https://x.com/search?q=%23SkibidiToilet&src=trend' }
+ * Why one card per trend (not per tweet):
+ *   We want the user to SEE the trend itself in the feed (e.g. "#SkibidiToilet
+ *   — trending #1 in US, 21M total views across top tweets") — not 21 separate
+ *   tweet cards from the same hashtag flooding the feed. The tweets are kept
+ *   in metrics.topTweets[] for the LLM and (eventually) the modal/UI.
  *
- * The trends list refreshes infrequently (~30 min real-world cadence) so we
- * decouple the API fetch from the scanner cycle: an internal timer hits Apify
- * every X_TRENDS_REFRESH_MINUTES (default 30), caches the result in memory,
- * and `collect()` returns a diff of NEW trends since last emit. This avoids
- * re-emitting "Taylor Swift" 50 times when she's been trending all afternoon
- * — but DOES re-emit if a trend disappeared and came back later.
+ * Emitted item shape:
+ *   {
+ *     externalId:  'xtrends-us-skibiditoilet-20260504',  // daily bucket
+ *     source:      'x_trends',
+ *     title:       '#SkibidiToilet',
+ *     description: 'Trending #1 on X in US (Live). Top tweets: ...',
+ *     url:         'https://x.com/search?q=...&src=trend',
+ *     // Visual content lifted from the highest-engagement tweet so the card
+ *     // has a poster/thumbnail/video to render in dashboard:
+ *     imageUrl, videoUrl, ...
+ *     metrics: {
+ *       // Aggregated REAL engagement (sum across topTweets)
+ *       views, likes, retweets, replies,
+ *       // Trend metadata
+ *       rank, country, timePeriod, tweetVolume,
+ *       // Source data — visible in TrendModal, used by Stage 1 prompt
+ *       topTweets: [{ id, url, author, text, views, likes, retweets, replies,
+ *                     thumbnailUrl, imageUrls, videoUrl }],
+ *       tweetsCount,
+ *     }
+ *   }
  *
- * Cost: ~$0.29 / 1000 results × ~30 trends/run × 48 runs/day ≈ $0.42/day,
- * about $13/month. Configurable via X_TRENDS_REFRESH_MINUTES if too pricey.
+ * Cost: 1 trends-list call/day (~100 results × $0.00039 = ~$0.04/day, $1.20/mo)
+ *       + N × K tweet fetches/day (3 × 7 = 21 tweets/day × $0.00025 = ~$0.005/day,
+ *         $0.16/mo with kaitoeasyapi). Total < $1.50/mo.
  *
- * NOTE on country: the actor exposes a `country` input but in our test runs
- * the JSON view didn't include it (form-only field?). We send it anyway —
- * harmless if ignored, defaults to US which is what we want for English
- * priority either way.
+ * Configurable via env:
+ *   X_TRENDS_REFRESH_MINUTES        — default 1440 (24h)
+ *   X_TRENDS_TOP_TRENDS             — default 3
+ *   X_TRENDS_TWEETS_PER_TREND       — default 7 (range 5-10 makes sense)
+ *   X_TRENDS_COUNTRY                — default "United States" (or numeric ID "1".."35")
+ *   X_TRENDS_ENABLED                — panic kill (set to "0")
  *
- * NOTE on volume: this actor returns `volume: ""` (empty string) for most
- * trends — X stopped exposing public tweet volume. So minTweetVolume filter
- * isn't viable; we rely on rank (array index) + AI Stage 1 scoring instead.
+ * NOTE on country: actor's input schema (build 0.0.33, 2026-03-06) requires a
+ * numeric-string enum ("1"..."35"), not the country name. We translate via
+ * COUNTRY_ID_MAP below; numeric env values pass through.
  */
 
 const ACTOR_ID = 'karamelo~twitter-trends-scraper';
 const APIFY_TIMEOUT_SECS = 90;
 
-// Re-emission cap. Same trend won't enter the pipeline more than once per
-// EMIT_TTL_MS even if it stays in the trending list across multiple refreshes.
-// After it's been absent from cache and returns later, we re-emit (real signal
-// of resurgence). Hourly bucketing also makes the externalId stable for DB-dedup.
-const EMIT_TTL_MS = 6 * 60 * 60 * 1000;  // 6 hours
+const COUNTRY_ID_MAP = {
+  'world':                '1',
+  'united states':        '2', 'us': '2', 'usa': '2',
+  'canada':               '3',
+  'mexico':               '4',
+  'united kingdom':       '5', 'uk': '5',
+  'france':               '6',
+  'germany':              '7',
+  'italy':                '8',
+  'spain':                '9',
+  'portugal':             '10',
+  'netherlands':          '11',
+  'denmark':              '12',
+  'austria':              '13',
+  'belgium':              '14',
+  'switzerland':          '15',
+  'greece':               '16',
+  'russian federation':   '17', 'russia': '17',
+  'turkey':               '18',
+  'korea':                '19', 'south korea': '19',
+  'singapore':            '20',
+  'indonesia':            '21',
+  'philippines':          '22',
+  'viet nam':             '23', 'vietnam': '23',
+  'thailand':             '24',
+  'australia':            '25',
+  'israel':               '26',
+  'united arab emirates': '27', 'uae': '27',
+  'saudi arabia':         '28',
+  'argentina':            '29',
+  'brazil':               '30',
+  'egypt':                '31',
+  'nigeria':              '32',
+  'kenya':                '33',
+  'south africa':         '34',
+  'japan':                '35',
+};
+
+function resolveCountryId(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '2';                  // default US
+  if (/^\d+$/.test(raw)) return raw;     // already an ID
+  return COUNTRY_ID_MAP[raw.toLowerCase()] || '2';
+}
+
+function dedupSlug(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9а-я]+/gi, '');
+}
 
 class XTrendsCollector extends BaseCollector {
-  constructor(config, logger, db) {
+  constructor(config, logger, db, twitterCollector) {
     super('XTrends', logger);
-    // Global kill switch via env (preserves admin runtime control via
-    // per-preset xtrends.enabled flag in presetConfigs blob).
+
     this.enabled = process.env.X_TRENDS_ENABLED !== '0';
-    // Reuse the project-wide Apify key — operator confirmed this token has
-    // access to all actors on their account. Override via APIFY_X_TRENDS_KEY
-    // if a scoped token becomes desirable later.
     this.apiKey = process.env.APIFY_X_TRENDS_KEY
                || config.apify?.apiKey
                || process.env.APIFY_API_KEY
                || '';
     this.actorId = process.env.APIFY_X_TRENDS_ACTOR_ID || ACTOR_ID;
     this.country = process.env.X_TRENDS_COUNTRY || 'United States';
-    this.refreshMinutes = Math.max(5, parseInt(process.env.X_TRENDS_REFRESH_MINUTES || '30', 10));
 
-    this.db = db;
+    // Daily by default. Was 30min when we emitted raw hashtags; now we pull
+    // real tweets per top trend, once-a-day is plenty.
+    this.refreshMinutes  = Math.max(60, parseInt(process.env.X_TRENDS_REFRESH_MINUTES || '1440', 10));
+    this.topTrendsCount  = Math.max(1,  parseInt(process.env.X_TRENDS_TOP_TRENDS      || '3',    10));
+    this.tweetsPerTrend  = Math.max(1,  parseInt(process.env.X_TRENDS_TWEETS_PER_TREND || '7',   10));
 
-    // In-memory state — survives within a single scanner process lifetime.
-    // _cache: { fetchedAt: Date.now(), items: [...] } — last successful API result
-    // _emitted: Map<trend-name, lastEmittedAt> — re-emit gate
-    // _refreshTimer: handle for setInterval, cleared on stop()
-    this._cache = { fetchedAt: 0, items: [] };
-    this._emitted = new Map();
-    this._refreshTimer = null;
-    this._inFlight = null;  // dedup concurrent _refresh() calls
+    this.db      = db;
+    this.twitter = twitterCollector;  // for searchByQuery() — required for tweet pulls
+
+    // _cache.items — array of normalized X-trend items (one per top trend)
+    // _emitted     — Set<externalId> already returned by collect() for the
+    //                current refresh; cleared on _refresh()
+    this._cache         = { fetchedAt: 0, items: [] };
+    this._emitted       = new Set();
+    this._refreshTimer  = null;
+    this._inFlight      = null;
 
     if (this.enabled && !this.apiKey) {
       this.logger.warn('[XTrends] enabled=true but no Apify key (set APIFY_API_KEY) — disabling');
       this.enabled = false;
     }
+    if (this.enabled && !this.twitter) {
+      this.logger.warn('[XTrends] no TwitterCollector reference — discovery layer needs it for tweet pulls; disabling');
+      this.enabled = false;
+    }
   }
 
-  /**
-   * Start the background refresh timer. Called once at scanner startup.
-   * Fires an immediate fetch then every X_TRENDS_REFRESH_MINUTES.
-   */
   startRefreshTimer() {
     if (!this.enabled) {
       this.logger.info('[XTrends] disabled — refresh timer not started');
       return;
     }
-    if (this._refreshTimer) return;  // idempotent
+    if (this._refreshTimer) return;
 
-    // Fire-and-forget initial fetch so the first collect() has data
     this._refresh().catch(e => this.logger.warn('[XTrends] initial refresh failed: ' + e.message));
 
     const intervalMs = this.refreshMinutes * 60 * 1000;
     this._refreshTimer = setInterval(() => {
       this._refresh().catch(e => this.logger.warn('[XTrends] refresh failed: ' + e.message));
     }, intervalMs);
-    this.logger.info(`[XTrends] refresh timer started (every ${this.refreshMinutes} min, country=${this.country})`);
+    this.logger.info(
+      `[XTrends] refresh timer started (every ${this.refreshMinutes} min, country=${this.country}, ` +
+      `top=${this.topTrendsCount}, tweetsPerTrend=${this.tweetsPerTrend})`
+    );
   }
 
-  /**
-   * Stop the background timer. Safe to call multiple times.
-   */
   stopRefreshTimer() {
     if (this._refreshTimer) {
       clearInterval(this._refreshTimer);
@@ -109,16 +176,44 @@ class XTrendsCollector extends BaseCollector {
   }
 
   /**
-   * Hit Apify, parse, store in cache. Coalesces concurrent calls so a slow
-   * sync-fetch from collect() doesn't fight the timer-driven refresh.
+   * Daily refresh: trends list → top-N → tweets per trend → aggregate into
+   * one X-Trend item per trend. Coalesces concurrent calls.
    */
   async _refresh() {
     if (this._inFlight) return this._inFlight;
     this._inFlight = (async () => {
       try {
-        const items = await this._fetchFromApify();
-        this._cache = { fetchedAt: Date.now(), items };
-        this.logger.info(`[XTrends] refreshed: ${items.length} trends from ${this.country}`);
+        const trendsList = await this._fetchTrendsList();
+        const top = trendsList.slice(0, this.topTrendsCount);
+        if (top.length === 0) {
+          this.logger.warn('[XTrends] trends list empty — keeping old cache');
+          return;
+        }
+
+        const items = [];
+        for (const trend of top) {
+          try {
+            // Relaxed floor — these are already the *top* tweets for a trending
+            // topic; the firehose-grade 500K-views bar would filter most out.
+            const tweets = await this.twitter.searchByQuery(trend.trend, this.tweetsPerTrend, { relaxedFloor: true });
+            if (!tweets || tweets.length === 0) {
+              this.logger.info(`[XTrends] "${trend.trend}" (rank ${trend.rank}) — no qualifying tweets, skipping`);
+              continue;
+            }
+            const item = this._buildTrendItem(trend, tweets);
+            items.push(item);
+            this.logger.info(
+              `[XTrends] "${trend.trend}" (rank ${trend.rank}) → ${tweets.length} tweets, ` +
+              `aggregated views=${item.metrics.views} likes=${item.metrics.likes}`
+            );
+          } catch (e) {
+            this.logger.warn(`[XTrends] tweet fetch for "${trend.trend}" failed: ${e.message}`);
+          }
+        }
+
+        this._cache   = { fetchedAt: Date.now(), items };
+        this._emitted = new Set();  // fresh cycle, allow re-emission of all
+        this.logger.info(`[XTrends] daily refresh: ${items.length}/${top.length} trends emitted from ${this.country}`);
       } finally {
         this._inFlight = null;
       }
@@ -126,14 +221,114 @@ class XTrendsCollector extends BaseCollector {
     return this._inFlight;
   }
 
-  async _fetchFromApify() {
+  /**
+   * Build a single X-Trend item from a trend descriptor + array of normalized
+   * tweets. Aggregates engagement, lifts visual content from the top tweet,
+   * and packs source tweets into metrics.topTweets[] for LLM context and UI.
+   */
+  _buildTrendItem(trend, tweets) {
+    // Sort by views desc; representative = highest views (fallback likes if no views)
+    const sorted = [...tweets].sort((a, b) => {
+      const av = a.metrics?.views ?? 0;
+      const bv = b.metrics?.views ?? 0;
+      if (bv !== av) return bv - av;
+      return (b.metrics?.likes ?? 0) - (a.metrics?.likes ?? 0);
+    });
+    const rep = sorted[0];
+
+    // Aggregate engagement (sum across all qualifying tweets — gives a
+    // realistic "trend size" signal for Stage 1 LLM)
+    let views = 0, likes = 0, retweets = 0, replies = 0;
+    for (const t of tweets) {
+      views    += t.metrics?.views    || 0;
+      likes    += t.metrics?.likes    || 0;
+      retweets += t.metrics?.retweets || 0;
+      replies  += t.metrics?.replies  || 0;
+    }
+
+    // Top tweets — condensed for storage / UI / prompt context
+    const topTweets = sorted.map(t => ({
+      id:           String(t.externalId || '').replace(/^twitter_/, ''),
+      url:          t.url || null,
+      author:       t.metrics?.author || null,
+      text:         (t.description || t.title || '').substring(0, 280),
+      views:        t.metrics?.views    || 0,
+      likes:        t.metrics?.likes    || 0,
+      retweets:     t.metrics?.retweets || 0,
+      replies:      t.metrics?.replies  || 0,
+      thumbnailUrl: t.metrics?.thumbnailUrl || null,
+      imageUrls:    Array.isArray(t.metrics?.imageUrls) ? t.metrics.imageUrls.slice(0, 4) : [],
+      videoUrl:     t.metrics?.videoUrl || null,
+    }));
+
+    // Daily bucket so DB-dedup catches the same trend across cycles within a
+    // calendar day. New day = fresh ID = re-enters pipeline (matches the
+    // "trending again" semantics of X's trending tab).
+    const slug = dedupSlug(trend.trend) || 'unknown';
+    const day  = new Date().toISOString().slice(0, 10).replace(/-/g, '');  // YYYYMMDD
+    const countryCode = this.country === 'United States' ? 'us'
+                      : this.country === 'United Kingdom' ? 'uk'
+                      : String(this.country).toLowerCase().slice(0, 2);
+    const externalId = `xtrends-${countryCode}-${slug}-${day}`;
+
+    // X's canonical "clicked from trending tab" URL — gives the curated trending
+    // feed (top-posts grouped, context card on top) instead of plain search.
+    // The actor doesn't expose X's internal topic_id (would let us use the
+    // /i/trending/<id> deep-link), so this is the closest UX-equivalent.
+    const url = `https://x.com/search?q=${encodeURIComponent(trend.trend)}&src=trend_click&vertical=trends`;
+
+    // Description: trend metadata + top 3 tweet snippets so Stage 1 prompt has
+    // real content to reason about (not just a hashtag string)
+    const sample = sorted.slice(0, 3).map(t => {
+      const who  = t.metrics?.author ? `${t.metrics.author}: ` : '';
+      const text = (t.description || '').replace(/\s+/g, ' ').trim().substring(0, 140);
+      return `${who}"${text}"`;
+    }).join(' | ');
+    const desc = `Trending #${trend.rank} on X in ${this.country} (${trend.timePeriod}). ` +
+                 `Top tweets: ${sample}`;
+
+    return {
+      externalId,
+      source:      'x_trends',
+      title:       trend.trend,
+      description: desc,
+      url,
+      author:      'x_trends',
+      timestamp:   new Date().toISOString(),
+      // Visual content from rep tweet — lets the X-Trend card have a poster/
+      // gallery/video in the dashboard feed, just like a regular twitter card
+      imageUrl:    rep.metrics?.thumbnailUrl || null,
+      videoUrl:    rep.metrics?.videoUrl    || null,
+      metrics: {
+        // Aggregated real engagement
+        views,
+        likes,
+        retweets,
+        replies,
+        // Trend metadata
+        rank:        trend.rank,
+        country:     this.country,
+        timePeriod:  trend.timePeriod,
+        tweetVolume: trend.volume || null,
+        // Visual aliases (collector schema uses thumbnailUrl/imageUrls; mirror
+        // here for cross-source compatibility with the dashboard's image carousel)
+        thumbnailUrl: rep.metrics?.thumbnailUrl || null,
+        imageUrls:    Array.isArray(rep.metrics?.imageUrls) ? rep.metrics.imageUrls.slice(0, 10) : [],
+        videoUrl:     rep.metrics?.videoUrl || null,
+        // Source tweets — used by Stage 1 prompt context, dashboard modal,
+        // and Stage 2 if it wants to verify/expand
+        topTweets,
+        tweetsCount: tweets.length,
+      },
+    };
+  }
+
+  async _fetchTrendsList() {
     if (!this.apiKey) throw new Error('No Apify key');
-    // Authorization: Bearer instead of ?token= so a network-error
-    // err.message can never leak the API key (see tiktok.js for rationale).
     const runUrl = `https://api.apify.com/v2/acts/${this.actorId}/run-sync-get-dataset-items?timeout=${APIFY_TIMEOUT_SECS}`;
 
     const input = {
-      country: this.country,
+      country: resolveCountryId(this.country),
       live:   true,
       hour1:  false, hour3:  false, hour6:  false, hour12: false, hour24: false,
       day2:   false, day3:   false,
@@ -157,9 +352,7 @@ class XTrendsCollector extends BaseCollector {
       this.logger.warn('[XTrends] non-array response from Apify');
       return [];
     }
-    // Sort/de-noise: actor returns trends presumably ordered by rank already.
-    // Filter out blank/garbage rows; trim trend strings; assign 1-based rank
-    // by array position.
+
     const cleaned = [];
     for (let i = 0; i < data.length; i++) {
       const raw = data[i];
@@ -169,38 +362,29 @@ class XTrendsCollector extends BaseCollector {
         trend,
         rank: i + 1,
         timePeriod: String(raw?.timePeriod || 'Live'),
-        volume: raw?.volume || null,  // usually empty string from this actor
-        capturedAt: raw?.time || new Date().toISOString(),
+        volume: raw?.volume || null,
       });
     }
     return cleaned;
   }
 
   /**
-   * Called once per scanner cycle (~90s). Returns trends that haven't been
-   * emitted recently — diff against _emitted map.
+   * Per scanner cycle (~90s). Returns X-Trend items deduped within the current
+   * refresh (so we don't re-emit the same set 96 times per day). DB-level dedup
+   * by externalId handles cross-day backstop.
    *
-   * If the cache is older than 2× refresh interval, force a fresh fetch
-   * synchronously (rare path — happens if the timer is silently dead, e.g.
-   * after host suspend/resume).
+   * Stale cache → force-refresh sync (catches dead-timer / first-call cases).
    */
   async collect() {
     if (!this.enabled) return [];
 
-    // Per-preset config decides whether we even emit + how many top trends
-    // to pass through. Read fresh every cycle so admin "Пресеты" edits to
-    // xtrends.enabled / .topN apply on the next cycle without restart.
     let presetCfg;
     try { presetCfg = getActivePresetConfig(this.db); }
     catch (_) { presetCfg = null; }
-    const xCfg = presetCfg?.sources?.xtrends || {};
-    if (xCfg.enabled === 0) return [];
-    const topN = Number.isFinite(+xCfg.topN) && +xCfg.topN > 0 ? +xCfg.topN : 20;
+    if (presetCfg?.sources?.xtrends?.enabled === 0) return [];
 
-    // Stale cache? Force-refresh sync (also catches the case where timer
-    // wasn't started — e.g. during admin manual-submit single-run paths).
     const ageMs = Date.now() - this._cache.fetchedAt;
-    if (this._cache.items.length === 0 || ageMs > 2 * this.refreshMinutes * 60 * 1000) {
+    if (this._cache.items.length === 0 || ageMs > 1.5 * this.refreshMinutes * 60 * 1000) {
       try { await this._refresh(); }
       catch (e) {
         this.logger.warn('[XTrends] sync refresh failed: ' + e.message);
@@ -208,77 +392,14 @@ class XTrendsCollector extends BaseCollector {
       }
     }
 
-    const top = this._cache.items.slice(0, topN);
-    const now = Date.now();
-
-    // Garbage-collect stale _emitted entries (older than EMIT_TTL_MS so they
-    // can re-fire). Keeps the map bounded.
-    for (const [key, ts] of this._emitted) {
-      if (now - ts > EMIT_TTL_MS) this._emitted.delete(key);
-    }
-
     const fresh = [];
-    for (const t of top) {
-      const key = this._dedupKey(t.trend);
-      if (this._emitted.has(key)) continue;
-      this._emitted.set(key, now);
-      fresh.push(this._normalize(t));
+    for (const item of this._cache.items) {
+      if (!item || !item.externalId) continue;
+      if (this._emitted.has(item.externalId)) continue;
+      this._emitted.add(item.externalId);
+      fresh.push(item);
     }
     return fresh;
-  }
-
-  /**
-   * Stable dedup key. Lowercased + stripped of non-alphanumerics so
-   * "Taylor Swift" and "TAYLOR SWIFT" and "#TaylorSwift" all collapse to
-   * one bucket.
-   */
-  _dedupKey(trend) {
-    return String(trend).toLowerCase().replace(/[^a-z0-9а-я]+/gi, '');
-  }
-
-  /**
-   * Map Apify shape → unified collector item shape used by the rest of the
-   * pipeline (Aggregator → cheapDedup → PreStage → Clusterer → Scorer).
-   */
-  _normalize(t) {
-    const trend = t.trend;
-    const slug  = this._dedupKey(trend) || 'unknown';
-    // Hour-bucketed externalId so DB-dedup catches re-emissions within the
-    // same hour. Across hours, the trend gets a fresh ID and re-enters the
-    // pipeline (matches the in-memory _emitted TTL semantics).
-    const hourBucket = new Date(t.capturedAt).toISOString().slice(0, 13).replace(/[-:T]/g, '');
-    const countryCode = this.country === 'United States' ? 'us'
-                      : this.country === 'United Kingdom' ? 'uk'
-                      : this.country.toLowerCase().slice(0, 2);
-    const externalId = 'xtrends-' + countryCode + '-' + slug + '-' + hourBucket;
-
-    // URL for the alert link: takes user to X's search results for the trend.
-    // src=trend tells X this came from a trending tab click (relevant search
-    // mode automatically). Encoded so hashtags / spaces / unicode work.
-    const url = 'https://x.com/search?q=' + encodeURIComponent(trend) + '&src=trend';
-
-    // Description optimised for AI Stage 1 — gives the model enough context
-    // (rank + country + period) to gauge whether the topic looks meme-worthy
-    // without seeing actual tweets. Stage 2 (Grok x_search) will fetch real
-    // tweets if the trend passes Stage 1.
-    const desc = 'Trending #' + t.rank + ' on X in ' + this.country + ' (' + t.timePeriod + ').' +
-                 (t.volume ? ' Volume: ' + t.volume + '.' : '');
-
-    return {
-      externalId,
-      source: 'x_trends',
-      title:  trend,
-      description: desc,
-      url,
-      author: 'x_trends',  // pseudo-author so downstream code doesn't crash on null
-      timestamp: t.capturedAt,
-      metrics: {
-        rank:        t.rank,
-        country:     this.country,
-        timePeriod:  t.timePeriod,
-        tweetVolume: t.volume || null,
-      },
-    };
   }
 }
 
