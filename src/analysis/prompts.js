@@ -73,6 +73,39 @@ Calibration check: ask yourself "is this clearly more meme-able than 9 out of 10
   Ask yourself: "Is this a new narrative/meme idea, or just another tweet from a popular account?"
   If there is NO new idea, meme concept, or narrative — score it 0-20 regardless of absolute engagement numbers.
 
+━━━ SOURCE-AWARE METRIC CALIBRATION ━━━
+Different platforms have very different metric inflation. DO NOT compare raw numbers across sources — calibrate each source's metric to its real cultural reach:
+
+• TikTok plays are HEAVILY inflated vs Twitter views (~5-10x):
+  - TikTok counts every 2-3 second autoreplay as a play, plus mass scroll-impressions
+  - Rough equivalence: 3M TikTok plays ≈ 300-600K Twitter views in real cultural reach
+  - DO NOT score a TikTok 95+ just because plays = 10M; score by INFERRED reach, not raw count
+  - 500K-1M plays on TikTok = baseline-viral (everyone gets this); 5M+ plays = actually distinctive
+
+• TikTok shares are the strongest virality signal on the platform:
+  - 5K+ shares means people are pasting the video into private chats — much stronger than likes
+  - Treat shares × 50 ≈ Twitter retweets in cultural-impact value
+
+• TikTok memes burn out FAST:
+  - A TikTok narrative >72h old is likely past peak (memes peak in 24-48h)
+  - Twitter narratives can keep growing for 5-7 days
+  - Reddit narratives can stay relevant for 1-2 weeks
+  - Adjust freshness scoring accordingly: a 4-day-old TikTok is stale; a 4-day-old Twitter thread can still be growing
+
+• TikTok meme propagation is FORMAT-driven, not content-driven:
+  - Memes spread by participating in a NAMED FORMAT (sound + setup + punchline structure)
+  - When evaluating a TikTok, ask "is this a recognizable meme template that others can copy?" — that's the spreadability signal
+  - The original creator matters less than the format adoption — score the FORMAT, not the post
+
+• Reddit upvotes are vote-democratized (1 user 1 vote, harder to game):
+  - 10K upvotes on Reddit ≈ real audience of 100K+ (most readers don't vote)
+  - More reliable signal than raw Twitter views
+  - Comments matter more than upvotes for narrative depth — 500+ comments = real discussion
+
+• Google Trends represents SEARCH demand:
+  - "Searches: 200K+" means people are actively googling the topic — strong narrative signal even without social media buzz
+  - Google Trends typically lags Twitter by 6-24h, so a fresh Google spike often confirms a Twitter trend has gone mainstream
+
 ━━━ ALERT TYPE (signal shape, not topic) ━━━
 Independently of category, classify the SHAPE of the signal — what kind of thing the user will see in their alert. Pick exactly one of:
 • "event"  — there is a SPECIFIC TRIGGER (someone did something, something happened, a launch/scandal/breaking moment). If you would write a non-empty whyNow, the alertType is almost always "event".

@@ -327,6 +327,8 @@ class AdminServer {
     merged.activePreset = this.db.getSetting('activePreset', 'general') || 'general';
     // Which Twitter/X scraper is active (maps to an actor in src/collectors/twitter.js)
     merged.twitterActor = (this.db.getSetting('twitterActor', 'kaitoeasyapi') || 'kaitoeasyapi').toLowerCase();
+    // Same for TikTok (src/collectors/tiktok.js ACTORS).
+    merged.tiktokActor  = (this.db.getSetting('tiktokActor',  'clockworks')   || 'clockworks').toLowerCase();
     return merged;
   }
 
@@ -343,6 +345,13 @@ class AdminServer {
       const a = String(body.twitterActor || '').toLowerCase();
       if (!VALID_TWITTER_ACTORS.has(a)) throw new Error('Invalid twitterActor');
       this.db.setSetting('twitterActor', a);
+    }
+    // TikTok scraper actor — must match keys in src/collectors/tiktok.js ACTORS.
+    const VALID_TIKTOK_ACTORS = new Set(['clockworks', 'apidojo']);
+    if ('tiktokActor' in body) {
+      const a = String(body.tiktokActor || '').toLowerCase();
+      if (!VALID_TIKTOK_ACTORS.has(a)) throw new Error('Invalid tiktokActor');
+      this.db.setSetting('tiktokActor', a);
     }
     // Allowed-list trimmed in 2026-05-01 PR-2: per-preset fields (alert
     // thresholds / weights / stale decay / cluster) moved to settings.presetConfigs
@@ -2525,6 +2534,25 @@ function ScannerConfigSection() {
     },
   ];
 
+  // TikTok scraper actors. The id must match a key in
+  // src/collectors/tiktok.js ACTORS + VALID_TIKTOK_ACTORS in _setScannerConfig.
+  const TIKTOK_ACTORS = [
+    {
+      id: 'clockworks',
+      icon: '⏱️',
+      label: 'Clockworks',
+      price: '$2.00 / 1K',
+      hint: 'Дефолт. Зрелый, нативный hashtag-вход, надёжно отдаёт обложку и engagement.',
+    },
+    {
+      id: 'apidojo',
+      icon: '🥷',
+      label: 'apidojo',
+      price: '$0.30 / 1K',
+      hint: 'Дешевле в ~6 раз. Видео-URL не отдаёт стабильно (header-bound), но обложку и метрики — да. Для нашего пайплайна разницы нет, мы и так используем cover.',
+    },
+  ];
+
   const row = (label, key, min, max, step, disp) => h('div', { className: 'scfg-row' },
     h('div', { className: 'scfg-row-top' },
       h('span', { className: 'scfg-label' }, label),
@@ -2571,6 +2599,32 @@ function ScannerConfigSection() {
           key: a.id,
           className: 'scfg-preset' + (cfg.twitterActor === a.id ? ' active' : ''),
           onClick: () => set('twitterActor', a.id),
+        },
+          h('div', { className: 'scfg-preset-icon' }, a.icon),
+          h('div', { className: 'scfg-preset-label' },
+            a.label,
+            h('span', { style: { marginLeft: 6, fontSize: 11, color: 'var(--muted)', fontWeight: 400 } }, a.price)
+          ),
+          h('div', { className: 'scfg-preset-hint' }, a.hint)
+        ))
+      )
+    ),
+
+    // TikTok scraper picker — same UX as Twitter. Each actor has its own
+    // Apify token (APIFY_API for clockworks default, APIFY_API_APIDOJO for the
+    // cheaper apidojo). Output fields differ slightly but the collector
+    // _normalize chain absorbs both.
+    h('div', { className: 'scfg-section' },
+      h('h4', { className: 'scfg-h4' }, '🎵 TikTok scraper'),
+      h('p', { className: 'scfg-desc' },
+        'Какой Apify-актёр будет скрейпить TikTok. Переключение применяется со следующего цикла. ' +
+        'Поля engagement (plays/likes/comments/shares) одинаковые — переключать безопасно. ' +
+        'Видео-файл напрямую мы не используем ни у одного актёра — берём только обложку и ссылку на пост.'),
+      h('div', { className: 'scfg-preset-grid' },
+        TIKTOK_ACTORS.map(a => h('div', {
+          key: a.id,
+          className: 'scfg-preset' + (cfg.tiktokActor === a.id ? ' active' : ''),
+          onClick: () => set('tiktokActor', a.id),
         },
           h('div', { className: 'scfg-preset-icon' }, a.icon),
           h('div', { className: 'scfg-preset-label' },
@@ -4323,7 +4377,9 @@ function ManualResultCard({ result, comment, setComment, onAlertSent }) {
                     : t.preStage.gemini.truncationReason === 'native_unavailable'
                       ? ' · нативное видео недоступно, использован poster'
                       : ' · использован poster')
-                : '') +
+                : (t.preStage.gemini.videoClipped
+                    ? ' · обрезано до первых ' + (t.preStage.gemini.videoMaxSec || 30) + 's'
+                    : '')) +
               (t.preStage.gemini.videoDurationSec ? ' · ' + t.preStage.gemini.videoDurationSec.toFixed(1) + 's' : '')
             ),
             t.preStage.gemini.visualCaption && React.createElement('div', { style: { fontSize: 13, color: 'var(--text)', marginBottom: 4 } },

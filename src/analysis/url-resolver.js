@@ -214,13 +214,182 @@ export async function resolveRedditUrl(url) {
 }
 
 // ── TikTok ──────────────────────────────────────────────────────────────────
-// oEmbed only — TikTok doesn't expose play counts via public APIs without
-// an Apify-style scraper. Title + thumbnail is enough for Stage 1 to score.
+// Two-tier resolution:
+//   1. apidojo Apify actor (if APIFY_API_APIDOJO is set) — gives full
+//      engagement (plays/likes/comments/shares/followers) AND a working
+//      videoUrl that Stage 0 Gemini-captioner can fetch nativно with proper
+//      Referer. Cost ~$0.0003 per single-URL run (1 item × $0.30/1K).
+//   2. oEmbed fallback — free, but only title + author + thumbnail. Used
+//      when apidojo isn't configured OR when the actor call fails. Stage 0
+//      has to fall through to image captioning in this path.
+//
+// Why force apidojo here even when collector is set to clockworks: clockworks
+// doesn't return videoUrl unless `shouldDownloadVideos: true` (which ships
+// off for cost reasons). For a one-off manual analysis, the user explicitly
+// wants the best signal — apidojo's videoUrl is exactly the thing we want
+// flowing into Gemini visual captioning. Clockworks scrape on a single URL
+// would give engagement but no video — strictly worse than apidojo here.
+
+const APIDOJO_TIKTOK_ACTOR = 'apidojo~tiktok-scraper';
+const APIDOJO_TIMEOUT_SECS = 60;
 
 export async function resolveTiktokUrl(url) {
   const videoIdMatch = url.match(/\/video\/(\d+)/);
   if (!videoIdMatch) throw new Error('Not a valid TikTok URL');
   const videoId = videoIdMatch[1];
+
+  // Tier 1: apidojo — full engagement + video URL.
+  // Token fallback chain matches the collector (`tiktok.js _activeActor`):
+  //   APIFY_API_APIDOJO  — preferred, dedicated per-actor key
+  //   APIFY_API          — generic single-account fallback (most users have this)
+  // One Apify account / token can run any actor it's been granted permission
+  // to. Some third-party actors (like apidojo) trigger a one-time
+  // "approve permissions" prompt in Apify Console — until that's done, the
+  // actor returns 403 `full-permission-actor-not-approved`. We treat that
+  // as a soft-fail and keep the oEmbed fallback for manual analysis.
+  const apidojoKey = process.env.APIFY_API_APIDOJO || process.env.APIFY_API || '';
+  if (apidojoKey) {
+    try {
+      const fromActor = await _resolveTiktokViaApidojo(url, videoId, apidojoKey);
+      if (fromActor) return fromActor;
+    } catch (e) {
+      // Soft-fail to oEmbed — manual analysis should never hard-fail because
+      // a paid actor had a hiccup. Log via console (resolver has no logger).
+      // eslint-disable-next-line no-console
+      console.warn(`[url-resolver] apidojo TikTok failed (${e.message}), falling back to oEmbed`);
+    }
+  }
+
+  // Tier 2: oEmbed fallback.
+  return _resolveTiktokViaOembed(url, videoId);
+}
+
+async function _resolveTiktokViaApidojo(url, videoId, apiKey) {
+  const runUrl = `https://api.apify.com/v2/acts/${APIDOJO_TIKTOK_ACTOR}/run-sync-get-dataset-items?timeout=${APIDOJO_TIMEOUT_SECS}`;
+  const input = {
+    startUrls: [{ url }],
+    maxItems: 1,
+    // Single-URL scrape, sort doesn't matter, but apidojo schema requires it.
+    sortType: 'RELEVANCE',
+    shouldDownloadVideos: false,
+    shouldDownloadCovers: false,
+  };
+  // 60s timeout headroom for the Apify run (which itself has 60s server-side cap)
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), (APIDOJO_TIMEOUT_SECS + 10) * 1000);
+  try {
+    const r = await fetch(runUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(input),
+    });
+    clearTimeout(timer);
+    if (!r.ok) {
+      const errText = await r.text();
+      throw new Error(`Apify ${r.status}: ${errText.substring(0, 200)}`);
+    }
+    const items = await r.json();
+    if (!Array.isArray(items) || items.length === 0) return null;
+    const v = items[0];
+
+    // Mirror the field-fallback chain in tiktok.js _normalize so manual
+    // analysis sees the same shape the cycle-collector produces.
+    // apidojo's actual schema (verified via curl on the running actor):
+    //   { id, title (caption), views, likes, comments, shares,
+    //     channel: { username, followers, ... },
+    //     uploadedAt (UNIX seconds),
+    //     video: { url (CDN mp4), cover, thumbnail, duration, ... },
+    //     hashtags: ["bare","strings","without","#"] }
+    const text     = v.text || v.desc || v.description || v.title || '';
+    const plays    = v.playCount    || v.views          || 0;
+    const likes    = v.diggCount    || v.likeCount      || v.likes    || 0;
+    const comments = v.commentCount || v.comments       || 0;
+    const shares   = v.shareCount   || v.shares         || 0;
+    const author   = v.authorMeta?.name
+                  || v.authorUsername
+                  || v.author?.uniqueId
+                  || v.channel?.username
+                  || 'unknown';
+    const followers = v.authorMeta?.fans
+                   || v.authorMeta?.followers
+                   || v.authorMeta?.followerCount
+                   || v.author?.fans
+                   || v.channel?.followers
+                   || 0;
+
+    const thumb = v.originCoverUrl
+               || v.covers?.[0]
+               || (typeof v.covers === 'object' && v.covers && (v.covers.default || v.covers.origin))
+               || v.cover
+               || v.dynamicCover
+               || v.shareCover?.[0]
+               || v.imageUrl
+               || v.video?.cover
+               || v.video?.thumbnail
+               || null;
+
+    // Skip music/audio URLs — apidojo fallback fields sometimes carry the
+    // TikTok soundtrack mp3 (on `*-music*.tiktokcdn.com`) instead of the
+    // actual video MP4. See tiktok.js _firstNonAudioUrl for the same logic.
+    const videoCandidates = [
+      v.video?.url,
+      v.videoUrlNoWaterMark,
+      typeof v.videoUrl === 'string' ? v.videoUrl : null,
+      Array.isArray(v.mediaUrls) ? v.mediaUrls[0] : null,
+      v.videoMeta?.downloadAddr,
+      v.videoMeta?.playAddr,
+    ];
+    const videoUrl = videoCandidates.find(
+      u => typeof u === 'string' && u && !/\/ies-music|-music[-.]|\.mp3(\?|$)/i.test(u),
+    ) || null;
+
+    const createdUnix = v.createTime || v.uploadedAt || null;
+    const createdAt = createdUnix ? new Date(createdUnix * 1000) : null;
+    const ageHours = createdAt ? Math.max(0.25, (Date.now() - createdAt.getTime()) / 3_600_000) : 1;
+
+    const hashtagMatches = text.match(/#\w+/g) || [];
+    const hashtags = [...new Set(hashtagMatches.map(h => h.toLowerCase()))];
+    const tickerMatches = text.match(/\$[A-Z]{2,8}/g) || [];
+    const tickers = [...new Set(tickerMatches)];
+
+    const cleanTitle = text.replace(/https?:\/\/\S+/g, '').replace(/#\w+|@\w+|\$\w+/g, '').replace(/\s+/g, ' ').trim().substring(0, 120)
+                    || `TikTok video by @${author}`;
+
+    return {
+      externalId: `manual_tiktok_${videoId}`,
+      source: 'tiktok',
+      title: cleanTitle,
+      originalTitle: cleanTitle,
+      description: text.substring(0, 300),
+      url,
+      metrics: {
+        plays,
+        likes,
+        comments,
+        shares,
+        followers,
+        upvotes: likes + shares * 3,                   // upvotes-equiv
+        velocity: Math.round(plays / Math.max(ageHours, 1)),
+        ageHours: Math.round(ageHours * 10) / 10,
+        hashtags,
+        tickers,
+        author: `@${author}`,
+        thumbnailUrl: thumb,
+        imageUrls: thumb ? [thumb] : [],
+        videoUrl,
+        searchQuery: '(manual)',
+      },
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function _resolveTiktokViaOembed(url, videoId) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {

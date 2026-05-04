@@ -54,6 +54,14 @@ const config = {
       kaitoeasyapi: process.env.APIFY_API_KAITO || '',
       xquik:        process.env.APIFY_API_XQUIK || '',
     },
+    // Same pattern for TikTok: per-actor tokens, runtime-switched via
+    // 'tiktokActor' DB setting (values: 'clockworks' | 'apidojo').
+    // Default actor (clockworks) reuses the generic APIFY_API for back-compat
+    // with single-key deployments — no .env change required to keep working.
+    tiktokKeys: {
+      clockworks: process.env.APIFY_API_CLOCKWORKS || process.env.APIFY_API || '',
+      apidojo:    process.env.APIFY_API_APIDOJO    || '',
+    },
     twitterAuthToken: process.env.TWITTER_AUTH_TOKEN || '',
     twitterCt0:       process.env.TWITTER_CT0        || '',
   },
@@ -138,7 +146,8 @@ flag(isProduction && !config.publicBaseUrl, 'PUBLIC_BASE_URL not set in producti
 // Soft (warn only)
 flag(!config.solanaPay.merchantWallet, 'SOLANA_MERCHANT_WALLET is not set - crypto payments disabled');
 flag(config.twitter.enabled && !config.apify.apiKey, 'TWITTER_ENABLED=true but APIFY_API not set');
-flag(config.tiktok.enabled  && !config.apify.apiKey, 'TIKTOK_ENABLED=true but APIFY_API not set');
+flag(config.tiktok.enabled && !Object.values(config.apify.tiktokKeys).some(Boolean),
+     'TIKTOK_ENABLED=true but no TikTok actor key (APIFY_API / APIFY_API_APIDOJO) set');
 flag(config.dashboard.enabled && !config.dashboard.apiKey, 'DASHBOARD_API_KEY not set - legacy header check will fail');
 flag(config.support.botToken && !config.support.groupId, 'SUPPORT_BOT_TOKEN set but SUPPORT_GROUP_ID missing - support bot disabled');
 

@@ -39,6 +39,9 @@
 
 import { spawn } from 'child_process';
 import crypto from 'crypto';
+import { promises as fs } from 'fs';
+import os from 'os';
+import path from 'path';
 
 const VISION_SYSTEM_PROMPT = `You are a VISUAL DESCRIPTION preprocessor for a memecoin trend analyzer. Your ONLY job: describe what is shown in the image or video factually so the downstream scorer has accurate visual context.
 
@@ -149,27 +152,56 @@ export class GeminiCaptioner {
     let videoDurationSec = null;
     let result = null;
     let videoTruncated = false;
+    let videoClipped = false;     // true when we fed Gemini ffmpeg-trimmed first N sec
     // Why we fell through to the poster (used by the admin badge so we don't
     // mislead with "видео > 30s" when the real reason was a Google 503/cooldown).
-    //   'duration_exceeded' — duration > STAGE0_VIDEO_MAX_SEC
+    //   'duration_exceeded' — duration > STAGE0_VIDEO_MAX_SEC AND ffmpeg trim failed
     //   'native_unavailable' — native video call failed (Google down/cooldown,
     //                          or fallback was OpenRouter which is image-only)
     let truncationReason = null;
     let provider = null;
 
     if (isVideo) {
-      // Probe duration once — long videos always go straight to poster path.
+      // Probe duration once.
       videoDurationSec = await this._probeVideoDuration(primaryUrl).catch(() => null);
       const tooLong = videoDurationSec !== null && videoDurationSec > this.videoMaxSec;
 
       if (tooLong) {
-        this.logger?.info?.(`[GeminiCaptioner] video ${videoDurationSec.toFixed(1)}s > ${this.videoMaxSec}s cap, using poster`);
-        if (!posterUrl) return null;
-        videoTruncated = true;
-        truncationReason = 'duration_exceeded';
-        ({ result, provider } = await this._captionImageWithFailover(posterUrl, trend));
+        // Long video → ffmpeg-trim to first videoMaxSec, send the clip natively.
+        // Falls through to poster only if trimming or Google call fails. This
+        // is the architectural fix — we used to throw away long videos; now
+        // we extract the most informative window (first N sec, where the meme
+        // hook usually lives) and let Gemini caption it.
+        this.logger?.info?.(
+          `[GeminiCaptioner] video ${videoDurationSec.toFixed(1)}s > ${this.videoMaxSec}s, ` +
+          `trimming to first ${this.videoMaxSec}s`
+        );
+        const trimmed = await this._trimVideoToBuffer(primaryUrl, this.videoMaxSec);
+        if (trimmed && this._canUseGoogle()) {
+          const r = await this._tryGoogleMedia(primaryUrl, 'video', trend, trimmed);
+          if (r) {
+            this._recordGoogleSuccess();
+            result = r;
+            provider = 'google';
+            videoClipped = true;
+          } else {
+            this._recordGoogleFailure();
+          }
+        }
+        // Trim or Google failed → poster fallback (preserves old behaviour).
+        if (!result && posterUrl) {
+          this.logger?.warn?.(
+            `[GeminiCaptioner] trim path unavailable, falling back to poster`
+          );
+          videoTruncated = true;
+          truncationReason = 'duration_exceeded';
+          ({ result, provider } = await this._captionImageWithFailover(posterUrl, trend));
+        } else if (!result && !posterUrl) {
+          // No video, no trim, no poster — give up.
+          return null;
+        }
       } else {
-        // 1) Try Google native video
+        // Short video → send raw to Google.
         if (this._canUseGoogle()) {
           const r = await this._tryGoogleMedia(primaryUrl, 'video', trend);
           if (r) {
@@ -199,6 +231,7 @@ export class GeminiCaptioner {
       mediaType: videoTruncated ? 'image' : (isVideo ? 'video' : 'image'),
       videoDurationSec,
       videoTruncated,
+      videoClipped,    // true when video was ffmpeg-trimmed to first N sec (still 'video' mediaType)
       truncationReason,
       videoMaxSec: isVideo ? this.videoMaxSec : null,
       provider,
@@ -260,7 +293,18 @@ export class GeminiCaptioner {
    * caption object, or null on any failure (caller decides whether to
    * fall back to OpenRouter).
    */
-  async _tryGoogleMedia(url, kind /* 'image' | 'video' */, trend) {
+  /**
+   * Send media (image or video) to Google AI Studio for captioning.
+   *
+   * @param {string} url        Source URL — used for download + diagnostic logs.
+   * @param {string} kind       'image' | 'video'
+   * @param {Object} trend      Trend object (for title context in prompt + log).
+   * @param {Buffer|null} prefetched  Optional pre-fetched bytes (e.g. ffmpeg-trimmed
+   *                                  video). When supplied, skips HEAD + download —
+   *                                  the buffer is treated as the final payload.
+   *                                  `url` still kept for log attribution.
+   */
+  async _tryGoogleMedia(url, kind /* 'image' | 'video' */, trend, prefetched = null) {
     if (!this.hasGoogle) return null;
     const startedAt = Date.now();
     const maxBytes = (kind === 'video' ? this.videoMaxMb : this.imageMaxMb) * 1024 * 1024;
@@ -268,41 +312,65 @@ export class GeminiCaptioner {
     // Reddit (v.redd.it) and some Twitter video CDN endpoints reject the
     // default Node fetch User-Agent. Use a Chrome UA for media downloads —
     // mirrors what the Reddit collector already does for JSON API calls.
+    //
+    // TikTok CDN (tiktokv.com / tiktokcdn.com / tiktokcdn-us.com) additionally
+    // gates by Referer — without `Referer: https://www.tiktok.com/` the URL
+    // returns 403 even with a valid signed token. apidojo's `videoUrl` is
+    // sometimes called "header-bound" because of this; it's not actually
+    // bound to the original request — just needs a tiktok-origin Referer.
     const downloadHeaders = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Accept': '*/*',
     };
-
-    // 1. HEAD probe for early size rejection
-    let contentLength = null;
-    try {
-      const head = await fetch(url, { method: 'HEAD', headers: downloadHeaders, signal: AbortSignal.timeout(8000) });
-      const cl = head.headers.get('content-length');
-      if (cl) contentLength = parseInt(cl, 10);
-    } catch { /* HEAD optional */ }
-    if (contentLength && contentLength > maxBytes) {
-      this.logger?.info?.(`[GeminiCaptioner] ${kind} ${(contentLength / 1024 / 1024).toFixed(1)}MB > ${maxBytes / 1024 / 1024}MB cap, skipping`);
-      return null;
+    if (_isTikTokMediaUrl(url)) {
+      downloadHeaders['Referer'] = 'https://www.tiktok.com/';
     }
 
-    // 2. Download bytes
     let buffer;
     let downloadContentType = null;
-    try {
-      const res = await fetch(url, { headers: downloadHeaders, signal: AbortSignal.timeout(this.downloadTimeoutMs) });
-      if (!res.ok) {
-        this.logger?.warn?.(`[GeminiCaptioner] ${kind} download HTTP ${res.status}`);
-        return null;
-      }
-      downloadContentType = res.headers.get('content-type') || null;
-      buffer = Buffer.from(await res.arrayBuffer());
+    let contentLength = null;
+
+    if (prefetched) {
+      // Bytes already in hand (e.g. ffmpeg trim output). Skip HEAD + download.
+      buffer = prefetched;
+      contentLength = buffer.length;
+      downloadContentType = kind === 'video' ? 'video/mp4' : null;  // ffmpeg writes mp4
       if (buffer.length > maxBytes) {
-        this.logger?.info?.(`[GeminiCaptioner] ${kind} ${(buffer.length / 1024 / 1024).toFixed(1)}MB exceeds cap after download, skipping`);
+        this.logger?.info?.(
+          `[GeminiCaptioner] ${kind} prefetched ${(buffer.length / 1024 / 1024).toFixed(1)}MB ` +
+          `exceeds cap, skipping`
+        );
         return null;
       }
-    } catch (e) {
-      this.logger?.warn?.(`[GeminiCaptioner] ${kind} download failed: ${e.message}`);
-      return null;
+    } else {
+      // 1. HEAD probe for early size rejection
+      try {
+        const head = await fetch(url, { method: 'HEAD', headers: downloadHeaders, signal: AbortSignal.timeout(8000) });
+        const cl = head.headers.get('content-length');
+        if (cl) contentLength = parseInt(cl, 10);
+      } catch { /* HEAD optional */ }
+      if (contentLength && contentLength > maxBytes) {
+        this.logger?.info?.(`[GeminiCaptioner] ${kind} ${(contentLength / 1024 / 1024).toFixed(1)}MB > ${maxBytes / 1024 / 1024}MB cap, skipping`);
+        return null;
+      }
+
+      // 2. Download bytes
+      try {
+        const res = await fetch(url, { headers: downloadHeaders, signal: AbortSignal.timeout(this.downloadTimeoutMs) });
+        if (!res.ok) {
+          this.logger?.warn?.(`[GeminiCaptioner] ${kind} download HTTP ${res.status}`);
+          return null;
+        }
+        downloadContentType = res.headers.get('content-type') || null;
+        buffer = Buffer.from(await res.arrayBuffer());
+        if (buffer.length > maxBytes) {
+          this.logger?.info?.(`[GeminiCaptioner] ${kind} ${(buffer.length / 1024 / 1024).toFixed(1)}MB exceeds cap after download, skipping`);
+          return null;
+        }
+      } catch (e) {
+        this.logger?.warn?.(`[GeminiCaptioner] ${kind} download failed: ${e.message}`);
+        return null;
+      }
     }
 
     // 3. Validate payload BEFORE shipping it to Google.
@@ -595,12 +663,23 @@ export class GeminiCaptioner {
 
   _probeVideoDuration(videoUrl) {
     return new Promise((resolve) => {
-      const proc = spawn('ffprobe', [
+      // ffprobe sends a default UA that some CDNs reject, and TikTok additionally
+      // requires Referer — without these probe returns code 1 ("HTTP 403") and
+      // we'd think the video has no duration. Adding both is harmless for other
+      // hosts (Twitter / Reddit / fxtwitter all accept anything).
+      const ffprobeArgs = [
         '-v', 'error',
+        '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      ];
+      if (_isTikTokMediaUrl(videoUrl)) {
+        ffprobeArgs.push('-referer', 'https://www.tiktok.com/');
+      }
+      ffprobeArgs.push(
         '-show_entries', 'format=duration',
         '-of', 'default=noprint_wrappers=1:nokey=1',
         videoUrl,
-      ]);
+      );
+      const proc = spawn('ffprobe', ffprobeArgs);
       let buf = '';
       let settled = false;
       const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
@@ -614,6 +693,105 @@ export class GeminiCaptioner {
       setTimeout(() => {
         if (!settled) { try { proc.kill('SIGKILL'); } catch {} finish(null); }
       }, 5000);
+    });
+  }
+
+  /**
+   * Clip the first `maxSec` seconds of a remote video and return its bytes.
+   *
+   * Uses ffmpeg with `-c copy` (stream copy, no re-encode) — typically 50-300ms
+   * total because we just rewrite container metadata + copy raw packets, no
+   * decode/encode pipeline. Output goes to a temp mp4 file then gets read back
+   * as Buffer (streaming-to-pipe needs fragmented mp4 which Gemini doesn't
+   * always accept; tmpfile is more compatible).
+   *
+   * Adds proper headers for sources that gate by them:
+   *   - User-Agent (Chrome) — Reddit v.redd.it, some Twitter CDN endpoints
+   *   - Referer https://www.tiktok.com/ — TikTok CDN (apidojo videoUrl etc.)
+   *
+   * Returns null on:
+   *   - ffmpeg failure (non-zero exit, source unreachable, codec mismatch)
+   *   - timeout (downloadTimeoutMs)
+   *   - empty output (corrupt source)
+   *   - resulting buffer >videoMaxMb (very rare — 30s clip should fit easily)
+   *
+   * Caller must always handle null by falling back to poster captioning.
+   */
+  async _trimVideoToBuffer(videoUrl, maxSec) {
+    const tmpFile = path.join(
+      os.tmpdir(),
+      `catalyst-trim-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.mp4`,
+    );
+    return new Promise((resolve) => {
+      const args = [
+        '-y',                                    // overwrite (defensive)
+        '-v', 'error',
+        '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      ];
+      if (_isTikTokMediaUrl(videoUrl)) {
+        args.push('-referer', 'https://www.tiktok.com/');
+      }
+      args.push(
+        '-i', videoUrl,
+        '-t', String(maxSec),
+        '-c', 'copy',                            // no re-encode — instant
+        '-movflags', '+faststart',               // moov at start (Gemini expects this)
+        tmpFile,
+      );
+
+      const proc = spawn('ffmpeg', args);
+      let stderrBuf = '';
+      proc.stderr.on('data', d => { stderrBuf += d.toString(); });
+
+      let settled = false;
+      const cleanup = async () => {
+        try { await fs.unlink(tmpFile); } catch { /* already gone */ }
+      };
+      const finish = async (val) => {
+        if (settled) return;
+        settled = true;
+        await cleanup();
+        resolve(val);
+      };
+
+      proc.on('error', (e) => {
+        this.logger?.warn?.(`[GeminiCaptioner] ffmpeg trim spawn error: ${e.message}`);
+        finish(null);
+      });
+      proc.on('close', async (code) => {
+        if (settled) return;
+        if (code !== 0) {
+          this.logger?.warn?.(
+            `[GeminiCaptioner] ffmpeg trim exit ${code}: ${stderrBuf.slice(0, 200)}`
+          );
+          return finish(null);
+        }
+        try {
+          const buf = await fs.readFile(tmpFile);
+          if (buf.length === 0) return finish(null);
+          if (buf.length > this.videoMaxMb * 1024 * 1024) {
+            this.logger?.info?.(
+              `[GeminiCaptioner] trimmed video ${(buf.length / 1024 / 1024).toFixed(1)}MB ` +
+              `> ${this.videoMaxMb}MB cap — falling back to poster`
+            );
+            return finish(null);
+          }
+          // Read OK, return buffer (cleanup happens after)
+          settled = true;
+          await fs.unlink(tmpFile).catch(() => {});
+          resolve(buf);
+        } catch (e) {
+          this.logger?.warn?.(`[GeminiCaptioner] ffmpeg trim read failed: ${e.message}`);
+          finish(null);
+        }
+      });
+
+      setTimeout(() => {
+        if (settled) return;
+        try { proc.kill('SIGKILL'); } catch {}
+        this.logger?.warn?.(`[GeminiCaptioner] ffmpeg trim timeout after ${this.downloadTimeoutMs}ms`);
+        finish(null);
+      }, this.downloadTimeoutMs);
     });
   }
 
@@ -651,6 +829,20 @@ export class GeminiCaptioner {
   _hash(str) {
     return crypto.createHash('sha1').update(String(str)).digest('hex').slice(0, 16);
   }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Detect a TikTok-CDN media URL (video or cover). Used to know when to add
+ * `Referer: https://www.tiktok.com/` to fetch / ffprobe — without it TikTok's
+ * CDN returns 403. The match is intentionally broad (covers tiktokcdn.com,
+ * tiktokv.com, tiktokcdn-us.com, p16-sign-*.tiktokcdn-us.com etc.) so future
+ * subdomain reshuffles by TikTok don't quietly break us.
+ */
+function _isTikTokMediaUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  return /(?:^|\.)(?:tiktok|tiktokcdn|tiktokcdn-us|tiktokv)\.com\b/i.test(url);
 }
 
 export default GeminiCaptioner;

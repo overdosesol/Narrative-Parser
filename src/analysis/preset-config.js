@@ -70,9 +70,14 @@ export const PRESET_FIELD_RANGES = Object.freeze({
                            desc: 'Поисковые запросы. По циклу запускается 2 (rotated).' },
     },
     tiktok: {
+      // Note: per-preset TikTok control was removed 2026-05-05. TikTok runs
+      // globally (env TIKTOK_ENABLED) using live-discovery from TikTok
+      // Creative Center as primary hashtag source. The hardcoded list below
+      // is only fallback for when the trends actor fails. To kill TikTok
+      // entirely → admin "Сканеры → 📡 Площадки" toggle (global, per-source).
       hashtags:          { type: 'list',  max: 30, itemMaxLen: 64,
-                           label: 'TikTok hashtags',
-                           desc: 'Хэштеги без #. По циклу запускается 2 (rotated).' },
+                           label: 'TikTok hashtags (fallback)',
+                           desc: 'Hardcoded fallback-список хэштегов. Используется ТОЛЬКО если live-discovery (clockworks/tiktok-trends-scraper) упал или не успел сделать первый fetch. Primary source — live-trending из TikTok Creative Center, refresh раз в 12h.' },
     },
     xtrends: {
       enabled:           { type: 'int', min: 0, max: 1, step: 1,
@@ -248,17 +253,19 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         ],
       },
       tiktok: {
-        // 10 hashtags — 2-3 per theme. Replaced the generic fyp/viral/trending
-        // bag that's basically TikTok's whole platform with curated themed tags.
+        // Hardcoded fallback list — used only if live-discovery from TikTok
+        // Creative Center fails. Primary source is the live trending pool
+        // refreshed every 12h. Mix of all 4 themes (3/3/3/3) so a fallback
+        // run still produces somewhat varied content.
         hashtags: [
           // animals
-          'cuteanimals', 'funnyanimals',
+          'animalsoftiktok', 'petsoftiktok', 'funnydogs',
           // culture
-          'meme', 'viral', 'brainrot',
+          'storytime', 'relatablememes', 'brainrotmemes',
           // celebrities
-          'celebnews', 'popculture',
+          'kpopfyp', 'fandomdrama', 'celebdrama',
           // events
-          'news', 'breakingnews', 'tech',
+          'weathertok', 'stormchasing', 'aitechnology',
         ],
       },
       // X Trends — broad cast, take top 20 (covers most of US live trends).
@@ -307,8 +314,15 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         ],
       },
       tiktok: {
-        // Added: dogsoftiktok (massive dedicated tag), catlovers (variant boost).
-        hashtags: ['cuteanimals', 'pets', 'doglover', 'catlover', 'animallover', 'wildlife', 'funnyanimals', 'dogsoftiktok', 'catlovers'],
+        // Hardcoded fallback list (animal-themed) for when live-discovery
+        // fails. In practice live trending hashtags from TikTok Creative
+        // Center will surface animal-related ones organically when relevant.
+        hashtags: [
+          'animalsoftiktok', 'petsoftiktok', 'funnydogs', 'funnycats',
+          'exoticpets', 'babyanimals', 'blackcatsoftiktok', 'catsoftiktok',
+          'doglovers', 'animalvideos', 'farmanimals', 'animalkingdom',
+          'puppylove', 'bunny', 'fosteringsaveslives',
+        ],
       },
       // X Trends — animals rarely make top trends, take 10 (less noise)
       xtrends:      { enabled: 1, topN: 10 },
@@ -360,10 +374,31 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         ],
       },
       tiktok: {
-        // Added: pov (POV-storytelling format dominates), brainrot (fresh slang).
-        // Kept internetculture — Grok suggested removing as too generic but it's
-        // the canonical meta-tag for culture-aware viral posts.
-        hashtags: ['meme', 'viral', 'fyp', 'trending', 'genz', 'internetculture', 'funny', 'pov', 'brainrot'],
+        // Hardcoded fallback list of named memes — used only if live-discovery
+        // from TikTok Creative Center fails. The live trending pool (refreshed
+        // every 12h) is the primary hashtag source and surfaces current memes
+        // organically; this list is a safety net for when the trends actor
+        // is down or hasn't done its first fetch after restart.
+        //
+        // Snapshot 2026-05-05 — Grok web-search of named meme formats actively
+        // spreading at the time. Each entry is a specific viral meme (sound /
+        // catchphrase / character / format), not a category tag.
+        hashtags: [
+          'ohokbecause',                  // wordplay-trend "sub had a way" / "doctor had a pepper", boxing-step dance to track 212
+          'rahskeleton',                  // skeleton character yelling "RAHHH", chaotic situations
+          'rememberwhoyouare',            // catchphrase meme "remember who you are [demographic]"
+          'dontleavemedry',               // catchphrase slang replacing "don't leave me hanging"
+          'homerdroppedhisdonut',         // sound-driven AI meme with Homer Simpson "D'oh!" remix
+          'blueshirtkid',                 // character meme — boy in blue shirt dancing sturdy
+          'areyoucomingtothetree',        // catchphrase from Hunger Games in phonk/conveyor edits
+          'ijusthitthejackpot',           // sound-driven meme on rap track for everyday wins
+          'theworstthingshecansayisno',   // catchphrase meme in humor/meme contexts
+          'bigarch',                      // food-meme on Arby's Big Arch — parodies, CEO reactions
+          'goofinator',                   // 2026 slang catchphrase for goofy behavior
+          'aimyguy',                      // catchphrase "AI, my guy" universal comment
+          'followthattune',               // sound-driven trend on Gymskin "follow that tune"
+          'everythinghallelujah',         // sound-driven trend on Justin Bieber "Hallelujah"
+        ],
       },
       // X Trends — memes spike fast in trends, take 25
       xtrends:      { enabled: 1, topN: 25 },
@@ -412,8 +447,14 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         ],
       },
       tiktok: {
-        // Added: bts + blackpink (dominant K-pop fandom hashtags 2026).
-        hashtags: ['celebrity', 'celebnews', 'popculture', 'hollywood', 'kpop', 'fandom', 'gossip', 'bts', 'blackpink'],
+        // Hardcoded fallback list (celebrity-themed) for when live-discovery
+        // fails. Live trending hashtags from TikTok Creative Center will
+        // surface celeb-drama tags organically when they spike.
+        hashtags: [
+          'kpopfyp', 'kpopdance', 'kpopedit', 'kpopstan', 'kpopfandom',
+          'fandomdrama', 'celebdrama', 'hollywooddrama', 'kpopnews',
+          'kpopidol', 'viraledit', 'kdrama',
+        ],
       },
       // X Trends — celebs flood the trending list, take 25
       xtrends:      { enabled: 1, topN: 25 },
@@ -459,8 +500,15 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
         ],
       },
       tiktok: {
-        // Added: aivideo (AI video viral 2026), severeweather (disaster spikes).
-        hashtags: ['news', 'breakingnews', 'sports', 'science', 'tech', 'space', 'world', 'aivideo', 'severeweather'],
+        // Hardcoded fallback list (events/news-themed) for when live-discovery
+        // fails. Live trending hashtags from TikTok Creative Center will
+        // surface event-driven tags organically (weathertok/tornadotok spike
+        // around real disasters; aitechnology/technews around AI launches).
+        hashtags: [
+          'weathertok', 'tornadotok', 'stormchasing', 'aitechnology',
+          'technews', 'sportshighlights', 'championsleague', 'nbaplayoffs',
+          'ucl', 'spaceexploration', 'sciencefacts', 'breakingweather',
+        ],
       },
       // X Trends — events dominate trending; take 30 (broadest cap, breaking news drives a lot)
       xtrends:      { enabled: 1, topN: 30 },
