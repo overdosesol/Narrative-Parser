@@ -80,12 +80,24 @@ export function formatTelegramAlert(trend, lang = 'en') {
         const tw = m.tweetsCount || (m.topTweets ? m.topTweets.length : 0);
         msg += parts.join('  ') + (tw > 0 ? `  ·  ${tw} tweets\n` : '\n');
       }
-    } else if (m.upvotes) {
-      const count = formatNumber(m.upvotes);
+    } else if (m.upvotes || (src === 'tiktok' && m.plays)) {
       const vel   = formatNumber(m.velocity || 0);
-      if (src === 'twitter')      msg += t.alertLikes(count, vel) + '\n';
-      else if (src === 'tiktok')  msg += t.alertPlays(count, vel) + '\n';
-      else                        msg += t.alertUpvotes(count, vel) + '\n';
+      if (src === 'twitter') {
+        msg += t.alertLikes(formatNumber(m.upvotes), vel) + '\n';
+      } else if (src === 'tiktok') {
+        // Show REAL plays count for TikTok, not the upvotes composite
+        // (likes + shares×3). Earlier the alert displayed `m.upvotes` labelled
+        // as "plays" — e.g. for a video with 128K likes + 17K shares the row
+        // read "180.6K plays" while real plays were 2.14M. This caused user
+        // confusion: the metric label "plays" was wrong, and the displayed
+        // count was a synthetic composite that didn't match either the
+        // platform's plays counter or its likes counter. Switch to actual
+        // `m.plays` so what the user sees in the alert matches what they
+        // see when they click through.
+        msg += t.alertPlays(formatNumber(m.plays || 0), vel) + '\n';
+      } else {
+        msg += t.alertUpvotes(formatNumber(m.upvotes), vel) + '\n';
+      }
     }
     if (m.comments && !isXTrend) msg += t.alertComments(formatNumber(m.comments)) + '\n';
     if (m.formattedTraffic) msg += t.alertGoogleTraffic(escHtml(m.formattedTraffic)) + '\n';

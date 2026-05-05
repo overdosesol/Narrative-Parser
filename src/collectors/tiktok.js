@@ -460,28 +460,32 @@ class TikTokCollector extends BaseCollector {
     //                         organically near-impossible to fake at scale)
     //   • shares ≥   5 000   (the strongest TikTok virality signal — a low-view
     //                         but heavily-shared video is still meaningful)
-    //   • viralScore ≥ 60    (composite — catches influencer posts with big
-    //                         follower counts even at lower direct engagement)
     //
-    // Floor was raised 2026-05-05 from 50K plays / 1K likes / 200 shares / 40
-    // viralScore — those values let through ~70-80% noise (random tiktoks with
-    // cluster-of-friends engagement, bot-watched ad clones, regional reposts).
+    // Floor was raised 2026-05-05 from 50K plays / 1K likes / 200 shares.
+    //
+    // viralScore was previously a 4th OR-option (≥60 default) but it's the
+    // sum of `log10` per metric — `10·log10(plays) + 12·log10(likes) +
+    // 8·log10(comments) + 15·log10(shares) + 5·log10(followers)`. Any video
+    // with ~200K plays alone gets viralScore = 100 (10·log10(200K) ≈ 53,
+    // plus *anything* on the other axes pushes past 60). That made the floor
+    // a no-op — videos with 6K likes and 100 shares slipped through because
+    // their 200K plays kept viralScore pinned at 100. Removed 2026-05-05.
+    // viralScore is still computed for downstream signals; it just no longer
+    // gates the floor.
     //
     // CJK-script videos get a harder bar — Apify's TikTok firehose drags in
     // regional virality that meets the default floor but never crosses into a
     // global narrative.
-    //   • Chinese (zh): 4× plays/likes/shares, +20 viralScore
-    //   • Japanese (ja) / Korean (ko): 2× plays/likes/shares, +10 viralScore
+    //   • Chinese (zh): 4× plays/likes/shares
+    //   • Japanese (ja) / Korean (ko): 2× plays/likes/shares
     const cjkScript = _detectCjkScript(desc);
     const cjkMult   = cjkScript === 'zh' ? 4 : cjkScript ? 2 : 1;
     const playsBar  = 500_000 * cjkMult;
     const likesBar  =  20_000 * cjkMult;
     const sharesBar =   5_000 * cjkMult;
-    const viralBar  = cjkScript === 'zh' ? 80 : cjkScript ? 70 : 60;
-    const meetsBar  = plays      >= playsBar
-                   || likes      >= likesBar
-                   || shares     >= sharesBar
-                   || viralScore >= viralBar;
+    const meetsBar  = plays  >= playsBar
+                   || likes  >= likesBar
+                   || shares >= sharesBar;
     if (!meetsBar) return null;
 
     // Drop obvious compilations / aggregator videos — they have no narrative
@@ -585,7 +589,21 @@ class TikTokCollector extends BaseCollector {
   }
 
   /**
-   * Group videos by shared hashtag clusters — surfaces emerging hashtag trends
+   * Group videos by shared hashtag clusters — surfaces emerging hashtag trends.
+   *
+   * Cluster output represents ONE specific video (the "representative") whose
+   * URL/author/thumbnail/metrics the user will see in the alert. The rep is
+   * picked as the highest-scoring video in the cluster (plays + shares×1000 +
+   * likes×10 — shares get the heaviest multiplier because they're the strongest
+   * TikTok virality signal per platform calibration).
+   *
+   * Cluster-wide aggregates are emitted as SEPARATE fields (`clusterPlays`,
+   * `clusterLikes`, `clusterShares`, `videoCount`) — never merged into the
+   * displayed metrics. Earlier versions summed everything into `metrics.plays`
+   * etc., but that caused alert/AI mismatches: the alert linked to a single
+   * video with 6K likes while AI's whyNow text said "@user posted with 128K
+   * likes" because the prompt got the cluster sum. Now what the user sees in
+   * the alert link MUST match the metrics in the alert body.
    */
   _clusterByHashtag(videos) {
     const clusters = new Map();
@@ -595,40 +613,69 @@ class TikTokCollector extends BaseCollector {
       const keys = [...tickers, ...hashtags.filter(h => h !== `#${sourceHashtag}`)].slice(0, 2);
       const clusterKey = keys.length > 0 ? keys[0] : `tiktok_${sourceHashtag}`;
 
+      // Viral-weighted score for representative selection. Shares are
+      // weighted heaviest — they're the strongest virality signal on TikTok
+      // and the hardest to fake at scale. Plays are raw reach. Likes are
+      // soft (autoplay-influenced).
+      const score = (video.metrics.plays  || 0)
+                  + (video.metrics.shares || 0) * 1000
+                  + (video.metrics.likes  || 0) * 10;
+
       if (!clusters.has(clusterKey)) {
-        clusters.set(clusterKey, { ...video, _count: 1 });
+        clusters.set(clusterKey, {
+          ...video,
+          _count: 1,
+          _repScore: score,
+          _clusterPlays:  video.metrics.plays  || 0,
+          _clusterLikes:  video.metrics.likes  || 0,
+          _clusterShares: video.metrics.shares || 0,
+        });
       } else {
         const c = clusters.get(clusterKey);
         c._count++;
-        c.metrics.plays    = (c.metrics.plays    || 0) + (video.metrics.plays    || 0);
-        c.metrics.likes    = (c.metrics.likes    || 0) + (video.metrics.likes    || 0);
-        c.metrics.shares   = (c.metrics.shares   || 0) + (video.metrics.shares   || 0);
-        c.metrics.upvotes  = (c.metrics.upvotes  || 0) + (video.metrics.upvotes  || 0);
-        // Keep the highest-plays video URL
-        if ((video.metrics.plays || 0) > (c.metrics.plays || 0)) {
-          c.url = video.url;
+        // Always accumulate cluster-wide totals (kept SEPARATE from the
+        // representative's individual metrics — never merged into them).
+        c._clusterPlays  += video.metrics.plays  || 0;
+        c._clusterLikes  += video.metrics.likes  || 0;
+        c._clusterShares += video.metrics.shares || 0;
+
+        // Swap representative if this video scores higher. Replace ALL
+        // identifying fields together so url + author + thumbnail + metrics
+        // remain in sync (the rep IS the video the user clicks through to).
+        if (score > c._repScore) {
+          c._repScore     = score;
+          c.url           = video.url;
+          c.title         = video.title;
+          c.description   = video.description;
+          c.externalId    = video.externalId;
+          c.metrics       = { ...video.metrics };
         }
       }
     }
 
-    return Array.from(clusters.values())
-      // Drop clusters whose summed engagement still doesn't meet bar after
-      // aggregation. Same OR logic as per-video floor in `_normalize`. Numbers
-      // are aggregated across all videos in the cluster, so even multi-video
-      // hashtag clusters need real combined engagement to pass.
-      .filter(c =>
-        (c.metrics.plays  || 0) >= 500_000
-        || (c.metrics.likes  || 0) >= 20_000
-        || (c.metrics.shares || 0) >= 5_000
-      )
-      .map(cluster => ({
-        ...cluster,
-        metrics: {
-          ...cluster.metrics,
-          videoCount: cluster._count,
-          velocity: cluster._count,
-        },
-      }));
+    // No aggregate-floor re-check at this stage. Each video already passed
+    // the individual floor in `_normalize` (500K plays OR 20K likes OR 5K
+    // shares), so any cluster formed here has at least one bona-fide viral
+    // video. The previous aggregate-floor was a safety-net from the era of
+    // looser individual floors — became redundant when we tightened those,
+    // and was actively harmful because it encouraged summing into the
+    // representative's metrics.
+    return Array.from(clusters.values()).map(cluster => ({
+      ...cluster,
+      metrics: {
+        ...cluster.metrics,
+        // Cluster-wide context — distinct from rep's individual metrics
+        // above. Prompts.js renders these on a separate line so the AI
+        // doesn't conflate cluster totals with the rep video's stats.
+        videoCount:    cluster._count,
+        clusterPlays:  cluster._clusterPlays,
+        clusterLikes:  cluster._clusterLikes,
+        clusterShares: cluster._clusterShares,
+        // velocity is preserved from rep's `_normalize` (= rep's plays/hour).
+        // Earlier code overwrote it with `cluster._count`, which displayed
+        // "↑4/hr" meaning "4 videos in cluster" — confusing. Removed.
+      },
+    }));
   }
 
   _delay(ms) {

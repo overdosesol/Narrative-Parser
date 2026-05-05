@@ -209,11 +209,18 @@ export function buildAnalysisPrompt(trends) {
         detail += ` | Viral: ${tw.viralityScore}/100`;
       }
 
-      // TikTok metrics
+      // TikTok metrics — IMPORTANT: `plays`/`likes`/`shares` are the REPRESENTATIVE
+      // video's own counts (the URL the user will click through to). They are
+      // NOT cluster sums. When writing whyNow about a specific user/post, use
+      // these numbers — referring to "@user posted with X plays" must match the
+      // linked video. Cluster aggregates are exposed separately (next line) and
+      // describe how many viral videos sit under the same hashtag.
       if (m.plays || m.videoCount) {
-        detail += `\n   TikTok: ${m.plays || 0} plays | ${m.likes || 0} likes | ${m.shares || 0} shares`;
-        if (m.videoCount) detail += ` | ${m.videoCount} videos in cluster`;
-        if (m.sourceHashtag) detail += ` | Source: #${m.sourceHashtag}`;
+        detail += `\n   TikTok (single video): ${m.plays || 0} plays | ${m.likes || 0} likes | ${m.shares || 0} shares`;
+        if (m.videoCount > 1) {
+          detail += `\n   TikTok (hashtag cluster): ${m.videoCount} viral videos | total ${m.clusterPlays || 0} plays | ${m.clusterLikes || 0} likes | ${m.clusterShares || 0} shares — describes the WAVE, not any one user`;
+        }
+        if (m.sourceHashtag) detail += `\n   Source: #${m.sourceHashtag}`;
         if (m.tickers?.length) detail += ` | Tickers: ${m.tickers.join(', ')}`;
         if (m.followers)   detail += ` | Followers: ${m.followers}`;
         if (m.engagementRate !== undefined) detail += ` | Engagement Rate: ${m.engagementRate}%`;
