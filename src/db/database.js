@@ -402,6 +402,25 @@ class TrendDatabase {
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tag_refresh_history_ts ON tag_refresh_history(ts DESC)`);
 
+    // Alert-score history — sparkline data for the dashboard modal. Each
+    // recompute (scan, hot-refresh, light-refresh) appends one row per trend
+    // so users can see "score was 65 -> 78 -> 82" over time. Admin-only for
+    // now; will open up later. Pruned to 30 days by maintenance loop.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS alert_score_history (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        trend_id        INTEGER NOT NULL,
+        ts              DATETIME DEFAULT CURRENT_TIMESTAMP,
+        score           INTEGER NOT NULL,
+        positive        INTEGER,
+        penalty         INTEGER,
+        floor_at_ts     INTEGER,
+        source          TEXT,
+        FOREIGN KEY(trend_id) REFERENCES trends(id) ON DELETE CASCADE
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_alert_score_history_trend_ts ON alert_score_history(trend_id, ts)`);
+
     // Auth sessions (Telegram-bot-verified login for the dashboard)
     // ── Flow ───────────────────────────────────────────────────────────────────
     //   1) Browser calls /api/auth/initiate     → row with session_id only
@@ -2268,6 +2287,53 @@ class TrendDatabase {
       ORDER BY ts DESC, id DESC
       LIMIT ?
     `).all(Number(limit) || 50);
+  }
+
+  // ── Alert score history (sparkline) ──────────────────────────────────────
+  // Append one row per recompute. breakdown is the object returned by
+  // computeAlertScore(); we extract score/positive/penalty. floorAtTs is
+  // the effective alert floor at write time (max of admin/user threshold).
+  // source is "scan" | "refresh-light" | "refresh-hot" | "manual" — useful
+  // for charting "this jump came from a hot refresh, not new feedback".
+  recordAlertScoreHistory({ trendId, breakdown, floorAtTs, source = 'scan' }) {
+    if (!trendId || !breakdown) return;
+    const score = Number(breakdown.score ?? breakdown.alertScore);
+    if (!Number.isFinite(score)) return;
+    try {
+      this.db.prepare(`
+        INSERT INTO alert_score_history (trend_id, score, positive, penalty, floor_at_ts, source)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        Number(trendId),
+        Math.round(score),
+        Number.isFinite(breakdown.positive) ? Math.round(breakdown.positive) : null,
+        Number.isFinite(breakdown.penalty)  ? Math.round(breakdown.penalty)  : null,
+        Number.isFinite(floorAtTs) ? Math.round(floorAtTs) : null,
+        source ? String(source).slice(0, 32) : null,
+      );
+    } catch { /* non-fatal: history is decorative */ }
+  }
+
+  // Read last N points for a trend (newest first). Limit caps the array
+  // size; the dashboard uses ~100 which gives ~3-4 days at hourly recompute.
+  getAlertScoreHistory(trendId, limit = 100) {
+    if (!trendId) return [];
+    return this.db.prepare(`
+      SELECT ts, score, positive, penalty, floor_at_ts AS floorAtTs, source
+      FROM alert_score_history
+      WHERE trend_id = ?
+      ORDER BY ts ASC, id ASC
+      LIMIT ?
+    `).all(Number(trendId), Math.max(1, Math.min(1000, Number(limit) || 100)));
+  }
+
+  // Daily prune. retentionDays defaults to 30 — sparkline rarely shows more
+  // than a week visually, but keeping a month means we can debug "why did
+  // this trend's score drop yesterday" after the fact.
+  pruneAlertScoreHistory(retentionDays = 30) {
+    const cutoff = new Date(Date.now() - retentionDays * 86400_000).toISOString();
+    const r = this.db.prepare(`DELETE FROM alert_score_history WHERE ts < ?`).run(cutoff);
+    return r.changes | 0;
   }
 
   close() {

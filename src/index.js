@@ -81,6 +81,21 @@ setInterval(() => {
   } catch (e) { logger.warn(`[Maintenance] hidden_trends sweep failed: ${e.message}`); }
 }, 24 * 60 * 60 * 1000);
 
+// Alert-score history retention (sparkline data). 30 days = balance of
+// "show last week's evolution" vs "table doesn't grow forever". On startup
+// + daily, same pattern as hidden_trends sweep above.
+const ALERT_SCORE_HISTORY_RETENTION_DAYS = 30;
+try {
+  const swept = db.pruneAlertScoreHistory(ALERT_SCORE_HISTORY_RETENTION_DAYS);
+  if (swept > 0) logger.info(`[Maintenance] alert_score_history: pruned ${swept} rows older than ${ALERT_SCORE_HISTORY_RETENTION_DAYS}d`);
+} catch (e) { logger.warn(`[Maintenance] alert_score_history sweep failed: ${e.message}`); }
+setInterval(() => {
+  try {
+    const swept = db.pruneAlertScoreHistory(ALERT_SCORE_HISTORY_RETENTION_DAYS);
+    if (swept > 0) logger.info(`[Maintenance] alert_score_history: pruned ${swept} rows (daily)`);
+  } catch (e) { logger.warn(`[Maintenance] alert_score_history sweep failed: ${e.message}`); }
+}, 24 * 60 * 60 * 1000);
+
 // ── Initialize Solana Pay Monitor ───────────────────────────────────────────
 const solanaMonitor = new SolanaPayMonitor(
   config,
@@ -138,7 +153,7 @@ hotRefresher.start();
 // Note: TwitterCollector instance is initialized below in `collectors`. The
 // tag-refresher needs it for reality-check probes — we wire it AFTER both
 // the refresher and the twitter instance exist (see _attachTwitter call below).
-const tagRefresher = new TagRefresher({ db, logger, config });
+const tagRefresher = new TagRefresher({ db, logger, config, telegram });
 
 // Hourly check loop — fires refreshAll() when 7-day cooldown expired AND
 // auto-refresh is enabled AND circuit breaker is closed. First check 5 min
@@ -508,7 +523,10 @@ async function runScanCycle() {
     //  - actual age in hours from first_seen_at (drives staleDecay)
     // The alertScore baked in by the scorer is only a coarse estimate — we
     // trust the live probe here, right before the gate.
-    recomputeAlertScores(validTrends, alertWeights, db);
+    recomputeAlertScores(validTrends, alertWeights, db, {
+      source: 'scan',
+      floor: globalAlertThreshold,
+    });
 
     logger.info(
       `Alert gate: alertScore>=${globalAlertThreshold} (weights: ` +

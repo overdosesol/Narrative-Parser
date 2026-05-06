@@ -98,7 +98,7 @@ class TelegramNotifier {
       { command: 'menu',      description: 'Open settings menu' },
       { command: 'dashboard', description: 'Open the web dashboard' },
       { command: 'top',       description: 'Top-10 memecoin narratives (24h)' },
-      { command: 'analyze',   description: 'Analyze a URL (Pro / Admin)' },
+      { command: 'analyze',   description: 'Analyze a URL (Pro)' },
     ];
 
     // Keep command descriptions in English for all locales

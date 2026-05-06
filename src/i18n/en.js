@@ -33,7 +33,7 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   btnFollowX: '\u{1D54F} Follow @Catalystparser',
   btnAskQuestion: '\u{1F4AC} Ask a question',
   btnDashboard: '\u{1F310} Open Dashboard',
-  dashboardPrompt: (url) => `\u{1F310} <b>Web dashboard</b>\n\nFull narrative feed, filters by phase / type / source, manual link analysis (Pro / Admin). Sign in with your Telegram account.\n\n<a href="${url}">${url}</a>`,
+  dashboardPrompt: (url) => `\u{1F310} <b>Web dashboard</b>\n\nFull narrative feed, filters by phase / type / source, manual link analysis (Pro). Sign in with your Telegram account.\n\n<a href="${url}">${url}</a>`,
   btnOpenMenu: '\u2699\uFE0F Open Menu',
   btnBack: '\u{25C0}\u{FE0F} Back',
   btnClose: '\u{274C} Close',

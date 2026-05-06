@@ -1641,7 +1641,11 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .dec-expand-btn:hover{border-color:var(--accent);color:var(--text)}
 
 /* Expanded math panel — full breakdown of every signal that fed alertScore */
-.dec-math{margin-top:8px;background:linear-gradient(180deg,rgba(140,140,255,.04),rgba(255,255,255,.01));border:1px solid rgba(140,140,255,.18);border-radius:8px;padding:14px}
+.dec-math{position:relative;margin-top:8px;background:linear-gradient(180deg,rgba(140,140,255,.04),rgba(255,255,255,.01));border:1px solid rgba(140,140,255,.18);border-radius:8px;padding:14px}
+.dec-math-copy-btn{position:absolute;top:10px;right:10px;padding:4px 10px;border-radius:5px;background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text2);font-size:11px;font-family:inherit;cursor:pointer;transition:background 120ms,border-color 120ms,color 120ms;z-index:1}
+.dec-math-copy-btn:hover{background:rgba(255,255,255,.07);border-color:var(--border2);color:var(--text)}
+.dec-math-copy-btn.copied{background:rgba(34,197,94,.10);border-color:rgba(34,197,94,.30);color:var(--green)}
+.dec-math-copy-btn.error{background:rgba(248,113,113,.08);border-color:rgba(248,113,113,.30);color:var(--red)}
 .dec-math-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media (max-width:900px){.dec-math-grid{grid-template-columns:1fr}}
 .dec-math-section{background:rgba(0,0,0,.18);border-radius:6px;padding:10px 12px;border:1px solid rgba(255,255,255,.04)}
@@ -3334,6 +3338,154 @@ const GATE_LABELS = {
   send:       'отправка',
 };
 
+// ── Copy-math helpers ──────────────────────────────────────────────────────
+// Build a plain-text representation of the alert math panel suitable for
+// pasting into Slack/issue/Telegram. Uses String.fromCharCode(10) for
+// newlines — literal escape sequences in inline-template strings break
+// the outer template literal (see SESSION_CONTEXT trap notes).
+function formatMathPanelAsText(d) {
+  if (!d || !d.breakdown) return '';
+  const NL = String.fromCharCode(10);
+  const b = d.breakdown;
+  const w = b.weights || {};
+  const fmt = (n) => {
+    const x = Number(n);
+    if (!isFinite(x)) return '—';
+    return (Math.round(x * 10) / 10).toString();
+  };
+  const pad = (s, n) => {
+    const str = String(s);
+    return str.length >= n ? str : str + ' '.repeat(n - str.length);
+  };
+
+  const score = Number(d.alertScore) || 0;
+  const floor = Number(d.threshold) || 0;
+  const passed = score >= floor;
+  const verdict = d.decision === 'sent'
+    ? 'SENT'
+    : 'SKIPPED (' + (d.reason || 'unknown') + ')';
+
+  const lines = [];
+  lines.push('Trend: ' + JSON.stringify((d.title || '—').slice(0, 120)));
+  lines.push('Verdict: score=' + score + ' / ' + floor + ' · '
+    + (passed ? 'PASS' : 'FAIL') + ' · ' + verdict);
+  if (d.source)    lines.push('Source: ' + d.source);
+  if (d.alertType) lines.push('Type: ' + d.alertType);
+  if (d.preset)    lines.push('Preset: ' + d.preset);
+  if (d.url)       lines.push('URL: ' + d.url);
+  lines.push('');
+
+  // Positive section
+  lines.push('─ POSITIVE (Σ +' + fmt(b.positive) + ')');
+  const posRows = [
+    { label: 'meme',     val: b.meme,      weight: w.weightMemePotential },
+    { label: 'viral',    val: b.viral,     weight: w.weightVirality },
+    { label: 'emerge',   val: b.emergence, weight: w.weightEmergence },
+    { label: 'twitter',  val: b.twitter,   weight: w.weightTwitter },
+    { label: 'feedback', val: b.feedback,  weight: w.weightFeedback },
+  ];
+  for (const r of posRows) {
+    const rawVal = Number(r.val) || 0;
+    const wVal = Number(r.weight) || 0;
+    const contrib = rawVal * wVal;
+    const calc = w.weightMemePotential != null
+      ? fmt(rawVal) + ' x ' + fmt(wVal)
+      : fmt(rawVal);
+    lines.push('   ' + pad(r.label, 9) + ' ' + pad(calc, 14)
+      + ' = ' + (contrib >= 0 ? '+' : '') + fmt(contrib));
+  }
+  lines.push('');
+
+  // Penalty section
+  lines.push('─ PENALTY (Σ −' + fmt(b.penalty) + ')');
+  const junkVal = Number(b.junk) || 0;
+  const junkWeight = Number(w.weightJunk) || 0;
+  const junkContrib = junkVal * junkWeight;
+  lines.push('   ' + pad('junk', 9) + ' '
+    + pad(fmt(junkVal) + ' x ' + fmt(junkWeight), 14)
+    + ' = −' + fmt(junkContrib));
+  const stale = Number(b.staleDecay) || 0;
+  const grace = w.staleDecayGraceHours != null ? w.staleDecayGraceHours : 24;
+  lines.push('   ' + pad('stale', 9) + ' '
+    + pad(fmt(b.ageHours) + 'h, grace ' + grace + 'h', 14)
+    + ' = −' + fmt(stale));
+
+  if (Array.isArray(b.junkReasons) && b.junkReasons.length > 0) {
+    lines.push('   junk triggers: ' + b.junkReasons.join(', '));
+  }
+  lines.push('');
+
+  // Equation
+  lines.push('+' + fmt(b.positive) + ' − ' + fmt(b.penalty) + ' = ' + score
+    + ' ' + (passed ? '≥' : '<') + ' ' + floor
+    + ' (' + (passed ? '✓ pass' : '✗ fail') + ')');
+
+  // Floor decomposition
+  const userFloor = Number(d.userFloor || 0);
+  const adminFloor = Number(d.globalFloor || 0);
+  if (userFloor || adminFloor) {
+    lines.push('Floor ' + floor + ' = max(user ' + (userFloor || 0)
+      + ', admin ' + (adminFloor || 0) + ')');
+  }
+
+  // Feedback details
+  if (b.feedbackStats) {
+    lines.push('Feedback: 👍 ' + (b.feedbackStats.likes | 0)
+      + ' / 👎 ' + (b.feedbackStats.dislikes | 0)
+      + ' → boost ' + (b.feedback != null ? b.feedback : 50));
+  }
+
+  return lines.join(NL);
+}
+
+// Inline copy-to-clipboard button. Uses navigator.clipboard with a textarea
+// fallback for older browsers / non-secure contexts. Local state shows
+// "Copied" feedback for 2 seconds, then reverts. Fully self-contained.
+function CopyMathButton({ getText }) {
+  const h = React.createElement;
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState(false);
+
+  const onClick = async () => {
+    const text = typeof getText === 'function' ? getText() : '';
+    if (!text) return;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // Fallback for non-secure contexts (http://) — execCommand path
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'absolute';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      setError(false);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      setError(true);
+      setTimeout(() => setError(false), 2500);
+    }
+  };
+
+  const cls = 'dec-math-copy-btn'
+    + (copied ? ' copied' : '')
+    + (error ? ' error' : '');
+  const label = error ? '⚠ ошибка' : (copied ? '✓ скопировано' : '📋 copy math');
+
+  return h('button', {
+    className: cls,
+    onClick,
+    title: copied ? 'Скопировано в буфер обмена' : 'Скопировать математику в plain-text',
+    type: 'button',
+  }, label);
+}
+
 function DecisionsPage() {
   const h = React.createElement;
   const [data, setData] = useState(null);
@@ -3467,6 +3619,11 @@ function DecisionsPage() {
     const hardJunkHit = (Number(b.junk) || 0) >= hardJunkStop;
 
     return h('div', { className: 'dec-math' },
+      // Copy-to-clipboard button — top-right corner, absolutely positioned.
+      // getText is a closure over the decision so the button always copies
+      // fresh numbers (relevant if the buffer rotates and the same row
+      // gets re-rendered with updated data).
+      h(CopyMathButton, { getText: () => formatMathPanelAsText(d) }),
       h('div', { className: 'dec-math-grid' },
         // Left column — positive contributions
         h('div', { className: 'dec-math-section' },
