@@ -276,15 +276,15 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 40, kpopPenalty: 30, celebNoisePenalty: 20,
-      noMemeShapePenalty: 15, noContentPenalty: 5, safeOverrideDivisor: 3, memeShapeBoost: 10,
+      noMemeShapePenalty: 20, noContentPenalty: 5, safeOverrideDivisor: 3, memeShapeBoost: 10,
     },
     alerts: {
-      thresholds: { alertThreshold: 60, minScoreToSave: 0,  maxAlertsPerCycle: 0,  alertHardJunkStop: 70 },
-      // Bumped meme 0.30 → 0.45 (2026-05-06): inversion bug — meme=91 posts
-      // were failing the 60 floor while meme=50 + high-virality posts passed.
-      // Σ stays at 1.00 (viral 0.25→0.20, emerge 0.25→0.20, twitter 0.10→0.05).
-      weights:    { weightMemePotential: 0.45, weightVirality: 0.20, weightEmergence: 0.20, weightTwitter: 0.05, weightFeedback: 0.10, weightJunk: 0.50 },
-      stale:      { staleDecayPerHour: 2, staleDecayGraceHours: 24, staleDecayCap: 30 },
+      thresholds: { alertThreshold: 60, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 70 },
+      // feedback 0.10→0.15 (в curated mix юзер-голоса важнее raw виральности),
+      // компенсация: viral 0.20→0.15. Σ = 1.00.
+      weights:    { weightMemePotential: 0.45, weightVirality: 0.15, weightEmergence: 0.20, weightTwitter: 0.05, weightFeedback: 0.15, weightJunk: 0.50 },
+      // 3-day life: 24h grace + 48h decay at 1pt/hr → tail-end 72h.
+      stale:      { staleDecayPerHour: 1, staleDecayGraceHours: 24, staleDecayCap: 48 },
     },
     cluster: { simThreshold: 0.55, timePenaltyHours: 24, weightEmbedding: 0.40, weightPhash: 0.30, weightEntity: 0.20, weightTicker: 0.10 },
   },
@@ -299,7 +299,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
           'NatureIsFuckingLit', 'Eyebleach', 'rarepuppers', 'capybara',
           'FunnyAnimals', 'AnimalMemes',
         ],
-        minUpvotes:        3000,   // Animal subs are smaller-volume than r/all
+        minUpvotes:        5000,
         postsPerSubreddit: 50,
       },
       twitter: {
@@ -333,12 +333,12 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 60, kpopPenalty: 40, celebNoisePenalty: 30,
-      noMemeShapePenalty: 10, noContentPenalty: 8, safeOverrideDivisor: 3, memeShapeBoost: 14,
+      noMemeShapePenalty: 15, noContentPenalty: 8, safeOverrideDivisor: 3, memeShapeBoost: 14,
     },
     alerts: {
-      thresholds: { alertThreshold: 55, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 65 },
-      weights:    { weightMemePotential: 0.45, weightVirality: 0.20, weightEmergence: 0.10, weightTwitter: 0.10, weightFeedback: 0.15, weightJunk: 0.40 },
-      stale:      { staleDecayPerHour: 1, staleDecayGraceHours: 48, staleDecayCap: 20 },
+      thresholds: { alertThreshold: 55, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 70 },
+      weights:    { weightMemePotential: 0.45, weightVirality: 0.20, weightEmergence: 0.15, weightTwitter: 0.05, weightFeedback: 0.15, weightJunk: 0.40 },
+      stale:      { staleDecayPerHour: 2, staleDecayGraceHours: 24, staleDecayCap: 30 },
     },
     cluster: { simThreshold: 0.55, timePenaltyHours: 48, weightEmbedding: 0.30, weightPhash: 0.50, weightEntity: 0.10, weightTicker: 0.10 },
   },
@@ -412,9 +412,10 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
       noMemeShapePenalty: 25, noContentPenalty: 6, safeOverrideDivisor: 3, memeShapeBoost: 12,
     },
     alerts: {
-      thresholds: { alertThreshold: 65, minScoreToSave: 10, maxAlertsPerCycle: 8, alertHardJunkStop: 75 },
+      thresholds: { alertThreshold: 60, minScoreToSave: 10, maxAlertsPerCycle: 5, alertHardJunkStop: 75 },
       weights:    { weightMemePotential: 0.45, weightVirality: 0.25, weightEmergence: 0.10, weightTwitter: 0.15, weightFeedback: 0.05, weightJunk: 0.50 },
-      stale:      { staleDecayPerHour: 3, staleDecayGraceHours: 12, staleDecayCap: 40 },
+      // 4-day life: 48h grace (мем разгорается без штрафа) + 48h decay at 1pt/hr.
+      stale:      { staleDecayPerHour: 1, staleDecayGraceHours: 48, staleDecayCap: 48 },
     },
     cluster: { simThreshold: 0.50, timePenaltyHours: 12, weightEmbedding: 0.40, weightPhash: 0.40, weightEntity: 0.10, weightTicker: 0.10 },
   },
@@ -465,15 +466,15 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 40, kpopPenalty: 15, celebNoisePenalty: 0,
-      noMemeShapePenalty: 20, noContentPenalty: 5, safeOverrideDivisor: 3, memeShapeBoost: 6,
+      noMemeShapePenalty: 25, noContentPenalty: 5, safeOverrideDivisor: 3, memeShapeBoost: 10,
     },
     alerts: {
-      thresholds: { alertThreshold: 70, minScoreToSave: 0, maxAlertsPerCycle: 6, alertHardJunkStop: 65 },
-      // Bumped meme 0.25 → 0.40 (2026-05-06): same inversion-bug fix as
-      // general — celebrities preset was virality-dominant, undercutting
-      // memePotential as the AI's primary judgment. Σ stays at 1.00
-      // (viral 0.30→0.25, twitter 0.15→0.10, emerge unchanged at 0.20).
-      weights:    { weightMemePotential: 0.40, weightVirality: 0.25, weightEmergence: 0.20, weightTwitter: 0.10, weightFeedback: 0.05, weightJunk: 0.55 },
+      thresholds: { alertThreshold: 70, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 70 },
+      // meme/viral в этом пресете — основные сигналы (рекалибровка под AI-judgment +
+      // organic engagement). Cross-platform spread в emergence убран на уровне
+      // clusterer'а 4 мая (single-source velocity/breakout остались) — поэтому
+      // emerge=0.10 не "вредный" сигнал. feedback=0 — celeb-фандомы поляризованы.
+      weights:    { weightMemePotential: 0.50, weightVirality: 0.30, weightEmergence: 0.10, weightTwitter: 0.10, weightFeedback: 0.00, weightJunk: 0.55 },
       stale:      { staleDecayPerHour: 3, staleDecayGraceHours: 12, staleDecayCap: 40 },
     },
     cluster: { simThreshold: 0.55, timePenaltyHours: 24, weightEmbedding: 0.40, weightPhash: 0.30, weightEntity: 0.25, weightTicker: 0.05 },
@@ -526,7 +527,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
       noMemeShapePenalty: 10, noContentPenalty: 0, safeOverrideDivisor: 2, memeShapeBoost: 4,
     },
     alerts: {
-      thresholds: { alertThreshold: 50, minScoreToSave: 0, maxAlertsPerCycle: 10, alertHardJunkStop: 85 },
+      thresholds: { alertThreshold: 60, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 75 },
       weights:    { weightMemePotential: 0.10, weightVirality: 0.30, weightEmergence: 0.35, weightTwitter: 0.15, weightFeedback: 0.10, weightJunk: 0.30 },
       stale:      { staleDecayPerHour: 5, staleDecayGraceHours: 6, staleDecayCap: 60 },
     },

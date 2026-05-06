@@ -644,6 +644,11 @@ class Scorer {
       return this._fallback(trends, 'Parse error');
     }
 
+    // Single source of truth for alert weights — dispatcher reads the same
+    // loadAlertWeights(db) in its recompute step. If we used DEFAULT_ALERT_WEIGHTS
+    // here, a per-preset override in settings.presetConfigs would silently
+    // diverge (e.g. dashboard shows 65, dispatcher gates on 52).
+    const aw = loadAlertWeights(this.db);
     return trends.map((trend, idx) => {
       const a = analyses[idx] || {};
       // originalTitle = raw source text (any language), title/titleEn = AI's
@@ -664,7 +669,7 @@ class Scorer {
         emergenceScore: emergence,
         metrics: trend.metrics,
         junkPenalty: trend.junkPenalty ?? trend.clusterMetrics?.junkPenalty ?? 0,
-      });
+      }, aw);
 
       return {
         ...trend,
@@ -882,7 +887,7 @@ class Scorer {
     trend.adoptionScore  = trend.memePotential;
     trend.narrativePhase = narrativePhase(trend.emergenceScore ?? 0, trend.adoptionScore);
     trend.rankScore      = narrativeRankScore(trend.emergenceScore ?? 0, trend.adoptionScore);
-    const alertProbe2 = computeAlertScore(trend);
+    const alertProbe2 = computeAlertScore(trend, loadAlertWeights(this.db));
     trend.alertScore     = alertProbe2.alertScore;
     trend.alertBreakdown = alertProbe2.breakdown;
 
@@ -1047,7 +1052,7 @@ class Scorer {
       memePotential: adoption, score: viral, emergenceScore: emergence,
       metrics: trend.metrics,
       junkPenalty: trend.junkPenalty ?? trend.clusterMetrics?.junkPenalty ?? 0,
-    });
+    }, loadAlertWeights(this.db));
     return {
       ...trend,
       score:            viral,
@@ -1069,6 +1074,7 @@ class Scorer {
   }
 
   _fallback(trends, reason) {
+    const aw = loadAlertWeights(this.db);
     return trends.map(t => {
       const adoption  = this._heuristicMemePotential(t);
       const emergence = t.clusterMetrics?.emergenceScore ?? 0;
@@ -1077,7 +1083,7 @@ class Scorer {
         memePotential: adoption, score: viral, emergenceScore: emergence,
         metrics: t.metrics,
         junkPenalty: t.junkPenalty ?? t.clusterMetrics?.junkPenalty ?? 0,
-      });
+      }, aw);
       return {
         ...t,
         score:            viral,
