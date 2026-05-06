@@ -12,6 +12,8 @@ import {
   DEFAULT_PRESET_CONFIGS,
   getEffectivePresetConfigs,
   validatePresetOverrides,
+  readPresetTagsLocked,
+  validatePresetTagsLocked,
 } from '../analysis/preset-config.js';
 import { runManualAnalysis } from '../analysis/manual-analysis.js';
 
@@ -458,6 +460,7 @@ class AdminServer {
       defaults:    DEFAULT_PRESET_CONFIGS,
       effective:   getEffectivePresetConfigs(overrides),
       overrides,
+      tagsLocked:  readPresetTagsLocked(this.db),
       fieldRanges: PRESET_FIELD_RANGES,
       presets:     PRESET_CONFIG_KEYS,
       groups:      PRESET_GROUPS,
@@ -466,15 +469,31 @@ class AdminServer {
 
   _setPresetConfigs(body) {
     const cleaned = validatePresetOverrides(body?.overrides);
-    if (Object.keys(cleaned).length === 0) {
-      // Clear ALL semantics: empty manual overrides AND wipe auto-overrides too.
-      // After this call, getActivePresetConfig falls back to pure code-defaults
-      // for ALL fields. This is the panic-button — restore to known-good state
-      // if Grok auto-refresh produces bad tags or the whole concept fails.
-      this.db.setSetting('presetConfigs', '');
+    const cleanedLocks = body?.tagsLocked !== undefined
+      ? validatePresetTagsLocked(body.tagsLocked)
+      : null;  // null = caller didn't touch locks, leave existing as-is
+
+    const manualEmpty = Object.keys(cleaned).length === 0;
+    const locksEmpty  = cleanedLocks !== null && Object.keys(cleanedLocks).length === 0;
+
+    // Clear-ALL panic semantics: manual overrides are empty AND lock-mask is
+    // also empty (or wasn't touched but client signals empty). Only then do
+    // we wipe the auto-overrides slot too. This means user can save just locks
+    // (with empty manual draft) without losing the auto-blob — locks-only save
+    // is a normal flow, not a panic.
+    const isPanicClear = manualEmpty && cleanedLocks !== null && locksEmpty;
+
+    if (manualEmpty) this.db.setSetting('presetConfigs', '');
+    else             this.db.setSetting('presetConfigs', JSON.stringify(cleaned));
+
+    if (cleanedLocks !== null) {
+      this.db.setSetting('presetTagsLocked', locksEmpty ? '' : JSON.stringify(cleanedLocks));
+    }
+
+    if (isPanicClear) {
+      // Panic-button — restore to known-good state if Grok auto-refresh
+      // produces bad tags or the whole concept fails.
       this.db.setSetting('presetConfigsAuto', '');
-    } else {
-      this.db.setSetting('presetConfigs', JSON.stringify(cleaned));
     }
   }
 
@@ -1799,6 +1818,9 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
 .pcfg-chip-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:320px;font-variant-numeric:tabular-nums}
 .pcfg-chip-x{background:transparent;border:none;color:var(--text2);cursor:pointer;width:18px;height:18px;border-radius:50%;font-size:11px;line-height:1;padding:0;transition:all .15s}
 .pcfg-chip-x:hover{background:rgba(239,68,68,.2);color:var(--red)}
+.pcfg-chip-lock{background:transparent;border:none;cursor:pointer;width:18px;height:18px;font-size:12px;line-height:1;padding:0;margin-right:-2px;transition:all .15s;opacity:.7}
+.pcfg-chip-lock:hover{opacity:1;transform:scale(1.15)}
+.pcfg-chip-locked{background:rgba(34,197,94,.16);border-color:rgba(34,197,94,.45);box-shadow:0 0 0 1px rgba(34,197,94,.25)}
 .pcfg-chip-input{flex:1;min-width:140px;background:transparent;border:none;outline:none;color:var(--text);font-size:12px;padding:4px 6px;font-family:inherit}
 .pcfg-chip-input::placeholder{color:var(--text3)}
 .pcfg-budget{margin-top:8px;font-size:12px;color:var(--text2);text-align:right;font-variant-numeric:tabular-nums}
@@ -5133,6 +5155,12 @@ function PresetConfigsPage() {
   const h = React.createElement;
   const [data,   setData]   = useState(null);
   const [draft,  setDraft]  = useState({});
+  // Lock-mask draft — Phase 3. Shape: { <preset>: { reddit: [...], twitter: [...] } }
+  // Locked items are protected from auto-refresh deletion (tag-refresher.js
+  // _computeDiff respects this list). For Twitter, lock-key is the keyword-PART
+  // of the query (without min_faves and -is:retweet) — that's how
+  // tag-refresher matches locks against current/proposed groups.
+  const [locked, setLocked] = useState({});
   const [tab,    setTab]    = useState('general');
   const [saving, setSaving] = useState(false);
   const [msg,    setMsg]    = useState('');
@@ -5140,7 +5168,7 @@ function PresetConfigsPage() {
 
   const load = () => {
     api('/api/preset-configs')
-      .then(d => { setData(d); setDraft(d.overrides || {}); })
+      .then(d => { setData(d); setDraft(d.overrides || {}); setLocked(d.tagsLocked || {}); })
       .catch(e => { setMsg('Ошибка загрузки: ' + e.message); setMsgKind('err'); });
   };
   useEffect(load, []);
@@ -5223,12 +5251,44 @@ function PresetConfigsPage() {
       delete next[preset];
       return next;
     });
+    setLocked(prev => {
+      const next = { ...prev };
+      delete next[preset];
+      return next;
+    });
     flash('Сброшен пресет ' + preset, 'ok');
   };
 
   const clearAll = () => {
     setDraft({});
-    flash('Все overrides будут удалены при Save', 'ok');
+    setLocked({});
+    flash('Все overrides и locks будут удалены при Save', 'ok');
+  };
+
+  // ── Lock-mask mutators ─────────────────────────────────────────────────
+  // sourceType: 'reddit' | 'twitter'. For twitter, lockKey should be the
+  // keyword-part (без min_faves/-is:retweet) — the chip rendering layer
+  // computes this before passing to toggleLock.
+  const toggleLock = (preset, sourceType, lockKey) => {
+    setLocked(prev => {
+      const next = JSON.parse(JSON.stringify(prev));
+      if (!next[preset]) next[preset] = {};
+      if (!next[preset][sourceType]) next[preset][sourceType] = [];
+      const arr = next[preset][sourceType];
+      const idx = arr.indexOf(lockKey);
+      if (idx >= 0) {
+        arr.splice(idx, 1);
+        if (arr.length === 0) delete next[preset][sourceType];
+        if (Object.keys(next[preset]).length === 0) delete next[preset];
+      } else {
+        arr.push(lockKey);
+      }
+      return next;
+    });
+  };
+  const isLocked = (preset, sourceType, lockKey) => {
+    const arr = locked[preset]?.[sourceType] || [];
+    return arr.includes(lockKey);
   };
 
   const reload = () => { load(); flash('Reloaded from server', 'ok'); };
@@ -5236,9 +5296,10 @@ function PresetConfigsPage() {
   const save = async () => {
     setSaving(true);
     try {
-      const res = await api('/api/preset-configs', 'POST', { overrides: draft });
+      const res = await api('/api/preset-configs', 'POST', { overrides: draft, tagsLocked: locked });
       setData(res);
       setDraft(res.overrides || {});
+      setLocked(res.tagsLocked || {});
       flash('Сохранено', 'ok');
     } catch (e) {
       flash('Ошибка: ' + e.message, 'err');
@@ -5345,12 +5406,35 @@ function PresetConfigsPage() {
 
   // PChips — chip-input for list fields. Renders items as removable chips
   // and an inline input that adds on Enter / blur.
+  //
+  // Phase 3: lockable chips — for paths under sources.reddit.subreddits and
+  // sources.twitter.queries we attach lock toggles. Lock-key for twitter is
+  // the keyword-part (without min_faves/-is:retweet) so it matches what
+  // tag-refresher.js stores in presetTagsLocked.
   const PChips = ({ preset, path, max, placeholder }) => {
     const items = getEffective(preset, path) || [];
     const overridden = isOverridden(preset, path);
     const dflt = getDefault(preset, path) || [];
     const setList = (next) => setLeaf(preset, path, next);
     const remove = (idx) => setList(items.filter((_, i) => i !== idx));
+
+    // Determine if this chip-list is lockable + which sourceType the lock-mask uses.
+    let lockSourceType = null;
+    let toLockKey = null;
+    if (path.length === 3 && path[0] === 'sources') {
+      if (path[1] === 'reddit' && path[2] === 'subreddits') {
+        lockSourceType = 'reddit';
+        toLockKey = (item) => item;  // subreddit name, used as-is
+      } else if (path[1] === 'twitter' && path[2] === 'queries') {
+        lockSourceType = 'twitter';
+        // Strip min_faves and -is:retweet — match tag-refresher's normalization.
+        toLockKey = (item) => String(item || '')
+          .replace(/\s*min_faves:\d+\s*/g, '')
+          .replace(/\s*-is:retweet\s*/g, '')
+          .trim();
+      }
+    }
+
     return h(ChipInputBox, {
       items, placeholder, max,
       onAdd: (v) => {
@@ -5358,10 +5442,27 @@ function PresetConfigsPage() {
         if (items.includes(v)) return;
         setList([...items, v]);
       },
-      onRemove: remove,
+      onRemove: (idx) => {
+        // If chip is locked — also unlock it, so we don't leave a dangling lock-key.
+        if (lockSourceType && toLockKey) {
+          const key = toLockKey(items[idx]);
+          if (key && isLocked(preset, lockSourceType, key)) {
+            toggleLock(preset, lockSourceType, key);
+          }
+        }
+        remove(idx);
+      },
       overridden,
       defaultLen: dflt.length,
       onReset: () => resetField(preset, path),
+      // Lock interface — null when path doesn't support locking.
+      lockSourceType,
+      isLocked: lockSourceType && toLockKey
+        ? (item) => isLocked(preset, lockSourceType, toLockKey(item))
+        : null,
+      onToggleLock: lockSourceType && toLockKey
+        ? (item) => toggleLock(preset, lockSourceType, toLockKey(item))
+        : null,
     });
   };
 
@@ -5494,7 +5595,7 @@ function renderInspectorPane(h, title, obj) {
 }
 
 // ── Chip input box (shared by all list fields) ──────────────────────────────
-function ChipInputBox({ items, placeholder, max, onAdd, onRemove, overridden, defaultLen, onReset }) {
+function ChipInputBox({ items, placeholder, max, onAdd, onRemove, overridden, defaultLen, onReset, lockSourceType, isLocked, onToggleLock }) {
   const h = React.createElement;
   const [input, setInput] = useState('');
 
@@ -5505,16 +5606,31 @@ function ChipInputBox({ items, placeholder, max, onAdd, onRemove, overridden, de
     setInput('');
   };
 
+  const lockable = !!(lockSourceType && isLocked && onToggleLock);
+
   return h('div', null,
     h('div', { className: 'pcfg-chips' },
-      items.map((it, i) => h('span', { key: i + ':' + it, className: 'pcfg-chip' },
-        h('span', { className: 'pcfg-chip-text', title: it }, it),
-        h('button', {
-          className: 'pcfg-chip-x',
-          onClick: () => onRemove(i),
-          title: 'Удалить',
-        }, '✕')
-      )),
+      items.map((it, i) => {
+        const locked = lockable && isLocked(it);
+        return h('span', {
+          key: i + ':' + it,
+          className: 'pcfg-chip' + (locked ? ' pcfg-chip-locked' : ''),
+          title: locked ? 'Залочено — auto-refresh не удалит этот элемент' : undefined,
+        },
+          lockable ? h('button', {
+            className: 'pcfg-chip-lock',
+            onClick: () => onToggleLock(it),
+            title: locked ? 'Снять lock — auto-refresh сможет удалить' : 'Залочить — auto-refresh не удалит',
+            style: { color: locked ? 'var(--ok)' : 'var(--text3)' },
+          }, locked ? '🔒' : '🔓') : null,
+          h('span', { className: 'pcfg-chip-text', title: it }, it),
+          h('button', {
+            className: 'pcfg-chip-x',
+            onClick: () => onRemove(i),
+            title: 'Удалить',
+          }, '✕')
+        );
+      }),
       h('input', {
         className: 'pcfg-chip-input',
         value: input,

@@ -790,6 +790,40 @@ export function readPresetTagsLocked(db) {
 }
 
 /**
+ * Sanitize a presetTagsLocked blob — strip unknown presets / sourceTypes,
+ * coerce tags to string array, dedupe. Throws on outright-malformed input.
+ *
+ * Allowed sourceTypes: 'reddit', 'twitter'. (TikTok hashtags are NOT
+ * locked-trackable in the current design — they're managed via live-discovery
+ * + per-preset fallback list, not via tag-refresher.)
+ *
+ * For 'twitter' lock keys: callers should pass the keyword-part of the query
+ * (without `min_faves:N` and `-is:retweet`) — that's how tag-refresher.js
+ * matches locks against current/proposed Twitter keyword groups.
+ */
+export function validatePresetTagsLocked(input) {
+  if (input == null) return {};
+  if (!isObj(input)) throw new Error('presetTagsLocked: must be an object');
+  const allowedSourceTypes = new Set(['reddit', 'twitter']);
+  const out = {};
+  for (const [preset, sourceMap] of Object.entries(input)) {
+    if (!PRESET_KEYS.includes(preset)) continue;  // silently drop unknown presets
+    if (!isObj(sourceMap)) continue;
+    const cleanedSources = {};
+    for (const [sourceType, tags] of Object.entries(sourceMap)) {
+      if (!allowedSourceTypes.has(sourceType)) continue;
+      if (!Array.isArray(tags)) continue;
+      const cleaned = Array.from(new Set(
+        tags.map(t => String(t || '').trim()).filter(t => t.length > 0 && t.length < 300)
+      ));
+      if (cleaned.length > 0) cleanedSources[sourceType] = cleaned;
+    }
+    if (Object.keys(cleanedSources).length > 0) out[preset] = cleanedSources;
+  }
+  return out;
+}
+
+/**
  * Convenience: resolve the active preset's config in a single call.
  * Used by collectors / scorer / clusterer / alert-loop on every cycle.
  *

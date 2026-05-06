@@ -130,10 +130,14 @@ const hotRefresher = new HotMetricsRefresher({
 hotRefresher.start();
 
 // Tag auto-refresh — weekly Grok call to suggest fresh subreddits + Twitter
-// keywords per preset. Phase 1: infra scaffold only (admin toggle / force / history).
-// Phase 2 will replace the Grok-call stub with a real xAI Responses API call
-// (search_parameters: {mode: 'on'}, model: grok-4.3, fallback: grok-4.20-0309-reasoning).
+// keywords per preset. Real xAI Responses API call with x_search tool +
+// fallback model on 5xx. Variant-3 reality-check for proposed Twitter
+// keyword groups via 1 Apify probe per group (skips already-existing groups).
+// Model: grok-4.3 primary, grok-4.20-0309-reasoning fallback.
 // Toggle: db setting tagAutoRefreshEnabled (admin).
+// Note: TwitterCollector instance is initialized below in `collectors`. The
+// tag-refresher needs it for reality-check probes — we wire it AFTER both
+// the refresher and the twitter instance exist (see _attachTwitter call below).
 const tagRefresher = new TagRefresher({ db, logger, config });
 
 // Hourly check loop — fires refreshAll() when 7-day cooldown expired AND
@@ -167,6 +171,10 @@ if (config.tiktok.enabled)       collectors.push(new TikTokCollector(config, log
 // for searchByQuery(); if Twitter is disabled, X Trends self-disables.
 // Kill switches: env X_TRENDS_ENABLED=0 OR per-preset xtrends.enabled=0.
 const twitterInstance = collectors.find(c => c.name === 'Twitter') || null;
+// Wire twitter instance into tag-refresher AFTER it's been constructed.
+// tag-refresher uses it for variant-3 reality-check probes on proposed
+// Twitter keyword groups (1 Apify call per new group; existing groups skipped).
+if (twitterInstance) tagRefresher.twitter = twitterInstance;
 const xTrendsCollector = new XTrendsCollector(config, logger, db, twitterInstance);
 if (xTrendsCollector.enabled) {
   collectors.push(xTrendsCollector);
