@@ -108,6 +108,7 @@ class AdminServer {
     this.telegram = extras.telegram || null;
     this.triggerFinder = extras.triggerFinder || null;  // Grok deep-search for SubmitPage trigger button
     this.hotRefresher = extras.hotRefresher || null;    // periodic re-fetch + re-score loop (status + manual trigger)
+    this.tagRefresher = extras.tagRefresher || null;    // weekly Grok call to refresh source-tags (Phase 1 stub)
     this.port = parseInt(process.env.ADMIN_PORT || '8080');
     this.host = process.env.ADMIN_HOST || '127.0.0.1';
     this.adminKey = process.env.ADMIN_API_KEY || '';
@@ -466,7 +467,12 @@ class AdminServer {
   _setPresetConfigs(body) {
     const cleaned = validatePresetOverrides(body?.overrides);
     if (Object.keys(cleaned).length === 0) {
+      // Clear ALL semantics: empty manual overrides AND wipe auto-overrides too.
+      // After this call, getActivePresetConfig falls back to pure code-defaults
+      // for ALL fields. This is the panic-button — restore to known-good state
+      // if Grok auto-refresh produces bad tags or the whole concept fails.
       this.db.setSetting('presetConfigs', '');
+      this.db.setSetting('presetConfigsAuto', '');
     } else {
       this.db.setSetting('presetConfigs', JSON.stringify(cleaned));
     }
@@ -994,6 +1000,42 @@ class AdminServer {
         } catch (e) {
           return json(res, 400, { error: e.message });
         }
+      }
+
+      // ── Tag auto-refresh — Grok-driven sources (subreddits + twitter keywords) ──
+      // Phase 1: status / toggle / force-stub / circuit-breaker reset / history.
+      // Phase 2 will wire the actual xAI Responses API call inside tagRefresher.
+      if (path === '/api/tag-refresh/status' && method === 'GET') {
+        if (!this.tagRefresher) return json(res, 503, { error: 'tag refresher not wired' });
+        const status = this.tagRefresher.getStatus();
+        const history = this.db.getTagRefreshHistory(50);
+        return json(res, 200, { ...status, history });
+      }
+      if (path === '/api/tag-refresh/toggle' && method === 'POST') {
+        if (!this.tagRefresher) return json(res, 503, { error: 'tag refresher not wired' });
+        try {
+          const body = await parseBody(req);
+          const enabled = !!body?.enabled;
+          this.tagRefresher.setEnabled(enabled);
+          return json(res, 200, { ok: true, enabled });
+        } catch (e) {
+          return json(res, 400, { error: e.message });
+        }
+      }
+      if (path === '/api/tag-refresh/force' && method === 'POST') {
+        if (!this.tagRefresher) return json(res, 503, { error: 'tag refresher not wired' });
+        try {
+          const result = await this.tagRefresher.refreshAll({ force: true });
+          if (!result.ok) return json(res, 429, result);
+          return json(res, 200, result);
+        } catch (e) {
+          return json(res, 500, { error: e.message });
+        }
+      }
+      if (path === '/api/tag-refresh/reset-breaker' && method === 'POST') {
+        if (!this.tagRefresher) return json(res, 503, { error: 'tag refresher not wired' });
+        this.tagRefresher.resetCircuitBreaker();
+        return json(res, 200, { ok: true });
       }
 
       // ── Junk-reason stats over last N hours (for observation panel) ──
@@ -5807,6 +5849,172 @@ function StatusBar({ onNavigate }) {
   );
 }
 
+// ── TagRefreshPage — Phase 1 admin UI for tag auto-refresh ─────────────────
+// Shows toggle, status badge, force button, history table, circuit-breaker reset.
+// Phase 2 will add per-tag pin checkboxes inside PresetConfigsPage source lists.
+function TagRefreshPage() {
+  const h = React.createElement;
+  const [data, setData] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [msgKind, setMsgKind] = useState('ok');
+
+  const flash = (m, kind) => {
+    setMsg(m); setMsgKind(kind || 'ok');
+    setTimeout(() => setMsg(''), 4000);
+  };
+
+  const load = () => {
+    api('/api/tag-refresh/status')
+      .then(d => setData(d))
+      .catch(e => flash('Ошибка загрузки: ' + e.message, 'err'));
+  };
+  useEffect(load, []);
+
+  const toggle = async () => {
+    if (!data) return;
+    setBusy(true);
+    try {
+      const next = !data.enabled;
+      await api('/api/tag-refresh/toggle', 'POST', { enabled: next });
+      flash(next ? 'Auto-refresh включён' : 'Auto-refresh выключен', 'ok');
+      load();
+    } catch (e) { flash('Ошибка: ' + e.message, 'err'); }
+    finally { setBusy(false); }
+  };
+
+  const force = async () => {
+    if (!data) return;
+    if (!confirm('Запустить refresh сейчас? Он съест ~$0.13 на токены grok-4.3 и пойдёт по всем 5 пресетам. Force-cooldown ' + data.forceCooldownHours + 'h.')) return;
+    setBusy(true);
+    try {
+      const r = await api('/api/tag-refresh/force', 'POST', {});
+      if (r.ok) {
+        flash('Refresh запущен — ' + r.results.length + ' пресетов обработано за ' + r.elapsedSec + 'с', 'ok');
+      } else {
+        flash('Заблокировано: ' + r.reason + (r.remainingMinutes ? ' (ещё ' + r.remainingMinutes + ' мин)' : ''), 'err');
+      }
+      load();
+    } catch (e) { flash('Ошибка: ' + e.message, 'err'); }
+    finally { setBusy(false); }
+  };
+
+  const resetBreaker = async () => {
+    if (!confirm('Сбросить circuit-breaker и разрешить новые попытки?')) return;
+    setBusy(true);
+    try {
+      await api('/api/tag-refresh/reset-breaker', 'POST', {});
+      flash('Circuit-breaker сброшен', 'ok');
+      load();
+    } catch (e) { flash('Ошибка: ' + e.message, 'err'); }
+    finally { setBusy(false); }
+  };
+
+  if (!data) return h('div', { className: 'page' }, h('h1', null, '🔄 Auto-tags'), h('p', null, 'Загрузка...'));
+
+  const fmtTs = (iso) => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return d.toLocaleString('ru-RU', { hour12: false });
+  };
+  const remaining = (iso) => {
+    if (!iso) return '';
+    const ms = new Date(iso).getTime() - Date.now();
+    if (ms <= 0) return 'готов';
+    const days = Math.floor(ms / 86400000);
+    const hours = Math.floor((ms % 86400000) / 3600000);
+    return days > 0 ? days + 'd ' + hours + 'h' : hours + 'h';
+  };
+
+  const statusBadge = data.circuitBreakerOpen
+    ? h('span', { style: { color: 'var(--err)', fontWeight: 600 } }, '⛔ Circuit breaker open (' + data.failureStreak + ' fails)')
+    : data.enabled
+      ? h('span', { style: { color: 'var(--ok)', fontWeight: 600 } }, '✓ Enabled')
+      : h('span', { style: { color: 'var(--muted)', fontWeight: 600 } }, '⏸ Disabled');
+
+  return h('div', { className: 'page' },
+    h('h1', null, '🔄 Auto-tags refresh'),
+    h('div', { style: { fontSize: 13, color: 'var(--muted)', marginBottom: 18, lineHeight: 1.5 } },
+      'Раз в ', String(data.cooldownDays), ' дней Grok ', data.model, ' (fallback: ', data.fallbackModel, ') ',
+      'предлагает обновлённые subreddits и Twitter keywords для каждого пресета. ',
+      'Manual overrides всегда побеждают auto. Cost: ~$0.13 за refresh, ~$0.54/мес.'
+    ),
+
+    // ── Status block ──
+    h('div', { className: 'card', style: { marginBottom: 18, padding: 16 } },
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
+        h('div', null, h('strong', null, 'Status: '), statusBadge),
+        h('div', { style: { display: 'flex', gap: 8 } },
+          h('button', {
+            className: 'btn btn-' + (data.enabled ? 'ghost' : 'primary') + ' btn-sm',
+            disabled: busy,
+            onClick: toggle,
+          }, data.enabled ? '⏸ Disable' : '▶ Enable'),
+          h('button', {
+            className: 'btn btn-primary btn-sm',
+            disabled: busy || !data.enabled || data.circuitBreakerOpen,
+            onClick: force,
+            title: 'Force refresh now (rate-limited to 1×/' + data.forceCooldownHours + 'h)',
+          }, '⚡ Force refresh now'),
+          data.circuitBreakerOpen ? h('button', {
+            className: 'btn btn-ghost btn-sm',
+            disabled: busy,
+            onClick: resetBreaker,
+          }, '🔓 Reset breaker') : null,
+        )
+      ),
+      h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, fontSize: 12 } },
+        h('div', null, h('div', { style: { color: 'var(--muted)' } }, 'Last run'), h('div', null, fmtTs(data.lastRunAt))),
+        h('div', null, h('div', { style: { color: 'var(--muted)' } }, 'Next scheduled'), h('div', null, fmtTs(data.nextRunAt), ' (', remaining(data.nextRunAt), ')')),
+        h('div', null, h('div', { style: { color: 'var(--muted)' } }, 'Force available after'), h('div', null, fmtTs(data.nextForceAt), ' (', remaining(data.nextForceAt), ')'))
+      )
+    ),
+
+    // ── Auto-overrides preview ──
+    h('div', { className: 'card', style: { marginBottom: 18, padding: 16 } },
+      h('h3', { style: { marginTop: 0, marginBottom: 8 } }, '🤖 Current auto-overrides'),
+      h('div', { style: { fontSize: 12, color: 'var(--muted)', marginBottom: 8 } },
+        'Поля где Grok что-то предложил. Manual overrides поверх — всегда побеждают.'
+      ),
+      Object.keys(data.autoOverrides || {}).length === 0
+        ? h('div', { style: { color: 'var(--muted)', fontSize: 12 } }, '— ничего не предложено (Phase 1 stub не делает реальных Grok-вызовов) —')
+        : h('pre', { style: { background: 'var(--bg)', padding: 10, borderRadius: 6, fontSize: 11, overflow: 'auto', maxHeight: 280 } },
+            JSON.stringify(data.autoOverrides, null, 2))
+    ),
+
+    // ── History table ──
+    h('div', { className: 'card', style: { padding: 16 } },
+      h('h3', { style: { marginTop: 0, marginBottom: 8 } }, '📜 Refresh history'),
+      (data.history || []).length === 0
+        ? h('div', { style: { color: 'var(--muted)', fontSize: 12 } }, '— пусто —')
+        : h('table', { className: 'tbl', style: { width: '100%', fontSize: 12 } },
+            h('thead', null, h('tr', null,
+              h('th', null, 'Time'), h('th', null, 'Preset'), h('th', null, 'Source'),
+              h('th', null, 'Status'), h('th', null, 'Model'), h('th', null, 'Cost'), h('th', null, 'Detail')
+            )),
+            h('tbody', null, ...(data.history || []).map(row => h('tr', { key: row.id },
+              h('td', null, fmtTs(row.ts)),
+              h('td', null, row.preset),
+              h('td', null, row.source_type),
+              h('td', null, h('span', {
+                style: {
+                  color: row.status === 'applied' ? 'var(--ok)' :
+                         row.status === 'error' ? 'var(--err)' : 'var(--muted)'
+                }
+              }, row.status)),
+              h('td', null, row.model || '—'),
+              h('td', null, row.cost_usd != null ? '$' + row.cost_usd.toFixed(3) : '—'),
+              h('td', { style: { fontSize: 11, color: 'var(--muted)' } }, row.error_message || (row.diff_json ? 'diff' : ''))
+            )))
+          )
+    ),
+
+    msg ? h('div', {
+      style: { marginTop: 14, fontSize: 12, color: msgKind === 'err' ? 'var(--err)' : 'var(--ok)' }
+    }, msg) : null
+  );
+}
+
 function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('adminKey'));
   const [tab, setTab] = useState('stats');
@@ -5839,6 +6047,7 @@ function App() {
     {id:'stats',     icon:'📊', label:'Статистика'},
     {id:'scanners',  icon:'⚙️',  label:'Сканеры'},
     {id:'presets',   icon:'🎛️', label:'Пресеты'},
+    {id:'tagrefresh',icon:'🔄', label:'Auto-tags'},
     {id:'submit',    icon:'🧪', label:'Ручной анализ'},
     {id:'decisions', icon:'🔔', label:'Алерты'},
     {id:'examples',  icon:'🎓', label:'AI Examples'},
@@ -5847,7 +6056,7 @@ function App() {
     {id:'bot',       icon:'🤖', label:'Бот и планы'},
   ];
 
-  const PAGE = {stats:StatsPage, scanners:ScannersPage, presets:PresetConfigsPage, submit:SubmitPage, decisions:DecisionsPage, examples:ExamplesPage, users:UsersPage, payments:PaymentsPage, bot:BotPage};
+  const PAGE = {stats:StatsPage, scanners:ScannersPage, presets:PresetConfigsPage, tagrefresh:TagRefreshPage, submit:SubmitPage, decisions:DecisionsPage, examples:ExamplesPage, users:UsersPage, payments:PaymentsPage, bot:BotPage};
   const CurrentPage = PAGE[tab];
 
   return React.createElement('div',{className:'layout'},

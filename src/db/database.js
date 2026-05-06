@@ -383,6 +383,25 @@ class TrendDatabase {
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_xa_history_trend ON x_analysis_history(trend_id, at DESC)`);
 
+    // ── Tag auto-refresh audit log ─────────────────────────────────────────
+    // Each row = one Grok-call attempt (success or failure) for one preset.
+    // status: 'applied' | 'skipped_no_diff' | 'rejected_validation' | 'error'
+    // diff_json: shape { added: {reddit: [...], twitter: [...]}, removed: {...} }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tag_refresh_history (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts              DATETIME DEFAULT CURRENT_TIMESTAMP,
+        preset          TEXT NOT NULL,
+        source_type     TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        diff_json       TEXT,
+        error_message   TEXT,
+        model           TEXT,
+        cost_usd        REAL
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tag_refresh_history_ts ON tag_refresh_history(ts DESC)`);
+
     // Auth sessions (Telegram-bot-verified login for the dashboard)
     // ── Flow ───────────────────────────────────────────────────────────────────
     //   1) Browser calls /api/auth/initiate     → row with session_id only
@@ -2225,6 +2244,31 @@ class TrendDatabase {
   // them simplifies ranking semantics — all users now see the same global
   // ordering. The users.personalization_enabled column is left in place;
   // SQLite has no cheap DROP COLUMN and the column has no consumers anymore.
+
+  // ── Tag auto-refresh history ──────────────────────────────────────────────
+  recordTagRefresh({ preset, sourceType, status, diff, errorMessage, model, costUsd }) {
+    this.db.prepare(`
+      INSERT INTO tag_refresh_history (preset, source_type, status, diff_json, error_message, model, cost_usd)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      String(preset),
+      String(sourceType),
+      String(status),
+      diff ? JSON.stringify(diff) : null,
+      errorMessage || null,
+      model || null,
+      Number.isFinite(costUsd) ? costUsd : null,
+    );
+  }
+
+  getTagRefreshHistory(limit = 50) {
+    return this.db.prepare(`
+      SELECT id, ts, preset, source_type, status, diff_json, error_message, model, cost_usd
+      FROM tag_refresh_history
+      ORDER BY ts DESC, id DESC
+      LIMIT ?
+    `).all(Number(limit) || 50);
+  }
 
   close() {
     this.db.close();

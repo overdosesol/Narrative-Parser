@@ -20,6 +20,7 @@ import TelegramNotifier from './notifications/telegram.js';
 import { recomputeAlertScores, dispatchAlerts } from './notifications/alert-dispatcher.js';
 import SupportBot from './support/bot.js';
 import HotMetricsRefresher from './refresh/hot-metrics.js';
+import TagRefresher from './refresh/tag-refresher.js';
 import SolanaPayMonitor from './billing/solana-pay.js';
 import DashboardServer from './dashboard/server.js';
 import AdminServer from './admin/server.js';
@@ -127,6 +128,30 @@ const hotRefresher = new HotMetricsRefresher({
   normalizeThreshold,                           // [0..100] integer clamp
 });
 hotRefresher.start();
+
+// Tag auto-refresh — weekly Grok call to suggest fresh subreddits + Twitter
+// keywords per preset. Phase 1: infra scaffold only (admin toggle / force / history).
+// Phase 2 will replace the Grok-call stub with a real xAI Responses API call
+// (search_parameters: {mode: 'on'}, model: grok-4.3, fallback: grok-4.20-0309-reasoning).
+// Toggle: db setting tagAutoRefreshEnabled (admin).
+const tagRefresher = new TagRefresher({ db, logger, config });
+
+// Hourly check loop — fires refreshAll() when 7-day cooldown expired AND
+// auto-refresh is enabled AND circuit breaker is closed. First check 5 min
+// after boot to keep startup light.
+setTimeout(() => {
+  setInterval(async () => {
+    try {
+      const gate = tagRefresher.shouldRefreshNow();
+      if (gate.ok) {
+        logger.info(`[TagRefresher] cooldown expired (${gate.reason}) — running scheduled refresh`);
+        await tagRefresher.refreshAll();
+      }
+    } catch (e) {
+      logger.error(`[TagRefresher] scheduled run failed: ${e.message}`);
+    }
+  }, 60 * 60 * 1000);  // hourly
+}, 5 * 60 * 1000);  // first check 5 min after boot
 
 // ── Initialize collectors ───────────────────────────────────────────────────
 const collectors = [];
@@ -277,6 +302,7 @@ const admin = new AdminServer(config, logger, db, telegram.bot, appState, () => 
   telegram,       // full wrapper — needed for sendAlertToUser + attachXButton
   triggerFinder,  // optional Grok deep-search; SubmitPage button → /api/trends/:id/trigger
   hotRefresher,   // status reads + manual trigger from admin /api/hot-refresh/*
+  tagRefresher,   // weekly auto-refresh of source-tags (admin /api/tag-refresh/*)
 });
 admin.start();
 

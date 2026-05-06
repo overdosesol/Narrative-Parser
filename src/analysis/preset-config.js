@@ -748,11 +748,40 @@ function assertWeightBudgets(presetKey, effective) {
 }
 
 /**
- * Read the stored overrides blob from DB settings. Tolerates missing /
+ * Read the stored MANUAL overrides blob from DB settings. Tolerates missing /
  * malformed JSON — returns {} so callers always get a valid object.
  */
 export function readPresetOverrides(db) {
   const raw = db?.getSetting?.('presetConfigs', null);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+  } catch (_) { return {}; }
+}
+
+/**
+ * Read the AUTO overrides blob (written by tag-refresher Grok-call).
+ * Same shape as manual overrides but stored under a different settings key.
+ * Manual overrides ALWAYS win when both slots have a value for the same field.
+ */
+export function readPresetAutoOverrides(db) {
+  const raw = db?.getSetting?.('presetConfigsAuto', null);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+  } catch (_) { return {}; }
+}
+
+/**
+ * Read per-tag pin lock-mask. Shape: { <preset>: { <sourceType>: [<tag>, ...] } }
+ * — locked items are protected from auto-refresh deletion. Manual overrides
+ * already win by merge-order, so this is specifically about preventing
+ * auto-refresh from overwriting individual list items.
+ */
+export function readPresetTagsLocked(db) {
+  const raw = db?.getSetting?.('presetTagsLocked', null);
   if (!raw) return {};
   try {
     const parsed = JSON.parse(raw);
@@ -776,9 +805,33 @@ export function getActivePresetConfig(db, opts = {}) {
   const fallback = opts.fallback || 'general';
   const stored = db?.getSetting?.('activePreset', fallback) || fallback;
   const preset = PRESET_KEYS.includes(stored) ? stored : fallback;
-  const overrides = readPresetOverrides(db);
-  const config = resolvePresetConfig(preset, overrides);
+  // 3-layer merge: defaults → auto-overrides → manual-overrides
+  // Manual ALWAYS wins. Auto is the middle layer (Grok-suggested values).
+  // If the same field appears in both auto and manual — manual is used.
+  const autoOverrides = readPresetAutoOverrides(db);
+  const manualOverrides = readPresetOverrides(db);
+  const merged = mergeOverrideBlobs(autoOverrides, manualOverrides);
+  const config = resolvePresetConfig(preset, merged);
   return { preset, ...config };
+}
+
+/**
+ * Deep-merge two override blobs. Used to combine auto + manual layers.
+ * Manual wins on conflict (passed second). Both blobs are sparse — fields
+ * absent in BOTH simply don't appear in the merged result, and resolvePresetConfig
+ * fills them from DEFAULT_PRESET_CONFIGS.
+ */
+function mergeOverrideBlobs(auto, manual) {
+  const out = {};
+  for (const preset of PRESET_KEYS) {
+    const a = auto?.[preset];
+    const m = manual?.[preset];
+    if (!a && !m) continue;
+    if (!a) { out[preset] = m; continue; }
+    if (!m) { out[preset] = a; continue; }
+    out[preset] = deepMerge(a, m);  // manual wins
+  }
+  return out;
 }
 
 /**
