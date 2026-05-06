@@ -132,6 +132,16 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
     let userDisabledSources = [];
     try { userDisabledSources = JSON.parse(user.disabled_sources || '[]'); } catch { /* ignore */ }
 
+    // Plan-allowed sources: free is locked to reddit + google_trends; paid
+    // plans include all 5 (reddit, twitter, tiktok, google_trends, x_trends).
+    // user.plan_sources comes from JOIN with plans table (CSV string).
+    // Empty/missing falls back to "all allowed" — paranoid default that
+    // protects admin/legacy rows where plan_sources isn't populated.
+    const planSourcesRaw = String(user.plan_sources || '').trim();
+    const planAllowedSources = planSourcesRaw
+      ? planSourcesRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      : []; // empty = no restriction (legacy/admin fallback)
+
     const userAlertTypes = db.getUserAlertTypes(user.telegram_chat_id);
     const userThreshold  = normalizeThreshold(user.alert_threshold, config.alertThreshold);
     const effectiveAlertThreshold = Math.max(userThreshold, globalAlertThreshold);
@@ -173,27 +183,30 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
       const sourceLc   = (trend.source || '').toLowerCase();
 
       const capPass       = !(maxAlertsPerCycle > 0 && alertsSentThisCycle >= maxAlertsPerCycle);
-      const dailyPass     = db.canUserReceiveAlert(user);
       const thresholdPass = alertScore >= effectiveAlertThreshold;
       const hardJunkPass  = !trend._alertHardJunk;
       const sourcePass    = !userDisabledSources.includes(sourceLc);
+      // Plan-source gate: free is restricted to reddit + google_trends. Paid
+      // plans (test/pro/admin) include all 5 sources. Empty plan_sources =
+      // no restriction (legacy/admin fallback).
+      const planSourcePass = planAllowedSources.length === 0 || planAllowedSources.includes(sourceLc);
       const dedupPass     = !db.wasNotificationSentToUser(trend._dbId, user.id);
 
       const trendAlertType = trend.alertType || null;
       const alertTypePass  = !trendAlertType || userAlertTypes.includes(trendAlertType);
 
-      gates.push({ name: 'threshold',  passed: thresholdPass, detail: `${alertScore} / ${effectiveAlertThreshold}` });
-      gates.push({ name: 'hard_junk',  passed: hardJunkPass,  detail: `junk=${junkVal}${junkReasons ? ' (' + junkReasons + ')' : ''} < ${alertWeights.hardJunkStop}` });
-      gates.push({ name: 'source',     passed: sourcePass,    detail: trend.source + (sourcePass ? '' : ' (muted)') });
-      gates.push({ name: 'alert_type', passed: alertTypePass, detail: trendAlertType ? `${trendAlertType} ∈ [${userAlertTypes.join(',')}]` : 'no type (wildcard)' });
-      gates.push({ name: 'dedup',      passed: dedupPass,     detail: dedupPass ? 'new trend' : 'already sent' });
-      gates.push({ name: 'daily',      passed: dailyPass,     detail: dailyPass ? 'ok' : `limit=${user.alert_limit}` });
-      gates.push({ name: 'cap',        passed: capPass,       detail: maxAlertsPerCycle > 0 ? `${alertsSentThisCycle}/${maxAlertsPerCycle}` : '∞' });
+      gates.push({ name: 'threshold',    passed: thresholdPass,    detail: `${alertScore} / ${effectiveAlertThreshold}` });
+      gates.push({ name: 'hard_junk',    passed: hardJunkPass,     detail: `junk=${junkVal}${junkReasons ? ' (' + junkReasons + ')' : ''} < ${alertWeights.hardJunkStop}` });
+      gates.push({ name: 'plan_source',  passed: planSourcePass,   detail: planSourcePass ? trend.source : `${trend.source} (not in ${user.plan_name || 'free'} plan)` });
+      gates.push({ name: 'source',       passed: sourcePass,       detail: trend.source + (sourcePass ? '' : ' (muted)') });
+      gates.push({ name: 'alert_type',   passed: alertTypePass,    detail: trendAlertType ? `${trendAlertType} ∈ [${userAlertTypes.join(',')}]` : 'no type (wildcard)' });
+      gates.push({ name: 'dedup',        passed: dedupPass,        detail: dedupPass ? 'new trend' : 'already sent' });
+      gates.push({ name: 'cap',          passed: capPass,          detail: maxAlertsPerCycle > 0 ? `${alertsSentThisCycle}/${maxAlertsPerCycle}` : '∞' });
 
       const firstFail = gates.find(g => !g.passed);
       const allPassed = !firstFail;
 
-      if (!capPass || !dailyPass) {
+      if (!capPass) {
         recordDecision({ ...decisionBase, decision: 'skipped', reason: firstFail.name, gates });
         totalSkipped++;
         break;

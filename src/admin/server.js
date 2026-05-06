@@ -1597,7 +1597,7 @@ textarea.msg-input:focus{border-color:var(--accent)}
 .broadcast-footer{display:flex;gap:10px;align-items:center;margin-top:10px}
 
 /* Plans table */
-.plan-row{display:grid;grid-template-columns:120px 100px 100px 100px 1fr;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border)}
+.plan-row{display:grid;grid-template-columns:120px 120px 1fr;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border)}
 .plan-row:last-child{border-bottom:none}
 .plan-head{background:var(--bg3);font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text2)}
 .plan-input{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:13px;outline:none;width:80px}
@@ -3869,21 +3869,25 @@ function BotPage() {
     // Plans & Feedback sub-tab — Plans / Feedback weights / Recent reasons
     subTab === 'plans' && React.createElement('div',{className:'adm-card'},
       React.createElement('h3',null,'💰 Настройка планов'),
+      // alert_limit and history_days columns removed 2026-05-06 — both fields
+      // are dead in the DB. Plan rights are now configured in
+      // src/billing/entitlements.js (sources, manualAnalyze cap, catalyst
+      // cap, historyHours). Price is the only thing the admin still tunes
+      // here. The DB columns stay (legacy), they're just no longer surfaced.
+      React.createElement('div',{style:{fontSize:12,color:'var(--text2)',marginBottom:12,padding:'8px 12px',background:'var(--bg3)',borderRadius:6,border:'1px solid var(--border)'}},
+        '⚠ Лимиты по фичам (источники, кап Manual analyze / Catalyst, окно истории) теперь живут в коде — src/billing/entitlements.js. Здесь правится только цена плана.'
+      ),
       React.createElement('div',{style:{borderRadius:8,overflow:'hidden',border:'1px solid var(--border)'}},
         React.createElement('div',{className:'plan-row plan-head'},
           React.createElement('span',null,'План'),
           React.createElement('span',null,'Цена (USD)'),
-          React.createElement('span',null,'Алертов/день'),
-          React.createElement('span',null,'Дней'),
-          React.createElement('span',null,''),
+          React.createElement('span',null,'Источники / save'),
         ),
         plans.map(p=>{
           const ed = editedPlans[p.id]||{};
           return React.createElement('div',{key:p.id,className:'plan-row'},
             React.createElement('span',null,React.createElement('span',{className:'badge badge-'+p.name},p.name)),
             React.createElement('input',{className:'plan-input',type:'number',step:'0.01',defaultValue:p.price_usd||0,onChange:e=>setPlanField(p.id,'price_usd',parseFloat(e.target.value))}),
-            React.createElement(UnlimitedInput,{value:(editedPlans[p.id]?.alert_limit??p.alert_limit),onChange:v=>setPlanField(p.id,'alert_limit',v)}),
-            React.createElement(UnlimitedInput,{value:(editedPlans[p.id]?.history_days??p.history_days),onChange:v=>setPlanField(p.id,'history_days',v)}),
             editedPlans[p.id]
               ? React.createElement('button',{className:'btn btn-primary btn-sm',onClick:()=>savePlan(p),disabled:savingPlan},'Сохранить')
               : React.createElement('span',{style:{fontSize:12,color:'var(--text2)'}},p.sources?'src: '+p.sources:'')

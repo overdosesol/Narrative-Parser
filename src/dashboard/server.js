@@ -15,6 +15,8 @@ import http from 'http';
 import path from 'path';
 import { LIFESPAN_VALUES, normalizeLifespan } from '../analysis/lifespan.js';
 import { runManualAnalysis, peekManualAnalysisCache } from '../analysis/manual-analysis.js';
+import { getActivePresetConfig } from '../analysis/preset-config.js';
+import { getPlanEntitlements, shouldShowUsageCounter } from '../billing/entitlements.js';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { timingSafeEqual, createHash } from 'crypto';
@@ -128,6 +130,11 @@ export function maskId(id) {
 function sqliteCutoff(msAgo) {
   return new Date(Date.now() - msAgo).toISOString().slice(0, 19).replace('T', ' ');
 }
+
+// ─── Plan-based gating helpers ────────────────────────────────────────────────
+// getPlanEntitlements is imported from src/billing/entitlements.js — shared
+// with the Telegram bot so source-filter, manual-analyze cap and catalyst cap
+// stay consistent across both surfaces.
 
 // ─── Tweet preview (hover popups) ─────────────────────────────────────────────
 // Lightweight in-memory cache keyed by tweet ID. The dashboard's hover-preview
@@ -422,10 +429,11 @@ class DashboardServer {
     this.started       = Date.now();
     this.sseClients    = new Set();  // active Server-Sent Event subscribers
     this._sseKeepAlive = null;
-    // In-memory rate-limit ring for /api/manual-analysis. Map<userId, number[]>
-    // - array of timestamps within the rolling window. Reset on restart, which
-    // is fine for a soft cap (only matters for sustained abuse).
+    // In-memory rate-limit rings. Map<userId, number[]> — array of timestamps
+    // within the rolling 24h window. Reset on restart, which is fine for a
+    // soft cap (only matters for sustained abuse).
     this._manualAnalysisHits = new Map();
+    this._catalystHits       = new Map();
 
     // Brute-force protection on /api/auth/verify. 6-digit codes have only
     // ~20 bits of entropy; without throttling an attacker who knows the
@@ -465,6 +473,11 @@ class DashboardServer {
         return Math.floor(s.mtimeMs);
       } catch { return this.started; }
     })();
+
+    // Bot username for nav-link to the Telegram bot. Resolves asynchronously
+    // at start() — empty string until then. SPA template injects whatever's
+    // cached at HTML render time. Falls back to a generic t.me link if empty.
+    this._botUsername = '';
   }
 
   /** Broadcast an event to all connected SSE clients. */
@@ -495,6 +508,21 @@ class DashboardServer {
     this.server.on('error', err => {
       this.logger.error(`Dashboard server error: ${err.message}`);
     });
+
+    // Resolve and cache bot username for the nav Telegram link. getMe() is
+    // ~150ms; happens once at start, never again. SPA reads this._botUsername
+    // at HTML-render time. Failure → empty string → SPA renders bot link
+    // as fallback `t.me/` (still valid, just lands on TG search).
+    if (this.telegram && typeof this.telegram.getBotUsername === 'function') {
+      this.telegram.getBotUsername()
+        .then(username => {
+          this._botUsername = username || '';
+          if (this._botUsername) {
+            this.logger.info(`Dashboard nav bot link → @${this._botUsername}`);
+          }
+        })
+        .catch(e => this.logger.warn(`getBotUsername failed: ${e.message}`));
+    }
   }
 
   /**
@@ -664,6 +692,12 @@ class DashboardServer {
       if (path.match(/^\/api\/trends\/\d+\/unhide$/)   && method === 'POST') return this._handleTrendUnhide(req, res, path);
       if (path === '/api/trends/hidden'        && method === 'GET')  return this._handleHiddenTrends(req, res);
       if (path === '/api/trends/hidden/clear'  && method === 'POST') return this._handleHiddenTrendsClear(req, res);
+      // Per-user favorites (Pro/Admin). POST = add, DELETE = remove,
+      // PATCH = edit note. GET /api/favorites returns the list.
+      if (path.match(/^\/api\/trends\/\d+\/favorite$/) && method === 'POST')   return this._handleTrendFavoriteAdd(req, res, path);
+      if (path.match(/^\/api\/trends\/\d+\/favorite$/) && method === 'DELETE') return this._handleTrendFavoriteRemove(req, res, path);
+      if (path.match(/^\/api\/trends\/\d+\/favorite$/) && method === 'PATCH')  return this._handleTrendFavoriteNote(req, res, path);
+      if (path === '/api/favorites' && method === 'GET') return this._handleFavorites(req, res);
       if (path === '/api/manual-analysis' && method === 'POST') return this._handleManualAnalysis(req, res);
 
       // SPA fallback — serve dashboard HTML for all non-API routes
@@ -794,11 +828,31 @@ class DashboardServer {
       plan:       user.plan_name || 'free',
       status:     user.status || 'active',
       threshold:  user.alert_threshold ?? null,
+      // Effective ADMIN-side floor (per-preset `alerts.thresholds.alertThreshold`).
+      // The actual alert gate compares alertScore against `max(user.threshold,
+      // alertFloor)`. Exposed so the dashboard modal can render an honest
+      // "would-alert" verdict — without it the client doesn't know the admin
+      // floor and would show false-positives if user.threshold < admin floor.
+      // Server-side this is read fresh per login response (preset config is
+      // app-global state, not a hot path).
+      alertFloor: (() => {
+        try {
+          const cfg = getActivePresetConfig(this.db);
+          const v = Number(cfg?.alerts?.thresholds?.alertThreshold);
+          return Number.isFinite(v) ? v : null;
+        } catch { return null; }
+      })(),
       // Subscription filter for the alert-type axis — array of canonical
       // values ('event'|'trend'|'post'). Empty/legacy → all 3 (handled by
       // db.getUserAlertTypes). The settings page uses this to render
       // checkboxes; client never sends raw CSV back, only the array.
       alertTypes: this.db.getUserAlertTypes(user.telegram_chat_id || user.chat_id || ''),
+      // Plan entitlements — single source of truth from getPlanEntitlements.
+      // Frontend reads these to render 🔒 markers and "X / cap today" counters
+      // on Catalyst / manual-analyze surfaces. Caps semantics:
+      //   -1 = unlimited (admin), 0 = blocked (free), N>0 = N/day soft cap.
+      // sources is the list of source-IDs the user can see in the feed.
+      entitlements: getPlanEntitlements(user.plan_name || 'free'),
       subscriptionExpiresAt: user.subscription_expires_at || null,
       // Avatar — present iff we've successfully fetched a profile photo from TG.
       // Cache-busting key: fileUniqueId changes when user updates their photo.
@@ -954,7 +1008,12 @@ class DashboardServer {
   // ── Handlers ────────────────────────────────────────────────────────────────
 
   _handleTrends(req, res, url) {
-    const hours       = parseInt(url.searchParams.get('hours')       || '24',  10);
+    const requestedHours = parseInt(url.searchParams.get('hours')    || '24',  10);
+    // Plan-history cap: Free is capped to 72h (3 days). Paid plans uncapped.
+    // Cap silently — if Free sends ?hours=168 (7d), backend honours 72h. SPA
+    // also blocks the slider client-side, so this is defence-in-depth.
+    const planHistoryHours = getPlanEntitlements(req.user?.plan_name).historyHours;
+    const hours = (planHistoryHours > 0) ? Math.min(requestedHours, planHistoryHours) : requestedHours;
     const limit       = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
     const offset      = parseInt(url.searchParams.get('offset')      || '0',   10);
     const category    = url.searchParams.get('category')    || null;
@@ -990,6 +1049,16 @@ class DashboardServer {
     const userIdEarly = String(req.user?.telegram_chat_id || '').trim() || null;
     const hiddenIds = userIdEarly ? this.db.getHiddenTrendIdsByChat(userIdEarly, 7) : [];
 
+    // Per-user favorites — pre-fetched once per request so _formatTrend can
+    // attach isFavorite via a Set.has() lookup (no per-row DB query).
+    const favoriteIds = userIdEarly ? this.db.getFavoriteTrendIds(userIdEarly) : [];
+    const favoriteIdSet = new Set(favoriteIds);
+    // ?favoritesOnly=1 — Pro/Admin filter that scopes feed to saved-only.
+    // Free/test never has favorites (plan-gate), so the filter would
+    // return empty for them — which is fine (they shouldn't be hitting it
+    // from the SPA in the first place since the toggle is locked).
+    const favoritesOnly = url.searchParams.get('favoritesOnly') === '1';
+
     // Window filter uses last_seen_at, not first_seen_at. The clusterer keeps
     // pulling fresh posts into an existing narrative — last_seen_at advances,
     // first_seen_at stays pinned to when the cluster was born. Filtering on
@@ -1008,6 +1077,24 @@ class DashboardServer {
       // statement; with retention=7d a sane user won't accumulate that many.
       query += ` AND id NOT IN (${hiddenIds.map(() => '?').join(',')})`;
       params.push(...hiddenIds);
+    }
+    // Favourites-only filter (Pro/Admin). Returns empty when user has no
+    // saves yet — empty IN clause would be a SQL syntax error, so guard it.
+    if (favoritesOnly) {
+      if (favoriteIds.length === 0) {
+        return json(res, 200, { trends: [], total: 0, limit, offset });
+      }
+      query += ` AND id IN (${favoriteIds.map(() => '?').join(',')})`;
+      params.push(...favoriteIds);
+    }
+    // Plan-source gate: free is locked to reddit + google_trends. Paid plans
+    // see all 5. Mirror of alert-dispatcher's plan_source gate so feed and
+    // alerts agree on what user can see.
+    const planSources = getPlanEntitlements(req.user?.plan_name).sources;
+    if (planSources && planSources.length > 0 && planSources.length < 5) {
+      const placeholders = planSources.map(() => '?').join(',');
+      query += ` AND source IN (${placeholders})`;
+      params.push(...planSources);
     }
     if (category)         { query += ` AND category = ?`;                                                                              params.push(category); }
     if (source)           { query += ` AND source = ?`;                                                                                params.push(source); }
@@ -1030,9 +1117,9 @@ class DashboardServer {
     const total = this.db.db.prepare(countQuery).get(...countParams)?.c ?? 0;
 
     const userId = String(req.user?.telegram_chat_id || '').trim() || null;
-    const trends = rows.map(row => this._formatTrend(row, userId));
+    const trends = rows.map(row => this._formatTrend(row, userId, favoriteIdSet));
 
-    return json(res, 200, { trends, total, limit, offset });
+    return json(res, 200, { trends, total, limit, offset, favoriteCount: favoriteIds.length });
   }
 
   _handleTrend(req, res, path) {
@@ -1040,33 +1127,45 @@ class DashboardServer {
     const row = this.db.db.prepare(`SELECT * FROM trends WHERE id = ?`).get(id);
     if (!row) return json(res, 404, { error: 'Trend not found' });
     const userId = String(req.user?.telegram_chat_id || '').trim() || null;
-    return json(res, 200, this._formatTrend(row, userId));
+    const favSet = userId ? new Set(this.db.getFavoriteTrendIds(userId)) : null;
+    return json(res, 200, this._formatTrend(row, userId, favSet));
   }
 
   _handleStats(req, res, url) {
-    const hours = parseInt(url.searchParams.get('hours') || '24', 10);
+    const requestedHours = parseInt(url.searchParams.get('hours') || '24', 10);
+    // Plan-history cap mirrors _handleTrends.
+    const planHistoryHours = getPlanEntitlements(req.user?.plan_name).historyHours;
+    const hours = (planHistoryHours > 0) ? Math.min(requestedHours, planHistoryHours) : requestedHours;
     const cutoff = sqliteCutoff(hours * 3_600_000);
+
+    // Plan-source gate (mirror of _handleTrends). Free user's stats reflect
+    // only the trends they're allowed to see — otherwise total / by-source /
+    // top-narratives leak counts of locked sources back.
+    const planSources = getPlanEntitlements(req.user?.plan_name).sources;
+    const planFiltered = planSources && planSources.length > 0 && planSources.length < 5;
+    const planClause = planFiltered ? ` AND source IN (${planSources.map(() => '?').join(',')})` : '';
+    const planParams = planFiltered ? planSources : [];
 
     // Same semantics as _handleTrends: "active in this window" via last_seen_at,
     // not "born in this window" via first_seen_at. See _handleTrends for why.
-    const total = this.db.db.prepare(`SELECT COUNT(*) as c FROM trends WHERE last_seen_at > ?`).get(cutoff).c;
+    const total = this.db.db.prepare(`SELECT COUNT(*) as c FROM trends WHERE last_seen_at > ?${planClause}`).get(cutoff, ...planParams).c;
 
     const bySource = this.db.db.prepare(
-      `SELECT source, COUNT(*) as count FROM trends WHERE last_seen_at > ? GROUP BY source`
-    ).all(cutoff);
+      `SELECT source, COUNT(*) as count FROM trends WHERE last_seen_at > ?${planClause} GROUP BY source`
+    ).all(cutoff, ...planParams);
 
     const byCategory = this.db.db.prepare(
-      `SELECT category, COUNT(*) as count FROM trends WHERE last_seen_at > ? GROUP BY category ORDER BY count DESC`
-    ).all(cutoff);
+      `SELECT category, COUNT(*) as count FROM trends WHERE last_seen_at > ?${planClause} GROUP BY category ORDER BY count DESC`
+    ).all(cutoff, ...planParams);
 
     const statsUserId = String(req.user?.telegram_chat_id || '').trim() || null;
     const topTrends = this.db.db.prepare(
-      `SELECT * FROM trends WHERE last_seen_at > ? ORDER BY CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC LIMIT 10`
-    ).all(cutoff).map(r => this._formatTrend(r, statsUserId));
+      `SELECT * FROM trends WHERE last_seen_at > ?${planClause} ORDER BY CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) DESC LIMIT 10`
+    ).all(cutoff, ...planParams).map(r => this._formatTrend(r, statsUserId));
 
     const avgScore = this.db.db.prepare(
-      `SELECT AVG(score) as avg FROM trends WHERE last_seen_at > ? AND score > 0`
-    ).get(cutoff).avg || 0;
+      `SELECT AVG(score) as avg FROM trends WHERE last_seen_at > ? AND score > 0${planClause}`
+    ).get(cutoff, ...planParams).avg || 0;
 
     const alerts24h = this.db.db.prepare(
       `SELECT COUNT(*) as c FROM notifications WHERE sent_at > ?`
@@ -1089,6 +1188,11 @@ class DashboardServer {
     const cutoff   = sqliteCutoff(60 * 60_000);              // 1h ago
     const cutoff24 = sqliteCutoff(24 * 3_600_000);           // 24h ago
 
+    // Plan-allowed sources for this user. Frontend uses inPlan to render a
+    // 🔒 marker on locked sources (free user sees twitter/tiktok/x_trends
+    // greyed out with an upgrade hint).
+    const planSources = getPlanEntitlements(req.user?.plan_name).sources;
+
     const result = sources.map(source => {
       const last = this.db.db.prepare(
         `SELECT COUNT(*) as count, MAX(first_seen_at) as last FROM trends WHERE source = ? AND first_seen_at > ?`
@@ -1099,8 +1203,9 @@ class DashboardServer {
       ).get(source, cutoff).c;
 
       const enabled = !this.appState.disabledCollectors?.has(source);
+      const inPlan = planSources.includes(source);
 
-      return { source, last24h: last.count, lastHour, lastSeen: last.last, enabled };
+      return { source, last24h: last.count, lastHour, lastSeen: last.last, enabled, inPlan };
     });
 
     return json(res, 200, { sources: result });
@@ -1424,32 +1529,34 @@ class DashboardServer {
     const userId = String(req.user?.telegram_chat_id || '').trim();
     if (!userId) return json(res, 401, { error: 'Authenticated user has no chat_id' });
     const planName = req.user?.plan_name || 'free';
+    const ent = getPlanEntitlements(planName);
 
-    // Plan gate — pro/admin only (mirrors TG button state)
-    if (planName !== 'pro' && planName !== 'admin') {
-      return json(res, 403, { error: 'Trigger search is a Pro-plan feature', reason: 'plan' });
+    // Plan gate — free is hard-locked (cap=0). Test/pro have daily caps,
+    // admin is unlimited (cap=-1). Per-user 15-min cooldown removed —
+    // Catalyst forecast is cheap (~$0.05/call), daily caps are enough.
+    if (ent.catalyst === 0) {
+      return json(res, 403, { error: 'Catalyst forecast is a Pro-plan feature', reason: 'plan' });
     }
 
     const trend = this.db.getTrendById ? this.db.getTrendById(trendId) : null;
     if (!trend) return json(res, 404, { error: 'Trend not found' });
 
-    // Cached fast-path
+    // Cached fast-path — shared across all users, no cap consumed
     const existing = this.db.getTrendTrigger(trendId);
     if (existing && existing.text) {
       return json(res, 200, { ...existing, fromCache: true });
     }
 
-    // Per-user 15min cooldown (admin bypass)
-    const COOLDOWN_MS = 15 * 60 * 1000;
-    if (planName !== 'admin') {
-      const lastAt = this.db.getLastTriggerSearchByUser(userId);
-      if (lastAt) {
-        const elapsedMs = Date.now() - new Date(lastAt + 'Z').getTime();
-        if (elapsedMs < COOLDOWN_MS) {
-          const minLeft = Math.max(1, Math.ceil((COOLDOWN_MS - elapsedMs) / 60000));
-          return json(res, 403, { error: 'Cooldown active', reason: 'cooldown', minLeft });
-        }
+    // Daily cap (per-user, rolling 24h, in-memory). Admin bypass.
+    if (ent.catalyst > 0) {
+      const now = Date.now();
+      const dayMs = 24 * 60 * 60 * 1000;
+      const hits = (this._catalystHits.get(userId) || []).filter(t => now - t < dayMs);
+      if (hits.length >= ent.catalyst) {
+        return json(res, 403, { error: 'Daily Catalyst limit reached', reason: 'daily_limit', cap: ent.catalyst });
       }
+      hits.push(now);
+      this._catalystHits.set(userId, hits);
     }
 
     // DB-level claim — dedupe parallel clicks across TG and dashboard
@@ -1469,7 +1576,13 @@ class DashboardServer {
       const result = await this.triggerFinder.findTrigger(trend);
       this.db.saveTrendTrigger(trendId, result);
       const saved = this.db.getTrendTrigger(trendId); // re-read to pick up timestamp
-      return json(res, 200, { ...saved, fromCache: false });
+      // Usage counter for plans that show it (test only). Pro/admin omit.
+      let usage = null;
+      if (shouldShowUsageCounter(planName) && ent.catalyst > 0) {
+        const used = (this._catalystHits.get(userId) || []).length;
+        usage = { used, cap: ent.catalyst, left: Math.max(0, ent.catalyst - used) };
+      }
+      return json(res, 200, { ...saved, fromCache: false, usage });
     } catch (err) {
       this.db.releaseTriggerLock(trendId);
       this.logger.error(`Trigger search failed for trend #${trendId}: ${err.message}`);
@@ -1541,6 +1654,117 @@ class DashboardServer {
     }
   }
 
+  // ── Per-user favorites (Pro/Admin) ───────────────────────────────────────
+  // Permanent saves of trends the user wants to keep around. Snapshot stored
+  // at save-time via db.addFavorite (see database.js _trendSnapshot) — even
+  // if the live trend rolls out of `trends` later, the favorite survives.
+  // Plan-gate: free/test get 403 with reason='plan'. Pro/admin pass.
+
+  _favoriteGate(req, res) {
+    const userId = String(req.user?.telegram_chat_id || '').trim();
+    if (!userId) { json(res, 401, { error: 'Authenticated user has no chat_id' }); return null; }
+    const planName = req.user?.plan_name || 'free';
+    if (!getPlanEntitlements(planName).favorites) {
+      json(res, 403, { error: 'Favorites is a Pro/Admin feature', reason: 'plan' });
+      return null;
+    }
+    return userId;
+  }
+
+  async _handleTrendFavoriteAdd(req, res, path) {
+    const m = path.match(/^\/api\/trends\/(\d+)\/favorite$/);
+    if (!m) return json(res, 400, { error: 'Invalid path' });
+    const trendId = parseInt(m[1], 10);
+    const userId = this._favoriteGate(req, res);
+    if (!userId) return;
+
+    let body = {};
+    try { body = await parseBody(req); } catch { /* note is optional */ }
+    let note = String(body?.note || '').trim();
+    if (note.length > 500) note = note.slice(0, 500);
+    if (!note) note = null;
+
+    try {
+      this.db.addFavorite(userId, trendId, note);
+      const count = this.db.countFavoritesByChat(userId);
+      return json(res, 200, { ok: true, favorited: true, count, note });
+    } catch (err) {
+      this.logger.warn(`favorite add #${trendId} for ${maskId(userId)}: ${err.message}`);
+      return json(res, 500, { error: err.message });
+    }
+  }
+
+  _handleTrendFavoriteRemove(req, res, path) {
+    const m = path.match(/^\/api\/trends\/(\d+)\/favorite$/);
+    if (!m) return json(res, 400, { error: 'Invalid path' });
+    const trendId = parseInt(m[1], 10);
+    const userId = this._favoriteGate(req, res);
+    if (!userId) return;
+
+    try {
+      this.db.removeFavorite(userId, trendId);
+      const count = this.db.countFavoritesByChat(userId);
+      return json(res, 200, { ok: true, favorited: false, count });
+    } catch (err) {
+      this.logger.warn(`favorite remove #${trendId} for ${maskId(userId)}: ${err.message}`);
+      return json(res, 500, { error: err.message });
+    }
+  }
+
+  async _handleTrendFavoriteNote(req, res, path) {
+    const m = path.match(/^\/api\/trends\/(\d+)\/favorite$/);
+    if (!m) return json(res, 400, { error: 'Invalid path' });
+    const trendId = parseInt(m[1], 10);
+    const userId = this._favoriteGate(req, res);
+    if (!userId) return;
+
+    let body = {};
+    try { body = await parseBody(req); }
+    catch (e) { return json(res, 400, { error: e.message }); }
+    let note = String(body?.note || '').trim();
+    if (note.length > 500) note = note.slice(0, 500);
+
+    try {
+      const changed = this.db.setFavoriteNote(userId, trendId, note || null);
+      if (!changed) return json(res, 404, { error: 'Favorite not found' });
+      return json(res, 200, { ok: true, note: note || null });
+    } catch (err) {
+      return json(res, 500, { error: err.message });
+    }
+  }
+
+  _handleFavorites(req, res) {
+    const userId = this._favoriteGate(req, res);
+    if (!userId) return;
+
+    try {
+      const rows = this.db.getFavoritesByChat(userId, 500);
+      const favIdSet = new Set(rows.map(r => r.fav_trend_id));
+      // For each row: prefer live trend data; fall back to snapshot when
+      // the LEFT JOIN missed (trend rolled out). Tag each entry with its
+      // note + saved_at so the frontend can render the note inline.
+      const trends = rows.map(r => {
+        const liveTrend = r.id != null;
+        const base = liveTrend ? r : (() => {
+          try { return JSON.parse(r.fav_snapshot || '{}'); }
+          catch { return null; }
+        })();
+        if (!base) return null;
+        // _formatTrend expects a row-shape with raw_metrics as a string —
+        // snapshot stores it as already-stored, so pass as-is.
+        const formatted = this._formatTrend(base, userId, favIdSet);
+        formatted.favoriteNote = r.fav_note || null;
+        formatted.favoriteSavedAt = r.fav_saved_at || null;
+        formatted.favoriteSnapshotted = !liveTrend; // UI hint: "saved copy"
+        return formatted;
+      }).filter(Boolean);
+      return json(res, 200, { trends, total: trends.length });
+    } catch (err) {
+      this.logger.warn(`favorites list for ${maskId(userId)}: ${err.message}`);
+      return json(res, 500, { error: err.message });
+    }
+  }
+
   /**
    * POST /api/manual-analysis — pro/admin only.
    *
@@ -1563,7 +1787,10 @@ class DashboardServer {
     const userId = String(req.user?.telegram_chat_id || '').trim();
     if (!userId) return json(res, 401, { error: 'Authenticated user has no chat_id' });
     const planName = req.user?.plan_name || 'free';
-    if (planName !== 'pro' && planName !== 'admin') {
+    const ent = getPlanEntitlements(planName);
+
+    // Plan gate: free is hard-locked (cap=0). Test/pro/admin pass.
+    if (ent.manualAnalyze === 0) {
       return json(res, 403, { error: 'Manual analysis is a Pro-plan feature', reason: 'plan' });
     }
 
@@ -1577,19 +1804,20 @@ class DashboardServer {
     // Rate limit only when the analysis will actually run the scorer. Cache
     // hits cost zero and arrive instantly, so we let them bypass — that
     // keeps a pro user from burning their daily cap on duplicate URL clicks.
+    // 30s cooldown stays for everyone except admin (anti-spam, anti-dupe).
     const cacheAge = peekManualAnalysisCache(rawUrl);
-    if (cacheAge === null && planName !== 'admin') {
+    if (cacheAge === null && ent.manualAnalyze > 0) {
       const now = Date.now();
       const dayMs = 24 * 60 * 60 * 1000;
       const cooldownMs = 30 * 1000;
-      const dailyCap = 20;
+      const dailyCap = ent.manualAnalyze;
       const hits = (this._manualAnalysisHits.get(userId) || []).filter(t => now - t < dayMs);
       if (hits.length && now - hits[hits.length - 1] < cooldownMs) {
         const secLeft = Math.max(1, Math.ceil((cooldownMs - (now - hits[hits.length - 1])) / 1000));
         return json(res, 403, { error: 'Cooldown active — analysis can take 10-30s', reason: 'cooldown', secLeft });
       }
       if (hits.length >= dailyCap) {
-        return json(res, 403, { error: 'Daily limit reached (' + dailyCap + ' / 24h)', reason: 'daily' });
+        return json(res, 403, { error: 'Daily limit reached (' + dailyCap + ' / 24h)', reason: 'daily', cap: dailyCap });
       }
       hits.push(now);
       this._manualAnalysisHits.set(userId, hits);
@@ -1657,6 +1885,13 @@ class DashboardServer {
         // Manual-analysis-only extras (the SPA can show these in a debug panel)
         xSearchData:     t.xSearchData || null,
       };
+      // Usage counter for plans that show it (test only). Skipped on cache
+      // hits — those don't consume a daily slot.
+      let usage = null;
+      if (!result.fromCache && shouldShowUsageCounter(planName) && ent.manualAnalyze > 0) {
+        const used = (this._manualAnalysisHits.get(userId) || []).length;
+        usage = { used, cap: ent.manualAnalyze, left: Math.max(0, ent.manualAnalyze - used) };
+      }
       return json(res, 200, {
         ok: true,
         elapsedMs: result.elapsedMs,
@@ -1667,6 +1902,7 @@ class DashboardServer {
         fromCache: !!result.fromCache,
         cacheAgeMs: result.cacheAgeMs || 0,
         trend: shaped,
+        usage,
       });
     } catch (err) {
       this.logger.error(`[ManualAnalysis] failed for user ${userId}: ${err.message}`);
@@ -1734,9 +1970,15 @@ class DashboardServer {
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
-  _formatTrend(row, userId = null) {
+  _formatTrend(row, userId = null, favSet = null) {
     let metrics = {};
-    try { metrics = JSON.parse(row.raw_metrics || '{}'); } catch (e) {}
+    try {
+      // raw_metrics may already be a parsed object (when called from the
+      // favorites snapshot path) — handle both.
+      metrics = typeof row.raw_metrics === 'string'
+        ? JSON.parse(row.raw_metrics || '{}')
+        : (row.raw_metrics || {});
+    } catch (e) {}
     // Feedback (likes / dislikes / user's current vote + their attached reason)
     let feedback = { likes: 0, dislikes: 0, score: 0, userVote: 0, userReason: '' };
     try {
@@ -1884,6 +2126,10 @@ class DashboardServer {
           }))
         : null,
       feedback,
+      // Favorite flag — true if this trend is in the caller's favorites set.
+      // favSet is pre-fetched once per feed request (see _handleTrends) so
+      // this is a single Set.has() check per row, not a per-row DB query.
+      isFavorite: favSet ? favSet.has(row.id) : false,
     };
   }
 
@@ -2213,16 +2459,14 @@ class DashboardServer {
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
-    /* ===== THEME SYSTEM (rewritten 2026-05-01) =====
-       4 monochrome themes inspired by X (Twitter):
-         ink   — pure black + X-blue        (default, no data-theme attribute)
-         dim   — X dim-mode bluish-graphite + X-blue
-         slate — neutral graphite + warm white accent (Apple-style)
-         mono  — pure grayscale, no chroma in accent (true monotone)
+    /* ===== THEME SYSTEM (rewritten 2026-05-06) =====
+       2 dark themes:
+         ink   — pure black + X-blue          (default, no data-theme attribute)
+         tide  — deep navy + cyan/aqua accent (crypto-terminal vibe)
 
        Design principles:
          • One accent colour per theme, used sparingly
-         • Borders are translucent white at low alpha (no saturated tint)
+         • Borders are translucent at low alpha — white in ink, cool steel-blue in tide
          • Surfaces use very subtle top-down gradients via box-shadow
            inset 0 1px 0 rgba(255,255,255,.04) for the "glassy" feel
          • Semantic state colours (green/red/orange/yellow) stay constant
@@ -2284,64 +2528,24 @@ class DashboardServer {
       --gloss-edge:  inset 0 0 0 1px rgba(255,255,255,.02);
     }
 
-    /* ── dim — X dim-mode ── */
-    body[data-theme="dim"] {
-      --bg:          #15202b;
-      --surface:     #1a2733;
-      --card:        #1e2c3c;
-      --card2:       #243345;
-      --card3:       #2a3d52;
-      --border:      rgba(139,152,165,.14);
-      --border2:     rgba(139,152,165,.22);
-      --border3:     rgba(139,152,165,.32);
-      --text:        #ffffff;
-      --text2:       #d6dde3;
-      --muted:       #8b98a5;
-      --dim:         #5c6c7b;
-      --accent:      #1d9bf0;
-      --accent2:     #4cb1ff;
-      --accent-rgb:  29,155,240;
-      --accent-glow: rgba(29,155,240,.18);
-    }
-
-    /* ── slate — Apple-style neutral graphite, white accent ── */
-    body[data-theme="slate"] {
-      --bg:          #0e0f10;
-      --surface:     #16181a;
-      --card:        #1c1e20;
-      --card2:       #25282b;
-      --card3:       #2f3236;
-      --border:      rgba(255,255,255,.06);
-      --border2:     rgba(255,255,255,.10);
-      --border3:     rgba(255,255,255,.18);
-      --text:        #f5f5f7;
-      --text2:       #c8c9cc;
-      --muted:       #86868b;
-      --dim:         #515154;
-      --accent:      #ffffff;
-      --accent2:     #d4d4d6;
-      --accent-rgb:  255,255,255;
-      --accent-glow: rgba(255,255,255,.10);
-    }
-
-    /* ── mono — pure grayscale, no chroma ── */
-    body[data-theme="mono"] {
-      --bg:          #0d0d0d;
-      --surface:     #161616;
-      --card:        #1d1d1d;
-      --card2:       #232323;
-      --card3:       #2c2c2c;
-      --border:      rgba(255,255,255,.07);
-      --border2:     rgba(255,255,255,.12);
-      --border3:     rgba(255,255,255,.20);
-      --text:        #f0f0f0;
-      --text2:       #c0c0c0;
-      --muted:       #808080;
-      --dim:         #4d4d4d;
-      --accent:      #b8b8b8;
-      --accent2:     #d4d4d4;
-      --accent-rgb:  184,184,184;
-      --accent-glow: rgba(255,255,255,.08);
+    /* ── tide — deep navy + cyan/aqua accent ── */
+    body[data-theme="tide"] {
+      --bg:          #0a1622;
+      --surface:     #0f1c2a;
+      --card:        #14202e;
+      --card2:       #1a2837;
+      --card3:       #213244;
+      --border:      rgba(115,168,210,.10);
+      --border2:     rgba(115,168,210,.18);
+      --border3:     rgba(115,168,210,.28);
+      --text:        #d6e1ec;
+      --text2:       #aebccc;
+      --muted:       #7387a0;
+      --dim:         #4a5b72;
+      --accent:      #4dd4e0;
+      --accent2:     #7ce8f0;
+      --accent-rgb:  77,212,224;
+      --accent-glow: rgba(77,212,224,.16);
     }
 
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2657,6 +2861,27 @@ class DashboardServer {
     }
     .source-item.off .source-icon { filter: grayscale(1); }
     .source-item.off .source-count { opacity: .4; }
+    /* Locked source (Free plan, premium source). Greyer than .off, lock icon
+       on the right where the count would normally be. Click does NOT toggle
+       (handled in JS) — opens an upgrade toast instead. */
+    .source-item.locked {
+      background: rgba(239,243,244,0.02);
+      border-color: var(--border);
+      color: var(--dim);
+      opacity: .55;
+      cursor: not-allowed;
+    }
+    .source-item.locked .source-icon { filter: grayscale(0.85) brightness(0.75); }
+    .source-item.locked .source-name { opacity: .7; }
+    .source-item.locked .source-lock {
+      font-size: 11px;
+      padding: 3px 7px;
+      background: rgba(239,243,244,0.04);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      flex-shrink: 0;
+    }
+    .source-item.locked:hover { opacity: .75; background: rgba(239,243,244,0.04); }
     .source-icon {
       width: 26px; height: 26px; border-radius: 7px;
       display: inline-flex; align-items: center; justify-content: center;
@@ -2793,6 +3018,21 @@ class DashboardServer {
       border-radius: 0 0 2px 2px;
     }
     .sb-foot-btn.active .sb-foot-ico { filter: saturate(1.2) drop-shadow(0 0 4px var(--accent-glow)); }
+    /* Locked tab — Free plan, "Analyze" stays visible but un-clickable so
+       the user discovers the feature exists. Click → upgrade toast (handled
+       in BottomNav). Visually muted, dashed border to read as "available
+       elsewhere", lock icon already replaces the regular tab icon. */
+    .sb-foot-btn.locked {
+      opacity: .55;
+      cursor: not-allowed;
+      border-style: dashed;
+    }
+    .sb-foot-btn.locked:hover {
+      opacity: .7;
+      background: rgba(239,243,244,0.03);
+      color: var(--muted);
+    }
+    .sb-foot-btn.locked:hover .sb-foot-ico { transform: none; }
 
     /* ── Main content ── */
     .main {
@@ -3619,15 +3859,9 @@ class DashboardServer {
     .theme-swatch[data-theme-preview="ink"]   .theme-swatch-dot-bg     { background: #000000; }
     .theme-swatch[data-theme-preview="ink"]   .theme-swatch-dot-accent { background: #1d9bf0; }
     .theme-swatch[data-theme-preview="ink"]   .theme-swatch-dot-card   { background: #16181c; }
-    .theme-swatch[data-theme-preview="dim"]   .theme-swatch-dot-bg     { background: #15202b; }
-    .theme-swatch[data-theme-preview="dim"]   .theme-swatch-dot-accent { background: #1d9bf0; }
-    .theme-swatch[data-theme-preview="dim"]   .theme-swatch-dot-card   { background: #1e2c3c; }
-    .theme-swatch[data-theme-preview="slate"] .theme-swatch-dot-bg     { background: #0e0f10; }
-    .theme-swatch[data-theme-preview="slate"] .theme-swatch-dot-accent { background: #ffffff; }
-    .theme-swatch[data-theme-preview="slate"] .theme-swatch-dot-card   { background: #1c1e20; }
-    .theme-swatch[data-theme-preview="mono"]  .theme-swatch-dot-bg     { background: #0d0d0d; }
-    .theme-swatch[data-theme-preview="mono"]  .theme-swatch-dot-accent { background: #b8b8b8; }
-    .theme-swatch[data-theme-preview="mono"]  .theme-swatch-dot-card   { background: #1d1d1d; }
+    .theme-swatch[data-theme-preview="tide"]  .theme-swatch-dot-bg     { background: #0a1622; }
+    .theme-swatch[data-theme-preview="tide"]  .theme-swatch-dot-accent { background: #4dd4e0; }
+    .theme-swatch[data-theme-preview="tide"]  .theme-swatch-dot-card   { background: #14202e; }
     .stats-view { display: grid; gap: 12px; }
     .stats-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
     .stats-block { padding: 14px 16px; }
@@ -3803,19 +4037,21 @@ class DashboardServer {
     .search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-glow); }
     .search-input::placeholder { color: var(--dim); }
 
-    /* ── Toast notifications ── slides down from top, dashboard-styled */
+    /* ── Toast notifications ── slides down from above the nav, Ink-styled.
+       Pill-shaped, glassy, no left accent stripe (legacy artifact from the
+       earlier right-side toast — removed 2026-05-06). Type signal carried
+       by border tint + icon colour, not a side bar. */
     @keyframes toastIn  {
-      from { opacity: 0; transform: translateY(-18px) scale(.96); }
-      to   { opacity: 1; transform: translateY(0)     scale(1);   }
+      from { opacity: 0; transform: translateY(-22px); }
+      to   { opacity: 1; transform: translateY(0); }
     }
     @keyframes toastOut {
-      from { opacity: 1; transform: translateY(0)     scale(1);   }
-      to   { opacity: 0; transform: translateY(-12px) scale(.97); }
+      from { opacity: 1; transform: translateY(0); }
+      to   { opacity: 0; transform: translateY(-14px); }
     }
     .toasts-wrap {
       position: fixed;
-      /* top: small offset below the nav bar, horizontally centered */
-      top: 64px;
+      top: 14px;
       left: 50%;
       transform: translateX(-50%);
       z-index: 9999;
@@ -3825,55 +4061,43 @@ class DashboardServer {
       max-width: calc(100vw - 24px);
     }
     .toast {
-      position: relative;
       display: flex; align-items: center; gap: 10px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 11px 16px 11px 14px;
-      font-size: 12.5px; font-weight: 500; color: var(--text);
+      background: rgba(10,10,10,0.92);
+      border: 1px solid var(--border, rgba(239,243,244,0.08));
+      border-radius: 999px;
+      padding: 9px 16px;
+      font-size: 13px; font-weight: 500; color: var(--text, #e7e9ea);
       letter-spacing: .1px;
-      /* layered glass: subtle top highlight + edge inset, accent-tinted shadow
-         that picks up the active theme's accent. */
+      /* Single layered shadow — depth without inset glossy lines that
+         compete with the pill shape. */
       box-shadow:
-        var(--gloss-top, inset 0 1px 0 rgba(255,255,255,.04)),
-        var(--gloss-edge, inset 0 0 0 1px rgba(255,255,255,.02)),
-        0 12px 32px -10px rgba(0,0,0,.55),
-        0 4px 12px -4px rgba(0,0,0,.45);
-      backdrop-filter: blur(14px);
-      -webkit-backdrop-filter: blur(14px);
+        0 12px 32px -10px rgba(0,0,0,.65),
+        0 2px 8px -2px rgba(0,0,0,.45);
+      backdrop-filter: blur(14px) saturate(1.1);
+      -webkit-backdrop-filter: blur(14px) saturate(1.1);
       animation: toastIn .22s cubic-bezier(.21,.62,.32,1.06);
       pointer-events: auto;
-      min-width: 260px; max-width: 380px;
-      overflow: hidden;
+      max-width: 440px;
     }
-    /* Left accent bar — color shifts per type. Constant 3px wide, full height. */
-    .toast::before {
-      content: '';
-      position: absolute; left: 0; top: 0; bottom: 0;
-      width: 3px;
-      background: var(--accent);
-      opacity: .85;
-    }
-    .toast.success::before { background: var(--green, #22c55e); }
-    .toast.error::before   { background: var(--red, #ef4444); }
-    .toast.success { border-color: rgba(var(--green-rgb), .28); }
-    .toast.success .toast-icon { color: var(--green2, var(--green)); }
-    .toast.error   { border-color: rgba(var(--red-rgb), .28); }
-    .toast.error   .toast-icon { color: var(--red2, var(--red)); }
-    .toast.info    { border-color: rgba(var(--accent-rgb), .28); }
+    /* Type tinting via border + icon colour only. No left stripe. */
+    .toast.info    { border-color: rgba(var(--accent-rgb), .30); }
     .toast.info    .toast-icon { color: var(--accent2, var(--accent)); }
+    .toast.success { border-color: rgba(var(--green-rgb), .30); }
+    .toast.success .toast-icon { color: var(--green2, var(--green)); }
+    .toast.error   { border-color: rgba(var(--red-rgb), .30); }
+    .toast.error   .toast-icon { color: var(--red2, var(--red)); }
     .toast-icon {
-      font-size: 14px;
+      font-size: 13px;
       flex-shrink: 0;
-      width: 18px; height: 18px;
+      width: 16px; height: 16px;
       display: inline-flex; align-items: center; justify-content: center;
-      filter: drop-shadow(0 1px 2px rgba(0,0,0,.4));
+      line-height: 1;
     }
-    .toast-msg  { flex: 1; line-height: 1.45; }
+    .toast-msg { flex: 1; line-height: 1.4; white-space: nowrap; }
     @media (max-width: 540px) {
-      .toasts-wrap { top: 56px; }
-      .toast { min-width: 0; max-width: calc(100vw - 24px); }
+      .toasts-wrap { top: 10px; }
+      .toast { max-width: calc(100vw - 24px); }
+      .toast-msg { white-space: normal; }
     }
 
     /* ── Refresh badge + keyboard hints ── */
@@ -4951,6 +5175,108 @@ class DashboardServer {
       .feed-hide-btn { opacity: .6; }
     }
 
+    /* ── Favorite (⭐) button — sits inline at the start of .feed-user-row
+       (left side, right after the avatar). Compact pill that matches the
+       row's font size; hidden until card hover unless the trend is saved.
+       Pro/Admin only — for free/test the button is omitted entirely. */
+    .feed-fav-btn {
+      width: 18px; height: 18px; border-radius: 4px;
+      background: transparent;
+      border: 1px solid var(--border2);
+      color: var(--text2);
+      font-size: 11px; line-height: 1;
+      display: inline-flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+      margin-right: 4px;
+      opacity: 0;
+      transition: opacity .12s, background .12s, color .12s, border-color .12s, transform .15s;
+    }
+    .feed-card:hover .feed-fav-btn { opacity: 1; }
+    .feed-fav-btn.saved {
+      opacity: 1;                    /* always-visible when saved */
+      background: rgba(var(--accent-rgb), .18);
+      border-color: rgba(var(--accent-rgb), .45);
+      color: var(--accent2);
+    }
+    .feed-fav-btn:hover {
+      background: rgba(var(--accent-rgb), .14);
+      color: var(--accent2);
+      border-color: rgba(var(--accent-rgb), .45);
+    }
+    .feed-fav-btn.just-saved { animation: favPulse .4s cubic-bezier(.21,.62,.32,1.06); }
+    @keyframes favPulse {
+      0%   { transform: scale(1); }
+      40%  { transform: scale(1.35); }
+      100% { transform: scale(1); }
+    }
+    @media (hover: none) {
+      .feed-fav-btn { opacity: .6; }
+      .feed-fav-btn.saved { opacity: 1; }
+    }
+
+    /* Modal star button — same styling, but inline in the modal head row */
+    .modal-fav-btn {
+      width: 26px; height: 26px; border-radius: 6px;
+      background: rgba(0,0,0,.4);
+      border: 1px solid var(--border2);
+      color: var(--text2);
+      font-size: 13px; line-height: 1;
+      display: inline-flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      transition: background .12s, color .12s, border-color .12s, transform .15s;
+    }
+    .modal-fav-btn.saved {
+      background: rgba(var(--accent-rgb), .18);
+      border-color: rgba(var(--accent-rgb), .45);
+      color: var(--accent2);
+    }
+    .modal-fav-btn:hover {
+      background: rgba(var(--accent-rgb), .22);
+      color: var(--accent2);
+      border-color: rgba(var(--accent-rgb), .50);
+    }
+    .modal-fav-btn.just-saved { animation: favPulse .4s cubic-bezier(.21,.62,.32,1.06); }
+
+    /* Favorite note editor — collapsible block in the modal under the header */
+    .fav-note-block {
+      margin: 10px 0 0;
+      padding: 10px 12px;
+      background: rgba(var(--accent-rgb), .04);
+      border: 1px solid rgba(var(--accent-rgb), .14);
+      border-radius: 8px;
+      font-size: 12.5px; color: var(--text2);
+    }
+    .fav-note-row { display: flex; align-items: flex-start; gap: 8px; }
+    .fav-note-text { flex: 1; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+    .fav-note-actions { display: flex; gap: 4px; flex-shrink: 0; }
+    .fav-note-act {
+      background: transparent; border: none; cursor: pointer;
+      color: var(--muted); font-size: 11px; padding: 2px 6px; border-radius: 4px;
+      transition: background .12s, color .12s;
+    }
+    .fav-note-act:hover { background: rgba(255,255,255,.06); color: var(--text); }
+    .fav-note-textarea {
+      width: 100%; min-height: 60px; max-height: 160px;
+      padding: 8px 10px;
+      background: rgba(0,0,0,.3); color: var(--text);
+      border: 1px solid var(--border2); border-radius: 6px;
+      font-size: 12.5px; line-height: 1.45;
+      font-family: inherit; resize: vertical;
+      box-sizing: border-box; outline: none;
+    }
+    .fav-note-textarea:focus { border-color: rgba(var(--accent-rgb), .45); }
+    .fav-note-controls { display: flex; gap: 6px; margin-top: 6px; }
+    .fav-note-controls .btn { padding: 4px 10px; font-size: 11px; }
+    .fav-note-saved-at { font-size: 10px; color: var(--dim); margin-top: 4px; }
+    .fav-snapshot-banner {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; margin-bottom: 8px;
+      font-size: 10.5px; color: var(--muted);
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border); border-radius: 999px;
+    }
+
     /* Undo toast — fixed bottom-center, single instance. Separate from the
        top-right .toast notification system (different purpose: actionable
        undo vs informational). 2026-05-02: bottom: 24 (was 64) since the
@@ -5511,6 +5837,16 @@ class DashboardServer {
       transition: opacity .15s, border-color .15s, background .15s;
     }
     .right-sources-pill.off { opacity: .4; }
+    /* Locked = source not in user's plan. Slightly more visible than .off so
+       the user perceives "available, just gated" rather than "broken". */
+    .right-sources-pill.locked {
+      opacity: .5;
+      background: rgba(239,243,244,0.02);
+      border-style: dashed;
+      cursor: help;
+    }
+    .right-sources-pill.locked .right-sources-dot { background: var(--muted); }
+    .right-sources-pill.locked .right-sources-glyph { color: var(--muted); font-size: 9px; }
     .right-sources-pill.on:hover { border-color: var(--border2); background: rgba(255,255,255,.05); }
     .right-sources-dot {
       width: 5px; height: 5px; border-radius: 50%;
@@ -5603,6 +5939,9 @@ const LIFESPAN_VALUES = ${JSON.stringify(LIFESPAN_VALUES)};
 // logo is still showing" trap that long Cache-Control would otherwise
 // cause.
 const LOGO_VERSION = ${JSON.stringify(this._logoVersion)};
+// Bot username injected at HTML render time. Empty string → fallback rendering
+// in nav (t.me/ root). Used for the Telegram-bot nav link next to the X icon.
+const BOT_USERNAME = ${JSON.stringify(this._botUsername || '')};
 
 // ── Auth token ────────────────────────────────────────────────────────────
 // Login is Telegram-bot-only. The bot issues a 6-digit code bound to a session;
@@ -5648,21 +5987,18 @@ function onLangChange(fn) { langListeners.add(fn); return () => langListeners.de
 try { document.documentElement.setAttribute('lang', CURRENT_LANG); } catch (e) {}
 
 // ── THEME ────────────────────────────────────────────────────────────────
-// 4 monochrome dark themes inspired by X (Twitter). Applied via
-// <body data-theme="...">. "ink" is the default and uses no data-theme
-// attribute (it's the :root block).
+// 2 dark themes. Applied via <body data-theme="...">. "ink" is the default
+// and uses no data-theme attribute (it's the :root block).
 //
-// Old themes (midnight/teal/abyss/violet/acid/sunset/cyberpunk) were
-// retired 2026-05-01 in favour of a single-accent monochrome palette.
-// Old saved values fall through detectTheme()'s validity check and reset
-// to the new default — no migration needed.
+// Old themes (dim/slate/mono — and even older midnight/teal/abyss/violet
+// /acid/sunset/cyberpunk) were retired. Old saved values fall through
+// detectTheme()'s validity check and reset to the new default — no
+// migration needed.
 const THEME_KEY = 'ts_theme';
-const SUPPORTED_THEMES = ['ink', 'dim', 'slate', 'mono'];
+const SUPPORTED_THEMES = ['ink', 'tide'];
 const THEME_META = {
-  ink:   { icon: '⬛', labelEn: 'Ink',   labelRu: 'Чернила' },
-  dim:   { icon: '🌑', labelEn: 'Dim',   labelRu: 'Приглушённая' },
-  slate: { icon: '◾', labelEn: 'Slate', labelRu: 'Графит' },
-  mono:  { icon: '◽', labelEn: 'Mono',  labelRu: 'Моно' },
+  ink:  { icon: '⬛', labelEn: 'Ink',  labelRu: 'Чернила' },
+  tide: { icon: '🌊', labelEn: 'Tide', labelRu: 'Прилив' },
 };
 function detectTheme() {
   try {
@@ -5715,6 +6051,7 @@ const I18N = {
     'nav.feed': 'Feed',
     'nav.account': 'Account',
     'nav.analyze': 'Analyze',
+    'nav.saved': 'Saved',
     'analyze.title': 'Manual analysis',
     'analyze.intro': 'Paste a Twitter / Reddit / TikTok / og:image URL — we will run it through the full pipeline (Stage 1 + Stage 2 Grok) and show the result. Pro / Admin only.',
     'analyze.url_label': 'Post URL',
@@ -5722,7 +6059,23 @@ const I18N = {
     'analyze.run_btn': 'Analyze',
     'analyze.running': 'Analyzing...',
     'analyze.subtitle': 'Usually takes 10-30 seconds',
-    'analyze.locked': 'Manual analysis is a Pro-plan feature.',
+    'analyze.locked': 'Manual analysis is a Test/Pro feature.',
+    'analyze.locked_tooltip': 'Available on Test/Pro plan',
+    'analyze.locked_toast': '🔒 Manual analysis is available on Test/Pro',
+    'fav.add_tooltip': 'Save to favorites',
+    'fav.remove_tooltip': 'Remove from favorites',
+    'fav.locked_tooltip': 'Favorites is a Pro/Admin feature',
+    'fav.locked_toast': '🔒 Favorites is a Pro/Admin feature',
+    'fav.added_toast': '⭐ Saved to favorites',
+    'fav.removed_toast': '☆ Removed from favorites',
+    'fav.note_placeholder': 'Add a note (private, optional)',
+    'fav.note_save': 'Save note',
+    'fav.note_cancel': 'Cancel',
+    'fav.note_edit': 'Edit note',
+    'fav.note_remove': 'Remove note',
+    'fav.filter_label': 'Saved only',
+    'fav.empty': 'No saved narratives yet — tap ⭐ on any post to save it',
+    'fav.snapshot_hint': 'Saved copy — original may have been removed',
     'analyze.cooldown': 'Cooldown active — please wait {sec}s.',
     'analyze.daily_cap': 'Daily limit reached (20 / 24h).',
     'analyze.error_prefix': 'Analysis failed: ',
@@ -5879,7 +6232,15 @@ const I18N = {
     // Trigger search (on-demand Grok reasoning)
     'trigger.label':         '🔮 Catalyst',
     'trigger.btn':           '🔮 Forecast Catalyst',
-    'trigger.btn_pro_only':  '🔒 Forecast Catalyst (Pro)',
+    'trigger.btn_pro_only':  '🔒 Catalyst forecast — Test/Pro',
+    'trigger.daily_limit':   '⛔ Daily Catalyst limit reached ({cap}/24h)',
+    'window.locked_tooltip': 'Available on Test/Pro plan',
+    'window.locked_toast':   '🔒 Wider time window is available on Test/Pro',
+    'source.locked_tooltip': 'Available on Test/Pro plan',
+    'source.locked_toast':   '🔒 This source is available on Test/Pro',
+    'usage.test_left':       '📊 {used}/{cap} used today ({left} left)',
+    'trigger.locked_title':  'Catalyst forecast',
+    'trigger.locked_desc':   'Available on Test and Pro plans',
     'trigger.btn_loading':   '🔮 Forecasting… (~30-60s)',
     'trigger.confidence':    'Confidence: {pct}%',
     'trigger.confidence_label': 'Confidence',
@@ -5906,6 +6267,21 @@ const I18N = {
     'modal.virality': 'Virality',
     'modal.sentiment': 'Vibe',
     'modal.velocity': 'Velocity',
+    'modal.alert_score': 'Alert',
+    'modal.alert_pass': 'would alert',
+    'modal.alert_fail': "won't alert",
+    'modal.alert_breakdown': '🔔 Alert verdict',
+    'modal.alert_floor': 'floor',
+    'modal.alert_type_in_filter': '✓ in your filter',
+    'modal.alert_type_muted': '✕ muted in your filter',
+    'modal.alert_breakdown_meme': 'meme',
+    'modal.alert_breakdown_viral': 'viral',
+    'modal.alert_breakdown_emerge': 'emerge',
+    'modal.alert_breakdown_twitter': 'X',
+    'modal.alert_breakdown_feedback': 'feedback',
+    'modal.alert_breakdown_junk': 'junk',
+    'modal.alert_breakdown_stale': 'stale',
+    'modal.alert_no_score': 'not scored yet',
     'modal.feedback': '💬 Your take',
     'modal.links': '🔗 Links',
     'modal.source_link': '{ico} Source →',
@@ -6066,6 +6442,7 @@ const I18N = {
     'nav.feed': 'Фид',
     'nav.account': 'Аккаунт',
     'nav.analyze': 'Анализ',
+    'nav.saved': 'Избранное',
     'analyze.title': 'Ручной анализ',
     'analyze.intro': 'Закинь URL поста (Twitter / Reddit / TikTok / любой сайт с og:image) — прогоним через полный пайплайн (Stage 1 + Stage 2 Grok). Доступно только Pro/Admin.',
     'analyze.url_label': 'URL поста',
@@ -6073,7 +6450,23 @@ const I18N = {
     'analyze.run_btn': 'Анализ',
     'analyze.running': 'Анализ идёт...',
     'analyze.subtitle': 'Обычно 10-30 секунд',
-    'analyze.locked': 'Ручной анализ доступен только на Pro-плане.',
+    'analyze.locked': 'Ручной анализ — на Test/Pro плане.',
+    'analyze.locked_tooltip': 'Доступно на Test/Pro',
+    'analyze.locked_toast': '🔒 Ручной анализ — на Test/Pro',
+    'fav.add_tooltip': 'В избранное',
+    'fav.remove_tooltip': 'Убрать из избранного',
+    'fav.locked_tooltip': 'Избранное — Pro/Admin',
+    'fav.locked_toast': '🔒 Избранное доступно на Pro/Admin',
+    'fav.added_toast': '⭐ Добавлено в избранное',
+    'fav.removed_toast': '☆ Убрано из избранного',
+    'fav.note_placeholder': 'Заметка (приватная, опционально)',
+    'fav.note_save': 'Сохранить',
+    'fav.note_cancel': 'Отмена',
+    'fav.note_edit': 'Изменить заметку',
+    'fav.note_remove': 'Удалить заметку',
+    'fav.filter_label': 'Только избранное',
+    'fav.empty': 'Пока ничего не сохранено — нажми ⭐ на любом тренде',
+    'fav.snapshot_hint': 'Сохранённая копия — оригинал мог быть удалён',
     'analyze.cooldown': 'Подожди {sec} с — анализ ещё идёт.',
     'analyze.daily_cap': 'Лимит на сегодня исчерпан (20 / 24ч).',
     'analyze.error_prefix': 'Ошибка: ',
@@ -6228,7 +6621,15 @@ const I18N = {
     // Trigger search (on-demand Grok reasoning)
     'trigger.label':         '🔮 Каталист',
     'trigger.btn':           '🔮 Найти Каталиста',
-    'trigger.btn_pro_only':  '🔒 Найти Каталиста (Pro)',
+    'trigger.btn_pro_only':  '🔒 Каталист — Test/Pro',
+    'trigger.daily_limit':   '⛔ Дневной лимит Каталиста ({cap}/24ч)',
+    'window.locked_tooltip': 'Доступно на Test/Pro',
+    'window.locked_toast':   '🔒 Большее окно времени — на Test/Pro',
+    'source.locked_tooltip': 'Доступно на Test/Pro',
+    'source.locked_toast':   '🔒 Этот источник — на Test/Pro',
+    'usage.test_left':       '📊 {used}/{cap} сегодня (осталось {left})',
+    'trigger.locked_title':  'Катализатор',
+    'trigger.locked_desc':   'Доступно на Test и Pro',
     'trigger.btn_loading':   '🔮 Ищу Каталиста… (~30-60с)',
     'trigger.confidence':    'Уверенность: {pct}%',
     'trigger.confidence_label': 'Уверенность',
@@ -6255,6 +6656,21 @@ const I18N = {
     'modal.virality': 'Виральность',
     'modal.sentiment': 'Сентимент',
     'modal.velocity': 'Скорость',
+    'modal.alert_score': 'Alert',
+    'modal.alert_pass': 'алерт пройдёт',
+    'modal.alert_fail': 'не алертится',
+    'modal.alert_breakdown': '🔔 Решение алерта',
+    'modal.alert_floor': 'порог',
+    'modal.alert_type_in_filter': '✓ в вашем фильтре',
+    'modal.alert_type_muted': '✕ выключен в фильтре',
+    'modal.alert_breakdown_meme': 'meme',
+    'modal.alert_breakdown_viral': 'viral',
+    'modal.alert_breakdown_emerge': 'emerge',
+    'modal.alert_breakdown_twitter': 'X',
+    'modal.alert_breakdown_feedback': 'feedback',
+    'modal.alert_breakdown_junk': 'junk',
+    'modal.alert_breakdown_stale': 'stale',
+    'modal.alert_no_score': 'ещё не оценено',
     'modal.feedback': '💬 Ваша оценка',
     'modal.links': '🔗 Ссылки',
     'modal.source_link': '{ico} Источник →',
@@ -6427,7 +6843,12 @@ const api = (path, opts = {}) => {
         err.status = 401;
         throw err;
       }
-      if (!r.ok) throw new Error(data && data.error ? data.error : ('HTTP ' + r.status));
+      if (!r.ok) {
+        const err = new Error(data && data.error ? data.error : ('HTTP ' + r.status));
+        err.status = r.status;
+        err.reason = data && data.reason ? data.reason : null;
+        throw err;
+      }
       return data;
     }));
 };
@@ -7441,7 +7862,7 @@ function FeedbackBar({ trend, variant }) {
   );
 }
 
-function FeedCard({ trend, onOpen, onHide }) {
+function FeedCard({ trend, onOpen, onHide, onFavToggle, canFavorite }) {
   useLang();
   const catCls = CAT_CLS[trend.category] || 'cat-other';
   const catIco = CAT_ICONS[trend.category] || '📌';
@@ -7534,6 +7955,16 @@ function FeedCard({ trend, onOpen, onHide }) {
       ),
       h('div', { className: 'feed-meta' },
         h('div', { className: 'feed-user-row' },
+          // ⭐ favorite button — Pro/Admin only. Inline at the start of the
+          // user-row (left side, right after the avatar) so it has clear
+          // visual space from the ✕ on the far right. Filled when saved,
+          // outline otherwise.
+          (canFavorite && onFavToggle) ? h('button', {
+            className: 'feed-fav-btn' + (trend.isFavorite ? ' saved' : ''),
+            title: trend.isFavorite ? t('fav.remove_tooltip') : t('fav.add_tooltip'),
+            'aria-label': trend.isFavorite ? t('fav.remove_tooltip') : t('fav.add_tooltip'),
+            onClick: (e) => { e.stopPropagation(); onFavToggle(trend, e.currentTarget); }
+          }, trend.isFavorite ? '★' : '☆') : null,
           h('span', { className: 'feed-user' }, srcLbl),
           h('span', { className: 'feed-handle' }, handle),
           h('span', { className: 'feed-dot' }),
@@ -7733,14 +8164,20 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
             }, activeSrc + '/' + totalSrc)
           ),
           h('div', { className: 'right-sources-list' },
-            srcList.map(s => h('span', {
-              key: s.source,
-              className: 'right-sources-pill' + (s.enabled ? ' on' : ' off'),
-              title: (SOURCE_LABELS[s.source] || s.source) + (s.enabled ? '' : ' — off')
-            },
-              h('span', { className: 'right-sources-dot' }),
-              h('span', { className: 'right-sources-glyph' }, SOURCE_ICONS[s.source] || '📡')
-            ))
+            srcList.map(s => {
+              const locked = s.inPlan === false;
+              const labelBase = SOURCE_LABELS[s.source] || s.source;
+              const cls = 'right-sources-pill' + (locked ? ' locked' : (s.enabled ? ' on' : ' off'));
+              const ttl = locked
+                ? labelBase + ' — locked (Test/Pro)'
+                : labelBase + (s.enabled ? '' : ' — off');
+              return h('span', { key: s.source, className: cls, title: ttl },
+                h('span', { className: 'right-sources-dot' }),
+                h('span', { className: 'right-sources-glyph' },
+                  locked ? '🔒' : (SOURCE_ICONS[s.source] || '📡')
+                )
+              );
+            })
           )
         ) : null
       )
@@ -7791,9 +8228,15 @@ function TriggerSection({ trend, lang, me }) {
   const [data, setData] = useState(initial);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  // Usage counter (only set when server returns one — Test plan, fresh call).
+  // Format: { used, cap, left }. Pro/admin: omitted; cache hits: omitted.
+  const [usage, setUsage] = useState(null);
 
   const planName = (me && typeof me === 'object') ? (me.plan || me.plan_name || 'free') : 'free';
-  const isPro = planName === 'pro' || planName === 'admin';
+  // Catalyst entitlement: -1 unlimited (admin), 0 locked (free), N>0 daily cap.
+  // Read from server-shipped me.entitlements.catalyst (single source of truth).
+  const catalystCap = (me && me.entitlements && typeof me.entitlements.catalyst === 'number') ? me.entitlements.catalyst : 0;
+  const isPro = catalystCap !== 0; // any non-zero entitlement = unlocked
 
   const onSearch = async () => {
     if (loading) return;
@@ -7819,6 +8262,8 @@ function TriggerSection({ trend, lang, me }) {
           risks:      Array.isArray(body.risks)   ? body.risks   : [],
         };
         setData(payload);
+        // Test-plan usage counter (server omits for pro/admin/cache-hit)
+        if (body.usage && typeof body.usage.used === 'number') setUsage(body.usage);
         // Mirror in module cache so closing+reopening the modal before the next
         // feed poll still shows the forecast. Server is authoritative — once
         // the next /api/trends poll runs, trend.trigger will overwrite this.
@@ -7827,6 +8272,10 @@ function TriggerSection({ trend, lang, me }) {
         setError(t('trigger.in_flight'));
       } else if (res.status === 403 && body.reason === 'cooldown') {
         setError(t('trigger.cooldown', { min: body.minLeft || 1 }));
+      } else if (res.status === 403 && body.reason === 'daily_limit') {
+        setError(t('trigger.daily_limit', { cap: body.cap || '?' }));
+      } else if (res.status === 403 && body.reason === 'plan') {
+        setError(t('trigger.btn_pro_only'));
       } else if (res.status === 503) {
         setError(t('trigger.disabled'));
       } else {
@@ -7896,6 +8345,12 @@ function TriggerSection({ trend, lang, me }) {
             h('span', { className: 'catalyst-confidence-val' }, data.confidence + '%'),
           )
         : null,
+      // Usage counter (Test plan only). Tiny line, dim color, after content.
+      usage
+        ? h('div', {
+            style: { marginTop: 10, fontSize: 11, color: 'var(--muted, #71767b)' }
+          }, t('usage.test_left', { used: usage.used, cap: usage.cap, left: usage.left }))
+        : null,
     );
   }
 
@@ -7916,19 +8371,104 @@ function TriggerSection({ trend, lang, me }) {
             onClick: onSearch,
             style: { padding: '8px 14px', borderRadius: 8, cursor: loading ? 'wait' : 'pointer' },
           }, loading ? t('trigger.btn_loading') : t('trigger.btn'))
-        : h('button', {
-            className: 'btn',
-            disabled: true,
-            title: 'Pro plan required',
-            style: { padding: '8px 14px', borderRadius: 8, opacity: 0.6, cursor: 'not-allowed' },
-          }, t('trigger.btn_pro_only')),
+        // Locked card for Free — small icon-tile + two-line text. Reads like
+        // a content row, not a dimmed-out button. Still inert on click; the
+        // upgrade-flow already lives in /menu / Account.
+        : h('div', {
+            style: {
+              display: 'flex', alignItems: 'center', gap: 12,
+              padding: '12px 14px',
+              background: 'rgba(239,243,244,0.025)',
+              border: '1px solid var(--border, rgba(239,243,244,0.08))',
+              borderRadius: 10,
+            }
+          },
+            h('div', {
+              style: {
+                width: 36, height: 36, borderRadius: 8,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(var(--accent-rgb), 0.08)',
+                border: '1px solid rgba(var(--accent-rgb), 0.18)',
+                fontSize: 16, lineHeight: 1, flexShrink: 0,
+              }
+            }, '🔒'),
+            h('div', { style: { flex: 1, minWidth: 0 } },
+              h('div', {
+                style: { fontSize: 13, fontWeight: 600, color: 'var(--text, #e7e9ea)' }
+              }, t('trigger.locked_title')),
+              h('div', {
+                style: { fontSize: 11, color: 'var(--muted, #71767b)', marginTop: 2 }
+              }, t('trigger.locked_desc'))
+            )
+          ),
     ),
     error ? h('div', { style: { marginTop: 6, fontSize: 12, color: 'var(--accent2, #f55)' } }, error) : null,
   );
 }
 
+// ── Favorite note editor — inline collapsible block in TrendModal ─────────
+// Three states: (1) no note → "Add note" button; (2) note set → render
+// text + ✏ edit + ✕ remove; (3) editing → textarea + Save/Cancel.
+function FavoriteNoteEditor({ trend, onSave }) {
+  useLang(); // re-render on lang switch
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(trend.favoriteNote || '');
+  const note = trend.favoriteNote;
+
+  // Reset draft when modal opens for a different trend (or note changes from
+  // server) so we don't leak stale text from a previous edit session.
+  useEffect(() => { setDraft(note || ''); setEditing(false); }, [trend.id, note]);
+
+  const commit = () => {
+    onSave && onSave(trend, draft.trim());
+    setEditing(false);
+  };
+  const cancel = () => { setDraft(note || ''); setEditing(false); };
+
+  if (editing) {
+    return h('div', { className: 'fav-note-block' },
+      h('textarea', {
+        className: 'fav-note-textarea',
+        value: draft,
+        autoFocus: true,
+        maxLength: 500,
+        placeholder: t('fav.note_placeholder'),
+        onChange: e => setDraft(e.target.value.slice(0, 500)),
+        onKeyDown: e => {
+          if (e.key === 'Escape') cancel();
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) commit();
+        },
+      }),
+      h('div', { className: 'fav-note-controls' },
+        h('button', { className: 'btn btn-primary', onClick: commit }, t('fav.note_save')),
+        h('button', { className: 'btn', onClick: cancel }, t('fav.note_cancel'))
+      )
+    );
+  }
+
+  if (!note) {
+    return h('div', { className: 'fav-note-block' },
+      h('button', {
+        className: 'fav-note-act',
+        onClick: () => setEditing(true),
+        style: { fontSize: 12, padding: '4px 0' },
+      }, '✏ ' + t('fav.note_placeholder'))
+    );
+  }
+
+  return h('div', { className: 'fav-note-block' },
+    h('div', { className: 'fav-note-row' },
+      h('div', { className: 'fav-note-text' }, note),
+      h('div', { className: 'fav-note-actions' },
+        h('button', { className: 'fav-note-act', title: t('fav.note_edit'), onClick: () => setEditing(true) }, '✏'),
+        h('button', { className: 'fav-note-act', title: t('fav.note_remove'), onClick: () => onSave && onSave(trend, '') }, '✕')
+      )
+    )
+  );
+}
+
 // ── TrendModal (side drawer) ───────────────────────────────────────────────────
-function TrendModal({ trend, onClose, me = null }) {
+function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote = null }) {
   const lang = useLang();
   const [imgUrl, setImgUrl] = useState(trend.imageUrl || null);
   const [imgLoading, setImgLoading] = useState(!trend.imageUrl && !!trend.url);
@@ -8013,6 +8553,15 @@ function TrendModal({ trend, onClose, me = null }) {
       // Phase moved here (used to live in its own labelled section). Without
       // its old subtitle hint — the badge color + label is enough signal.
       h('div', { className: 'modal-head' },
+        // ⭐ Favorite — Pro/Admin only. Leftmost position so it's the first
+        // thing the user sees when the modal opens (and isn't squeezed
+        // between badges and ✕).
+        (onFavToggle && me && me.entitlements && me.entitlements.favorites) ? h('button', {
+          className: 'modal-fav-btn' + (trend.isFavorite ? ' saved' : ''),
+          title: trend.isFavorite ? t('fav.remove_tooltip') : t('fav.add_tooltip'),
+          'aria-label': trend.isFavorite ? t('fav.remove_tooltip') : t('fav.add_tooltip'),
+          onClick: (e) => { onFavToggle(trend, e.currentTarget); }
+        }, trend.isFavorite ? '★' : '☆') : null,
         trend.alertType
           ? h('span', { className: 'badge badge-atype badge-atype-' + trend.alertType }, t('badge.alert_type.' + trend.alertType))
           : null,
@@ -8023,9 +8572,22 @@ function TrendModal({ trend, onClose, me = null }) {
         h('span', { className: 'time-cell', style: { fontSize: 11 } }, fmtTime(trend.lastSeen || trend.firstSeen)),
         h('button', { className: 'modal-close', onClick: onClose }, t('app.esc_close'))
       ),
+      // Snapshot banner — shown when this trend was reconstructed from the
+      // favorite snapshot (live row was deleted from the trends table).
+      // Tells the user "you're looking at the saved copy".
+      trend.favoriteSnapshotted ? h('div', { className: 'modal-body', style: { paddingTop: 0, paddingBottom: 0 } },
+        h('span', { className: 'fav-snapshot-banner' }, '🗄 ' + t('fav.snapshot_hint'))
+      ) : null,
 
       // Body
       h('div', { className: 'modal-body' },
+
+        // ⭐ Favorite note editor — only when this trend is saved AND the
+        // user has the entitlement. Sits at the top of the modal body so
+        // the user's own context appears before AI-derived content.
+        (trend.isFavorite && onFavNote && me && me.entitlements && me.entitlements.favorites)
+          ? h(FavoriteNoteEditor, { trend, onSave: onFavNote })
+          : null,
 
         // Meme Score — promoted to the very top above the media with a
         // dedicated "hero" treatment (bigger number, thicker gradient bar,
@@ -8363,12 +8925,123 @@ function TrendModal({ trend, onClose, me = null }) {
                 }, vel || '—')
               );
             })(),
-            h('div', { className: 'modal-stat' },
-              h('div', { className: 'modal-stat-label' }, t('modal.lifespan')),
-              h('span', { className: 'lifespan' }, lifespanLabel(trend.predictedLifespan))
-            )
+            // Alert tile — replaces the old "Lifespan" tile (2026-05-06).
+            // The alert verdict is the user's primary "should I care?" signal,
+            // far more actionable than the AI's lifespan guess. We compute the
+            // EFFECTIVE floor (max of user.threshold and admin/preset floor)
+            // and compare against alertScore — same arithmetic the gate uses.
+            //
+            // Color is intentionally only green/red — this is a binary verdict
+            // (would the alert have fired or not?), not a continuous score
+            // worth gradient-coloring. Em-dash when alertScore is null (older
+            // rows or save-only items that never went through Stage 1).
+            (() => {
+              const score = (trend.alertScore == null) ? null : Number(trend.alertScore);
+              const userFloor = Number(me?.threshold) || 0;
+              const adminFloor = Number(me?.alertFloor) || 0;
+              const floor = Math.max(userFloor, adminFloor);
+              const passed = score != null && score >= floor;
+              const color = score == null
+                ? 'var(--dim)'
+                : (passed ? 'var(--accent2)' : '#ff5b6a');
+              return h('div', { className: 'modal-stat' },
+                h('div', { className: 'modal-stat-label' }, t('modal.alert_score')),
+                h('span', {
+                  style: {
+                    fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700,
+                    color,
+                  }
+                }, score == null
+                    ? '—'
+                    : (score + ' / ' + floor)
+                )
+              );
+            })()
           )
-        )
+        ),
+
+        // ── Alert verdict / breakdown — shows the unified alertScore vs the
+        // user's effective floor PLUS each component's contribution. The dash-
+        // board's per-trend question is "would I have been alerted?", and the
+        // formula behind alertScore is non-obvious (memePotential is only 30-
+        // 45% of it depending on preset). This block surfaces the real numbers
+        // so users don't have to guess why a high-meme post didn't fire (the
+        // common case: low virality dragged it under floor, or alertType was
+        // muted in their filter). Hidden when alertScore is null (save-only
+        // rows that bypassed Stage 1) — there's no useful signal to show.
+        trend.alertScore != null ? (() => {
+          const score = Number(trend.alertScore);
+          const userFloor = Number(me?.threshold) || 0;
+          const adminFloor = Number(me?.alertFloor) || 0;
+          const floor = Math.max(userFloor, adminFloor);
+          const passed = score >= floor;
+          const breakdown = trend.alertBreakdown || null;
+          const userTypes = Array.isArray(me?.alertTypes) ? me.alertTypes : null;
+          const trendType = trend.alertType || null;
+          // alertType muted iff the user has an explicit filter AND it doesn't
+          // include this trend's type. Empty/missing filter → "all" (handled
+          // server-side in db.getUserAlertTypes), so trendTypeMuted=false.
+          const trendTypeMuted = trendType && Array.isArray(userTypes)
+            && userTypes.length > 0 && !userTypes.includes(trendType);
+
+          // breakdown components — only render the rows we actually have so
+          // older rows (saved before alertBreakdown was persisted) don't show
+          // a wall of zeros.
+          const chips = [];
+          if (breakdown) {
+            const add = (key, val) => {
+              if (val == null || val === 0) return;
+              chips.push({
+                k: t('modal.alert_breakdown_' + key),
+                v: Math.round(Number(val) * 10) / 10,
+                neg: key === 'junk' || key === 'stale',
+              });
+            };
+            add('meme',     breakdown.meme);
+            add('viral',    breakdown.viral);
+            add('emerge',   breakdown.emergence);
+            add('twitter',  breakdown.twitter);
+            add('feedback', breakdown.feedback);
+            add('junk',     breakdown.junk);
+            add('stale',    breakdown.staleDecay);
+          }
+
+          return h('div', { className: 'modal-section' },
+            h('div', { className: 'modal-section-label' }, t('modal.alert_breakdown')),
+            h('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, fontSize: 12 } },
+              // Pass/fail pill — primary verdict
+              h('span', {
+                style: {
+                  padding: '3px 10px', borderRadius: 6,
+                  fontFamily: 'JetBrains Mono', fontWeight: 700,
+                  background: passed ? 'rgba(0, 200, 120, 0.15)' : 'rgba(255, 91, 106, 0.15)',
+                  color:      passed ? 'var(--accent2)'           : '#ff5b6a',
+                }
+              }, (passed ? '✓ ' : '✕ ') + score + ' / ' + floor + ' · ' + (passed ? t('modal.alert_pass') : t('modal.alert_fail'))),
+              // alertType verdict — separate from score (a trend can have
+              // alertScore over the floor but still be filtered by type).
+              trendType ? h('span', {
+                style: {
+                  padding: '3px 8px', borderRadius: 6,
+                  background: trendTypeMuted ? 'rgba(255, 91, 106, 0.10)' : 'rgba(140, 140, 140, 0.10)',
+                  color: trendTypeMuted ? '#ff5b6a' : 'var(--dim)',
+                }
+              }, trendType + ' · ' + (trendTypeMuted ? t('modal.alert_type_muted') : t('modal.alert_type_in_filter'))) : null
+            ),
+            chips.length ? h('div', {
+              style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8, fontSize: 11, fontFamily: 'JetBrains Mono' }
+            },
+              chips.map((c, i) => h('span', {
+                key: i,
+                style: {
+                  padding: '2px 8px', borderRadius: 4,
+                  background: c.neg ? 'rgba(255, 91, 106, 0.08)' : 'rgba(140, 140, 140, 0.08)',
+                  color: c.neg ? '#ff8a93' : 'var(--dim)',
+                }
+              }, c.k + ' ' + (c.neg ? '−' : '') + c.v))
+            ) : null
+          );
+        })() : null
       )
     )
    )
@@ -8376,12 +9049,23 @@ function TrendModal({ trend, onClose, me = null }) {
 }
 
 // ── Toast system ───────────────────────────────────────────────────────────────
+// Skips the auto type-icon (✅/❌/ℹ️) when the message already starts with an
+// emoji or symbol — most user-facing toasts include a contextual lead char
+// (🔒 ⛔ ✓ ✕ 📊 ⚠), and stacking ℹ️ in front looked like a double-icon bug.
+// Detection: if first char is a letter/digit/whitespace → plain text → show
+// auto-icon. Anything else → assume the user-supplied char carries the
+// signal and don't add another.
 function Toasts({ toasts }) {
   return h('div', { className: 'toasts-wrap' },
-    toasts.map(t => h('div', { key: t.id, className: 'toast ' + (t.type || 'info') },
-      h('span', { className: 'toast-icon' }, t.type === 'success' ? '✅' : t.type === 'error' ? '❌' : 'ℹ️'),
-      h('span', { className: 'toast-msg' }, t.msg)
-    ))
+    toasts.map(t => {
+      const msg = t.msg || '';
+      const showAutoIcon = /^[\p{L}\p{N}\s]/u.test(msg);
+      const autoIcon = t.type === 'success' ? '✓' : t.type === 'error' ? '✕' : 'ℹ';
+      return h('div', { key: t.id, className: 'toast ' + (t.type || 'info') },
+        showAutoIcon ? h('span', { className: 'toast-icon' }, autoIcon) : null,
+        h('span', { className: 'toast-msg' }, msg)
+      );
+    })
   );
 }
 
@@ -8608,6 +9292,14 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
           title: result.pipeline.stage2SkipReason || 'Stage 2 ran',
         }, (result.pipeline.stage2Ran ? '✓' : '⏭') + ' Stage 2' + (result.pipeline.stage2SkipReason ? ' — ' + result.pipeline.stage2SkipReason : ''))
       ) : null,
+      // Test-plan usage counter — only set when server returned one (cache
+      // hits and non-test plans omit it). Tiny dim line, doesn't compete
+      // with the result content.
+      result.usage
+        ? h('div', {
+            style: { marginTop: 8, fontSize: 11, color: 'var(--muted, #71767b)' }
+          }, t('usage.test_left', { used: result.usage.used, cap: result.usage.cap, left: result.usage.left }))
+        : null,
       // Score grid
       h('div', { className: 'analyze-scores' },
         h('div', { className: 'analyze-score ' + memeCls },
@@ -9378,13 +10070,15 @@ function AccountPanel({ onBack, user, onLogout }) {
 // ── App ──────────────────────────────────────────────────────────────────────
 // ── LoginScreen ──────────────────────────────────────────────────────────────
 // Telegram-bot-only login. Flow:
-//   1. POST /api/auth/initiate → { sessionId, botUrl }
-//   2. User clicks "Войти через Telegram" → bot issues a 6-digit code
-//   3. User enters code → POST /api/auth/verify → { token, user }
+//   1. POST /api/auth/initiate -> sessionId + botUrl
+//   2. User clicks Sign in -> bot issues a 6-digit code
+//   3. User enters code -> POST /api/auth/verify -> token + user
+//
+// EN-only by design (top-level pre-auth surface). Strings are hardcoded —
+// language switcher lives inside the app, accessible after sign-in.
 function LoginScreen({ onLoggedIn }) {
-  const lang = useLang();
-  const [phase, setPhase]       = useState('idle');        // idle | linking | code | verifying
-  const [session, setSession]   = useState(null);          // { sessionId, botUrl }
+  const [phase, setPhase]       = useState('idle');        // idle | code
+  const [session, setSession]   = useState(null);
   const [code, setCode]         = useState('');
   const [error, setError]       = useState('');
   const [loading, setLoading]   = useState(false);
@@ -9395,7 +10089,7 @@ function LoginScreen({ onLoggedIn }) {
       const r = await fetch('/api/auth/initiate', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || 'HTTP ' + r.status);
-      if (!data.botUrl) throw new Error(t('login.bot_unavailable'));
+      if (!data.botUrl) throw new Error('Bot is temporarily unavailable. Try again later.');
       setSession(data);
       setPhase('code');
       try { window.open(data.botUrl, '_blank', 'noopener'); } catch (e) {}
@@ -9405,7 +10099,7 @@ function LoginScreen({ onLoggedIn }) {
 
   const submitCode = async () => {
     const clean = String(code || '').replace(/\D/g, '').slice(0, 6);
-    if (clean.length !== 6) { setError(t('login.err_need_6')); return; }
+    if (clean.length !== 6) { setError('Enter the 6 digits from the bot message'); return; }
     setLoading(true); setError('');
     try {
       const r = await fetch('/api/auth/verify', {
@@ -9421,79 +10115,217 @@ function LoginScreen({ onLoggedIn }) {
     setLoading(false);
   };
 
+  // ── Stage page (ambient bg + center card) ──────────────────────────
+  // Colors driven by CSS vars — auto-adapts to user's theme (Ink default).
+  // Ink: --bg=#000, --accent=#1d9bf0 (X blue), --accent-rgb=29,155,240,
+  // --surface=#0a0a0a, --border=rgba(239,243,244,.08).
   return h('div', {
     style: {
-      minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      padding: '20px', background: 'var(--bg, #0a0a0f)'
+      minHeight: '100vh', position: 'relative', overflow: 'hidden',
+      display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center',
+      padding: '24px',
+      background: 'var(--bg, #000)'
     }
   },
+    // Ambient X-blue radial blobs — single accent hue at varying intensities,
+    // monochrome by Ink design philosophy. Pure CSS, zero JS repaint.
+    h('div', {
+      'aria-hidden': 'true',
+      style: {
+        position: 'absolute', inset: 0, pointerEvents: 'none',
+        background:
+          'radial-gradient(60% 50% at 18% 22%, rgba(var(--accent-rgb), 0.18) 0%, transparent 60%),' +
+          'radial-gradient(50% 40% at 82% 18%, rgba(var(--accent-rgb), 0.10) 0%, transparent 60%),' +
+          'radial-gradient(70% 55% at 50% 95%, rgba(var(--accent-rgb), 0.07) 0%, transparent 60%)',
+        filter: 'blur(40px)',
+      }
+    }),
+    // Subtle grid overlay (translucent white, faded toward edges)
+    h('div', {
+      'aria-hidden': 'true',
+      style: {
+        position: 'absolute', inset: 0, pointerEvents: 'none', opacity: 0.35,
+        backgroundImage:
+          'linear-gradient(rgba(239,243,244,0.03) 1px, transparent 1px),' +
+          'linear-gradient(90deg, rgba(239,243,244,0.03) 1px, transparent 1px)',
+        backgroundSize: '48px 48px',
+        maskImage: 'radial-gradient(70% 70% at 50% 50%, #000 0%, transparent 100%)',
+        WebkitMaskImage: 'radial-gradient(70% 70% at 50% 50%, #000 0%, transparent 100%)',
+      }
+    }),
+
+    // ── Card ────────────────────────────────────────────────────────────
     h('div', {
       style: {
-        maxWidth: '420px', width: '100%',
-        background: 'var(--card, #14141c)',
-        border: '1px solid var(--border, #22222e)',
-        borderRadius: '16px',
-        padding: '32px 28px',
-        boxShadow: '0 20px 60px rgba(0,0,0,0.45)'
+        position: 'relative', zIndex: 1,
+        width: '100%', maxWidth: '440px',
+        background: 'linear-gradient(180deg, rgba(22,24,28,0.92) 0%, rgba(10,10,10,0.94) 100%)',
+        border: '1px solid var(--border, rgba(239,243,244,0.08))',
+        borderRadius: '20px',
+        padding: '40px 32px 28px',
+        boxShadow:
+          '0 30px 80px rgba(0,0,0,0.65),' +
+          '0 0 0 1px rgba(239,243,244,0.02) inset,' +
+          'inset 0 1px 0 rgba(239,243,244,0.04)',
+        backdropFilter: 'blur(12px)',
+        WebkitBackdropFilter: 'blur(12px)',
       }
     },
-      // Language switcher — small, top-right corner, so first-time users can pick
-      h('div', {
-        style: {
-          display: 'flex', justifyContent: 'flex-end', gap: 6,
-          marginBottom: 10, marginTop: -6
-        }
-      },
-        [{ v: 'en', l: '🇺🇸 EN' }, { v: 'ru', l: '🇷🇺 RU' }].map(o =>
-          h('button', {
-            key: o.v,
-            onClick: () => setLang(o.v),
-            style: {
-              padding: '4px 10px', fontSize: 11,
-              background: lang === o.v ? 'rgba(var(--accent-rgb), 0.18)' : 'transparent',
-              color: lang === o.v ? '#9ea7ff' : 'var(--muted, #888)',
-              border: '1px solid ' + (lang === o.v ? 'rgba(var(--accent-rgb), 0.4)' : 'rgba(255,255,255,0.08)'),
-              borderRadius: 6, cursor: 'pointer'
-            }
-          }, o.l)
-        )
-      ),
-
-      h('div', { style: { textAlign: 'center', marginBottom: '20px' } },
-        h('div', { style: { fontSize: '44px', lineHeight: '1' } }, '🔥'),
-        h('div', { style: { fontSize: '22px', fontWeight: '700', marginTop: '8px' } }, t('app.title')),
-        h('div', { style: { fontSize: '13px', opacity: '0.65', marginTop: '4px' } }, t('login.subtitle'))
-      ),
-
-      phase === 'idle' && h('div', null,
-        h('p', { style: { fontSize: '14px', lineHeight: '1.5', opacity: '0.85', marginBottom: '16px' } },
-          t('login.idle_desc')
-        ),
-        h('button', {
-          className: 'btn',
+      // ── Brand mark ────────────────────────────────────────────────────
+      // Cat logo on a glowing X-blue tile. PNG via /assets/logo.png?v=...
+      // Same cache-bust + onError fallback (🐱) as the nav logo. Transparent
+      // PNG sits on the accent glow so the cat reads through cleanly.
+      h('div', { style: { textAlign: 'center', marginBottom: '28px' } },
+        h('div', {
           style: {
-            width: '100%', padding: '12px 16px', fontSize: '15px', fontWeight: '600',
-            background: '#229ED9', color: '#fff', border: 'none', borderRadius: '10px',
-            cursor: 'pointer', opacity: loading ? 0.6 : 1
-          },
-          disabled: loading,
-          onClick: startLogin
-        }, loading ? t('app.please_wait') : t('login.idle_btn'))
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            width: 80, height: 80, borderRadius: 20,
+            background: 'radial-gradient(120% 100% at 50% 0%, rgba(var(--accent-rgb), 0.22) 0%, rgba(var(--accent-rgb), 0.05) 60%, transparent 100%)',
+            border: '1px solid rgba(var(--accent-rgb), 0.20)',
+            boxShadow: '0 0 40px rgba(var(--accent-rgb), 0.18), inset 0 1px 0 rgba(239,243,244,0.05)',
+            padding: 10, boxSizing: 'border-box',
+          }
+        },
+          h('img', {
+            src: '/assets/logo.png?v=' + LOGO_VERSION,
+            alt: 'Catalyst',
+            style: {
+              width: '100%', height: '100%',
+              objectFit: 'contain', display: 'block',
+            },
+            onError: (e) => {
+              // Mirror nav logo: drop the broken <img>, fall back to 🐱
+              const tile = e.target.parentNode;
+              if (tile) {
+                tile.removeChild(e.target);
+                tile.style.fontSize = '38px';
+                tile.style.lineHeight = '1';
+                tile.style.padding = '0';
+                tile.textContent = '\u{1F431}'; // 🐱
+              }
+            },
+          })
+        ),
+        h('h1', {
+          style: {
+            margin: '18px 0 0', fontSize: 30, fontWeight: 800,
+            letterSpacing: '-0.02em', lineHeight: 1.1,
+            background: 'linear-gradient(180deg, var(--text, #e7e9ea) 0%, var(--text2, #c4c8cc) 100%)',
+            WebkitBackgroundClip: 'text', backgroundClip: 'text',
+            WebkitTextFillColor: 'transparent', color: 'transparent',
+          }
+        }, 'Catalyst'),
+        h('div', {
+          style: {
+            marginTop: 8, fontSize: 14, lineHeight: 1.45,
+            color: 'var(--muted, #71767b)',
+            // Short copy fits full card width on one line (39 chars). No
+            // maxWidth, no nowrap — falls back gracefully on tiny screens.
+          }
+        }, 'Track narratives across the social web.')
       ),
 
-      phase === 'code' && h('div', null,
-        h('p', { style: { fontSize: '14px', lineHeight: '1.5', opacity: '0.85', marginBottom: '12px' } },
-          t('login.code_desc')
+      // ── Idle phase (default) ──────────────────────────────────────────
+      phase === 'idle' && h('div', null,
+        // 3-row mini feature list
+        h('div', {
+          style: {
+            display: 'grid', rowGap: 10,
+            padding: '14px 14px',
+            background: 'rgba(239,243,244,0.025)',
+            border: '1px solid var(--border, rgba(239,243,244,0.08))',
+            borderRadius: 12,
+            marginBottom: 22,
+          }
+        },
+          [
+            { i: '📡', t: 'Multi-source feed', s: 'Reddit · X · TikTok · Google · X Trends' },
+            { i: '🎯', t: 'Trend scoring',     s: 'Memetic potential, virality, emergence' },
+            { i: '🔔', t: 'Real-time alerts',  s: 'Direct to your Telegram, instantly' },
+          ].map((row, i) =>
+            h('div', { key: i, style: { display: 'flex', alignItems: 'center', gap: 12 } },
+              h('div', {
+                style: {
+                  flex: '0 0 32px', height: 32, borderRadius: 8,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 16,
+                  background: 'rgba(239,243,244,0.04)',
+                  border: '1px solid var(--border, rgba(239,243,244,0.08))',
+                }
+              }, row.i),
+              h('div', { style: { flex: 1, minWidth: 0 } },
+                h('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text, #e7e9ea)' } }, row.t),
+                h('div', { style: { fontSize: 11, color: 'var(--muted, #71767b)', marginTop: 2 } }, row.s)
+              )
+            )
+          )
         ),
+
+        // ── Primary CTA — X-blue glossy ───────────────────────────────
+        h('button', {
+          onClick: startLogin,
+          disabled: loading,
+          style: {
+            width: '100%', padding: '14px 18px',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+            fontSize: 15, fontWeight: 700, letterSpacing: '0.01em',
+            color: '#fff',
+            background: 'linear-gradient(180deg, var(--accent, #1d9bf0) 0%, #146da8 100%)',
+            border: '1px solid rgba(var(--accent-rgb), 0.40)',
+            borderRadius: 12,
+            cursor: loading ? 'wait' : 'pointer',
+            // Flat — outer glow only, no inset highlight/shadow that read as
+            // a stripe on the button surface.
+            boxShadow: '0 8px 24px rgba(var(--accent-rgb), 0.26)',
+            opacity: loading ? 0.7 : 1,
+            transition: 'transform 120ms ease, box-shadow 120ms ease',
+          },
+          onMouseEnter: (e) => { if (!loading) e.currentTarget.style.transform = 'translateY(-1px)'; },
+          onMouseLeave: (e) => { e.currentTarget.style.transform = 'translateY(0)'; },
+        },
+          // Paper-plane glyph — Material "send" silhouette rotated -25 deg
+          // so the tip points up-right (Telegram's logo orientation),
+          // instead of straight right (which read as a directional arrow).
+          h('svg', {
+            width: 16, height: 16, viewBox: '0 0 24 24', fill: 'currentColor',
+            style: { display: 'block', transform: 'rotate(-25deg)' }
+          },
+            h('path', { d: 'M2.01 21l20.99-9L2.01 3 2 10l15 2-15 2z' })
+          ),
+          loading ? 'Please wait…' : 'Sign in with Telegram'
+        ),
+
+        h('div', {
+          style: {
+            marginTop: 16, fontSize: 11, lineHeight: 1.5,
+            color: 'var(--dim, #4d5258)', textAlign: 'center',
+          }
+        }, "No password needed. We'll send a one-time code to your Telegram.")
+      ),
+
+      // ── Code phase (after click "Sign in") ────────────────────────────
+      phase === 'code' && h('div', null,
+        h('p', {
+          style: {
+            fontSize: 13, lineHeight: 1.55,
+            color: 'var(--text2, #c4c8cc)',
+            margin: '0 0 14px',
+          }
+        }, "Open the bot and tap Start — it'll send a 6-digit code. Paste it below:"),
         session?.botUrl && h('a', {
           href: session.botUrl, target: '_blank', rel: 'noopener',
           style: {
-            display: 'block', textAlign: 'center', padding: '10px 14px',
-            background: 'rgba(34,158,217,0.15)', color: '#5bb8e0',
-            border: '1px solid rgba(34,158,217,0.35)', borderRadius: '8px',
-            textDecoration: 'none', fontSize: '13px', marginBottom: '16px'
+            display: 'block', textAlign: 'center',
+            padding: '10px 14px', marginBottom: 16,
+            fontSize: 13, fontWeight: 500,
+            background: 'rgba(var(--accent-rgb), 0.10)',
+            color: 'var(--accent2, #4cb1ff)',
+            border: '1px solid rgba(var(--accent-rgb), 0.30)',
+            borderRadius: 10,
+            textDecoration: 'none',
           }
-        }, t('login.reopen_bot')),
+        }, '↗ Reopen the bot'),
         h('input', {
           type: 'text', inputMode: 'numeric', pattern: '[0-9]*', autoFocus: true,
           maxLength: 6, value: code,
@@ -9502,43 +10334,98 @@ function LoginScreen({ onLoggedIn }) {
             setCode(v);
             if (error) setError('');
           },
-          onKeyDown: e => {
-            if (e.key === 'Enter' && code.length === 6 && !loading) submitCode();
-          },
+          onKeyDown: e => { if (e.key === 'Enter' && code.length === 6 && !loading) submitCode(); },
           placeholder: '• • • • • •',
           style: {
-            width: '100%', padding: '14px', fontSize: '22px', letterSpacing: '0.4em',
-            textAlign: 'center', background: '#0b0b12', color: 'var(--text, #e8e8ef)',
-            border: '1px solid var(--border, #22222e)', borderRadius: '10px',
-            fontFamily: 'ui-monospace, monospace', marginBottom: '12px', boxSizing: 'border-box'
+            width: '100%', padding: '16px',
+            fontSize: 24, letterSpacing: '0.45em', textAlign: 'center',
+            color: 'var(--text, #e7e9ea)',
+            background: 'rgba(0,0,0,0.45)',
+            border: '1px solid var(--border, rgba(239,243,244,0.08))',
+            borderRadius: 12,
+            fontFamily: 'ui-monospace, monospace',
+            marginBottom: 14, boxSizing: 'border-box',
+            outline: 'none',
           }
         }),
         h('button', {
-          style: {
-            width: '100%', padding: '12px 16px', fontSize: '15px', fontWeight: '600',
-            background: 'var(--accent, #ff6b35)', color: '#fff', border: 'none',
-            borderRadius: '10px', cursor: 'pointer', opacity: loading ? 0.6 : 1
-          },
+          onClick: submitCode,
           disabled: loading || code.length !== 6,
-          onClick: submitCode
-        }, loading ? t('login.verifying') : t('login.verify_btn')),
-        h('button', {
           style: {
-            width: '100%', marginTop: '10px', padding: '8px', fontSize: '12px',
-            background: 'transparent', color: 'var(--muted, #888)', border: 'none',
-            cursor: 'pointer'
+            width: '100%', padding: '14px 18px',
+            fontSize: 15, fontWeight: 700,
+            color: '#fff',
+            background: code.length === 6
+              ? 'linear-gradient(180deg, var(--accent, #1d9bf0) 0%, #146da8 100%)'
+              : 'rgba(239,243,244,0.06)',
+            border: '1px solid ' + (code.length === 6 ? 'rgba(var(--accent-rgb), 0.40)' : 'var(--border, rgba(239,243,244,0.08))'),
+            borderRadius: 12,
+            cursor: (loading || code.length !== 6) ? 'not-allowed' : 'pointer',
+            // Flat — outer glow only, matches the primary CTA above.
+            boxShadow: code.length === 6
+              ? '0 8px 24px rgba(var(--accent-rgb), 0.24)'
+              : 'none',
+            opacity: loading ? 0.7 : 1,
+            transition: 'background 120ms ease, box-shadow 120ms ease',
           },
-          onClick: () => { setPhase('idle'); setSession(null); setCode(''); setError(''); }
-        }, t('app.cancel'))
+        }, loading ? 'Verifying…' : 'Sign in'),
+        h('button', {
+          onClick: () => { setPhase('idle'); setSession(null); setCode(''); setError(''); },
+          style: {
+            width: '100%', marginTop: 10, padding: '10px',
+            fontSize: 12,
+            color: 'var(--muted, #71767b)',
+            background: 'transparent', border: 'none',
+            cursor: 'pointer',
+          }
+        }, 'Cancel')
       ),
 
+      // ── Error toast (semantic red — constant across themes) ──────────
       error && h('div', {
         style: {
-          marginTop: '14px', padding: '10px 12px', fontSize: '13px',
-          background: 'rgba(239,68,68,0.1)', color: '#f87171',
-          border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px'
+          marginTop: 14, padding: '10px 12px',
+          fontSize: 13, lineHeight: 1.4,
+          color: 'var(--red2, #ff6b6b)',
+          background: 'rgba(var(--red-rgb), 0.08)',
+          border: '1px solid rgba(var(--red-rgb), 0.25)',
+          borderRadius: 10,
         }
       }, error)
+    ),
+
+    // ── Footer — Twitter/X follow link, subtle ───────────────────────
+    // Uses the same handle as the in-app nav (https://x.com/Catalystparser).
+    // Active CTA, not decoration: pre-auth users discover the brand on X.
+    h('a', {
+      href: 'https://x.com/Catalystparser',
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      style: {
+        position: 'relative', zIndex: 1,
+        display: 'inline-flex', alignItems: 'center', gap: 6,
+        marginTop: 20, padding: '6px 12px',
+        fontSize: 12, fontWeight: 500,
+        color: 'var(--muted, #71767b)',
+        background: 'rgba(239,243,244,0.025)',
+        border: '1px solid var(--border, rgba(239,243,244,0.08))',
+        borderRadius: 999,
+        textDecoration: 'none',
+        transition: 'color 120ms ease, background 120ms ease, border-color 120ms ease',
+      },
+      onMouseEnter: (e) => {
+        e.currentTarget.style.color = 'var(--text, #e7e9ea)';
+        e.currentTarget.style.background = 'rgba(239,243,244,0.05)';
+        e.currentTarget.style.borderColor = 'rgba(239,243,244,0.18)';
+      },
+      onMouseLeave: (e) => {
+        e.currentTarget.style.color = 'var(--muted, #71767b)';
+        e.currentTarget.style.background = 'rgba(239,243,244,0.025)';
+        e.currentTarget.style.borderColor = 'var(--border, rgba(239,243,244,0.08))';
+      },
+    },
+      h('span', { style: { fontSize: 13, lineHeight: 1 } }, '\u{1D54F}'),
+      h('span', null, '@Catalystparser')
     )
   );
 }
@@ -9607,22 +10494,36 @@ function ColumnResizer({ side }) {
 }
 
 // Unified bottom nav — shown in both trends sidebar and settings/stats sidebar.
-// Single source of truth for "Feed / Stats / Settings" navigation.
-// The me prop is the authenticated user (or null/false). When their plan
-// is pro or admin, the "Analyze" tab is rendered alongside Feed + Stats.
-function BottomNav({ view, setView, me }) {
+// Three tabs: Feed / Saved / Analyze. Saved is a *filtered* view of Feed
+// (toggles favoritesOnly state), not a separate route — but rendered as a
+// tab so it sits in the user's primary nav surface alongside Feed/Analyze.
+// Plan-locked tabs (Saved for free/test, Analyze for free) render with 🔒
+// and emit an upgrade toast on click instead of switching view.
+function BottomNav({ view, setView, me, favoritesOnly, setFavoritesOnly, favoriteCount, setOffset, addToast }) {
   useLang(); // re-render on language switch
-  // Settings/Account live in top-right of the nav bar — not duplicated here.
-  const plan = (me && (me.plan || me.plan_name)) || 'free';
-  const canAnalyze = plan === 'pro' || plan === 'admin';
+  const manualCap = (me && me.entitlements && typeof me.entitlements.manualAnalyze === 'number') ? me.entitlements.manualAnalyze : 0;
+  const analyzeLocked = manualCap === 0;
+  const canFav = !!(me && me.entitlements && me.entitlements.favorites);
+  const savedLocked = !canFav;
+
+  // Active-tab logic: Analyze when on its view; Saved when on trends with
+  // favoritesOnly; otherwise Feed. Three buttons are mutually exclusive
+  // visually even though only the view variable is real route state.
+  const activeKey =
+    view === 'analyze' ? 'analyze' :
+    (view === 'trends' && favoritesOnly && canFav) ? 'saved' :
+    'trends';
+
   const tabs = [
-    { id: 'trends',  icon: '🔥', label: t('nav.feed')  },
-    { id: 'stats',   icon: '📊', label: t('nav.stats') },
+    { id: 'trends',  icon: '🔥',                              label: t('nav.feed'),    locked: false        },
+    { id: 'saved',   icon: savedLocked ? '🔒' : '⭐',          label: t('nav.saved'),   locked: savedLocked  },
+    { id: 'analyze', icon: analyzeLocked ? '🔒' : '🧪',       label: t('nav.analyze'), locked: analyzeLocked },
   ];
-  if (canAnalyze) tabs.push({ id: 'analyze', icon: '🧪', label: t('nav.analyze') });
-  // Inline grid template — repeat(N, 1fr) so 2-tab and 3-tab layouts both
-  // distribute width evenly. Without this the 3rd tab ("Analyze" for pro/
-  // admin) wraps to a second row instead of joining the others.
+
+  const persistFav = (next) => {
+    try { localStorage.setItem('ts_favorites_only', next ? '1' : '0'); } catch (e) {}
+  };
+
   return h('div', { className: 'sidebar-footer' },
     h('div', {
       className: 'sb-foot-nav',
@@ -9633,13 +10534,50 @@ function BottomNav({ view, setView, me }) {
         key: tab.id,
         type: 'button',
         role: 'tab',
-        'aria-selected': view === tab.id,
-        className: 'sb-foot-btn' + (view === tab.id ? ' active' : ''),
-        onClick: () => setView(tab.id),
-        title: tab.label,
+        'aria-selected': activeKey === tab.id,
+        className: 'sb-foot-btn' + (activeKey === tab.id ? ' active' : '') + (tab.locked ? ' locked' : ''),
+        onClick: () => {
+          if (tab.locked) {
+            const lockMsg = tab.id === 'saved' ? t('fav.locked_toast') : t('analyze.locked_toast');
+            if (typeof addToast === 'function') addToast(lockMsg, 'info');
+            return;
+          }
+          if (tab.id === 'saved') {
+            // Toggle favoritesOnly + ensure we're on the trends view. If
+            // already on Saved, clicking again turns the filter off (acts
+            // as "back to all"). Reset pagination so we don't open page-2
+            // of a freshly-applied filter.
+            const next = !(favoritesOnly && view === 'trends');
+            setFavoritesOnly(next);
+            persistFav(next);
+            if (typeof setOffset === 'function') setOffset(0);
+            if (view !== 'trends') setView('trends');
+          } else if (tab.id === 'trends') {
+            // Plain Feed — clear favorites filter to avoid surprise empty
+            // feed if the user was on Saved.
+            if (favoritesOnly) {
+              setFavoritesOnly(false);
+              persistFav(false);
+              if (typeof setOffset === 'function') setOffset(0);
+            }
+            setView('trends');
+          } else {
+            setView(tab.id);
+          }
+        },
+        title: tab.locked
+          ? (tab.id === 'saved' ? t('fav.locked_tooltip') : t('analyze.locked_tooltip'))
+          : tab.label,
       },
         h('span', { className: 'sb-foot-ico' }, tab.icon),
-        h('span', null, tab.label)
+        h('span', null,
+          tab.label,
+          // Counter on Saved tab — shown only for Pro/Admin with at least
+          // one favorite saved. Tiny dim badge to the right of the label.
+          (tab.id === 'saved' && canFav && favoriteCount > 0)
+            ? h('span', { style: { marginLeft: 4, opacity: 0.6, fontSize: 10 } }, favoriteCount)
+            : null
+        )
       ))
     )
   );
@@ -9700,6 +10638,17 @@ function App() {
     try { return localStorage.getItem('ts_manual_only') === '1'; }
     catch (e) { return false; }
   });
+  // "Saved only" (favorites-only) filter — Pro/Admin. Server-side filter
+  // (?favoritesOnly=1) so pagination doesn't skip non-faved rows. Persisted
+  // in localStorage; cleared on logout if user downgrades.
+  const [favoritesOnly, setFavoritesOnly] = useState(() => {
+    try { return localStorage.getItem('ts_favorites_only') === '1'; }
+    catch (e) { return false; }
+  });
+  // Counter — how many trends user has saved overall (not the current view).
+  // Updated optimistically by toggleFavorite + on every /api/trends pull
+  // (server returns favoriteCount in payload).
+  const [favoriteCount, setFavoriteCount] = useState(0);
   // Alert-type chip filter — multi-select. Stored as sorted comma-separated
   // string (e.g. 'event,post'); empty string = all. Pure client-side (the
   // feed already includes the type per-row), so no round-trip to the server.
@@ -9760,6 +10709,62 @@ function App() {
     }
   }, [addToast]);
 
+  // ── Favorites toggle (Pro/Admin) ─────────────────────────────────────────
+  // Optimistic UI: flip trend.isFavorite immediately in both the trends list
+  // and the open modal trend, fire the request. On 403 (plan) → roll back +
+  // show locked toast (defensive — UI shouldn't render the button for Free
+  // anyway). On other failure → roll back + error toast. On success → toast
+  // + brief pulse animation on the source button (passed as 2nd arg).
+  const toggleFavorite = useCallback(async (trend, btnEl = null) => {
+    if (!trend?.id) return;
+    const wasFav = !!trend.isFavorite;
+    const willFav = !wasFav;
+    // Optimistic: patch the trend in both feed list and modal state
+    const patch = (t) => (t && t.id === trend.id) ? { ...t, isFavorite: willFav } : t;
+    setTrends(prev => prev.map(patch));
+    setModalTrend(prev => patch(prev));
+    setFavoriteCount(prev => Math.max(0, prev + (willFav ? 1 : -1)));
+    // Pulse animation (one-shot)
+    if (btnEl && willFav) {
+      btnEl.classList.add('just-saved');
+      setTimeout(() => btnEl.classList.remove('just-saved'), 450);
+    }
+    try {
+      await api('/trends/' + trend.id + '/favorite', {
+        method: willFav ? 'POST' : 'DELETE',
+      });
+      addToast(willFav ? t('fav.added_toast') : t('fav.removed_toast'), 'info');
+    } catch (e) {
+      // Rollback
+      setTrends(prev => prev.map(t => (t && t.id === trend.id) ? { ...t, isFavorite: wasFav } : t));
+      setModalTrend(prev => (prev && prev.id === trend.id) ? { ...prev, isFavorite: wasFav } : prev);
+      setFavoriteCount(prev => Math.max(0, prev + (willFav ? -1 : 1)));
+      if (e.status === 403) addToast(t('fav.locked_toast'), 'info');
+      else addToast('⚠ ' + (e.message || 'favorite failed'), 'error');
+    }
+  }, [addToast]);
+
+  // PATCH /api/trends/:id/favorite — update the note on an already-favorited
+  // trend. Optimistic update of the modal trend's favoriteNote field; on
+  // failure rollback + error toast.
+  const saveFavNote = useCallback(async (trend, note) => {
+    if (!trend?.id) return;
+    const trimmed = String(note || '').trim().slice(0, 500);
+    const prev = trend.favoriteNote || null;
+    setModalTrend(p => (p && p.id === trend.id) ? { ...p, favoriteNote: trimmed || null } : p);
+    setTrends(prevList => prevList.map(t => (t && t.id === trend.id) ? { ...t, favoriteNote: trimmed || null } : t));
+    try {
+      await api('/trends/' + trend.id + '/favorite', {
+        method: 'PATCH',
+        body: JSON.stringify({ note: trimmed }),
+      });
+    } catch (e) {
+      setModalTrend(p => (p && p.id === trend.id) ? { ...p, favoriteNote: prev } : p);
+      setTrends(prevList => prevList.map(t => (t && t.id === trend.id) ? { ...t, favoriteNote: prev } : t));
+      addToast('⚠ ' + (e.message || 'note save failed'), 'error');
+    }
+  }, [addToast]);
+
   const fetchData = useCallback(async () => {
     const started = Date.now();
     const MIN_PULSE_MS = 650; // minimum duration the refresh indicator stays visible
@@ -9775,7 +10780,8 @@ function App() {
         (category ? '&category=' + category : '') +
         (source   ? '&source='   + source   : '') +
         (phases   ? '&phase='    + phases   : '') +
-        (minMeme > 0 ? '&minMeme=' + minMeme : '');
+        (minMeme > 0 ? '&minMeme=' + minMeme : '') +
+        (favoritesOnly ? '&favoritesOnly=1' : '');
 
       const [st, tr, sr] = await Promise.all([
         api('/stats?hours=' + hours),
@@ -9784,6 +10790,10 @@ function App() {
       ]);
       setStats(st);
       setTotal(tr.total  || 0);
+      // Server returns total favorites count in feed payload — use as the
+      // sidebar badge counter. Falls back to current value if undefined
+      // (e.g. when /api/trends is called before the feature is deployed).
+      if (typeof tr.favoriteCount === 'number') setFavoriteCount(tr.favoriteCount);
       if (shouldAppend) {
         const incoming = tr.trends || [];
         setTrends(prev => {
@@ -9805,7 +10815,7 @@ function App() {
     const elapsed = Date.now() - started;
     const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
     setTimeout(() => setRefreshPulse(false), remaining);
-  }, [hours, category, source, phases, minMeme, offset, sort]);
+  }, [hours, category, source, phases, minMeme, offset, sort, favoritesOnly]);
 
   // Full refresh for SSE 'refresh' events and the manual refresh button.
   // Refetches from the top with a big enough limit to cover every page the
@@ -9824,7 +10834,8 @@ function App() {
         (category ? '&category=' + category : '') +
         (source   ? '&source='   + source   : '') +
         (phases   ? '&phase='    + phases   : '') +
-        (minMeme > 0 ? '&minMeme=' + minMeme : '');
+        (minMeme > 0 ? '&minMeme=' + minMeme : '') +
+        (favoritesOnly ? '&favoritesOnly=1' : '');
       const [st, tr, sr] = await Promise.all([
         api('/stats?hours=' + hours),
         api('/trends' + q),
@@ -9833,6 +10844,7 @@ function App() {
       setStats(st);
       setTotal(tr.total || 0);
       setTrends(tr.trends || []);
+      if (typeof tr.favoriteCount === 'number') setFavoriteCount(tr.favoriteCount);
       // Reset optimistic local-hide on full reload — server is authoritative.
       setLocalHidden(new Set());
       setSources(sr.sources || []);
@@ -9840,7 +10852,7 @@ function App() {
     const elapsed = Date.now() - started;
     const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
     setTimeout(() => setRefreshPulse(false), remaining);
-  }, [hours, category, source, phases, minMeme, offset, sort]);
+  }, [hours, category, source, phases, minMeme, offset, sort, favoritesOnly]);
 
 
   // Resolve the authenticated user on load / whenever the token changes.
@@ -10166,7 +11178,13 @@ function App() {
     // single Twitter-like column-set without a footer strip.
 
     // Side drawer modal
-    modalTrend ? h(TrendModal, { trend: modalTrend, onClose: () => setModalTrend(null), me }) : null,
+    modalTrend ? h(TrendModal, {
+      trend: modalTrend,
+      onClose: () => setModalTrend(null),
+      me,
+      onFavToggle: toggleFavorite,
+      onFavNote: saveFavNote,
+    }) : null,
 
     // ── Nav ──
     h('nav', { className: 'nav' },
@@ -10198,6 +11216,30 @@ function App() {
       // a global status badge (e.g. "scanning…", "stale 2m"); for now the
       // status pill in the bottom bar carries that signal.
       h('div', { className: 'nav-right' },
+        // Telegram bot link — same icon-button styling as X. Username is
+        // injected at HTML render time (BOT_USERNAME); falls back to a bare
+        // t.me link if unresolved (still works, lands on Telegram home).
+        h('a', {
+          className: 'nav-icon-btn',
+          href: BOT_USERNAME ? ('https://t.me/' + BOT_USERNAME) : 'https://t.me/',
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          title: BOT_USERNAME ? ('Open @' + BOT_USERNAME + ' bot') : 'Open Telegram bot',
+          'aria-label': 'Open Telegram bot',
+        },
+          // Telegram brand glyph — paper plane SVG, fill via currentColor so
+          // it inherits .nav-icon-btn-ico colour rules and matches X.
+          h('span', { className: 'nav-icon-btn-ico' },
+            h('svg', {
+              width: 16, height: 16, viewBox: '0 0 24 24', fill: 'currentColor',
+              style: { display: 'block', transform: 'translateX(-1px)' }
+            },
+              h('path', {
+                d: 'M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z'
+              })
+            )
+          )
+        ),
         h('a', {
           className: 'nav-icon-btn',
           href: 'https://x.com/Catalystparser',
@@ -10260,16 +11302,27 @@ function App() {
             ...sources.map(s => {
               const visible = !hiddenSources.has(s.source);
               const cnt = s.last24h || 0;
+              // Locked source = not in user's plan (Free can't toggle premium
+              // sources). Click → upgrade toast instead of toggle. The
+              // count is still shown so the user sees what they're missing.
+              const locked = s.inPlan === false;
               return h('div', {
                 key: s.source,
                 'data-src': s.source,
-                className: 'source-item ' + (visible ? 'on' : 'off'),
-                onClick: () => toggle(s.source),
-                title: visible ? t('tooltip.hide_source') : t('tooltip.show_source')
+                className: 'source-item ' + (locked ? 'locked' : (visible ? 'on' : 'off')),
+                onClick: () => {
+                  if (locked) { addToast(t('source.locked_toast'), 'info'); return; }
+                  toggle(s.source);
+                },
+                title: locked
+                  ? t('source.locked_tooltip')
+                  : (visible ? t('tooltip.hide_source') : t('tooltip.show_source'))
               },
                 h('span', { className: 'source-icon' }, h(SourceMark, { src: s.source, fallback: '·' })),
                 h('span', { className: 'source-name' }, SOURCE_LABELS[s.source] || s.source),
-                h('span', { className: 'source-count' + (cnt >= 50 ? ' hot' : '') }, cnt)
+                locked
+                  ? h('span', { className: 'source-lock', title: t('source.locked_tooltip') }, '🔒')
+                  : h('span', { className: 'source-count' + (cnt >= 50 ? ' hot' : '') }, cnt)
               );
             }),
 
@@ -10404,6 +11457,8 @@ function App() {
                 h('span', { className: 'phase-chip-dot' }, '🧪'),
                 h('span', { className: 'phase-chip-label' }, t('sidebar.manual_only'))
               )
+              // Saved-only chip removed from sidebar 2026-05-06 — moved into
+              // BottomNav between Feed and Analyze for prominence.
             ),
 
             h('div', { className: 'sidebar-section' },
@@ -10414,20 +11469,29 @@ function App() {
             ),
             h('div', { className: 'sidebar-filters' },
 
-              // Time window (segmented)
+              // Time window (segmented). Plan-historyHours caps Free at 72h
+              // (3 days). Options beyond cap render with 🔒 + tooltip and
+              // emit an upgrade-toast on click instead of switching window.
               h('div', { className: 'filter-group' },
                 h('div', { className: 'filter-label' },
                   h('span', null, t('sidebar.window')),
                   h('span', { className: 'filter-val' }, hours < 24 ? hours + 'h' : (hours / 24) + 'd')
                 ),
                 h('div', { className: 'seg-group seg-compact' },
-                  [{ v: 6, l: '6h' }, { v: 24, l: '24h' }, { v: 72, l: '3d' }, { v: 168, l: '7d' }].map(o =>
-                    h('button', {
+                  [{ v: 6, l: '6h' }, { v: 24, l: '24h' }, { v: 72, l: '3d' }, { v: 168, l: '7d' }].map(o => {
+                    const planHist = (me && me.entitlements && typeof me.entitlements.historyHours === 'number') ? me.entitlements.historyHours : -1;
+                    const locked = (planHist > 0) && (o.v > planHist);
+                    return h('button', {
                       key: o.v,
-                      className: 'seg-btn' + (hours === o.v ? ' active' : ''),
-                      onClick: () => { setHours(o.v); setOffset(0); }
-                    }, o.l)
-                  )
+                      className: 'seg-btn' + (hours === o.v ? ' active' : '') + (locked ? ' seg-btn-locked' : ''),
+                      title: locked ? t('window.locked_tooltip') : null,
+                      style: locked ? { opacity: 0.55, cursor: 'not-allowed' } : null,
+                      onClick: () => {
+                        if (locked) { addToast(t('window.locked_toast'), 'info'); return; }
+                        setHours(o.v); setOffset(0);
+                      },
+                    }, locked ? '🔒 ' + o.l : o.l);
+                  })
                 )
               ),
 
@@ -10487,7 +11551,7 @@ function App() {
             h('div', { style: { flex: 1 } }),
 
             // Unified bottom nav (Feed / Stats / Settings + Analyze for pro/admin)
-            h(BottomNav, { view, setView, me })
+            h(BottomNav, { view, setView, me, favoritesOnly, setFavoritesOnly, favoriteCount, setOffset, addToast })
           ),
 
           // Draggable divider between sidebar and main feed
@@ -10562,7 +11626,13 @@ function App() {
                       h('div', { className: 'empty-feed-sub' }, t('feed.empty.hint'))
                     )
                   : h('div', { className: 'feed-list' + (refreshPulse ? ' is-refreshing' : '') },
-                      visibleTrends.map(t => h(FeedCard, { key: t.id, trend: t, onOpen: setModalTrend, onHide: hideTrend }))
+                      visibleTrends.map(tr => h(FeedCard, {
+                        key: tr.id, trend: tr,
+                        onOpen: setModalTrend,
+                        onHide: hideTrend,
+                        onFavToggle: toggleFavorite,
+                        canFavorite: !!(me && me.entitlements && me.entitlements.favorites),
+                      }))
                     ),
 
               // Infinite-scroll sentinel + "loading more" spinner.
@@ -10625,17 +11695,8 @@ function App() {
       })
     ) : null,
 
-    view === 'stats' ? h(Sheet, {
-      title: t('nav.stats'),
-      icon: '📊',
-      onClose: () => setView('trends'),
-    },
-      h(StatsPanel, {
-        stats, hours,
-        onBack: () => setView('trends'),
-        onOpenTrend: setModalTrend,
-      })
-    ) : null,
+    // Stats tab removed 2026-05-06 — see BottomNav comment. StatsPanel
+    // component definition kept intact for now (dead code, easy revival).
 
     view === 'analyze' ? h(Sheet, {
       title: t('analyze.title'),

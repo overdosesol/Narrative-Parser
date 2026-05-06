@@ -280,7 +280,10 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     alerts: {
       thresholds: { alertThreshold: 60, minScoreToSave: 0,  maxAlertsPerCycle: 0,  alertHardJunkStop: 70 },
-      weights:    { weightMemePotential: 0.30, weightVirality: 0.25, weightEmergence: 0.25, weightTwitter: 0.10, weightFeedback: 0.10, weightJunk: 0.50 },
+      // Bumped meme 0.30 → 0.45 (2026-05-06): inversion bug — meme=91 posts
+      // were failing the 60 floor while meme=50 + high-virality posts passed.
+      // Σ stays at 1.00 (viral 0.25→0.20, emerge 0.25→0.20, twitter 0.10→0.05).
+      weights:    { weightMemePotential: 0.45, weightVirality: 0.20, weightEmergence: 0.20, weightTwitter: 0.05, weightFeedback: 0.10, weightJunk: 0.50 },
       stale:      { staleDecayPerHour: 2, staleDecayGraceHours: 24, staleDecayCap: 30 },
     },
     cluster: { simThreshold: 0.55, timePenaltyHours: 24, weightEmbedding: 0.40, weightPhash: 0.30, weightEntity: 0.20, weightTicker: 0.10 },
@@ -466,7 +469,11 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     alerts: {
       thresholds: { alertThreshold: 70, minScoreToSave: 0, maxAlertsPerCycle: 6, alertHardJunkStop: 65 },
-      weights:    { weightMemePotential: 0.25, weightVirality: 0.30, weightEmergence: 0.20, weightTwitter: 0.15, weightFeedback: 0.10, weightJunk: 0.55 },
+      // Bumped meme 0.25 → 0.40 (2026-05-06): same inversion-bug fix as
+      // general — celebrities preset was virality-dominant, undercutting
+      // memePotential as the AI's primary judgment. Σ stays at 1.00
+      // (viral 0.30→0.25, twitter 0.15→0.10, emerge unchanged at 0.20).
+      weights:    { weightMemePotential: 0.40, weightVirality: 0.25, weightEmergence: 0.20, weightTwitter: 0.10, weightFeedback: 0.05, weightJunk: 0.55 },
       stale:      { staleDecayPerHour: 3, staleDecayGraceHours: 12, staleDecayCap: 40 },
     },
     cluster: { simThreshold: 0.55, timePenaltyHours: 24, weightEmbedding: 0.40, weightPhash: 0.30, weightEntity: 0.25, weightTicker: 0.05 },

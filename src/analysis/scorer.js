@@ -74,13 +74,26 @@ export function narrativeRankScore(e, a, feedbackBias = 0) {
  * Default weights for the unified alertScore. Admin can override any of these
  * via settings keys `alertWeight<Name>`. Positive weights sum to 1.0 so the
  * positive part stays in 0–100; junk is a pure subtraction on top.
+ *
+ * Calibration philosophy (2026-05-06): memePotential dominates because it's
+ * the AI's holistic verdict — "is this actually a real meme worth caring
+ * about?" — and the dashboard's primary visible score. The previous balance
+ * (meme=0.35, viral=0.25, emerge=0.20) caused user-reported inversions where
+ * a meme=91 post failed the 60 floor (91·0.35 + low-virality dragged it down)
+ * while a meme=50 post with high virality+emergence passed. Bumping meme to
+ * 0.45 anchors the formula on the AI's primary judgment.
+ *
+ * Per-preset overrides in `preset-config.js` can still tilt this balance —
+ * `events` keeps meme low (0.10) and emergence high (0.35) because events care
+ * about timing/breadth, not meme-shape. Animals/culture also use 0.45+ which
+ * is in line with this default.
  */
 export const DEFAULT_ALERT_WEIGHTS = {
-  weightMemePotential:  0.35, // AI-assessed meme quality
-  weightVirality:       0.25, // AI/heuristic virality score
-  weightEmergence:      0.20, // cluster velocity + spread + ideaBoost
-  weightTwitter:        0.10, // on-platform X signal
-  weightFeedback:       0.10, // global 👍/👎 bias on this trend (50 = neutral)
+  weightMemePotential:  0.45, // AI-assessed meme quality (dominant signal)
+  weightVirality:       0.20, // AI/heuristic virality score
+  weightEmergence:      0.15, // cluster velocity + spread + ideaBoost
+  weightTwitter:        0.05, // on-platform X signal
+  weightFeedback:       0.15, // global 👍/👎 bias on this trend (50 = neutral)
   weightJunk:           0.50, // subtracted: junk × this
   staleDecayPerHour:    2,    // points subtracted per hour of age (after grace)
   staleDecayGraceHours: 24,   // no stale penalty for trends younger than this
