@@ -290,7 +290,10 @@ export default class HotMetricsRefresher {
             this.config.alertThreshold
           );
 
-          recomputeAlertScores(trendsForAlert, alertWeights, this.db);
+          recomputeAlertScores(trendsForAlert, alertWeights, this.db, {
+            source: 'refresh-hot',
+            floor: globalAlertThreshold,
+          });
 
           const dispatchResult = await dispatchAlerts({
             trends: trendsForAlert,

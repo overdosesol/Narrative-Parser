@@ -73,12 +73,24 @@ const X_SEARCH_TOOL = {
 const APIFY_PROBE_MIN_FAVES = 100;
 const APIFY_PROBE_MAX_ITEMS = 5;
 
+// Reddit reality-check — Grok routinely hallucinates plausible-sounding
+// subreddit names that don't exist. We hit reddit.com/r/<name>/about.json
+// (free public endpoint, ~10 req/min unauthenticated rate limit) to confirm
+// each PROPOSED subreddit actually exists before applying it.
+const REDDIT_USER_AGENT = process.env.REDDIT_USER_AGENT || 'Catalyst:tag-refresher:v1.0';
+const REDDIT_PROBE_DELAY_MS = 6_500;          // 6.5s between probes — safe margin under 10/min
+const REDDIT_PROBE_TIMEOUT_MS = 8_000;        // per-request timeout
+const REDDIT_PROBE_NETWORK_ERROR_BAILOUT = 3; // after 3 consecutive net errors, pass-through rest
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 class TagRefresher {
-  constructor({ db, logger, config = {}, twitter = null }) {
+  constructor({ db, logger, config = {}, twitter = null, telegram = null }) {
     this.db = db;
     this.logger = logger;
     this.config = config;
-    this.twitter = twitter;  // TwitterCollector instance, used for reality-check probes
+    this.twitter = twitter;    // TwitterCollector instance, used for reality-check probes
+    this.telegram = telegram;  // TelegramNotifier — used to DM admins after each refresh cycle
   }
 
   // ── Toggle / status ─────────────────────────────────────────────────────
@@ -204,7 +216,127 @@ class TagRefresher {
 
     const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
     this.logger?.info?.(`[TagRefresher] done in ${elapsedSec}s — ${results.length} presets, anyFailure=${anyFailure}, cost=$${totalCost.toFixed(3)}`);
+
+    // Post-cycle Telegram digest to admins (best-effort; never fails the run).
+    // Skipped when no telegram instance is wired — index.js may decide not to
+    // pass one (eg. dev environments without a bot token).
+    try {
+      await this._notifyAdmins({ results, totalCost, elapsedSec, anyFailure, isForce, newStreak });
+    } catch (e) {
+      this.logger?.warn?.(`[TagRefresher] admin notify failed: ${e.message}`);
+    }
+
     return { ok: true, results, elapsedSec, anyFailure, totalCost };
+  }
+
+  // ── Admin Telegram digest ────────────────────────────────────────────────
+  // Sent after every refreshAll() — success OR failure, force OR scheduled.
+  // Only admins (plan_name === 'admin') receive it. Best-effort: errors are
+  // logged but never propagate up. The message is HTML-formatted, capped at
+  // ~3500 chars so we don't hit Telegram's 4096 limit even if Grok proposed
+  // 50+ subs per preset.
+  async _notifyAdmins({ results, totalCost, elapsedSec, anyFailure, isForce, newStreak }) {
+    if (!this.telegram?.bot) return;  // no bot wired — silent skip
+    const admins = this._getAdminChatIds();
+    if (admins.length === 0) {
+      this.logger?.debug?.('[TagRefresher] no admins to notify (no plan_name=admin users)');
+      return;
+    }
+
+    const html = this._formatAdminDigestHtml({
+      results, totalCost, elapsedSec, anyFailure, isForce, newStreak,
+    });
+
+    for (const chatId of admins) {
+      try {
+        await this.telegram.bot.sendMessage(chatId, html, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        });
+      } catch (e) {
+        this.logger?.warn?.(`[TagRefresher] notify chat ${chatId} failed: ${e.message}`);
+      }
+    }
+  }
+
+  _getAdminChatIds() {
+    try {
+      const all = this.db.getActiveUsers ? this.db.getActiveUsers() : [];
+      return all
+        .filter(u => u.plan_name === 'admin' && u.telegram_chat_id)
+        .map(u => String(u.telegram_chat_id));
+    } catch (e) {
+      this.logger?.warn?.(`[TagRefresher] getAdminChatIds failed: ${e.message}`);
+      return [];
+    }
+  }
+
+  // HTML digest. Uses Telegram-flavoured tags only (b/i/code/pre/a). Avoids
+  // \n inside string literals (SPA-template-literal shim is irrelevant here
+  // since this file isn't an SPA, but consistency with other server-side
+  // HTML helpers in the codebase keeps muscle memory clean).
+  _formatAdminDigestHtml({ results, totalCost, elapsedSec, anyFailure, isForce, newStreak }) {
+    const NL = String.fromCharCode(10);
+    const esc = (s) => String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    const trigger = isForce ? 'Force refresh' : 'Scheduled refresh';
+    const statusEmoji = anyFailure ? '⚠️' : '✅';
+    const lines = [];
+
+    lines.push(`${statusEmoji} <b>Tag auto-refresh — ${trigger}</b>`);
+    lines.push(`<i>${results.length} presets · ${elapsedSec}s · $${totalCost.toFixed(3)}</i>`);
+    if (newStreak >= 3) {
+      lines.push(`🚨 <b>Circuit breaker tripped</b> — ${newStreak} consecutive failures. Manual reset required in admin panel.`);
+    } else if (anyFailure) {
+      lines.push(`⚠️ Failure streak now: <b>${newStreak}</b>`);
+    }
+    lines.push('');
+
+    // Per-preset block
+    for (const r of results) {
+      const status = r.status || 'unknown';
+      const presetEmoji = status === 'applied' ? '🔄'
+                       : status === 'no-op'    ? '·'
+                       : status === 'rejected_validation' ? '✗'
+                       : status === 'error'    ? '⚠️'
+                       : '?';
+      const costStr = r.costUsd ? `$${r.costUsd.toFixed(3)}` : '—';
+      lines.push(`${presetEmoji} <b>${esc(r.preset)}</b> — <code>${esc(status)}</code> · ${costStr}`);
+
+      if (r.error) {
+        lines.push(`   <i>error: ${esc(r.error.slice(0, 200))}</i>`);
+      } else if (r.diff) {
+        const d = r.diff;
+        const fmtList = (arr, max = 6) => {
+          if (!Array.isArray(arr) || arr.length === 0) return null;
+          const shown = arr.slice(0, max).map(s => esc(s)).join(', ');
+          const more = arr.length > max ? ` <i>(+${arr.length - max} more)</i>` : '';
+          return shown + more;
+        };
+        const addedSubs = fmtList(d.addedSubs);
+        if (addedSubs)   lines.push(`   <b>+ subs:</b> ${addedSubs}`);
+        const removedSubs = fmtList(d.removedSubs);
+        if (removedSubs) lines.push(`   <b>− subs:</b> ${removedSubs}`);
+        const addedTw = fmtList(d.addedTwitter);
+        if (addedTw)     lines.push(`   <b>+ tw:</b> ${addedTw}`);
+        const removedTw = fmtList(d.removedTwitter);
+        if (removedTw)   lines.push(`   <b>− tw:</b> ${removedTw}`);
+        if (!addedSubs && !removedSubs && !addedTw && !removedTw) {
+          lines.push(`   <i>no changes</i>`);
+        }
+      }
+    }
+
+    lines.push('');
+    lines.push(`<i>Open admin panel → Auto-tags for full diff & history.</i>`);
+
+    let html = lines.join(NL);
+    // Telegram caps at 4096; trim conservatively at 3800 with an ellipsis tail.
+    if (html.length > 3800) {
+      html = html.slice(0, 3800) + NL + '<i>... (digest truncated, see admin panel)</i>';
+    }
+    return html;
   }
 
   // ── Per-preset refresh ──────────────────────────────────────────────────
@@ -229,12 +361,17 @@ class TagRefresher {
       return { status: 'rejected_validation', costUsd, model };
     }
 
-    // 4. Variant-3 reality-check on Twitter keyword groups (probe each PROPOSED group)
+    // 4a. Reddit reality-check — probe each PROPOSED subreddit via free
+    //     /r/<name>/about.json endpoint to filter Grok hallucinations
+    //     (model invents plausible-sounding subs that don't exist).
+    const verifiedSubs = await this._realityCheckSubreddits(sanitized.subreddits, preset);
+
+    // 4b. Variant-3 reality-check on Twitter keyword groups (probe each PROPOSED group)
     const verifiedTwitter = await this._realityCheckTwitter(sanitized.twitter_keywords, preset);
 
     // 5. Compute diff vs current effective sources, respecting locked tags
     const diff = this._computeDiff(preset, {
-      subreddits: sanitized.subreddits,
+      subreddits: verifiedSubs,
       twitter_keywords: verifiedTwitter,
     });
 
@@ -249,7 +386,11 @@ class TagRefresher {
       model, costUsd,
     });
 
-    return { status, costUsd, model, inputTokens, outputTokens, addedCount: diff.addedSubs.length + diff.addedTwitter.length };
+    return {
+      status, costUsd, model, inputTokens, outputTokens,
+      addedCount: diff.addedSubs.length + diff.addedTwitter.length,
+      diff,  // exposed so refreshAll can pass it to admin Telegram digest
+    };
   }
 
   // ── Grok call with fallback model on 5xx / model_not_found ──────────────
@@ -426,6 +567,129 @@ class TagRefresher {
       }
     }
     return verified;
+  }
+
+  // ── Reality-check: probe each PROPOSED subreddit via Reddit public API ──
+  // Grok hallucinates ~20-30% of subreddit names (sounds-plausible-but-doesn't-
+  // exist pattern: r/cuteanimalvideos, r/memesofthe2020s, etc). This filters
+  // them out before they contaminate the active source list.
+  //
+  // Skips subreddits already in effective sources — they're known to work,
+  // probing them wastes the rate-limit budget. Bails out if Reddit is
+  // unreachable (3+ consecutive network errors): conservative approach
+  // would wipe everything, which is worse than letting one cycle through
+  // unverified.
+  async _realityCheckSubreddits(proposedSubs, preset) {
+    if (!Array.isArray(proposedSubs) || proposedSubs.length === 0) return proposedSubs;
+
+    const currentSubs = new Set(
+      this._getCurrentSubreddits(preset).map(s => s.toLowerCase())
+    );
+    const toProbe = proposedSubs.filter(s => !currentSubs.has(s.toLowerCase()));
+    const toKeep  = proposedSubs.filter(s =>  currentSubs.has(s.toLowerCase()));
+
+    if (toProbe.length === 0) return proposedSubs;
+
+    const verified = [...toKeep];
+    let networkErrorStreak = 0;
+    let bailedOut = false;
+
+    for (let i = 0; i < toProbe.length; i++) {
+      const name = toProbe[i];
+      if (bailedOut) {
+        // Reddit unreachable — pass remaining through unverified
+        verified.push(name);
+        continue;
+      }
+      try {
+        const result = await this._probeSubreddit(name);
+        if (result.networkError) {
+          networkErrorStreak++;
+          this.logger?.warn?.(`[TagRefresher] reddit probe net-err /r/${name}: ${result.reason} (streak=${networkErrorStreak})`);
+          if (networkErrorStreak >= REDDIT_PROBE_NETWORK_ERROR_BAILOUT) {
+            bailedOut = true;
+            this.logger?.warn?.(`[TagRefresher] reddit unreachable — passing remaining ${toProbe.length - i} subs through unverified`);
+          }
+          // Conservative on individual net-err: keep the sub (don't drop on flake)
+          verified.push(name);
+        } else if (result.exists) {
+          networkErrorStreak = 0;
+          verified.push(name);
+          this.logger?.debug?.(`[TagRefresher] reddit ✓ /r/${name} (${result.subreddit_type || 'public'}, ${result.subscribers ?? '?'} subs)`);
+        } else {
+          networkErrorStreak = 0;
+          this.logger?.info?.(`[TagRefresher] reddit ✗ /r/${name} — ${result.reason}, dropped`);
+        }
+      } catch (e) {
+        networkErrorStreak++;
+        verified.push(name);  // keep on unexpected error — conservative
+        this.logger?.warn?.(`[TagRefresher] reddit probe threw /r/${name}: ${e.message}`);
+        if (networkErrorStreak >= REDDIT_PROBE_NETWORK_ERROR_BAILOUT) {
+          bailedOut = true;
+          this.logger?.warn?.(`[TagRefresher] reddit probe bailout — passing remaining ${toProbe.length - i - 1} subs through unverified`);
+        }
+      }
+      // Throttle for next iteration (skip after last)
+      if (i < toProbe.length - 1 && !bailedOut) await sleep(REDDIT_PROBE_DELAY_MS);
+    }
+    return verified;
+  }
+
+  // Single Reddit probe. Returns { exists, reason, subreddit_type?, subscribers?, networkError? }.
+  async _probeSubreddit(name) {
+    const url = 'https://www.reddit.com/r/' + encodeURIComponent(name) + '/about.json';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), REDDIT_PROBE_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(url, {
+        signal: ctrl.signal,
+        headers: {
+          'User-Agent': REDDIT_USER_AGENT,
+          'Accept': 'application/json',
+        },
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      return { exists: false, networkError: true, reason: e.name === 'AbortError' ? 'timeout' : e.message };
+    }
+    clearTimeout(timer);
+
+    if (response.status === 404) return { exists: false, reason: '404 (not found)' };
+    if (response.status === 403) return { exists: false, reason: '403 (private/banned)' };
+    if (response.status === 451) return { exists: false, reason: '451 (legal block)' };
+    if (response.status === 429) {
+      // Rate-limited — be conservative and treat as exists rather than drop
+      return { exists: true, reason: '429 rate-limited (assumed exists)' };
+    }
+    if (!response.ok) {
+      return { exists: false, networkError: true, reason: 'HTTP ' + response.status };
+    }
+
+    let data;
+    try { data = await response.json(); }
+    catch (e) { return { exists: false, networkError: true, reason: 'json parse: ' + e.message }; }
+
+    // Reddit returns { kind: "t5", data: {...} } for valid subreddit;
+    // { kind: "Listing", data: { children: [] } } for non-existent /r/<name>
+    if (data && data.kind === 't5' && data.data && data.data.display_name) {
+      return {
+        exists: true,
+        subreddit_type: data.data.subreddit_type,
+        subscribers:    data.data.subscribers,
+      };
+    }
+    return { exists: false, reason: 'unexpected response shape' };
+  }
+
+  _getCurrentSubreddits(preset) {
+    // Effective subreddits for this preset (defaults + auto + manual layers).
+    const auto   = readPresetAutoOverrides(this.db)[preset]?.sources?.reddit?.subreddits;
+    const manual = readPresetOverrides(this.db)[preset]?.sources?.reddit?.subreddits;
+    const def    = DEFAULT_PRESET_CONFIGS[preset]?.sources?.reddit?.subreddits || [];
+    if (Array.isArray(manual)) return manual;
+    if (Array.isArray(auto))   return auto;
+    return def;
   }
 
   _getCurrentTwitterKeywordParts(preset) {

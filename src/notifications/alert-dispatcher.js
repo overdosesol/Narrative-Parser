@@ -47,8 +47,16 @@ function maskId(id) {
  *
  * Mutates trends in place. Returns the same array for chaining convenience.
  */
-export function recomputeAlertScores(trends, alertWeights, db) {
+export function recomputeAlertScores(trends, alertWeights, db, opts = {}) {
   const nowMs = Date.now();
+  // History-write knobs. source defaults to 'scan'; hot-metrics passes
+  // 'refresh-light' / 'refresh-hot' so the sparkline can later show what
+  // kind of cycle caused each tick. floorAtTs is the effective alert floor
+  // at write time (callers know this from preset config).
+  const historySource = opts.source || 'scan';
+  const floorAtTs = Number.isFinite(opts.floor) ? Math.round(opts.floor) : null;
+  const recordHistory = typeof db?.recordAlertScoreHistory === 'function';
+
   for (const t of trends) {
     let feedbackBoost = 50;
     let feedbackStats = null;
@@ -70,6 +78,17 @@ export function recomputeAlertScores(trends, alertWeights, db) {
     t.alertScore = probe.alertScore;
     t.alertBreakdown = probe.breakdown;
     t._alertHardJunk = probe.hardJunk;
+
+    // Append sparkline point. Skip when we have no DB id (pre-persist trends
+    // wouldn't have anything to FK to anyway).
+    if (recordHistory && t._dbId) {
+      db.recordAlertScoreHistory({
+        trendId: t._dbId,
+        breakdown: { ...probe.breakdown, score: probe.alertScore },
+        floorAtTs,
+        source: historySource,
+      });
+    }
   }
   return trends;
 }

@@ -700,6 +700,10 @@ class DashboardServer {
       if (path === '/api/favorites' && method === 'GET') return this._handleFavorites(req, res);
       if (path === '/api/manual-analysis' && method === 'POST') return this._handleManualAnalysis(req, res);
 
+      // Alert-score history (sparkline). Admin-only for now; will open up
+      // later when we trust the visual + retention defaults.
+      if (path.match(/^\/api\/trends\/\d+\/alert-history$/) && method === 'GET') return this._handleAlertHistory(req, res, path);
+
       // SPA fallback — serve dashboard HTML for all non-API routes
       if (!path.startsWith('/api/')) return html(res, this._buildSPA());
 
@@ -1403,7 +1407,7 @@ class DashboardServer {
     // enforcement layer.
     const planName = req.user?.plan_name || 'free';
     if (planName !== 'admin') {
-      return json(res, 403, { error: 'Admin only' });
+      return json(res, 403, { error: 'Forbidden' });
     }
 
     const name = path.split('/')[3]; // /api/collectors/:name/toggle
@@ -1665,7 +1669,7 @@ class DashboardServer {
     if (!userId) { json(res, 401, { error: 'Authenticated user has no chat_id' }); return null; }
     const planName = req.user?.plan_name || 'free';
     if (!getPlanEntitlements(planName).favorites) {
-      json(res, 403, { error: 'Favorites is a Pro/Admin feature', reason: 'plan' });
+      json(res, 403, { error: 'Favorites is a Pro feature', reason: 'plan' });
       return null;
     }
     return userId;
@@ -1780,6 +1784,45 @@ class DashboardServer {
    * and max 20 / 24h. Stage 2 deep-dive can cost ~5¢, so unlimited access
    * is a footgun even for paying customers.
    */
+  // ── Alert score history (sparkline) ────────────────────────────────────
+  // GET /api/trends/:id/alert-history -> { points: [{ts, score, positive,
+  // penalty, floor, source}, ...], floor: <effective floor at request time> }
+  // Admin-only for now (gate symmetric with the dashboard SPA which only
+  // renders the Alert verdict panel for plan==="admin"). When we open this
+  // up to all plans, drop the planName guard below — the API itself is
+  // read-only and trend-scoped, so leaking it more broadly is fine.
+  async _handleAlertHistory(req, res, path) {
+    const planName = req.user?.plan_name || 'free';
+    if (planName !== 'admin') {
+      return json(res, 403, { error: 'Forbidden' });
+    }
+    const m = path.match(/^\/api\/trends\/(\d+)\/alert-history$/);
+    if (!m) return json(res, 400, { error: 'Bad path' });
+    const trendId = Number(m[1]);
+    if (!Number.isFinite(trendId) || trendId <= 0) return json(res, 400, { error: 'Bad trend id' });
+
+    let points = [];
+    try { points = this.db.getAlertScoreHistory(trendId, 200); }
+    catch (e) {
+      this.logger.warn?.(`alert-history fetch failed for trend ${trendId}: ${e.message}`);
+      return json(res, 500, { error: e.message });
+    }
+
+    // Effective floor at request time — same arithmetic the gate uses,
+    // so the sparkline can draw the floor line where it currently sits.
+    // Pulled from active preset config (mirrors /api/me alertFloor logic).
+    const userFloor = Number(req.user?.alert_threshold) || 0;
+    let adminFloor = 0;
+    try {
+      const cfg = getActivePresetConfig(this.db);
+      const v = Number(cfg?.alerts?.thresholds?.alertThreshold);
+      if (Number.isFinite(v)) adminFloor = v;
+    } catch { /* fall back to 0 */ }
+    const floor = Math.max(userFloor, adminFloor);
+
+    return json(res, 200, { points, floor });
+  }
+
   async _handleManualAnalysis(req, res) {
     if (!this.scorer) {
       return json(res, 503, { error: 'Manual analysis unavailable on this server', reason: 'disabled' });
@@ -4578,6 +4621,267 @@ class DashboardServer {
     .story-hook-mark.right { transform: translateY(8px); }
     .story-hook-text { flex: 1; }
 
+    /* ── Alert verdict — compact header + collapsible math panel ──
+       The header is always visible (verdict pill + alertType chip + toggle
+       button); the math panel only renders when the user clicks "show math".
+       Same visual language as the admin Decisions page MathPanel so anyone
+       used to one is at home in the other. */
+    .alert-verdict-header {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+      font-size: 12px;
+    }
+    .alert-verdict-pill {
+      padding: 4px 12px; border-radius: 6px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-weight: 700;
+    }
+    .alert-verdict-pill.pass {
+      background: rgba(var(--green-rgb), .15); color: var(--green2);
+    }
+    .alert-verdict-pill.fail {
+      background: rgba(var(--red-rgb), .15); color: #ff6b6b;
+    }
+    .alert-type-chip {
+      padding: 4px 10px; border-radius: 6px;
+      background: rgba(140,140,140,.10); color: var(--dim);
+    }
+    .alert-type-chip.muted {
+      background: rgba(var(--red-rgb), .10); color: #ff6b6b;
+    }
+    .alert-details-btn {
+      margin-left: auto; padding: 4px 12px;
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--border);
+      color: var(--text2); font-size: 11px; border-radius: 6px;
+      font-family: inherit; cursor: pointer;
+      transition: background 120ms, border-color 120ms, color 120ms;
+      white-space: nowrap;
+    }
+    .alert-details-btn:hover {
+      background: rgba(255,255,255,.07);
+      border-color: var(--border2); color: var(--text);
+    }
+    .alert-details-btn.open {
+      background: rgba(var(--accent-rgb), .08);
+      border-color: rgba(var(--accent-rgb), .25);
+      color: var(--accent2);
+    }
+    .alert-math-panel {
+      margin-top: 10px; padding: 12px;
+      background: linear-gradient(180deg, rgba(var(--accent-rgb), .04), rgba(255,255,255,.01));
+      border: 1px solid rgba(var(--accent-rgb), .18);
+      border-radius: 8px;
+    }
+    .alert-math-panel.empty {
+      text-align: center; color: var(--muted); font-size: 12px;
+      padding: 20px 12px; font-style: italic;
+    }
+    .alert-math-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+    }
+    @media (max-width: 720px) {
+      .alert-math-grid { grid-template-columns: 1fr; }
+    }
+    .alert-math-section {
+      background: rgba(0,0,0,.20); border-radius: 6px;
+      padding: 9px 11px; border: 1px solid rgba(255,255,255,.04);
+    }
+    .alert-math-h {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+      color: var(--text2); font-weight: 700; margin-bottom: 7px;
+      gap: 8px;
+    }
+    .alert-math-sum {
+      font-size: 10px; padding: 2px 6px; border-radius: 3px;
+      background: rgba(255,255,255,.05); color: var(--muted);
+      letter-spacing: 0; text-transform: none;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-weight: 700;
+    }
+    .alert-math-sum.pos { color: var(--green2); }
+    .alert-math-sum.neg { color: #ff8a93; }
+    .alert-math-table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+    }
+    .alert-math-table td {
+      padding: 4px 5px;
+      border-bottom: 1px solid rgba(255,255,255,.03);
+    }
+    .alert-math-table tr:last-child td { border-bottom: none; }
+    .alert-math-table td.lbl { color: var(--text2); width: 32%; }
+    .alert-math-table td.calc {
+      color: var(--muted); text-align: right; font-size: 11px;
+    }
+    .alert-math-table td.val {
+      text-align: right; font-weight: 700; width: 22%;
+    }
+    .alert-math-table td.val.pos { color: var(--green); }
+    .alert-math-table td.val.neg { color: var(--red); }
+    .alert-math-table td.val.zero { color: var(--dim); }
+    .alert-math-table tr.muted td { opacity: .45; }
+
+    .alert-math-reasons {
+      margin-top: 7px; padding-top: 7px;
+      border-top: 1px dashed rgba(255,255,255,.06);
+      font-size: 11px;
+      display: flex; flex-wrap: wrap; gap: 5px; align-items: center;
+    }
+    .alert-math-reasons .lbl {
+      color: var(--muted);
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      margin-right: 3px;
+    }
+    .alert-math-reasons .tag {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      color: #ff8a93;
+      background: rgba(var(--red-rgb), .10);
+      border: 1px solid rgba(var(--red-rgb), .25);
+      padding: 1px 7px; border-radius: 3px; font-size: 11px;
+    }
+    .alert-math-reasons .tag.safe {
+      color: #7fcfff;
+      background: rgba(120,180,255,.08);
+      border-color: rgba(120,180,255,.25);
+    }
+    .alert-math-eq {
+      margin-top: 10px; padding: 9px 12px;
+      background: rgba(0,0,0,.30); border-radius: 6px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 13px; text-align: center;
+      color: var(--text2); line-height: 1.7;
+    }
+    .alert-math-eq .pos { color: var(--green); font-weight: 700; }
+    .alert-math-eq .neg { color: var(--red); font-weight: 700; }
+    .alert-math-eq .final {
+      font-weight: 800; font-size: 17px; margin-left: 6px;
+      color: var(--text);
+    }
+    .alert-math-eq .final.pass { color: var(--green); }
+    .alert-math-eq .final.fail { color: var(--red); }
+    .alert-math-eq .cmp {
+      color: var(--muted); font-size: 12px; margin-left: 4px;
+    }
+    .alert-math-floor {
+      margin-top: 7px; font-size: 11px;
+      color: var(--muted); text-align: center;
+    }
+
+    /* ── Term-help (?) tooltip ──
+       Small "?" bubble next to term labels (Meme Score, Velocity, Emergence,
+       etc). On hover shows a CSS-only tooltip with a plain-text definition.
+       Admin-gated for now via the isAdmin flag in TrendModal — when we
+       open it up to all users, just remove the gate, no CSS change. */
+    .term-help {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 13px; height: 13px;
+      margin-left: 5px;
+      vertical-align: middle;
+      border-radius: 50%;
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.08);
+      color: var(--muted);
+      font-size: 9px; font-weight: 700; font-family: inherit;
+      letter-spacing: 0; text-transform: none;
+      cursor: help;
+      position: relative;
+      user-select: none;
+      transition: background 120ms, color 120ms, border-color 120ms;
+    }
+    .term-help:hover {
+      background: rgba(var(--accent-rgb), .15);
+      border-color: rgba(var(--accent-rgb), .35);
+      color: var(--accent2);
+    }
+    .term-help::before {
+      content: attr(data-tooltip);
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      width: 240px;
+      padding: 9px 11px;
+      background: #16181c;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 6px;
+      font-size: 11px; font-weight: 400;
+      color: var(--text2);
+      letter-spacing: 0; text-transform: none;
+      white-space: normal;
+      text-align: left;
+      line-height: 1.5;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 150ms;
+      z-index: 100;
+      box-shadow: 0 6px 20px rgba(0,0,0,.5);
+    }
+    .term-help::after {
+      content: '';
+      position: absolute;
+      bottom: calc(100% + 2px);
+      left: 50%;
+      transform: translateX(-50%);
+      border: 5px solid transparent;
+      border-top-color: rgba(255,255,255,.10);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 150ms;
+    }
+    .term-help:hover::before, .term-help:hover::after {
+      opacity: 1;
+    }
+    /* Right-edge fallback: when the icon is too close to the right edge,
+       the tooltip clips. The .term-help-right modifier flips the anchor. */
+    .term-help.right::before {
+      left: auto; right: 0; transform: none;
+    }
+    .term-help.right::after {
+      left: auto; right: 6px; transform: none;
+    }
+
+    /* ── Sparkline (alertScore evolution) ── */
+    .alert-spark {
+      margin-top: 12px; padding: 10px 12px;
+      background: rgba(0,0,0,.20);
+      border: 1px solid rgba(255,255,255,.04);
+      border-radius: 6px;
+    }
+    .alert-spark-header {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+      color: var(--text2); font-weight: 700; margin-bottom: 6px;
+    }
+    .alert-spark-header .lbl { color: var(--text2); }
+    .alert-spark-header .meta {
+      color: var(--muted); font-weight: 600;
+      letter-spacing: 0; text-transform: none; font-size: 11px;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+    }
+    .alert-spark-header .meta .delta {
+      margin-left: 4px; font-weight: 700;
+      padding: 1px 6px; border-radius: 3px;
+      background: rgba(255,255,255,.04);
+    }
+    .alert-spark-header .meta .delta.pos { color: var(--green); }
+    .alert-spark-header .meta .delta.neg { color: #ff8a93; }
+    .alert-spark-header .meta .delta.zero { color: var(--muted); }
+    .alert-spark-svg {
+      display: block; width: 100%; height: 56px;
+    }
+    .alert-spark-svg .alert-spark-floor {
+      stroke: var(--muted); stroke-width: 1;
+      stroke-dasharray: 3,3; opacity: .5;
+    }
+    .alert-spark-legend {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; margin-top: 5px;
+      font-size: 10px; color: var(--muted);
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+    }
+    .alert-spark-legend .arrow { color: var(--dim); }
+
     /* ── Catalyst forecast (TriggerSection) ── */
     /* Forecast body — neutral accent-tinted, NOT red (red is reserved for the
        past-event block, see why-now). Slightly larger leading and a soft
@@ -6053,7 +6357,7 @@ const I18N = {
     'nav.analyze': 'Analyze',
     'nav.saved': 'Saved',
     'analyze.title': 'Manual analysis',
-    'analyze.intro': 'Paste a Twitter / Reddit / TikTok / og:image URL — we will run it through the full pipeline (Stage 1 + Stage 2 Grok) and show the result. Pro / Admin only.',
+    'analyze.intro': 'Paste a Twitter / Reddit / TikTok / og:image URL — we will run it through the full pipeline (Stage 1 + Stage 2 Grok) and show the result. Pro only.',
     'analyze.url_label': 'Post URL',
     'analyze.url_placeholder': 'https://twitter.com/user/status/12345',
     'analyze.run_btn': 'Analyze',
@@ -6064,8 +6368,8 @@ const I18N = {
     'analyze.locked_toast': '🔒 Manual analysis is available on Test/Pro',
     'fav.add_tooltip': 'Save to favorites',
     'fav.remove_tooltip': 'Remove from favorites',
-    'fav.locked_tooltip': 'Favorites is a Pro/Admin feature',
-    'fav.locked_toast': '🔒 Favorites is a Pro/Admin feature',
+    'fav.locked_tooltip': 'Favorites is a Pro feature',
+    'fav.locked_toast': '🔒 Favorites is a Pro feature',
     'fav.added_toast': '⭐ Saved to favorites',
     'fav.removed_toast': '☆ Removed from favorites',
     'fav.note_placeholder': 'Add a note (private, optional)',
@@ -6119,7 +6423,7 @@ const I18N = {
     'feed.open_source': 'Open',
     'feed.copy_title': 'Copy title',
     'feed.category_tip': 'Category',
-    'feed.manual_tip': 'Manually submitted via admin panel',
+    'feed.manual_tip': 'Manually submitted',
     'feed.fresh_tip':  'First seen within the last hour',
     'feed.catalyst_tip': 'Catalyst forecast available — open the card to read it',
     'badge.fresh':     'NEW',
@@ -6281,7 +6585,27 @@ const I18N = {
     'modal.alert_breakdown_feedback': 'feedback',
     'modal.alert_breakdown_junk': 'junk',
     'modal.alert_breakdown_stale': 'stale',
+    'modal.alert_details_show': 'show math',
+    'modal.alert_details_hide': 'hide math',
+    'modal.alert_section_positive': '+ positive signals',
+    'modal.alert_section_penalty': '- penalties',
+    'modal.alert_floor_explain': 'Floor {floor} = max(your {user}, admin {admin})',
+    'modal.alert_junk_triggers': 'junk triggers',
+    'modal.alert_no_breakdown': 'No detailed breakdown saved for this trend',
+    'modal.alert_spark_label': 'score evolution',
+    'modal.alert_spark_points': 'pts',
     'modal.alert_no_score': 'not scored yet',
+
+    // ── Term-help tooltips (admin-only "?" bubbles) ──
+    'term.meme_score':  'AI estimate (0-100) of how meme-shaped the trend is — animal, absurd, heartwarming, copypasta. Drives ~45% of the alert score by default.',
+    'term.virality':    'Engagement-based virality (0-100) — likes, retweets, comments, replies, upvotes plus velocity weighting.',
+    'term.velocity':    'Engagement growth rate per hour (e.g. 12K/h). Empty when negative or stale.',
+    'term.alert_score': 'Composite 0-100 verdict. Combines meme, virality, emergence, X signal and feedback votes minus junk and stale-decay penalties. Decides if a Telegram alert fires.',
+    'term.lifespan':    'AI prediction of how long this trend stays interesting — short / medium / long.',
+    'term.emergence':   'Cluster velocity: how fast this narrative spreads vs background noise. High = picking up steam right now.',
+    'term.feedback':    'Bias from user 👍/👎 votes (50 = neutral). Likes push the score up; mass dislikes pull it down. Below 5 votes the effect is dampened.',
+    'term.junk':        'Junk-filter penalty (0-100) — politics, k-pop drama, celeb noise, no meme-shape, text-only. Subtracted from positive score.',
+    'term.stale':       'Age penalty. After 24h grace each hour subtracts ~2 points (max −30). Punishes alerts about old news.',
     'modal.feedback': '💬 Your take',
     'modal.links': '🔗 Links',
     'modal.source_link': '{ico} Source →',
@@ -6377,7 +6701,7 @@ const I18N = {
     // Stage-1-scored trends regardless. Sidebar's Adoption filter is the
     // dashboard-side equivalent.
     'account.threshold': 'Telegram alert threshold',
-    'account.threshold_desc': 'Minimum alertScore for the bot to push you a Telegram alert. Higher = fewer, stronger alerts. Applies on top of the admin floor. Does NOT filter the dashboard feed — use the sidebar Adoption filter for that.',
+    'account.threshold_desc': 'Minimum alertScore for the bot to push you a Telegram alert. Higher = fewer, stronger alerts. Applies on top of the platform floor. Does NOT filter the dashboard feed — use the sidebar Adoption filter for that.',
     'settings.logout': 'Log out',
     'settings.logout_desc': "Unlink this browser. You'll need a fresh bot code to sign back in.",
     'settings.logout_confirm': "Log out? You'll need to verify a fresh bot code to sign back in.",
@@ -6444,7 +6768,7 @@ const I18N = {
     'nav.analyze': 'Анализ',
     'nav.saved': 'Избранное',
     'analyze.title': 'Ручной анализ',
-    'analyze.intro': 'Закинь URL поста (Twitter / Reddit / TikTok / любой сайт с og:image) — прогоним через полный пайплайн (Stage 1 + Stage 2 Grok). Доступно только Pro/Admin.',
+    'analyze.intro': 'Закинь URL поста (Twitter / Reddit / TikTok / любой сайт с og:image) — прогоним через полный пайплайн (Stage 1 + Stage 2 Grok). Доступно только Pro.',
     'analyze.url_label': 'URL поста',
     'analyze.url_placeholder': 'https://twitter.com/user/status/12345',
     'analyze.run_btn': 'Анализ',
@@ -6455,8 +6779,8 @@ const I18N = {
     'analyze.locked_toast': '🔒 Ручной анализ — на Test/Pro',
     'fav.add_tooltip': 'В избранное',
     'fav.remove_tooltip': 'Убрать из избранного',
-    'fav.locked_tooltip': 'Избранное — Pro/Admin',
-    'fav.locked_toast': '🔒 Избранное доступно на Pro/Admin',
+    'fav.locked_tooltip': 'Избранное — только на Pro',
+    'fav.locked_toast': '🔒 Избранное доступно только на Pro',
     'fav.added_toast': '⭐ Добавлено в избранное',
     'fav.removed_toast': '☆ Убрано из избранного',
     'fav.note_placeholder': 'Заметка (приватная, опционально)',
@@ -6510,7 +6834,7 @@ const I18N = {
     'feed.open_source': 'Открыть',
     'feed.copy_title': 'Скопировать заголовок',
     'feed.category_tip': 'Категория',
-    'feed.manual_tip': 'Ручная отправка через админку',
+    'feed.manual_tip': 'Добавлено вручную',
     'feed.fresh_tip':  'Появился в последний час',
     'feed.catalyst_tip': 'Каталист найден — открой карточку чтобы прочитать прогноз',
     'badge.fresh':     'NEW',
@@ -6670,7 +6994,27 @@ const I18N = {
     'modal.alert_breakdown_feedback': 'feedback',
     'modal.alert_breakdown_junk': 'junk',
     'modal.alert_breakdown_stale': 'stale',
+    'modal.alert_details_show': 'детали',
+    'modal.alert_details_hide': 'скрыть',
+    'modal.alert_section_positive': '+ положительные',
+    'modal.alert_section_penalty': '- штрафы',
+    'modal.alert_floor_explain': 'Порог {floor} = max(твой {user}, админ {admin})',
+    'modal.alert_junk_triggers': 'junk триггеры',
+    'modal.alert_no_breakdown': 'Подробная разбивка для этого тренда не сохранена',
+    'modal.alert_spark_label': 'эволюция score',
+    'modal.alert_spark_points': 'точек',
     'modal.alert_no_score': 'ещё не оценено',
+
+    // ── Term-help tooltips (admin-only "?" bubbles) ──
+    'term.meme_score':  'Оценка AI (0-100): насколько штука похожа на мем — животные, абсурд, heartwarming, копипаста. Даёт ~45% веса в alertScore по дефолту.',
+    'term.virality':    'Вирусность по engagement (0-100) — лайки, ретвиты, комменты, реплаи, апвоуты плюс velocity-вес.',
+    'term.velocity':    'Прирост engagement в час (например 12K/ч). Пусто если отрицательный или старый тренд.',
+    'term.alert_score': 'Итоговый 0-100 verdict. Складывает meme, virality, emergence, X-сигнал и feedback votes минус penalties (junk, stale-decay). Решает: отправится ли Telegram-алерт.',
+    'term.lifespan':    'Предсказание AI: как долго тренд останется интересным — короткий / средний / длинный.',
+    'term.emergence':   'Cluster velocity: насколько быстро нарратив распространяется относительно фонового шума. Высокий = сейчас набирает обороты.',
+    'term.feedback':    'Bias от 👍/👎 юзеров (50 = нейтрал). Лайки толкают score вверх, дизы — вниз. Меньше 5 голосов — эффект ослаблен.',
+    'term.junk':        'Штраф junk-фильтра (0-100) — политика, k-pop, celeb-шум, нет meme-shape, text-only. Вычитается из positive score.',
+    'term.stale':       'Штраф за возраст. После 24h grace каждый час -2 очка (max -30). Бьёт по алертам о вчерашних новостях.',
     'modal.feedback': '💬 Ваша оценка',
     'modal.links': '🔗 Ссылки',
     'modal.source_link': '{ico} Источник →',
@@ -6765,7 +7109,7 @@ const I18N = {
     // создавало впечатление общего фильтра. Для фильтрации фида в
     // дашбоде — слайдер Adoption в сайдбаре.
     'account.threshold': 'Порог Telegram-алертов',
-    'account.threshold_desc': 'Минимальный alertScore, при котором бот пришлёт алерт в Telegram. Выше = строже (меньше, но сильнее). Действует поверх глобального floor админа. На фид в дашбоде НЕ влияет — для этого есть фильтр Adoption в сайдбаре.',
+    'account.threshold_desc': 'Минимальный alertScore, при котором бот пришлёт алерт в Telegram. Выше = строже (меньше, но сильнее). Действует поверх глобального floor платформы. На фид в дашбоде НЕ влияет — для этого есть фильтр Adoption в сайдбаре.',
     'settings.logout': 'Выйти',
     'settings.logout_desc': 'Отвязать этот браузер. Для повторного входа потребуется новый код из бота.',
     'settings.logout_confirm': 'Выйти из аккаунта? Нужно будет снова подтвердить код в Telegram.',
@@ -8467,6 +8811,124 @@ function FavoriteNoteEditor({ trend, onSave }) {
   );
 }
 
+// ── Alert score sparkline ──────────────────────────────────────────────────
+// Inline SVG renderer, no chart library. Takes the points array from
+// /api/trends/:id/alert-history and the effective floor; produces a small
+// path with floor reference line, color-coded by pass/fail at last point.
+//
+// Layout: 240w x 56h. Y axis 0..100 mapped to the 56px height (with 4px
+// top/bottom padding so the path doesn"t touch the edges). X axis is
+// time-spaced (NOT index-spaced) — gaps are real time, not noise.
+function renderAlertSparkline(points, floor, t) {
+  const h = React.createElement;
+  if (!Array.isArray(points) || points.length < 2) return null;
+
+  const W = 240, H = 56, PAD_Y = 5, PAD_X = 2;
+  const innerH = H - PAD_Y * 2;
+  const innerW = W - PAD_X * 2;
+
+  const tsToMs = (p) => {
+    const v = p && p.ts;
+    if (!v) return 0;
+    // SQLite TEXT timestamp ("YYYY-MM-DD HH:MM:SS") needs T injected for Date()
+    const s = String(v).indexOf('T') >= 0 ? v : String(v).replace(' ', 'T') + 'Z';
+    const n = Date.parse(s);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const minMs = tsToMs(points[0]);
+  const maxMs = tsToMs(points[points.length - 1]);
+  const spanMs = Math.max(1, maxMs - minMs);
+
+  const xy = points.map(p => {
+    const ms = tsToMs(p);
+    const score = Math.max(0, Math.min(100, Number(p.score) || 0));
+    return {
+      x: PAD_X + ((ms - minMs) / spanMs) * innerW,
+      y: PAD_Y + (1 - score / 100) * innerH,
+      score,
+      ts: p.ts,
+      source: p.source,
+    };
+  });
+
+  const pathD = xy.map((pt, i) => (i === 0 ? 'M' : 'L') + pt.x.toFixed(1) + ',' + pt.y.toFixed(1)).join(' ');
+
+  // Floor reference line — only when in 0..100 range
+  const floorY = (Number.isFinite(floor) && floor >= 0 && floor <= 100)
+    ? PAD_Y + (1 - floor / 100) * innerH : null;
+
+  const last = xy[xy.length - 1];
+  const passed = last.score >= (Number(floor) || 0);
+  const lineColor = passed ? 'var(--green)' : 'var(--red)';
+  const fillColor = passed ? 'rgba(0,186,124,.10)' : 'rgba(244,33,46,.10)';
+
+  // Filled area under the line
+  const areaD = pathD
+    + ' L' + xy[xy.length - 1].x.toFixed(1) + ',' + (PAD_Y + innerH).toFixed(1)
+    + ' L' + xy[0].x.toFixed(1) + ',' + (PAD_Y + innerH).toFixed(1)
+    + ' Z';
+
+  // Time delta from first to last point — humanized
+  const deltaH = (maxMs - minMs) / 3_600_000;
+  const deltaLabel = deltaH < 1
+    ? Math.round(deltaH * 60) + 'm'
+    : (deltaH < 24 ? deltaH.toFixed(1) + 'h' : Math.round(deltaH / 24) + 'd');
+
+  // Score delta first -> last
+  const scoreDelta = xy[xy.length - 1].score - xy[0].score;
+  const deltaSign = scoreDelta > 0 ? '+' : '';
+  const deltaCls = scoreDelta > 0 ? 'pos' : (scoreDelta < 0 ? 'neg' : 'zero');
+
+  return h('div', { className: 'alert-spark' },
+    h('div', { className: 'alert-spark-header' },
+      h('span', { className: 'lbl' }, t('modal.alert_spark_label')),
+      h('span', { className: 'meta' },
+        points.length + ' ' + t('modal.alert_spark_points')
+        + ' / ' + deltaLabel + ' / ',
+        h('span', { className: 'delta ' + deltaCls },
+          deltaSign + scoreDelta.toFixed(0))
+      )
+    ),
+    h('svg', {
+      width: W, height: H, viewBox: '0 0 ' + W + ' ' + H,
+      className: 'alert-spark-svg',
+      preserveAspectRatio: 'none',
+    },
+      // Floor reference line (dashed)
+      floorY != null ? h('line', {
+        x1: 0, y1: floorY, x2: W, y2: floorY,
+        className: 'alert-spark-floor',
+      }) : null,
+      // Filled area
+      h('path', { d: areaD, fill: fillColor, stroke: 'none' }),
+      // Score line
+      h('path', { d: pathD, fill: 'none', stroke: lineColor, strokeWidth: 1.6 }),
+      // Last-point dot
+      h('circle', {
+        cx: last.x, cy: last.y, r: 2.4,
+        fill: lineColor, stroke: 'var(--card)', strokeWidth: 1.5,
+      })
+    ),
+    // Mini-legend: first→last with timestamps (helpful when chart is small)
+    h('div', { className: 'alert-spark-legend' },
+      h('span', null, fmtSparkTs(xy[0].ts) + ' · ' + xy[0].score),
+      h('span', { className: 'arrow' }, '→'),
+      h('span', null, fmtSparkTs(last.ts) + ' · ' + last.score)
+    )
+  );
+}
+
+function fmtSparkTs(ts) {
+  if (!ts) return '—';
+  const s = String(ts).indexOf('T') >= 0 ? ts : String(ts).replace(' ', 'T') + 'Z';
+  const d = new Date(s);
+  if (!isFinite(d.getTime())) return String(ts).slice(5, 16);
+  // Compact: MM-DD HH:MM
+  const pad = n => (n < 10 ? '0' : '') + n;
+  return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' '
+    + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
 // ── TrendModal (side drawer) ───────────────────────────────────────────────────
 function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote = null }) {
   const lang = useLang();
@@ -8478,8 +8940,37 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
   const [extraUrls, setExtraUrls] = useState([]);
   // Lightbox: when the user clicks an image inside the carousel / single-image
   // wrap, we surface a fullscreen viewer above the modal. Esc closes it (and
-  // is stopPropagation'd so the modal stays open).
+  // is stopPropagation"d so the modal stays open).
   const [lightboxSrc, setLightboxSrc] = useState(null);
+  // Alert verdict math panel — collapsed by default. The compact header
+  // (pass/fail pill + alertType chip) is enough for the "would I be alerted?"
+  // question; the full breakdown opens only when the user wants the math.
+  const [alertDetailsOpen, setAlertDetailsOpen] = useState(false);
+  // Sparkline history (admin-only). Fetched lazily — only when the user
+  // opens the math panel, so we don"t hammer the API for everyone clicking
+  // around the feed. null = not loaded, [] = loaded but empty (old trend
+  // before history feature shipped).
+  const [alertHistory, setAlertHistory] = useState(null);
+  const [alertHistoryLoading, setAlertHistoryLoading] = useState(false);
+
+  // Admin-only flag — gates internal-mechanics affordances (term-help "?"
+  // bubbles, sparkline, math panel, etc). Same pattern as elsewhere in
+  // this file (line 8396, 9436). When we open features up to all plans,
+  // flip the targeted condition only — leaves this flag for admin-only
+  // affordances that stay private.
+  const isAdmin = me?.plan === 'admin' || me?.plan_name === 'admin';
+
+  // Tiny "?" bubble with hover tooltip. Renders only for admin and only
+  // when text is provided. Pass right=true to anchor the tooltip to the
+  // right edge (use when the icon is near the right side of the modal).
+  const termHelp = (text, right = false) => {
+    if (!isAdmin || !text) return null;
+    return React.createElement('span', {
+      className: 'term-help' + (right ? ' right' : ''),
+      'data-tooltip': text,
+      'aria-label': text,
+    }, '?');
+  };
   const catCls = CAT_CLS[trend.category] || 'cat-other';
   const catIco = CAT_ICONS[trend.category] || '📌';
   const srcIco = SOURCE_ICONS[trend.source] || '📡';
@@ -8524,6 +9015,28 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
     window.addEventListener('keydown', fn);
     return () => window.removeEventListener('keydown', fn);
   }, [lightboxSrc]);
+
+  // Lazy-fetch alert score history when the user opens the math panel.
+  // Admin-only (the API gates with 403); we still try the fetch for
+  // everyone — non-admin gets 403 and we just never render the sparkline.
+  // Fetched once per modal-open; closing/reopening refetches because the
+  // state was reset by lightbox unmount.
+  useEffect(() => {
+    if (!alertDetailsOpen || alertHistory !== null || alertHistoryLoading) return;
+    if (!trend?._dbId && !trend?.id) return;
+    const id = trend._dbId || trend.id;
+    setAlertHistoryLoading(true);
+    api('/api/trends/' + id + '/alert-history')
+      .then(d => {
+        setAlertHistory(Array.isArray(d?.points) ? d.points : []);
+        setAlertHistoryLoading(false);
+      })
+      .catch(() => {
+        // 403 (not admin) or 5xx — silent fail, no sparkline rendered
+        setAlertHistory([]);
+        setAlertHistoryLoading(false);
+      });
+  }, [alertDetailsOpen]);
 
   // Sentiment removed from the modal visual (2026-05-04). The field is still
   // populated by Stage 1 and shown elsewhere (Telegram alert, feed card chip),
@@ -8600,7 +9113,10 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
           return h('div', { className: 'modal-section' },
             h('div', { className: 'meme-hero' },
               h('div', { className: 'meme-hero-left' },
-                h('div', { className: 'meme-hero-label' }, t('modal.meme_score')),
+                h('div', { className: 'meme-hero-label' },
+                  t('modal.meme_score'),
+                  termHelp(t('term.meme_score'))
+                ),
                 h('div', { className: 'meme-hero-num ' + tier },
                   v,
                   h('span', { className: 'meme-hero-num-sub' }, ' / 100')
@@ -8900,7 +9416,10 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
               ].filter(it => fmtCount(it.n) !== null);
 
               return h('div', { className: 'modal-stat' },
-                h('div', { className: 'modal-stat-label' }, t('modal.virality')),
+                h('div', { className: 'modal-stat-label' },
+                  t('modal.virality'),
+                  termHelp(t('term.virality'))
+                ),
                 items.length
                   ? h('div', { className: 'modal-engagement' },
                       items.map((it, i) => h('span', { key: i, className: 'modal-engagement-item' },
@@ -8916,7 +9435,10 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
             (() => {
               const vel = fmtVelocity(trend.velocity || 0);
               return h('div', { className: 'modal-stat' },
-                h('div', { className: 'modal-stat-label' }, t('modal.velocity')),
+                h('div', { className: 'modal-stat-label' },
+                  t('modal.velocity'),
+                  termHelp(t('term.velocity'))
+                ),
                 h('span', {
                   style: {
                     fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700,
@@ -8945,7 +9467,10 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                 ? 'var(--dim)'
                 : (passed ? 'var(--accent2)' : '#ff5b6a');
               return h('div', { className: 'modal-stat' },
-                h('div', { className: 'modal-stat-label' }, t('modal.alert_score')),
+                h('div', { className: 'modal-stat-label' },
+                  t('modal.alert_score'),
+                  termHelp(t('term.alert_score'), true)
+                ),
                 h('span', {
                   style: {
                     fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700,
@@ -8961,15 +9486,24 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
         ),
 
         // ── Alert verdict / breakdown — shows the unified alertScore vs the
-        // user's effective floor PLUS each component's contribution. The dash-
-        // board's per-trend question is "would I have been alerted?", and the
+        // user effective floor PLUS each component contribution. The dash-
+        // board per-trend question is "would I have been alerted?", and the
         // formula behind alertScore is non-obvious (memePotential is only 30-
-        // 45% of it depending on preset). This block surfaces the real numbers
-        // so users don't have to guess why a high-meme post didn't fire (the
-        // common case: low virality dragged it under floor, or alertType was
-        // muted in their filter). Hidden when alertScore is null (save-only
-        // rows that bypassed Stage 1) — there's no useful signal to show.
-        trend.alertScore != null ? (() => {
+        // 45% of it depending on preset).
+        //
+        // Layout: compact verdict header (always) + collapsible math panel
+        // (toggle button). Header shows pass/fail pill, alertType filter
+        // chip, and "show math" button. Expanded panel shows real
+        // contributions (meme x weight = +N) instead of raw input values,
+        // with junk triggers and floor decomposition. Hidden when alertScore
+        // is null (save-only rows that bypassed Stage 1).
+        //
+        // ADMIN-ONLY: scoring weights, junk triggers, and floor decomposition
+        // are internal mechanics — surfacing them to free/test/pro users
+        // creates more confusion than insight ("why is my -10 stale penalty
+        // missing in this row but not that one?"). Same me.plan==="admin"
+        // check pattern used elsewhere in this file (line 8396, 9436).
+        (trend.alertScore != null && (me?.plan === 'admin' || me?.plan_name === 'admin')) ? (() => {
           const score = Number(trend.alertScore);
           const userFloor = Number(me?.threshold) || 0;
           const adminFloor = Number(me?.alertFloor) || 0;
@@ -8978,68 +9512,160 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
           const breakdown = trend.alertBreakdown || null;
           const userTypes = Array.isArray(me?.alertTypes) ? me.alertTypes : null;
           const trendType = trend.alertType || null;
-          // alertType muted iff the user has an explicit filter AND it doesn't
-          // include this trend's type. Empty/missing filter → "all" (handled
-          // server-side in db.getUserAlertTypes), so trendTypeMuted=false.
+          // alertType muted iff the user has an explicit filter AND it
+          // doesnt include this trend type. Empty/missing filter -> "all"
+          // (server-side in db.getUserAlertTypes), so trendTypeMuted=false.
           const trendTypeMuted = trendType && Array.isArray(userTypes)
             && userTypes.length > 0 && !userTypes.includes(trendType);
 
-          // breakdown components — only render the rows we actually have so
-          // older rows (saved before alertBreakdown was persisted) don't show
-          // a wall of zeros.
-          const chips = [];
-          if (breakdown) {
-            const add = (key, val) => {
-              if (val == null || val === 0) return;
-              chips.push({
-                k: t('modal.alert_breakdown_' + key),
-                v: Math.round(Number(val) * 10) / 10,
-                neg: key === 'junk' || key === 'stale',
-              });
-            };
-            add('meme',     breakdown.meme);
-            add('viral',    breakdown.viral);
-            add('emerge',   breakdown.emergence);
-            add('twitter',  breakdown.twitter);
-            add('feedback', breakdown.feedback);
-            add('junk',     breakdown.junk);
-            add('stale',    breakdown.staleDecay);
-          }
+          // Math helpers — same fmt1 the admin Math panel uses, kept inline
+          // so this section stays self-contained.
+          const fmt1 = (n) => {
+            const x = Number(n);
+            if (!isFinite(x)) return '—';
+            return (Math.round(x * 10) / 10).toString();
+          };
+          const w = (breakdown && breakdown.weights) || null;
+
+          // Positive rows — drive the contribution column off the saved
+          // weight snapshot. When weights are missing (older decisions),
+          // calc column falls back to raw input only.
+          const posRows = breakdown ? [
+            { label: t('modal.alert_breakdown_meme'),     val: breakdown.meme,      weight: w && w.weightMemePotential, tooltip: t('term.meme_score') },
+            { label: t('modal.alert_breakdown_viral'),    val: breakdown.viral,     weight: w && w.weightVirality,      tooltip: t('term.virality') },
+            { label: t('modal.alert_breakdown_emerge'),   val: breakdown.emergence, weight: w && w.weightEmergence,     tooltip: t('term.emergence') },
+            { label: t('modal.alert_breakdown_twitter'),  val: breakdown.twitter,   weight: w && w.weightTwitter },
+            { label: t('modal.alert_breakdown_feedback'), val: breakdown.feedback,  weight: w && w.weightFeedback,      tooltip: t('term.feedback') },
+          ] : [];
+
+          const junkVal = breakdown ? (Number(breakdown.junk) || 0) : 0;
+          const staleVal = breakdown ? (Number(breakdown.staleDecay) || 0) : 0;
+          const junkContrib = junkVal * (Number(w && w.weightJunk) || 0);
 
           return h('div', { className: 'modal-section' },
             h('div', { className: 'modal-section-label' }, t('modal.alert_breakdown')),
-            h('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, fontSize: 12 } },
-              // Pass/fail pill — primary verdict
+            // Compact verdict header — always visible
+            h('div', { className: 'alert-verdict-header' },
               h('span', {
-                style: {
-                  padding: '3px 10px', borderRadius: 6,
-                  fontFamily: 'JetBrains Mono', fontWeight: 700,
-                  background: passed ? 'rgba(0, 200, 120, 0.15)' : 'rgba(255, 91, 106, 0.15)',
-                  color:      passed ? 'var(--accent2)'           : '#ff5b6a',
-                }
-              }, (passed ? '✓ ' : '✕ ') + score + ' / ' + floor + ' · ' + (passed ? t('modal.alert_pass') : t('modal.alert_fail'))),
-              // alertType verdict — separate from score (a trend can have
-              // alertScore over the floor but still be filtered by type).
+                className: 'alert-verdict-pill ' + (passed ? 'pass' : 'fail'),
+              }, (passed ? '✓ ' : '✕ ') + score + ' / ' + floor + ' · '
+                 + (passed ? t('modal.alert_pass') : t('modal.alert_fail'))),
               trendType ? h('span', {
-                style: {
-                  padding: '3px 8px', borderRadius: 6,
-                  background: trendTypeMuted ? 'rgba(255, 91, 106, 0.10)' : 'rgba(140, 140, 140, 0.10)',
-                  color: trendTypeMuted ? '#ff5b6a' : 'var(--dim)',
-                }
-              }, trendType + ' · ' + (trendTypeMuted ? t('modal.alert_type_muted') : t('modal.alert_type_in_filter'))) : null
+                className: 'alert-type-chip ' + (trendTypeMuted ? 'muted' : 'ok'),
+              }, trendType + ' · ' + (trendTypeMuted
+                ? t('modal.alert_type_muted')
+                : t('modal.alert_type_in_filter'))) : null,
+              breakdown ? h('button', {
+                className: 'alert-details-btn' + (alertDetailsOpen ? ' open' : ''),
+                onClick: () => setAlertDetailsOpen(v => !v),
+                'aria-expanded': alertDetailsOpen ? 'true' : 'false',
+              }, (alertDetailsOpen ? '▴ ' : '▾ ')
+                 + (alertDetailsOpen
+                   ? t('modal.alert_details_hide')
+                   : t('modal.alert_details_show'))) : null
             ),
-            chips.length ? h('div', {
-              style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8, fontSize: 11, fontFamily: 'JetBrains Mono' }
-            },
-              chips.map((c, i) => h('span', {
-                key: i,
-                style: {
-                  padding: '2px 8px', borderRadius: 4,
-                  background: c.neg ? 'rgba(255, 91, 106, 0.08)' : 'rgba(140, 140, 140, 0.08)',
-                  color: c.neg ? '#ff8a93' : 'var(--dim)',
-                }
-              }, c.k + ' ' + (c.neg ? '−' : '') + c.v))
-            ) : null
+            // Math panel — only when expanded AND we have a breakdown
+            (alertDetailsOpen && breakdown) ? h('div', { className: 'alert-math-panel' },
+              h('div', { className: 'alert-math-grid' },
+                // Left column — positive contributions
+                h('div', { className: 'alert-math-section' },
+                  h('div', { className: 'alert-math-h' },
+                    h('span', null, t('modal.alert_section_positive')),
+                    h('span', { className: 'alert-math-sum pos' },
+                      'Σ +' + fmt1(breakdown.positive))
+                  ),
+                  h('table', { className: 'alert-math-table' },
+                    h('tbody', null,
+                      ...posRows.map((r, ri) => {
+                        const rawVal = Number(r.val) || 0;
+                        const wVal = Number(r.weight) || 0;
+                        const contrib = rawVal * wVal;
+                        const isZero = !contrib;
+                        return h('tr', { key: ri, className: isZero ? 'muted' : '' },
+                          h('td', { className: 'lbl' },
+                            r.label,
+                            termHelp(r.tooltip)
+                          ),
+                          h('td', { className: 'calc' },
+                            w ? (fmt1(rawVal) + ' × ' + fmt1(wVal)) : fmt1(rawVal)),
+                          h('td', { className: 'val ' + (isZero ? 'zero' : 'pos') },
+                            isZero ? '0' : ('+' + fmt1(contrib)))
+                        );
+                      })
+                    )
+                  )
+                ),
+                // Right column — penalties
+                h('div', { className: 'alert-math-section' },
+                  h('div', { className: 'alert-math-h' },
+                    h('span', null, t('modal.alert_section_penalty')),
+                    h('span', { className: 'alert-math-sum neg' },
+                      'Σ −' + fmt1(breakdown.penalty))
+                  ),
+                  h('table', { className: 'alert-math-table' },
+                    h('tbody', null,
+                      h('tr', { className: !junkContrib ? 'muted' : '' },
+                        h('td', { className: 'lbl' },
+                          t('modal.alert_breakdown_junk'),
+                          termHelp(t('term.junk'))
+                        ),
+                        h('td', { className: 'calc' },
+                          w ? (fmt1(junkVal) + ' × ' + fmt1(w.weightJunk)) : fmt1(junkVal)),
+                        h('td', { className: 'val ' + (!junkContrib ? 'zero' : 'neg') },
+                          !junkContrib ? '0' : ('−' + fmt1(junkContrib)))
+                      ),
+                      h('tr', { className: !staleVal ? 'muted' : '' },
+                        h('td', { className: 'lbl' },
+                          t('modal.alert_breakdown_stale'),
+                          termHelp(t('term.stale'))
+                        ),
+                        h('td', { className: 'calc' },
+                          fmt1(breakdown.ageHours) + 'h, grace '
+                          + ((w && w.staleDecayGraceHours != null) ? w.staleDecayGraceHours : 24) + 'h'),
+                        h('td', { className: 'val ' + (!staleVal ? 'zero' : 'neg') },
+                          !staleVal ? '0' : ('−' + fmt1(staleVal)))
+                      )
+                    )
+                  ),
+                  // Junk triggers (politics / no-meme-shape / text-only / etc.)
+                  Array.isArray(breakdown.junkReasons) && breakdown.junkReasons.length > 0
+                    ? h('div', { className: 'alert-math-reasons' },
+                        h('span', { className: 'lbl' },
+                          t('modal.alert_junk_triggers') + ':'),
+                        ...breakdown.junkReasons.map((r, ri) => h('span', {
+                          key: ri,
+                          className: 'tag' + (String(r).startsWith('safe-override') ? ' safe' : ''),
+                        }, r))
+                      )
+                    : null
+                )
+              ),
+              // Equation line
+              h('div', { className: 'alert-math-eq' },
+                h('span', { className: 'pos' }, '+' + fmt1(breakdown.positive)),
+                ' − ',
+                h('span', { className: 'neg' }, fmt1(breakdown.penalty)),
+                ' = ',
+                h('span', { className: 'final ' + (passed ? 'pass' : 'fail') }, score),
+                h('span', { className: 'cmp' }, (passed ? ' ≥ ' : ' < ') + floor)
+              ),
+              // Sparkline of alertScore evolution. Rendered when we have at
+              // least 2 history points (1 point is just a dot, no signal).
+              // Built inline as SVG — no chart library dependency.
+              (Array.isArray(alertHistory) && alertHistory.length >= 2)
+                ? renderAlertSparkline(alertHistory, floor, t)
+                : null,
+              // Floor decomposition
+              h('div', { className: 'alert-math-floor' },
+                t('modal.alert_floor_explain')
+                  .replace('{floor}', floor)
+                  .replace('{user}', userFloor || 0)
+                  .replace('{admin}', adminFloor || 0)
+              )
+            ) : (alertDetailsOpen && !breakdown
+              ? h('div', { className: 'alert-math-panel empty' },
+                  t('modal.alert_no_breakdown'))
+              : null)
           );
         })() : null
       )
