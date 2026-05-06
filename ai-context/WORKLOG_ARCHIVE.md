@@ -6,6 +6,163 @@
 Append-only внутри файла — порядок: новейшие архивированные сверху, старейшие снизу.
 Полная история до агрегации — в git.
 
+## 2026-05-05 (TikTok: только для мемов + compilation regex filter)
+
+После поднятия порогов владелец увидел что TikTok всё ещё ловит много мусора — категорийные подборки животных, мемов, дайджесты «top 10 funny dogs» и т.д. Проблема фундаментальная: хэштег-поиск на TikTok ищет КАТЕГОРИИ, не НАРРАТИВЫ. `#funnydogs` это reach-tag, его ставят на любое смешное видео с собакой; нет способа отличить «вот сейчас вирусный момент с собакой» от «очередной CompilationBros вкинул сборник 2026».
+
+**Решение в три шага** (выбрано из обсуждения с владельцем — он отверг переписывание хэштегов и cross-source narrative gate как «мультиплатформенность не работает»):
+
+1. **Compilation regex в `tiktok.js _normalize`** — отбрасывает видео с типичными маркерами подборки в caption'е:
+   ```
+   compilation, funniest, funny moments, cute moments, best of, 
+   top \d+, \d+ minutes/seconds of, weekly best, of the week, 
+   highlights of, memes #\d+, #\d+ в конце title
+   ```
+   Высокая precision, низкий recall — лучше пропустить пару подборок чем дропнуть legit narrative с фразой «top scorer» в названии. Дропает сразу после engagement-bar проверки, до всех expensive enrichment'ов.
+
+2. **TikTok = только для мемов** — добавил `enabled` поле в `sources.tiktok` schema (mirror'ит существующий pattern `sources.xtrends.enabled`). По дефолту TikTok включён ТОЛЬКО в `culture` пресете (мемы — единственная тематика где TikTok-нарративы органически возникают через format propagation, sound trends, brainrot virality). В general/animals/celebrities/events — `enabled=0`. Хэштеги в выключенных пресетах оставлены as-is для forward-compat (если владелец вернёт через админку).
+
+3. **Коллектор `collect()` rано выходит** если `_isEnabledForActivePreset()=false` с info-логом `[TikTok] disabled for active preset (sources.tiktok.enabled=0) — skipping cycle`. Никаких Apify-вызовов на выключенных пресетах.
+
+**Изменённые файлы**:
+- `src/collectors/tiktok.js` — `COMPILATION_RE`, `_isEnabledForActivePreset()`, ранний return в `collect()`
+- `src/analysis/preset-config.js` — `tiktok.enabled` schema field, defaults across 5 пресетов
+
+**Деплой + проверка**: первый цикл после деплоя — `[TikTok] disabled for active preset (sources.tiktok.enabled=0)` (текущий activePreset=general). Когда владелец переключит активный пресет на `culture` — TikTok снова заработает с meme-хэштегами + compilation filter'ом.
+
+**Эффект**:
+- На 4-х из 5 пресетов TikTok отключён — нулевой Apify-расход на TikTok пока активный пресет ≠ culture
+- На culture — пройдут только non-compilation видео по meme-хэштегам (regex отрезает ~30-40% подборок)
+- В сумме TikTok-доля в feed резко упадёт — но качество того что осталось будет выше (видео с реальным narrative arc)
+
+**Замечание про 30% feed share**: ранее была глобальная задача о распределении 30/30/30/10/10. После этого изменения TikTok будет давать ~30% feed только когда активный пресет = `culture`. На остальных пресетах TikTok-доля будет 0%. Это **сознательный trade-off** — лучше 0% качественного TikTok чем 30% мусорных подборок.
+
+**Что НЕ сделали** (из обсуждения):
+- Не переписывали хэштеги на event-driven (`viralmoment`, `caughtoncamera` и т.д.) — владелец предпочёл оставить текущие meme-хэштеги в culture как есть
+- Не сделали cross-source narrative gate (TikTok entity ∩ Twitter/Reddit entities) — owner deemed «multi-source mostly broken»
+- Не реализовали entity-driven TikTok search (как X-Trends) — это уровень 3, отложено до момента когда уровень 1 покажет потолок
+
+---
+
+## 2026-05-05 (TikTok pipeline-аудит: пороги ↑10×, новые хэштеги, audio-URL filter)
+
+С момента запуска проекта TikTok-настройки никто глубоко не пересматривал — тренды шли через копеечные пороги (50K plays / 1K likes / 200 shares / 40 viralScore = OR), и через generic-теги (`fyp/viral/trending` буквально весь TikTok). Владелец попросил пройтись и поднять пороги + взять свежие 2026-хэштеги через web-search Grok'а.
+
+**Новый floor в `tiktok.js _normalize` + `_clusterByHashtag`** (OR-логика, как в Twitter):
+- `plays ≥ 500 000`
+- ИЛИ `likes ≥ 20 000`
+- ИЛИ `shares ≥ 5 000`
+- ИЛИ `viralScore ≥ 60` (composite, ловит influencer-посты)
+
+Все volume-метрики (plays/likes/shares) скейлятся по CJK ×2 (ja/ko) или ×4 (zh). viralScore additive +10/+20. Все 4 порога подняты в ~10× от прежних значений (50K plays / 1K likes / 200 shares / 40 viralScore).
+
+**Новые хэштеги** (per-preset, через 2026 web-search Grok'а):
+- **animals**: `animalsoftiktok, petsoftiktok, funnydogs, funnycats, exoticpets, babyanimals, blackcatsoftiktok, catsoftiktok, doglovers, animalvideos, farmanimals, animalkingdom, puppylove, bunny, fosteringsaveslives` (15)
+- **culture**: `storytime, relatablememes, genzmemes, comedytok, tiktokhumor, pranktok, sketchcomedy, brainrotmemes, italianbrainrot, skit, relatable, genztrends` (12) — убраны generic `viral/fyp/trending`, добавлены формат-теги (storytime/comedytok/sketch) и текущий сленг (italianbrainrot — спайк late 2025 / early 2026)
+- **celebrities**: `kpopfyp, kpopdance, kpopedit, kpopstan, kpopfandom, fandomdrama, celebdrama, hollywooddrama, kpopnews, kpopidol, viraledit, kdrama` (12) — сильный сдвиг в K-pop экосистему (Grok сказал: kpopfyp/kpopdance/kpopedit доминируют 2026)
+- **events**: `weathertok, tornadotok, stormchasing, aitechnology, technews, sportshighlights, championsleague, nbaplayoffs, ucl, spaceexploration, sciencefacts, breakingweather` (12) — погодный TikTok сильно поднялся 2025-2026 (weathertok + stormchasing), плюс post-LLM news (aitechnology/technews)
+- **general**: `animalsoftiktok, petsoftiktok, funnydogs, storytime, relatablememes, brainrotmemes, kpopfyp, fandomdrama, celebdrama, weathertok, stormchasing, aitechnology` (12) — куратированный микс по 3 из каждой темы
+
+**Audio-URL filter** в `tiktok.js _firstNonAudioUrl` + url-resolver.js: первый цикл после деплоя выявил что для ~3/13 видео apidojo прокидывает не video-URL а music-track URL (`*-music*.tiktokcdn.com/*.mp3`) в fallback-полях. Mime-sniff guard в gemini-captioner это ловил постфактум (download впустую → buffer signature ID3 → отказ). Добавил early skip по regex (`/\/ies-music|-music[-.]|\.mp3(\?|$)/`) — теперь fallback chain пропускает audio-URL'ы и идёт на следующий кандидат, либо null → poster.
+
+**Деплой + первый цикл (с поднятыми порогами)**: TikTok собрал 13 items (vs 18-21 до), 8 из них успешно прокаптионены video в Gemini, остальные через постер. Volume стал ниже но качество значительно выше — все titles реально из тематических хэштегов (`#funnydogs #goldenretriever`, `#storytime #truestory`, `#funnydogs #dogcompilation`).
+
+**Глобальная задача (на потом)**: владелец хочет распределение feed'а ~30/30/30/10/10 (Reddit / Twitter / TikTok / X Trends / Google Trends). Сейчас распределение возникает естественно из объёмов сборки и качества — после поднятия порогов TikTok может стать недопредставлен. Если в течение нескольких дней реальная доля TikTok будет <20%, нужно будет добавить explicit per-source quota в `dashboard/server.js` `/api/trends` (взвешенный SELECT с лимитом per-source) ИЛИ снизить пороги. Решение по данным после ~24-48h наблюдения.
+
+**Риски/заметки**:
+- Новые хэштеги ещё не «обкатаны», некоторые (italianbrainrot, kpopstan) могут оказаться нишевыми. Если через сутки видим что они не дают трендов — заменим. Старые `viral/fyp/trending` оставлены ТОЛЬКО в дефолтах если кто-то восстановит из админки.
+- Cluster aggregator floor подкручен симметрично: если хэштег набрал >1 видео, их `sum(plays/likes/shares)` тоже должны пройти OR-floor. Это не отрезает trend'ы где одно сильное видео тянет — это только для ситуации когда никакое из видео в кластере не сильное по отдельности.
+
+---
+
+## 2026-05-05 (Stage 0: ffmpeg-trim длинных видео для всех источников)
+
+**Контекст**: владелец заметил несоответствие между поведением и промптом. Промпт Gemini'а уже говорит «focus on FIRST 30 SECONDS only», но в коде была `if (duration > 30s) → throw away video, use poster`. Получалось что ~30% TikTok-роликов (которые длиннее 30s) теряли video-сигнал и шли через постер. Промпт намекал на трим, но реализован он не был.
+
+**Что сделал** (применимо к ВСЕМ источникам видео — Twitter / Reddit / TikTok / X Trends / manual analysis):
+
+- **`src/analysis/gemini-captioner.js` `_trimVideoToBuffer(url, maxSec)`** — новый helper, использует `ffmpeg -c copy` (stream copy, без re-encode) чтобы вырезать первые `maxSec` секунд в tmp-файл, читает обратно как Buffer, затем удаляет tmp. Стоимость: 50-300ms на ролик, 0% CPU-перерасхода (нет декодирования/кодирования). Adds `-user_agent` + `-referer` (для TikTok-CDN) автоматически.
+- **`_tryGoogleMedia`** расширен опциональным `prefetched` параметром — когда передаём готовый Buffer, метод skip'ает HEAD+download и идёт сразу к sniff+send. Это позволило переиспользовать всю валидацию + Google API call для trimmed-видео, без дублирования кода.
+- **`captionTrend` `tooLong` ветка** теперь сначала пытается ffmpeg-trim → если получили валидный buffer → шлём в Gemini как обычное короткое видео. Постер используется ТОЛЬКО если trim упал (network / codec mismatch / corrupt source) ИЛИ Google вернул ошибку.
+- Новый флаг `videoClipped: true` в результате (отличается от `videoTruncated`). Когда trim удался — `mediaType='video'`, `videoTruncated=false`, `videoClipped=true`. Когда упал на постер — `mediaType='image'`, `videoTruncated=true` (старое поведение).
+- **Admin UI**: badge в Gemini-карточке Stage 0 показывает «обрезано до первых 30s» когда `videoClipped=true`, или «видео > 30s, использован poster» когда упал на постер. Отдельные states видны явно.
+
+**Деплой + проверка**: первый scan-cycle после правки на TikTok'ах: 21 item → 12 успешных video-caption (включая `[GeminiCaptioner] video 38.8s > 30s, trimming to first 30s` → `google video caption in 3504ms (0.56MB)` — 38s ролик был обрезан, попал в Gemini, прокаптионен). Постер-fallback больше не используется для длинных TikTok'ов.
+
+**Риски/заметки**:
+- ffmpeg `-c copy` требует чтобы первый keyframe был в начале потока. Для TikTok mp4 / Twitter mp4 / Reddit mp4 это всегда так. Если попадётся источник с keyframe не в начале — может получиться fragment с pre-roll до первого keyframe. Gemini это переживает (он смотрит видео с начала).
+- `-movflags +faststart` требует двух проходов (write packets, then move moov atom to start). На tmp-файле это работает, на pipe — нет. Поэтому tmp-file подход.
+- Стоимость в Gemini-токенах увеличивается: длинные видео раньше шли как один image-frame (~700 input tokens), теперь как 30s native video (~5K-10K input tokens). На батч в 16 трендов прирост ~50K input tokens = ~$0.0025 (gemini-2.5-flash $0.075/1M). Пренебрежимо.
+- Tmp-файлы пишутся в `os.tmpdir()` (`/tmp` в docker), удаляются после чтения. Если контейнер крашится во время trim — orphan-файлы могут накопиться, но `/tmp` чистится при рестарте.
+- Если ffmpeg отсутствует (на хост-системе вне docker'а где `RUN apk add ffmpeg`) — trim тихо падает, fallback на постер. Никогда не throw'ится.
+
+---
+
+## 2026-05-05 (TikTok: apidojo schema mapping fix — реальная схема ≠ research)
+
+После approve apidojo и fallback'а на `APIFY_API` владелец продолжал получать `Gemini (image)` (или вообще без Gemini-секции, `gemini=0/1`). Подсказка от владельца «была такая ошибка с Twitter, но проблема была у нас» оказалась золотой — bug был в нормализаторе.
+
+**Проблема**: Я писал mapper на основе research-агента, а тот выдал устаревшую/неточную информацию. Реальная схема apidojo (проверена `curl`'ом по живому actor'у):
+
+```
+{ id, title (caption + hashtags), views, likes, comments, shares,
+  channel: { username, followers, ... },
+  uploadedAt (UNIX seconds),
+  video: { url (CDN mp4, ~6h TTL), cover, thumbnail, duration, ... },
+  hashtags: ["bare","strings","without","#"] }
+```
+
+Мой код искал `playCount` / `diggCount` / `commentCount` / `shareCount` (это clockworks-style), `authorMeta.name` / `authorUsername` (тоже не apidojo), `originCoverUrl` / `videoUrlNoWaterMark` (нет таких полей). Поэтому:
+- `videoUrl = null` (искал на топ-уровне, реально лежит в `video.url`)
+- `thumbnailUrl = null` (искал на топ-уровне, реально в `video.cover` / `video.thumbnail`)
+- engagement = 0 (искал `*Count`-варианты, реально голые `views/likes/comments/shares`)
+
+→ Gemini-captioner раннее выходил на `if (!isVideo && !posterUrl) return null` (тихо, без ошибок в логах).
+
+**Что починил**:
+- **`src/collectors/tiktok.js` `_normalize`** — расширил все fallback цепочки реальными apidojo-полями (`video.likes`, `video.comments`, `video.shares`, `channel.username`, `channel.followers`, `video.video?.url`, `video.video?.cover/thumbnail`, `video.uploadedAt`, `video.title` для caption). Cyle collector теперь даёт scorer'у `videoUrl` + `thumbnailUrl` + полный engagement.
+- **`src/analysis/url-resolver.js` `_resolveTiktokViaApidojo`** — те же правки в manual-analysis path. Теперь все 3 surfaces ручного анализа (admin/dashboard/TG) получают видео в Gemini.
+
+**Деплой + проверка**: первый scan-cycle после правки — `[PreStage] 16 trends in 20951ms (nano=16/16, gemini=11/16)`, 11 TikTok-видео нативно прокаптионены через Gemini (`google video caption in 4524ms (0.69MB)` и подобные). 5 видео упали на постер из-за `STAGE0_VIDEO_MAX_SEC=30` cap'а — нормальное поведение для роликов >30s.
+
+**Урок**: при добавлении нового Apify-actor'а ВСЕГДА сначала вызывать его руками и логировать первый item, чтобы увидеть точную схему. Research-агенты дают приближённую картину, реальные поля могут отличаться. Теперь в `tiktok.js` для apidojo комментарий с реальной схемой — будущий refactorer не наступит на те же грабли.
+
+---
+
+## 2026-05-05 (TikTok: apidojo full-permission approve + url-resolver fallback на APIFY_API)
+
+После предыдущего деплоя apidojo cycle-collector начал получать 403 `full-permission-actor-not-approved` от Apify. Третий-party actor (`apidojo/tiktok-scraper`) требует **одноразового approve** в Apify Console — security-фича Apify, актёр получает full-account-access и должен быть явно разрешён.
+
+**Что сделал**:
+
+- **Просил владельца**: открыть `https://console.apify.com/actors/<actorId>?approvePermissions=true` и нажать «Approve permissions». После этого 403 пропал в течение секунд (без рестарта). Это **навсегда per Apify-аккаунт** — больше не понадобится.
+- **`src/analysis/url-resolver.js`** `resolveTiktokUrl`: расширил token-fallback для apidojo Apify-вызова. Раньше требовал именно `APIFY_API_APIDOJO`, теперь fallback chain: `APIFY_API_APIDOJO || APIFY_API`. Это match'ит логику коллектора (`tiktok.js _activeActor`), где один общий ключ `APIFY_API` работает для всех актёров если у юзера один Apify-аккаунт. До фикса ручной анализ TikTok всегда сваливался на oEmbed (без видео в Gemini), даже если cycle-collector использовал apidojo нормально.
+
+**Деплой**: `deploy.ps1`. После рестарта первый scan-cycle: `[TikTok] Collected 2 items`, никаких 403, в том же цикле Gemini успешно прокаптионил video caption 8.96MB нативно через `gemini-2.5-flash`.
+
+**Ловушка для будущих third-party Apify-актёров**: некоторые actor'ы (особенно с `full-permission-actor-not-approved` в манифесте) требуют ручного approve в Apify Console. Симптом — 403 со специфичным error type'ом + `approvalUrl` в payload. Деплоить новые actor'ы в продакшен — сначала жмём approval URL для всех Apify-аккаунтов, чьи токены поедут в `.env`.
+
+---
+
+## 2026-05-05 (TikTok: ручной анализ теперь идёт через apidojo, не oEmbed)
+
+**Контекст**: после деплоя Referer-фикса владелец прислал скриншоты — оба ручных анализа TikTok-ссылок показали `Gemini (image)` вместо video. Причина оказалась не в Gemini-captioner и не в коллекторе: `resolveTiktokUrl()` (используемый всеми тремя surfaces ручного анализа — админка, дашборд, TG-бот) ходит через **TikTok oEmbed API**, который возвращает только title + автора + thumbnail. Ни engagement, ни videoUrl. Поэтому переключение `tiktokActor` в админке (между clockworks/apidojo) на ручной анализ не влияет — он actorless.
+
+**Что сделал**: расширил `resolveTiktokUrl(url)` в `src/analysis/url-resolver.js` двумя tier'ами:
+
+1. **Primary (apidojo)**: если `process.env.APIFY_API_APIDOJO` установлен — вызываю apidojo Apify-актёр напрямую с `startUrls: [{url}]`, `maxItems: 1`. Получаю полный payload с engagement (plays/likes/comments/shares/followers) + `videoUrlNoWaterMark/videoUrl`. Нормализую той же fallback-цепочкой что и `tiktok.js _normalize` (DRY-shape с pipeline-collector'ом). Стоимость одного manual-анализа ~$0.0003.
+
+2. **Fallback (oEmbed)**: если apidojo-токен отсутствует ИЛИ actor падает (network/timeout/empty result) — soft-fallback на старый oEmbed-путь. Бесплатно, только title+thumb (текущее поведение). Manual analysis никогда не hard-fail'ит из-за apidojo.
+
+Все три surfaces (admin SubmitPage, dashboard AnalyzePanel, TG `/analyze` + URL-paste) идут через `runManualAnalysis()` → `resolveUrlToTrend()` → `resolveTiktokUrl()` — поэтому фикс одновременно покрывает все три точки входа без отдельных правок.
+
+**Активация**: владельцу нужно положить `APIFY_API_APIDOJO=...` в `/opt/catalyst/.env` на проде + рестартануть контейнер. Сейчас ключа нет — manual analysis продолжает идти через oEmbed (graceful fallback).
+
+**Риски/заметки**:
+- apidojo считает manual-анализ как 1 item ($0.30/1K), это $0.0003 на запрос — пренебрежимо. Cross-user 1h cache в `manual-analysis.js` дополнительно режет дубли.
+- Если apidojo вернёт не TikTok-видео а похожий пост (например ad/livestream), поля могут быть пустыми — fallback работает корректно (return null → catch → oEmbed).
+- `videoUrlNoWaterMark` может отсутствовать у некоторых видео; используется обычный `videoUrl` с вотермаркой — Gemini-captioner всё равно нормально читает.
+
 ---
 ## 2026-05-05 (TikTok: видео apidojo доезжают до Gemini нативно — fix Referer)
 

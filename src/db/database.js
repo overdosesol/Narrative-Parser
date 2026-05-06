@@ -157,6 +157,30 @@ class TrendDatabase {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_hidden_trends_chat ON hidden_trends(chat_id)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_hidden_trends_at   ON hidden_trends(hidden_at)`);
 
+    // Per-user favourites. Pro/Admin save trends here for *permanent* recall.
+    // Two-source-of-truth design (resilient to trends-table cleanup):
+    //   - `trend_id` references the live trend (preferred for fresh metrics)
+    //   - `snapshot` is a frozen JSON copy at save-time (title/source/url/
+    //     image/score/raw_metrics/etc) — fallback when the live row is gone.
+    // Render-time logic (dashboard server): try live trend by id; if NULL,
+    // deserialize snapshot. Either way the user sees the post they saved
+    // months/years ago, even after retention has rotated it from `trends`.
+    // No FK CASCADE: we want the favourite to outlive the trend row.
+    // Optional free-form `note` (cap 500 chars, enforced app-side).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS user_favorites (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id     TEXT NOT NULL,
+        trend_id    INTEGER NOT NULL,
+        note        TEXT,
+        snapshot    TEXT,
+        created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(chat_id, trend_id)
+      )
+    `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_user_favorites_chat ON user_favorites(chat_id, created_at DESC)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_user_favorites_trend ON user_favorites(trend_id)`);
+
     // Support-bot ticket threads. Each row maps a user's private chat with
     // the support bot to a forum topic in the admin group. Two-way relay:
     //   user → topic    : src/support/bot.js looks up by chat_id
@@ -392,11 +416,17 @@ class TrendDatabase {
       ).run();
     } catch (e) { /* best-effort */ }
 
-    // Plan normalization (v3 pricing/policy)
+    // Plan normalization (v4 pricing/policy 2026-05-06):
+    //   - alert_limit kept at -1 (unlimited) for all plans — alerts are
+    //     marketing, not cost. Daily-cap gate removed in alert-dispatcher.
+    //   - sources column expanded to include x_trends (5th source) for
+    //     test/pro/admin. Free stays locked to reddit + google_trends.
+    //   - Premium feature caps (manual analyze, catalyst forecast) enforced
+    //     in src/billing/entitlements.js — sources column matches it.
     const normalizePlans = this.db.transaction(() => {
       this.db.prepare(`
         INSERT INTO plans (name, price_usd, sources, alert_limit, history_days, api_access, description)
-        VALUES ('free', 0, 'reddit,google_trends', -1, 3, 0, 'Free tier - unlimited alerts')
+        VALUES ('free', 0, 'reddit,google_trends', -1, 3, 0, 'Free - Reddit + Google Trends, unlimited alerts')
         ON CONFLICT(name) DO UPDATE SET
           price_usd=excluded.price_usd,
           sources=excluded.sources,
@@ -408,7 +438,7 @@ class TrendDatabase {
 
       this.db.prepare(`
         INSERT INTO plans (name, price_usd, sources, alert_limit, history_days, api_access, description)
-        VALUES ('test', 5, 'reddit,google_trends,twitter,tiktok', -1, 1, 0, 'Test plan - one-time, 1 day, all sources, no X analysis')
+        VALUES ('test', 5, 'reddit,google_trends,twitter,tiktok,x_trends', -1, 1, 0, 'Test - 1 day, all 5 sources, premium features with daily caps')
         ON CONFLICT(name) DO UPDATE SET
           price_usd=excluded.price_usd,
           sources=excluded.sources,
@@ -420,7 +450,7 @@ class TrendDatabase {
 
       this.db.prepare(`
         INSERT INTO plans (name, price_usd, sources, alert_limit, history_days, api_access, description)
-        VALUES ('pro', 100, 'reddit,google_trends,twitter,tiktok', -1, 30, 1, 'Pro - 30 days, unlimited alerts, all sources')
+        VALUES ('pro', 100, 'reddit,google_trends,twitter,tiktok,x_trends', -1, 30, 1, 'Pro - 30 days, all 5 sources, premium features (high anti-spam caps)')
         ON CONFLICT(name) DO UPDATE SET
           price_usd=excluded.price_usd,
           sources=excluded.sources,
@@ -432,7 +462,7 @@ class TrendDatabase {
 
       this.db.prepare(`
         INSERT INTO plans (name, price_usd, sources, alert_limit, history_days, api_access, description)
-        VALUES ('admin', 0, 'reddit,google_trends,twitter,tiktok', -1, -1, 1, 'Admin plan - unlimited everything')
+        VALUES ('admin', 0, 'reddit,google_trends,twitter,tiktok,x_trends', -1, -1, 1, 'Admin - unlimited everything')
         ON CONFLICT(name) DO UPDATE SET
           price_usd=excluded.price_usd,
           sources=excluded.sources,
@@ -1068,6 +1098,114 @@ class TrendDatabase {
     const cutoff = new Date(Date.now() - retentionDays * 86400_000).toISOString();
     return this.db.prepare(`DELETE FROM hidden_trends WHERE hidden_at < ?`)
       .run(cutoff).changes;
+  }
+
+  // ── User favorites (Pro/Admin permanent saves) ───────────────────────────
+  // Same chat_id-keyed shape as hidden_trends, but stored permanently — no
+  // retention sweep. Snapshot is the entire trend row at save-time, so the
+  // favourite survives even if the live trend rotates out of `trends`.
+  // Note field is optional free-form (cap enforced app-side, default 500
+  // chars). Plan-gate is enforced by the dashboard server.
+
+  /** Build the snapshot JSON for a trend row. Captures everything the feed-
+   *  card and modal need to render: title, source, url, image, score, raw
+   *  metrics blob (memePotential, virality, narrativePhase, alertScore, all
+   *  the AI fields), category, alert_type, first_seen_at. Skips heavy
+   *  derived fields that can be re-computed from raw_metrics. */
+  _trendSnapshot(trend) {
+    if (!trend) return null;
+    const fields = [
+      'id', 'title', 'description', 'source', 'url',
+      'image_url', 'image_urls', 'category', 'sentiment',
+      'score', 'raw_metrics', 'first_seen_at', 'last_seen_at',
+      'alert_type', 'whyNow', 'why_now',
+      'trigger_text', 'trigger_phase', 'trigger_window',
+      'trigger_drivers', 'trigger_risks', 'trigger_sources', 'trigger_confidence',
+      'tg_message_id', 'tg_message_url', 'manual',
+      // External fields the bot writers may have added
+      'externalId', 'external_id', 'author',
+    ];
+    const out = {};
+    for (const k of fields) {
+      if (trend[k] !== undefined) out[k] = trend[k];
+    }
+    out._snapshotAt = new Date().toISOString();
+    return JSON.stringify(out);
+  }
+
+  addFavorite(chatId, trendId, note = null) {
+    if (!chatId || !trendId) return;
+    // Snapshot the trend at save-time. If the trend is gone right now, we
+    // store NULL snapshot (rare race: the user clicked save just as the
+    // trend rolled out). The render path tolerates that.
+    const trend = this.getTrendById ? this.getTrendById(trendId) : null;
+    const snapshot = this._trendSnapshot(trend);
+    this.db.prepare(`
+      INSERT INTO user_favorites (chat_id, trend_id, note, snapshot, created_at)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(chat_id, trend_id) DO UPDATE SET
+        note = excluded.note,
+        snapshot = COALESCE(excluded.snapshot, user_favorites.snapshot)
+    `).run(String(chatId), trendId, note, snapshot);
+  }
+
+  removeFavorite(chatId, trendId) {
+    if (!chatId || !trendId) return 0;
+    return this.db.prepare(
+      `DELETE FROM user_favorites WHERE chat_id = ? AND trend_id = ?`
+    ).run(String(chatId), trendId).changes;
+  }
+
+  setFavoriteNote(chatId, trendId, note) {
+    if (!chatId || !trendId) return 0;
+    return this.db.prepare(
+      `UPDATE user_favorites SET note = ? WHERE chat_id = ? AND trend_id = ?`
+    ).run(note, String(chatId), trendId).changes;
+  }
+
+  /** Returns trend_ids favorited by this user. Pre-fetched once per feed
+   *  request and passed to _formatTrend so each row gets isFavorite. */
+  getFavoriteTrendIds(chatId) {
+    if (!chatId) return [];
+    return this.db.prepare(
+      `SELECT trend_id FROM user_favorites WHERE chat_id = ?`
+    ).all(String(chatId)).map(r => r.trend_id);
+  }
+
+  /** Note + created_at for one trend (used to populate the modal note editor). */
+  getFavoriteMeta(chatId, trendId) {
+    if (!chatId || !trendId) return null;
+    return this.db.prepare(
+      `SELECT note, created_at FROM user_favorites WHERE chat_id = ? AND trend_id = ?`
+    ).get(String(chatId), trendId) || null;
+  }
+
+  /** Favourites list for /api/favorites. LEFT JOIN with trends so we get
+   *  fresh data when the trend is alive, else snapshot fallback. Caller
+   *  (dashboard server) merges fresh+snapshot before shaping the card. */
+  getFavoritesByChat(chatId, limit = 500) {
+    if (!chatId) return [];
+    return this.db.prepare(`
+      SELECT
+        f.trend_id    as fav_trend_id,
+        f.note        as fav_note,
+        f.snapshot    as fav_snapshot,
+        f.created_at  as fav_saved_at,
+        t.*
+      FROM user_favorites f
+      LEFT JOIN trends t ON t.id = f.trend_id
+      WHERE f.chat_id = ?
+      ORDER BY f.created_at DESC
+      LIMIT ?
+    `).all(String(chatId), limit);
+  }
+
+  countFavoritesByChat(chatId) {
+    if (!chatId) return 0;
+    const row = this.db.prepare(
+      `SELECT COUNT(*) as c FROM user_favorites WHERE chat_id = ?`
+    ).get(String(chatId));
+    return row?.c || 0;
   }
 
   // ── Support threads (forum-topic relay) ──────────────────────────────────────

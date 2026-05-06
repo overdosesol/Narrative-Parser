@@ -8,6 +8,7 @@ import { getTranslations } from '../i18n/index.js';
 import { normalizeLifespan } from '../analysis/lifespan.js';
 import TwitterChecker from '../collectors/twitter-check.js';
 import { UserRateLimiter } from '../utils/rate-limiter.js';
+import { getPlanEntitlements, shouldShowUsageCounter } from '../billing/entitlements.js';
 
 // PII masking for log lines (last 4 chars of identifier). See dashboard
 // server.js for rationale - long-term stdout shouldn't keep full chat_ids.
@@ -58,9 +59,11 @@ class TelegramNotifier {
     // State: users awaiting a text input (e.g. custom threshold)
     // Map<chatId, { type: 'threshold' }>
     this._awaitingInput = new Map();
-    // Manual analysis cooldown - Map<chatId, number[]> of timestamps within
-    // the rolling window. Reset on restart (in-memory only).
+    // Manual analysis & Catalyst-forecast rate-limit rings. Map<chatId,
+    // number[]> — timestamps within the rolling 24h window. Reset on restart
+    // (in-memory only — soft cap, not a security boundary).
     this._manualAnalysisHits = new Map();
+    this._catalystHits       = new Map();
 
     if (!this.botToken) {
       this.logger.warn('Telegram bot token not set - Telegram alerts disabled');
@@ -91,10 +94,11 @@ class TelegramNotifier {
   _registerBotCommands() {
     // English (default for all languages)
     const enCommands = [
-      { command: 'start',   description: 'Start the bot / register' },
-      { command: 'menu',    description: 'Open settings menu' },
-      { command: 'top',     description: 'Top-10 memecoin narratives (24h)' },
-      { command: 'analyze', description: 'Analyze a URL (Pro / Admin)' },
+      { command: 'start',     description: 'Start the bot / register' },
+      { command: 'menu',      description: 'Open settings menu' },
+      { command: 'dashboard', description: 'Open the web dashboard' },
+      { command: 'top',       description: 'Top-10 memecoin narratives (24h)' },
+      { command: 'analyze',   description: 'Analyze a URL (Pro / Admin)' },
     ];
 
     // Keep command descriptions in English for all locales
@@ -170,6 +174,23 @@ class TelegramNotifier {
       });
     });
 
+    // /dashboard - send the web-dashboard URL with a clickable button. URL
+    // comes from PUBLIC_BASE_URL (set in production .env) with a hardcoded
+    // fallback so it still works in dev or if the env var is missing.
+    this.bot.onText(/^\/dashboard/, (msg) => {
+      const chatId = msg.chat.id;
+      const user = this.db.getOrCreateUser(chatId, msg.from?.username);
+      const t = getTranslations(user.language);
+      const url = process.env.PUBLIC_BASE_URL || 'https://catalystparser.io';
+
+      this.bot.sendMessage(chatId, t.dashboardPrompt(url), {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[{ text: t.btnDashboard, url }]],
+        },
+      });
+    });
+
     // /analyze <url> - pro/admin only. Resolves the URL, runs the full
     // scorer pipeline, and replies with a regular alert message (same
     // rendering as autonomous alerts). Bare URLs from the same plans are
@@ -228,9 +249,10 @@ class TelegramNotifier {
       const m = text.match(/(https?:\/\/\S+)/i);
       if (!m) return;
       const user = this.db.getOrCreateUser(msg.chat.id, msg.from?.username);
-      // Plan gate - silently ignore for free/test (no spam). Pro/admin get
-      // automatic analysis on bare URL paste; that's the whole feature.
-      if (user.plan_name !== 'pro' && user.plan_name !== 'admin') return;
+      // Plan gate - silently ignore for free (no spam). Test/pro/admin get
+      // automatic analysis on bare URL paste; daily caps applied downstream
+      // in _runManualAnalysisForUser.
+      if (getPlanEntitlements(user.plan_name).manualAnalyze === 0) return;
       this._runManualAnalysisForUser(msg, user, m[1]).catch(e =>
         this.logger.warn(`[Manual TG bare-url] ${e.message}`)
       );
@@ -360,6 +382,20 @@ class TelegramNotifier {
         }
         else if (data.startsWith('toggle_source:')) {
           const sourceName = data.split(':')[1];
+          // Defence-in-depth: server-side check that the user actually has
+          // this source in their plan. The keyboard already filters them
+          // (locked sources emit 'source_locked:' instead), but this guard
+          // protects against stale message buttons from before a plan
+          // downgrade.
+          const planSources = getPlanEntitlements(user.plan_name).sources;
+          if (!planSources.includes(sourceName)) {
+            const txt = user.language === 'ru'
+              ? '🔒 Этот источник доступен на Test и Pro планах.'
+              : '🔒 This source is available on Test/Pro plans.';
+            await this.bot.answerCallbackQuery(query.id, { text: txt, show_alert: true });
+            return;
+          }
+
           let disabled = JSON.parse(user.disabled_sources || '[]');
 
           if (disabled.includes(sourceName)) {
@@ -375,6 +411,13 @@ class TelegramNotifier {
           const displayName = t.sourceNames[sourceName] || sourceName;
           await this.bot.answerCallbackQuery(query.id, { text: t.sourceToggled(displayName, isEnabled) });
           await this._editMessage(chatId, query.message.message_id, t.sourcesTitle, this._sourcesKeyboard(user));
+        }
+        else if (data.startsWith('source_locked:')) {
+          // Free user clicked a 🔒 source. Show upgrade hint, no state change.
+          const txt = user.language === 'ru'
+            ? '🔒 Этот источник доступен на Test и Pro планах. Открой /menu → Подписка чтобы апгрейднуть.'
+            : '🔒 This source is available on Test/Pro plans. Open /menu → Subscription to upgrade.';
+          await this.bot.answerCallbackQuery(query.id, { text: txt, show_alert: true });
         }
 
         // ── Alert types ───────────────────────
@@ -519,15 +562,16 @@ class TelegramNotifier {
         // ── Trigger search (on-demand Grok reasoning) ────────────────────
         else if (data === 'trigger_locked') {
           await this.bot.answerCallbackQuery(query.id, {
-            text: t.triggerLocked || 'Trigger search is for Pro plan',
+            text: t.triggerLocked || 'Catalyst forecast is for Test/Pro plan',
             show_alert: true,
           });
         }
         else if (data.startsWith('trigger:')) {
-          // Plan gate - pro and admin only
-          if (user.plan_name !== 'pro' && user.plan_name !== 'admin') {
+          // Plan gate — free is hard-locked. Test/pro/admin pass; daily caps
+          // applied per plan in _handleTriggerSearch.
+          if (user.plan_name === 'free') {
             await this.bot.answerCallbackQuery(query.id, {
-              text: t.triggerLocked || 'Trigger search is for Pro plan',
+              text: t.triggerLocked || 'Catalyst forecast is for Test/Pro plan',
               show_alert: true,
             });
             return;
@@ -661,9 +705,11 @@ class TelegramNotifier {
 
   _startKeyboard(user) {
     const t = getTranslations(user.language);
+    const dashboardUrl = process.env.PUBLIC_BASE_URL || 'https://catalystparser.io';
     return {
       inline_keyboard: [
-        [{ text: t.btnOpenMenu || '⚙️ Open Menu', callback_data: 'menu' }],
+        [{ text: t.btnOpenMenu  || '⚙️ Open Menu',     callback_data: 'menu' }],
+        [{ text: t.btnDashboard || '\u{1F310} Open Dashboard', url: dashboardUrl }],
       ],
     };
   }
@@ -680,6 +726,7 @@ class TelegramNotifier {
     const languageBadge   = t.badgeLanguage   ? t.badgeLanguage(user.language || 'en') : '';
     const alertTypesList  = (this.db?.getUserAlertTypes ? this.db.getUserAlertTypes(user.telegram_chat_id) : []) || [];
     const alertTypesBadge = t.badgeAlertTypes ? t.badgeAlertTypes(alertTypesList.length, 3) : '';
+    const dashboardUrl    = process.env.PUBLIC_BASE_URL || 'https://catalystparser.io';
 
     return {
       inline_keyboard: [
@@ -695,6 +742,7 @@ class TelegramNotifier {
           { text: t.btnTop,          callback_data: 'top'          },
           { text: t.btnSubscription, callback_data: 'subscription' },
         ],
+        [{ text: t.btnDashboard || '\u{1F310} Open Dashboard', url: dashboardUrl }],
         [{ text: t.btnStartStop(user.status === 'paused'), callback_data: 'toggle_pause' }],
         [{ text: t.btnAskQuestion || '💬 Ask a question', url: this._supportUrl() }],
         [{ text: t.btnClose, callback_data: 'close' }],
@@ -731,11 +779,19 @@ class TelegramNotifier {
     const t = getTranslations(user.language);
     const disabled = JSON.parse(user.disabled_sources || '[]');
     const allSources = ['reddit', 'google_trends', 'twitter', 'tiktok', 'x_trends'];
+    // Plan-allowed sources: free is locked to reddit + google_trends.
+    // Premium sources show a 🔒 instead of ✅/❌, and clicking them shows
+    // an "upgrade" toast instead of toggling on/off.
+    const planSources = getPlanEntitlements(user.plan_name).sources;
 
     const buttons = allSources.map(src => {
+      const inPlan = planSources.includes(src);
+      const name = t.sourceNames[src] || src;
+      if (!inPlan) {
+        return [{ text: `\u{1F512} ${name}`, callback_data: `source_locked:${src}` }];
+      }
       const enabled = !disabled.includes(src);
       const icon = enabled ? '\u{2705}' : '\u{274C}';
-      const name = t.sourceNames[src] || src;
       return [{ text: `${icon} ${name}`, callback_data: `toggle_source:${src}` }];
     });
 
@@ -969,10 +1025,12 @@ class TelegramNotifier {
   async _runManualAnalysisForUser(msg, user, url) {
     const chatId = String(msg.chat.id);
 
-    if (user.plan_name !== 'pro' && user.plan_name !== 'admin') {
+    const ent = getPlanEntitlements(user.plan_name);
+    // Plan gate — free is hard-locked. Test/pro/admin pass; daily cap below.
+    if (ent.manualAnalyze === 0) {
       const txt = user.language === 'ru'
-        ? '🔒 Ручной анализ доступен только Pro и Admin. Открой /menu чтобы апгрейднуть план.'
-        : '🔒 Manual analysis is a Pro / Admin feature. Use /menu to upgrade.';
+        ? '🔒 Ручной анализ доступен на Test и Pro планах. Открой /menu чтобы апгрейднуть.'
+        : '🔒 Manual analysis is a Test/Pro feature. Use /menu to upgrade.';
       return this.bot.sendMessage(chatId, txt).catch(() => {});
     }
     if (!this.scorer) {
@@ -982,12 +1040,13 @@ class TelegramNotifier {
     // Rate limit only when scorer will actually run. Cache hits are free
     // and instant - letting them bypass means a pro user can re-paste a
     // URL someone else just analysed without burning their daily quota.
+    // 30s cooldown stays for everyone except admin (anti-dupe protection).
     const cacheAge = peekManualAnalysisCache(url);
-    if (cacheAge === null && user.plan_name !== 'admin') {
+    if (cacheAge === null && ent.manualAnalyze > 0) {
       const now = Date.now();
       const dayMs = 24 * 60 * 60 * 1000;
       const cooldownMs = 30 * 1000;
-      const dailyCap = 20;
+      const dailyCap = ent.manualAnalyze;
       const hits = (this._manualAnalysisHits.get(chatId) || []).filter(t => now - t < dayMs);
       if (hits.length && now - hits[hits.length - 1] < cooldownMs) {
         const sec = Math.max(1, Math.ceil((cooldownMs - (now - hits[hits.length - 1])) / 1000));
@@ -1042,6 +1101,17 @@ class TelegramNotifier {
       if (!sent) {
         const txt = user.language === 'ru' ? '⚠ Не удалось отправить результат.' : '⚠ Failed to deliver the result.';
         await this.bot.sendMessage(chatId, txt).catch(() => {});
+      }
+      // Test-plan usage counter — sent as a separate small message so the
+      // user sees daily-cap remaining without us editing the alert template.
+      // Skipped on cache hits (no slot consumed) and for pro/admin/free.
+      if (!result.fromCache && shouldShowUsageCounter(user.plan_name) && ent.manualAnalyze > 0) {
+        const used = (this._manualAnalysisHits.get(chatId) || []).length;
+        const left = Math.max(0, ent.manualAnalyze - used);
+        const counterText = user.language === 'ru'
+          ? `📊 ${used}/${ent.manualAnalyze} использовано сегодня (осталось ${left})`
+          : `📊 ${used}/${ent.manualAnalyze} used today (${left} left)`;
+        await this.bot.sendMessage(chatId, counterText).catch(() => {});
       }
     } catch (err) {
       if (waitMsgId) {
@@ -1259,10 +1329,11 @@ class TelegramNotifier {
     const xText = isLocked ? (t.xAnalysisLockedBtn || '\u{1F512} X Analysis') : t.xAnalysisBtn;
     const xData = isLocked ? 'x_locked' : `x_analysis:${dbId}`;
 
-    // Trigger button - three states reflect plan + cache
-    const isPro = plan === 'pro' || plan === 'admin';
+    // Trigger button — locked for free, available on test/pro/admin
+    // (daily caps applied server-side in _handleTriggerSearch).
+    const catalystEnabled = plan && plan !== 'free';
     let triggerText, triggerData;
-    if (!isPro) {
+    if (!catalystEnabled) {
       triggerText = t.triggerLockedBtn || '\u{1F512} Trigger';
       triggerData = 'trigger_locked';
     } else {
@@ -1620,21 +1691,23 @@ class TelegramNotifier {
       return;
     }
 
-    // ── Step 2: cooldown (15min, admin bypass) ────────────────────────────
-    const COOLDOWN_MS = 15 * 60 * 1000;
-    if (user.plan_name !== 'admin') {
-      const lastAt = this.db.getLastTriggerSearchByUser(String(chatId));
-      if (lastAt) {
-        const elapsedMs = Date.now() - new Date(lastAt + 'Z').getTime();
-        if (elapsedMs < COOLDOWN_MS) {
-          const minLeft = Math.max(1, Math.ceil((COOLDOWN_MS - elapsedMs) / 60000));
-          await this.bot.answerCallbackQuery(cbId, {
-            text: t.triggerCooldown(minLeft),
-            show_alert: true,
-          }).catch(() => {});
-          return;
-        }
+    // ── Step 2: daily cap (per-plan, in-memory). Admin bypass. ────────────
+    // Replaces the old 15-min cooldown — Catalyst is cheap (~$0.05/call), so
+    // daily caps (test=5/day, pro=100/day) are enough anti-spam protection.
+    const ent = getPlanEntitlements(user.plan_name);
+    if (ent.catalyst > 0) {
+      const now = Date.now();
+      const dayMs = 24 * 60 * 60 * 1000;
+      const hits = (this._catalystHits.get(String(chatId)) || []).filter(t => now - t < dayMs);
+      if (hits.length >= ent.catalyst) {
+        const txt = user.language === 'ru'
+          ? `⛔ Дневной лимит Catalyst исчерпан (${ent.catalyst}/24ч).`
+          : `⛔ Daily Catalyst limit reached (${ent.catalyst} / 24h).`;
+        await this.bot.answerCallbackQuery(cbId, { text: txt, show_alert: true }).catch(() => {});
+        return;
       }
+      hits.push(now);
+      this._catalystHits.set(String(chatId), hits);
     }
 
     // ── Step 3: claim the lock atomically ─────────────────────────────────
@@ -1693,6 +1766,18 @@ class TelegramNotifier {
         reply_to_message_id: messageId,
         disable_web_page_preview: true,
       });
+
+      // Test-plan usage counter — small follow-up message with daily-cap
+      // remaining. Skipped for pro/admin/free (free can't reach this code
+      // path; pro's cap is huge so counter would be noise).
+      if (shouldShowUsageCounter(user.plan_name) && ent.catalyst > 0) {
+        const used = (this._catalystHits.get(String(chatId)) || []).length;
+        const left = Math.max(0, ent.catalyst - used);
+        const counterText = user.language === 'ru'
+          ? `📊 ${used}/${ent.catalyst} Каталистов сегодня (осталось ${left})`
+          : `📊 ${used}/${ent.catalyst} Catalyst calls today (${left} left)`;
+        await this.bot.sendMessage(chatId, counterText).catch(() => {});
+      }
 
       // Update the original alert's keyboard so the button now shows 💡 (cached)
       // for everyone who comes back to this message later.

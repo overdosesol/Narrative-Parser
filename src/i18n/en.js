@@ -32,6 +32,8 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   btnStartStop: (paused) => paused ? '\u{25B6}\u{FE0F} Resume Alerts' : '\u{23F8}\u{FE0F} Pause Alerts',
   btnFollowX: '\u{1D54F} Follow @Catalystparser',
   btnAskQuestion: '\u{1F4AC} Ask a question',
+  btnDashboard: '\u{1F310} Open Dashboard',
+  dashboardPrompt: (url) => `\u{1F310} <b>Web dashboard</b>\n\nFull narrative feed, filters by phase / type / source, manual link analysis (Pro / Admin). Sign in with your Telegram account.\n\n<a href="${url}">${url}</a>`,
   btnOpenMenu: '\u2699\uFE0F Open Menu',
   btnBack: '\u{25C0}\u{FE0F} Back',
   btnClose: '\u{274C} Close',
@@ -90,7 +92,7 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   planPro: 'Pro ($100 / 30 days)',
 
   // ── Payment ────────────────────────────────────────────────────────────
-  paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🆓 <b>Free - free forever (current)</b>\n• Sources: Reddit, Google Trends\n• Unlimited alerts\n• Twitter, TikTok and X Analysis not available\n\n🧪 <b>Test - $5 / 1 day (one-time)</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis is not available\n\n🚀 <b>Pro - $100 / 30 days</b>\n• All sources (Reddit, Google, Twitter, TikTok)\n• Unlimited alerts\n• X Analysis included',
+  paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🆓 <b>Free - free forever</b>\n• Sources: Reddit, Google Trends\n• Unlimited alerts\n• 🔒 Manual analysis & Catalyst forecast not included\n\n🧪 <b>Test - $5 / 1 day (one-time)</b>\n• All 5 sources (Reddit, Google, Twitter, TikTok, X Trends)\n• Unlimited alerts\n• Manual analysis: 5/day\n• Catalyst forecast: 5/day\n\n🚀 <b>Pro - $100 / 30 days</b>\n• All 5 sources\n• Unlimited alerts\n• Manual analysis: 100/day\n• Catalyst forecast: 100/day',
   paymentMethod: '\u{1F4B0} <b>Payment</b>\n\nChoose payment method:',
   btnPaySOL: '\u{26A1} Pay with SOL',
   btnPayUSDC: '\u{1F4B5} Pay with USDC',
