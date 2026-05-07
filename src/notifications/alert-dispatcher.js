@@ -30,6 +30,19 @@
 
 import { computeAlertScore, feedbackBoostFromStats } from '../analysis/scorer.js';
 
+// ─── TikTok quality gate constants ───────────────────────────────────────────
+// TikTok firehose drags in tons of "scroll-bait" (ASMR / satisfying loops /
+// tutorials / process timelapses / aesthetic vlogs). They get massive
+// engagement but are NOT memecoin material. The gate runs ONLY for
+// source='tiktok' and uses Gemini PreStage signals:
+//   • viralPattern in AMBIENT_PATTERNS → hard skip (Gemini classified as scroll-bait)
+//   • isAmbient=true                   → hard skip (Gemini's own boolean judgment)
+//   • memeShapeStrength < FLOOR        → hard skip (TikTok-only quality bar)
+// Keeping these as module-level constants (not config knobs) per "хардкод"
+// directive — flip to admin sliders later if calibration needs tuning.
+const AMBIENT_PATTERNS = new Set(['satisfying', 'asmr', 'tutorial', 'process', 'aesthetic']);
+const TIKTOK_MEME_SHAPE_FLOOR = 60;
+
 // PII masking for log lines. Long-term stdout (Docker / journald) shouldn't
 // retain full Telegram chat_ids - they're stable identifiers that can be
 // cross-referenced. Last 4 chars is enough to correlate two log lines about
@@ -223,6 +236,33 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
       const isLipSync     = trend.preStage?.gemini?.isLipSync === true;
       const lipsyncPass   = !isLipSync;
 
+      // ── TikTok quality gate ────────────────────────────────────────────
+      // TikTok firehose drags in tons of "scroll-bait" — ASMR, satisfying
+      // loops, tutorials, process timelapses, mood vlogs. They get massive
+      // engagement (people zone out and watch) but are NOT memecoin material.
+      // Three sub-checks (any failure → hard skip):
+      //   1) Gemini flagged isAmbient=true (its own judgment)
+      //   2) viralPattern in the AMBIENT_PATTERNS set
+      //   3) memeShapeStrength below TIKTOK_MEME_SHAPE_FLOOR
+      // Only fires when source='tiktok'. Old trends without Gemini fields
+      // pass naturally (memeShape undefined → not a number → no penalty).
+      // Reddit/Twitter/Google trends bypass this gate entirely.
+      const isTikTok = sourceLc === 'tiktok';
+      const gemini   = trend.preStage?.gemini;
+      const isAmbient        = gemini?.isAmbient === true;
+      const ambientPattern   = AMBIENT_PATTERNS.has(gemini?.viralPattern);
+      const memeShape        = gemini?.memeShapeStrength;
+      const memeShapeKnown   = Number.isFinite(memeShape);
+      const memeShapeTooLow  = memeShapeKnown && memeShape < TIKTOK_MEME_SHAPE_FLOOR;
+
+      let tiktokQualityFail = null;
+      if (isTikTok) {
+        if (isAmbient)             tiktokQualityFail = 'ambient flag (Gemini)';
+        else if (ambientPattern)   tiktokQualityFail = `pattern=${gemini.viralPattern}`;
+        else if (memeShapeTooLow)  tiktokQualityFail = `memeShape=${memeShape}/100 < ${TIKTOK_MEME_SHAPE_FLOOR}`;
+      }
+      const tiktokQualityPass = !tiktokQualityFail;
+
       const capPass       = !(maxAlertsPerCycle > 0 && alertsSentThisCycle >= maxAlertsPerCycle);
       const thresholdPass = alertScore >= effectiveAlertThreshold;
       const hardJunkPass  = !trend._alertHardJunk;
@@ -239,6 +279,7 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
       gates.push({ name: 'threshold',    passed: thresholdPass,    detail: `${alertScore} / ${effectiveAlertThreshold}` });
       gates.push({ name: 'hard_junk',    passed: hardJunkPass,     detail: `junk=${junkVal}${junkReasons ? ' (' + junkReasons + ')' : ''} < ${alertWeights.hardJunkStop}` });
       gates.push({ name: 'lipsync',      passed: lipsyncPass,      detail: isLipSync ? 'gemini flagged: lip-sync / sound participation' : 'no lip-sync' });
+      gates.push({ name: 'tiktok_quality', passed: tiktokQualityPass, detail: isTikTok ? (tiktokQualityFail || `ok (memeShape=${memeShapeKnown ? memeShape : 'n/a'}, pattern=${gemini?.viralPattern || 'n/a'})`) : 'n/a (not tiktok)' });
       gates.push({ name: 'plan_source',  passed: planSourcePass,   detail: planSourcePass ? trend.source : `${trend.source} (not in ${user.plan_name || 'free'} plan)` });
       gates.push({ name: 'source',       passed: sourcePass,       detail: trend.source + (sourcePass ? '' : ' (muted)') });
       gates.push({ name: 'alert_type',   passed: alertTypePass,    detail: trendAlertType ? `${trendAlertType} ∈ [${userAlertTypes.join(',')}]` : 'no type (wildcard)' });
@@ -258,6 +299,8 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
           logger.debug?.(`[HardJunk:${source}] SKIP "${trend.title?.substring(0, 50)}" junk=${junkVal} (${junkReasons})`);
         } else if (firstFail.name === 'lipsync') {
           logger.debug?.(`[LipSync:${source}] SKIP "${trend.title?.substring(0, 50)}" — Gemini flagged sound-participation`);
+        } else if (firstFail.name === 'tiktok_quality') {
+          logger.debug?.(`[TikTokQuality:${source}] SKIP "${trend.title?.substring(0, 50)}" — ${tiktokQualityFail}`);
         }
         recordDecision({ ...decisionBase, decision: 'skipped', reason: firstFail.name, gates });
         totalSkipped++;

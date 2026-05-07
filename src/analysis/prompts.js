@@ -118,6 +118,22 @@ Rules of thumb:
 • If multi-platform / multi-author chatter without a single inciting moment → "trend"
 • When in doubt between trend and post: if there are clearly other independent voices on the same topic, it's "trend"; if it's just this one post going viral, it's "post"
 
+━━━ GEMINI VISION+AUDIO IS GROUND TRUTH ━━━
+When a trend has Gemini PreStage output (Visual / Video / Audio / Speech / VisibleText / Mood / GeminiScoring lines in the input), TREAT IT AS GROUND TRUTH for what is actually in the content:
+
+• Gemini watched and listened to the actual media. Titles and descriptions are often misleading — clickbait, untranslated foreign text, aggregator headlines ("you won't believe what happens next"), or scraped fragments. When the Gemini analysis disagrees with the title, BELIEVE GEMINI.
+• Use Gemini's "Speech" line as the primary source of what is actually said in the video. If Speech is non-empty, the meme/narrative often lives THERE — not in the title. Read it carefully.
+• Use "Audio" to detect sound-driven trends (recognizable songs, ASMR, viral sounds) and to confirm/deny clickbait titles.
+• Use the GeminiScoring line as a strong prior on memePotential:
+  - memeShape ≥ 70 + hasSubject=true + hasNarrative=true → high meme potential, lean upward
+  - memeShape < 30 → low meme potential, lean downward regardless of engagement
+  - hasSubject=false AND hasNarrative=false → almost never a memecoin candidate (no character, no story)
+  - viralPattern='compilation' or 'sound_format' without explicit narrative → cap memePotential ≤ 50
+  - viralPattern in {'satisfying', 'asmr', 'tutorial', 'process', 'aesthetic'} → AMBIENT scroll-bait, cap memePotential ≤ 25 regardless of engagement (this is "relaxing to watch", not a meme)
+  - GeminiScoring contains "AMBIENT" or "LIPSYNC" tag → cap memePotential ≤ 20 — the trend is on track to be hard-skipped at the alert gate; do not over-score it just because engagement is high
+  - tickerHint present → use it as a tie-breaker for ticker-friendliness in scoring
+• Gemini scoring is a PRIOR, not a verdict. If your overall judgment differs strongly (e.g. you see a context Gemini cannot — political/news framing in the title), you may override, but DO so consciously and reflect it in the explanation.
+
 ━━━ HARD RULES ━━━
 1. Trends may come in ANY language (English, Spanish, Russian, Portuguese, etc.) — understand and evaluate them regardless of language.
 2. All output fields must be in ENGLISH.
@@ -125,7 +141,7 @@ Rules of thumb:
 4. Standard sports results = 0. Exception: a player does something insane/absurd/meme-worthy.
 5. If the "trend" is clearly spam, bot-generated, crypto promotion, or nonsensical gibberish → set isGenuinelyInteresting: false and memePotential: 0.
 6. If a trend is from Twitter/TikTok source, weight engagement metrics AND engagement rate together. Raw numbers alone are misleading without follower context.
-7. Never invent context. If you don't know the topic, score conservatively.
+7. Never invent context. If you don't know the topic, score conservatively. (Exception: when Gemini Visual/Video/Speech describes the content factually, that IS context — use it.)
 8. Focus on NARRATIVE / MEME POTENTIAL not news importance. A silly cat video can score 90, a major political event scores 0.
 
 ━━━ PRESTAGE METADATA (when present) ━━━
@@ -161,12 +177,33 @@ export function buildAnalysisPrompt(trends) {
     }
     if (ps?.gemini) {
       const g = ps.gemini;
+      // Gemini is a multimodal voter, not just a captioner. Its visual+audio
+      // analysis is GROUND TRUTH for what is actually in the content — titles
+      // and descriptions can be misleading clickbait, untranslated foreign
+      // text, or aggregator wrappers ("you won't believe what happens next").
+      // When Gemini's analysis disagrees with the title, TRUST GEMINI.
       if (g.visualCaption)                  detail += `\n   Visual: ${g.visualCaption}`;
       if (g.videoSummary && g.videoSummary.trim())
                                             detail += `\n   Video: ${g.videoSummary}`;
+      if (g.audioSummary && g.audioSummary.trim())
+                                            detail += `\n   Audio: ${g.audioSummary}`;
+      if (g.spokenText && g.spokenText.trim())
+                                            detail += `\n   Speech: "${g.spokenText}"`;
       if (g.visibleText && g.visibleText.trim())
                                             detail += `\n   VisibleText: "${g.visibleText}"`;
       if (g.mood)                           detail += `\n   Mood: ${g.mood}`;
+      // Scoring signals — Gemini's own voting. Surfaced verbatim so the
+      // scorer can weigh them. Treat them as a strong prior on memePotential.
+      const scoringBits = [];
+      if (Number.isFinite(g.memeShapeStrength)) scoringBits.push(`memeShape=${g.memeShapeStrength}/100`);
+      if (typeof g.hasNarrative === 'boolean')  scoringBits.push(`hasNarrative=${g.hasNarrative}`);
+      if (typeof g.hasSubject === 'boolean')    scoringBits.push(`hasSubject=${g.hasSubject}`);
+      if (g.viralPattern)                       scoringBits.push(`pattern=${g.viralPattern}`);
+      if (g.tickerSuggestion && g.tickerSuggestion.trim())
+                                                scoringBits.push(`tickerHint=${g.tickerSuggestion}`);
+      if (g.isAmbient === true)                 scoringBits.push(`AMBIENT`);
+      if (g.isLipSync === true)                 scoringBits.push(`LIPSYNC`);
+      if (scoringBits.length > 0)           detail += `\n   GeminiScoring: ${scoringBits.join(', ')}`;
     }
 
     // [MARKET_STAGE] optional context hint — remove 3 lines to disable

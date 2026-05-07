@@ -4886,10 +4886,46 @@ function ManualResultCard({ result, comment, setComment, onAlertSent }) {
                 React.createElement('span', { style: { color: 'var(--text2)' } }, 'Видео: '),
                 t.preStage.gemini.videoSummary
               ),
+            t.preStage.gemini.audioSummary && t.preStage.gemini.audioSummary.trim() &&
+              React.createElement('div', { style: { fontSize: 12, color: 'var(--text)', marginBottom: 4 } },
+                React.createElement('span', { style: { color: 'var(--text2)' } }, '🎤 Аудио: '),
+                t.preStage.gemini.audioSummary
+              ),
+            t.preStage.gemini.spokenText && t.preStage.gemini.spokenText.trim() &&
+              React.createElement('div', { style: { fontSize: 12, color: 'var(--text)', marginBottom: 4 } },
+                React.createElement('span', { style: { color: 'var(--text2)' } }, '💬 Речь: '),
+                React.createElement('span', { style: { fontStyle: 'italic' } }, '"' + t.preStage.gemini.spokenText + '"')
+              ),
             t.preStage.gemini.visibleText && t.preStage.gemini.visibleText.trim() &&
               React.createElement('div', { style: { fontSize: 12, color: 'var(--text)', marginBottom: 4 } },
                 React.createElement('span', { style: { color: 'var(--text2)' } }, 'Текст в кадре: '),
                 React.createElement('span', { style: { fontStyle: 'italic' } }, '"' + t.preStage.gemini.visibleText + '"')
+              ),
+            // Scoring signals row — Gemini's own voting (memeShape, hasNarrative,
+            // hasSubject, viralPattern, tickerSuggestion). Shown as compact chips
+            // so the admin can see Gemini's prior at a glance.
+            (Number.isFinite(t.preStage.gemini.memeShapeStrength)
+                || typeof t.preStage.gemini.hasNarrative === 'boolean'
+                || typeof t.preStage.gemini.hasSubject === 'boolean'
+                || t.preStage.gemini.viralPattern
+                || (t.preStage.gemini.tickerSuggestion && t.preStage.gemini.tickerSuggestion.trim())
+                || t.preStage.gemini.isLipSync
+                || t.preStage.gemini.isAmbient) &&
+              React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6, marginBottom: 4 } },
+                Number.isFinite(t.preStage.gemini.memeShapeStrength) &&
+                  React.createElement('span', { className: 'sp-chip', style: { fontSize: 10 } }, '🎯 memeShape ' + t.preStage.gemini.memeShapeStrength + '/100'),
+                typeof t.preStage.gemini.hasNarrative === 'boolean' &&
+                  React.createElement('span', { className: 'sp-chip', style: { fontSize: 10 } }, (t.preStage.gemini.hasNarrative ? '📖' : '🚫') + ' narrative'),
+                typeof t.preStage.gemini.hasSubject === 'boolean' &&
+                  React.createElement('span', { className: 'sp-chip', style: { fontSize: 10 } }, (t.preStage.gemini.hasSubject ? '👤' : '🚫') + ' subject'),
+                t.preStage.gemini.viralPattern &&
+                  React.createElement('span', { className: 'sp-chip', style: { fontSize: 10 } }, '🌀 ' + t.preStage.gemini.viralPattern),
+                t.preStage.gemini.tickerSuggestion && t.preStage.gemini.tickerSuggestion.trim() &&
+                  React.createElement('span', { className: 'sp-chip', style: { fontSize: 10, color: '#fdcb6e' } }, '$' + t.preStage.gemini.tickerSuggestion),
+                t.preStage.gemini.isLipSync &&
+                  React.createElement('span', { className: 'sp-chip', style: { fontSize: 10, color: '#ff7675' } }, '🎤 lip-sync'),
+                t.preStage.gemini.isAmbient &&
+                  React.createElement('span', { className: 'sp-chip', style: { fontSize: 10, color: '#ff7675' } }, '😴 ambient')
               ),
             t.preStage.gemini.mood && React.createElement('span', { style: { fontSize: 11, color: 'var(--text2)' } }, 'mood: ' + t.preStage.gemini.mood)
           )

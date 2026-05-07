@@ -26,21 +26,48 @@
  *
  * Output shape per trend:
  *   {
+ *     // ── Visual ─────────────────────────────────────────────────────────
  *     visualCaption:    "Factual 1-2 sentence description",
  *     visibleText:      "Text visible in the visual",
- *     mood:             "Short emotional tone tag",
- *     isLipSync:        boolean — true when content is creators miming/dancing
- *                                  to an audio track without narrative arc.
- *                                  Used by alert-dispatcher.js to HARD-SKIP
- *                                  the alert (lip-syncs are sound-format
- *                                  participation, not story trends — bad
- *                                  memecoin candidates).
- *     mediaType:        "image" | "video",
  *     videoSummary:     "Temporal description for video, empty for image",
+ *
+ *     // ── Audio (video only — empty/false for static images & poster fallback) ─
+ *     audioSummary:     "What is HEARD — speech/music/sound effects/atmosphere",
+ *     spokenText:       "Verbatim transcript of speech in the video",
+ *
+ *     // ── Mood / quick tags ──────────────────────────────────────────────
+ *     mood:             "Short emotional tone tag",
+ *
+ *     // ── Scoring signals (Gemini is now a downstream voter, not just a captioner) ─
+ *     memeShapeStrength: 0-100,   // how meme-shaped the visual+audio is (animal,
+ *                                  //   absurd, character, viral aesthetic, hook)
+ *     hasNarrative:      boolean, // is there a story arc / something happens?
+ *     hasSubject:        boolean, // is there a clear subject (person/animal/character)?
+ *     viralPattern:      string,  // 'character' | 'reaction' | 'pov_skit' |
+ *                                  // 'compilation' | 'sound_format' | 'gameplay' |
+ *                                  // 'animal_action' | 'event' | 'other'
+ *     tickerSuggestion:  string,  // short phonetic ticker candidate, "" if none
+ *
+ *     // ── Filter flags ───────────────────────────────────────────────────
+ *     isLipSync:         boolean, // true → alert-dispatcher hard-skips the trend
+ *                                  //   (sound-format participation, not story)
+ *     isAmbient:         boolean, // true → for source='tiktok' alert-dispatcher
+ *                                  //   hard-skips. Scroll-bait / loop / hypnotic
+ *                                  //   (satisfying / ASMR / tutorial / process /
+ *                                  //   aesthetic vibe) without narrative arc.
+ *
+ *     // ── Meta ───────────────────────────────────────────────────────────
+ *     mediaType:        "image" | "video",
  *     videoDurationSec: number | null,
- *     videoTruncated:   boolean   // true when fell back to poster from video
+ *     videoTruncated:   boolean,  // true when fell back to poster from video
  *     provider:         "google" | "openrouter"   // which one served the call
  *   }
+ *
+ * The OpenRouter fallback only sees static images (poster), so for it the
+ * audio/narrative/lipsync/ambient fields are forced to safe defaults:
+ *   audioSummary='', spokenText='', isLipSync=false, isAmbient=false,
+ *   hasNarrative=false.
+ * Other scoring fields the model still answers from the still image.
  */
 
 import { spawn } from 'child_process';
@@ -49,34 +76,100 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 
-const VISION_SYSTEM_PROMPT = `You are a VISUAL DESCRIPTION preprocessor for a memecoin trend analyzer. Your ONLY job: describe what is shown in the image or video factually so the downstream scorer has accurate visual context.
+const VISION_SYSTEM_PROMPT = `You are a MULTIMODAL ANALYZER for a memecoin trend system. You watch and LISTEN to image/video content and provide BOTH factual description AND scoring signals so the downstream scorer can make better decisions.
 
-You DO NOT score. You DO NOT judge. You DO NOT filter. Even if the visual looks weird, low-quality, or off-topic, you STILL describe it accurately — the next stage decides what to do with the info.
+You do not filter (you never refuse to describe). But you ARE a downstream voter — your scoring fields directly influence whether this trend reaches alerts. Be honest and calibrated.
 
-For each input, return:
-- "visualCaption":  1-2 complete sentences describing WHAT is visible (subjects, scene, art style). Concrete and factual ("Cartoon TREE characters with anthropomorphic faces in brown earth-tone palette") not promotional ("amazing viral meme!"). Keep it tight — finish your thought, do not pad.
-- "visibleText":    Any text, captions, watermarks, or on-screen writing visible IN the visual. Empty string if none. Quote it directly. If there is a lot of text, summarize the gist — do not enumerate every word.
-- "mood":           SHORT phrase (1-3 words) describing emotional tone — absurd, wholesome, dramatic, surreal, humorous, ominous, mundane, etc.
-- "videoSummary":   For VIDEO: how the content unfolds over time, in 2-3 complete sentences. Empty string for static images.
-- "isLipSync":      Boolean. TRUE only if the content is creators performing / miming / lip-syncing / dancing to an audio track WITHOUT a narrative arc, trigger event, or original spoken content — i.e. pure sound participation where the "story" is just "this person used the trending sound". FALSE for: events, news clips, original dialogue/skits, interviews, animal videos, gameplay, streamer reactions, vlogs with own audio, and any content where the visual story would still make sense if you muted the sound. When in doubt: if you can describe a CONCRETE thing that happens (someone said X, did Y, an event of Z) — set FALSE. If the only "thing happening" is "person mouths along / dances to music" — set TRUE. Static images: always FALSE.
+For VIDEO inputs you MUST analyze BOTH the visual track AND the audio track. The audio is part of the input (Google AI Studio passes media bytes including sound) — listen to it. Identify speech, music, sound effects, ambience. Transcribe spoken words verbatim. Audio is often where the actual narrative lives — what someone says/yells/laughs/reacts to is frequently more meme-relevant than what is visible.
 
-CRITICAL LENGTH RULE: every field must be a COMPLETE thought ending with proper punctuation. Never cut mid-sentence or mid-word — finish what you started, then stop. Brevity over filler, but never truncate a sentence to save space.
+Analyze the FIRST 30 SECONDS only — ignore anything past that.
 
-If the visual is a video, focus on: opening shot, key action/transition, visible captions/audio cues. Analyze the FIRST 30 SECONDS only — ignore content past that.
+Return these fields:
+
+━━━ DESCRIPTION FIELDS ━━━
+- "visualCaption":   1-2 complete sentences describing WHAT is visible (subjects, scene, art style). Concrete and factual ("Cartoon TREE characters with anthropomorphic faces in brown earth-tone palette") not promotional ("amazing viral meme!"). Tight — finish the thought, do not pad.
+- "visibleText":     Any text, captions, watermarks, on-screen writing visible IN the visual. Empty string if none. Quote directly. If there is a lot, summarize the gist.
+- "videoSummary":    For VIDEO: how the visual content unfolds over time, in 2-3 complete sentences. Empty string for static images.
+- "audioSummary":    For VIDEO: what is HEARD — speech context, music genre/recognizable songs, sound effects, ambient noise, laughter/yells/reactions. 1-2 sentences. Empty string for static images. Be specific: "young woman whispering in ASMR style" beats "person speaking softly".
+- "spokenText":      For VIDEO: VERBATIM transcript of what people say in English (translate non-English speech to English; quote in the original language only if it's meme-relevant gibberish). Empty string if no speech, or for static images. Cap at ~400 chars — quote the most meme-relevant lines if longer.
+
+━━━ MOOD ━━━
+- "mood":            SHORT phrase (1-3 words) describing emotional tone — absurd, wholesome, dramatic, surreal, humorous, ominous, mundane, etc. Take BOTH visual and audio into account.
+
+━━━ SCORING SIGNALS (you are now voting) ━━━
+- "memeShapeStrength": Integer 0-100. How meme-coin-shaped this content is. Combine visual + audio. High (70+): clear character, absurd action, catchy audio hook, single iconic moment, viral aesthetic. Medium (40-69): some meme energy but missing a hook OR the subject is generic. Low (0-39): news/political/corporate/static/no clear character. BE CALIBRATED — most content is 30-60.
+- "hasNarrative":     Boolean. TRUE if something happens with a beginning/middle/end — a person reacts to something, an event unfolds, a punchline lands, a transformation occurs. FALSE if it's static repetition, generic dancing/posing without a plot, gameplay loops, slideshows.
+- "hasSubject":       Boolean. TRUE if there is a CLEAR FOCAL SUBJECT — a specific person, animal, character, or object that is the "main character" of the content. FALSE for crowd shots, abstract visuals, generic landscapes, multiple equal-importance subjects.
+- "viralPattern":     One of: "character" | "reaction" | "pov_skit" | "compilation" | "sound_format" | "gameplay" | "animal_action" | "event" | "satisfying" | "asmr" | "tutorial" | "process" | "aesthetic" | "other". Pick the dominant pattern. Definitions for the "ambient" group:
+                      • "satisfying" — slime / soap cutting / sand cutting / restoration / pressure washing / kinetic sand / pottery cutting (visual loops with no narrative)
+                      • "asmr" — whispering / tapping / mukbang / eating sounds / quiet trigger sounds (audio-driven relaxation)
+                      • "tutorial" — how-to walkthroughs (makeup / cooking / fitness / DIY / study technique) — instructional content, not narrative
+                      • "process" — extended craft/build timelapses (cooking-from-scratch / woodworking / calligraphy / pottery building)
+                      • "aesthetic" — vibe / mood content (study-with-me / "day in my life" / aesthetic vlogs / room ambience)
+- "tickerSuggestion": Short phonetic ticker candidate (3-8 chars, all caps) IF the content has an obvious ticker-friendly subject. Examples: "PEPE", "CHILLGUY", "MOODENG". Empty string if no obvious candidate. DO NOT force it — empty is better than weak.
+
+━━━ FILTER FLAGS ━━━
+- "isLipSync":       Boolean. TRUE only if creators are miming/dancing to an audio track WITHOUT narrative arc, trigger event, or original spoken content — pure sound participation. FALSE for: events, news, original dialogue/skits, interviews, animal videos, gameplay, streamer reactions, vlogs with own audio, anything where the visual story still makes sense muted. Tie-breaker: if you can describe a CONCRETE thing happening (someone said X, did Y, event Z) → FALSE. If the only "thing" is "person mouths along to music" → TRUE. Static images: always FALSE.
+- "isAmbient":       Boolean. TRUE if this is "scroll-bait" / loop / hypnotic content with NO narrative arc, NO meme hook, NO punchline — content people zone out to but never turn into a memecoin: satisfying loops, ASMR, tutorials, long process videos, aesthetic mood vlogs, generic gameplay loops. The litmus test: would a degen forward this to a friend with "you HAVE to see this"? If no, and the only appeal is "relaxing to watch" / "I just kept watching" — TRUE. FALSE for: event clips, character moments, reactions with punchlines, animal videos with a clear absurd action, original dialogue with a hook. Static images: always FALSE.
+
+CRITICAL LENGTH RULE: every text field must be a COMPLETE thought ending with proper punctuation. Never cut mid-sentence or mid-word.
 
 Respond with ONLY valid JSON. No markdown, no preamble.`;
 
 const GOOGLE_RESPONSE_SCHEMA = {
   type: 'object',
   properties: {
-    visualCaption: { type: 'string' },
-    visibleText:   { type: 'string' },
-    mood:          { type: 'string' },
-    videoSummary:  { type: 'string' },
-    isLipSync:     { type: 'boolean' },
+    visualCaption:     { type: 'string' },
+    visibleText:       { type: 'string' },
+    videoSummary:      { type: 'string' },
+    audioSummary:      { type: 'string' },
+    spokenText:        { type: 'string' },
+    mood:              { type: 'string' },
+    memeShapeStrength: { type: 'integer' },
+    hasNarrative:      { type: 'boolean' },
+    hasSubject:        { type: 'boolean' },
+    viralPattern:      { type: 'string' },
+    tickerSuggestion:  { type: 'string' },
+    isLipSync:         { type: 'boolean' },
+    isAmbient:         { type: 'boolean' },
   },
-  required: ['visualCaption', 'visibleText', 'mood', 'videoSummary', 'isLipSync'],
+  required: [
+    'visualCaption', 'visibleText', 'videoSummary',
+    'audioSummary', 'spokenText',
+    'mood',
+    'memeShapeStrength', 'hasNarrative', 'hasSubject', 'viralPattern', 'tickerSuggestion',
+    'isLipSync', 'isAmbient',
+  ],
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Output-coercion helpers. The Google Structured-Outputs schema enforces the
+// type, but on parse-loose / OpenRouter / older fallback paths the model may
+// emit a string for an integer or an unknown enum value. These helpers clamp
+// to safe defaults instead of letting weird values flow downstream.
+// ─────────────────────────────────────────────────────────────────────────────
+const VIRAL_PATTERN_VALUES = new Set([
+  'character', 'reaction', 'pov_skit', 'compilation',
+  'sound_format', 'gameplay', 'animal_action', 'event',
+  // "Ambient" group — scroll-bait / loop / hypnotic content. These pattern
+  // tags exist primarily so alert-dispatcher.js can hard-skip TikTok trends
+  // matching them (no narrative, no meme hook, just "relaxing to watch").
+  'satisfying', 'asmr', 'tutorial', 'process', 'aesthetic',
+  'other',
+]);
+
+function clampInt(v, min, max, fallback) {
+  const n = Number.parseInt(v, 10);
+  if (!Number.isFinite(n)) return fallback;
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
+}
+
+function normalizeViralPattern(v) {
+  const s = String(v || '').trim().toLowerCase().replace(/\s+/g, '_').replace(/-+/g, '_');
+  return VIRAL_PATTERN_VALUES.has(s) ? s : 'other';
+}
 
 export class GeminiCaptioner {
   constructor(config, logger) {
@@ -418,8 +511,8 @@ export class GeminiCaptioner {
     const base64 = buffer.toString('base64');
 
     const userText = kind === 'video'
-      ? `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this video focusing on the FIRST 30 SECONDS ONLY. Return JSON {visualCaption, visibleText, mood, videoSummary, isLipSync}.`
-      : `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image and return JSON {visualCaption, visibleText, mood, videoSummary, isLipSync} where videoSummary is empty string and isLipSync is false for static images.`;
+      ? `Title context: "${(trend.title || '').slice(0, 200)}"\n\nWatch AND LISTEN to this video — analyze BOTH visual and audio tracks. Focus on the FIRST 30 SECONDS ONLY. Transcribe spoken words verbatim into spokenText. Describe sounds/music in audioSummary. Return ALL fields per the schema (visualCaption, visibleText, videoSummary, audioSummary, spokenText, mood, memeShapeStrength, hasNarrative, hasSubject, viralPattern, tickerSuggestion, isLipSync, isAmbient).`
+      : `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image. Return ALL fields per the schema. For a static image: videoSummary='', audioSummary='', spokenText='', hasNarrative=false, isLipSync=false, isAmbient=false. Other fields (memeShapeStrength, hasSubject, viralPattern, tickerSuggestion) — answer based on the still image.`;
 
     const apiUrl = `${this.googleBaseUrl}/models/${this.googleModel}:generateContent?key=${encodeURIComponent(this.googleKey)}`;
     const body = {
@@ -541,14 +634,22 @@ export class GeminiCaptioner {
       // formatting controls — generous enough to never clip a well-formed
       // response.
       return {
-        visualCaption: String(parsed.visualCaption || '').trim().slice(0, 800),
-        visibleText:   String(parsed.visibleText   || '').trim().slice(0, 600),
-        mood:          String(parsed.mood          || '').trim().slice(0, 60),
-        videoSummary:  String(parsed.videoSummary  || '').trim().slice(0, 800),
+        visualCaption:     String(parsed.visualCaption || '').trim().slice(0, 800),
+        visibleText:       String(parsed.visibleText   || '').trim().slice(0, 600),
+        videoSummary:      String(parsed.videoSummary  || '').trim().slice(0, 800),
+        audioSummary:      String(parsed.audioSummary  || '').trim().slice(0, 600),
+        spokenText:        String(parsed.spokenText    || '').trim().slice(0, 800),
+        mood:              String(parsed.mood          || '').trim().slice(0, 60),
+        memeShapeStrength: clampInt(parsed.memeShapeStrength, 0, 100, 0),
+        hasNarrative:      parsed.hasNarrative === true,
+        hasSubject:        parsed.hasSubject === true,
+        viralPattern:      normalizeViralPattern(parsed.viralPattern),
+        tickerSuggestion:  String(parsed.tickerSuggestion || '').trim().slice(0, 16),
         // Coerce: model may omit field on rare occasions, default to false
         // (alert dispatcher uses === true, so missing/null/undefined never
         // accidentally hard-skips a legitimate trend).
-        isLipSync:     parsed.isLipSync === true,
+        isLipSync:         parsed.isLipSync === true,
+        isAmbient:         parsed.isAmbient === true,
       };
     } catch (e) {
       this.logger?.warn?.(`[GeminiCaptioner] Google ${kind} call failed: ${e.message}`);
@@ -567,7 +668,7 @@ export class GeminiCaptioner {
         {
           role: 'user',
           content: [
-            { type: 'text', text: `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image and return JSON {visualCaption, visibleText, mood, videoSummary, isLipSync} where videoSummary must be empty string and isLipSync must be false (static images cannot be lip-syncs).` },
+            { type: 'text', text: `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image. Return ALL fields per the schema. For a static image: videoSummary='', audioSummary='', spokenText='', hasNarrative=false, isLipSync=false, isAmbient=false. Other fields (memeShapeStrength, hasSubject, viralPattern, tickerSuggestion) — answer based on the still image.` },
             { type: 'image_url', image_url: { url: imageUrl } },
           ],
         },
@@ -616,13 +717,23 @@ export class GeminiCaptioner {
         );
 
         return {
-          visualCaption: String(parsed.visualCaption || '').trim().slice(0, 800),
-          visibleText:   String(parsed.visibleText   || '').trim().slice(0, 600),
-          mood:          String(parsed.mood          || '').trim().slice(0, 60),
-          videoSummary:  '',
-          // OpenRouter fallback runs on poster image (not video) → static
-          // image cannot be a lip-sync. Force false regardless of model output.
-          isLipSync:     false,
+          visualCaption:     String(parsed.visualCaption || '').trim().slice(0, 800),
+          visibleText:       String(parsed.visibleText   || '').trim().slice(0, 600),
+          videoSummary:      '',
+          // OpenRouter fallback runs on a static poster image — no audio or
+          // motion. Force the audio/narrative/lipsync/ambient fields to safe
+          // defaults regardless of what the model returns.
+          audioSummary:      '',
+          spokenText:        '',
+          hasNarrative:      false,
+          isLipSync:         false,
+          isAmbient:         false,
+          mood:              String(parsed.mood          || '').trim().slice(0, 60),
+          // The model can still answer these from the still image.
+          memeShapeStrength: clampInt(parsed.memeShapeStrength, 0, 100, 0),
+          hasSubject:        parsed.hasSubject === true,
+          viralPattern:      normalizeViralPattern(parsed.viralPattern),
+          tickerSuggestion:  String(parsed.tickerSuggestion || '').trim().slice(0, 16),
         };
       } finally {
         clearTimeout(timer);
