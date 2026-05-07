@@ -231,14 +231,17 @@ class TrendDatabase {
       `);
       const seedExamples = [
         // ── Examples (positive calibration across the 0-100 range) ─────────
-        ['example', 'Elon tweets a meme picture (no commentary, just image)', 'elon',         95, 'Mega-impact author + meme image = instant ticker-spawn pattern. Always 90+.',                  10],
+        ['example', 'Elon tweets a meme picture (no commentary, just image)',                  'celebrity',     95, 'Mega-impact author + meme image = instant ticker-spawn pattern. Always 90+.',                  10],
         ['example', 'A-list celebrity does something absurd / embarrassing on camera',         'celebrity',     90, 'Celebrity + absurdity = strong meme energy. Boost only if shareable visual exists.',           20],
         ['example', 'Bizarre cute animal viral video (penguin/capybara/frog doing weird thing)','animals',      85, 'Cute animals are evergreen meme fuel. Short phonetic name = perfect ticker. No political baggage.', 30],
         ['example', 'Random street-interview catchphrase goes viral overnight',                'meme',          80, 'Catchy short phrase + organic spread + low-stakes context. Classic meme arc.',                 40],
-        ['example', 'AI chatbot publicly fails / says something deranged in screenshots',      'ai_drama',      60, 'AI weirdness has its own meme cycle but shorter lifespan. Boost if specific named model.',     50],
-        ['example', 'Non-Elon tech CEO makes minor announcement (no drama, no leaked emails)', 'tech_drama',    35, 'Tech news without conflict / scandal = mild interest, not meme territory.',                    60],
-        ['example', 'Sports team wins championship (results only, no narrative arc)',          'sports_degen',  15, 'Standard sports = near-zero meme. Boost ONLY if a player did something absurd/legendary.',     70],
-        ['example', 'Politician signs bill / makes policy speech',                             'boring',         0, 'Politics = 0 by HARD RULE. No exceptions for raw views or breaking-news framing.',            80],
+        ['example', 'New indie game blows up overnight on Twitch / TikTok playthroughs',       'gaming',        70, 'Gaming virality with character/aesthetic = ticker candidate if name is short and phonetic.',   45],
+        ['example', 'Surprise music drop or viral TikTok song from unknown artist',            'entertainment', 65, 'Music virality has shorter lifespan than visual memes but spawns tickers when the artist name or hook is sticky.', 48],
+        ['example', 'AI chatbot publicly fails / says something deranged in screenshots',      'tech',          60, 'AI weirdness has its own meme cycle but shorter lifespan. Boost if specific named model.',     50],
+        ['example', 'Non-Elon tech CEO makes minor announcement (no drama, no leaked emails)', 'tech',          35, 'Tech news without conflict / scandal = mild interest, not meme territory.',                    60],
+        ['example', 'WSB / pump.fun degens chase a microcap with absurd PnL screenshots',      'gambling',      40, 'Gambling chatter has narrative energy but most candles are not ticker-worthy. Boost on genuine narrative arc.', 65],
+        ['example', 'Sports team wins championship (results only, no narrative arc)',          'sports',        15, 'Standard sports = near-zero meme. Boost ONLY if a player did something absurd/legendary.',     70],
+        ['example', 'Politician signs bill / makes policy speech',                             'politics',       0, 'Politics = 0 by HARD RULE. No exceptions for raw views or breaking-news framing.',            80],
         ['example', 'Mainstream news article about routine corporate earnings',                'boring',         0, 'Corporate / financial news without scandal = 0. Not meme content even at high reach.',         90],
         // ── Mistakes (anti-patterns the model commonly slips on) ───────────
         ['mistake', 'Trump signed an executive order (5M views, top trending)',                null,           null, 'POLITICS RULE: even with viral metrics, score 0. Do not be tempted by raw engagement numbers.', 100],

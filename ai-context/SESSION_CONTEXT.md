@@ -128,6 +128,12 @@ alertScore = w_meme·memePotential + w_viral·virality + w_emerg·emergence
 
 **Decision logging**: ring buffer `appState.alertDecisions[]` (cap 500, in-memory, reset на рестарте). Gate-loop пишет массив `gates[{name, passed, detail}]` для observability в admin DecisionsPage.
 
+**Score history (sparkline)**: каждый `recomputeAlertScores()` вызов (scan каждые 15мин + hot-refresh каждые 12h) пишет точку в `alert_score_history(trend_id, ts, score, positive, penalty, floor_at_ts, source)` с FK CASCADE. Retention 30 дней (daily prune в index.js maintenance loop — startup + 24h interval). Используется sparkline'ом в дашборде trend-modal Alert verdict block (admin-only сейчас) — `/api/trends/:id/alert-history` возвращает последние 200 точек + текущий floor. SVG sparkline 240×56, color-coded по passed-state на последней точке, time-scaled X-axis (gaps = реальное время), mini-legend с first→last timestamps.
+
+**Admin-only сейчас (UX gate, не security)**:
+- Dashboard trend-modal **Alert verdict block** целиком — pass/fail pill, alertType chip, math panel с contributions, sparkline, junk triggers, floor decomposition. Гейт: `me.plan === 'admin' || me.plan_name === 'admin'`. Когда откроем для всех — убрать одну строчку в TrendModal + одну в `_handleAlertHistory`.
+- Term-help `?` подсказки на стат-лейблах в trend-modal (Meme Score / Virality / Velocity / Alert + breakdown rows). i18n словарь `term.*` на EN+RU. Гейт через `isAdmin` флаг в TrendModal — открывается одной строкой `const isAdmin = true`.
+
 ## Scoring metadata
 
 Поля trend object'а после full pipeline:
@@ -404,9 +410,12 @@ Weekly background job — Grok `grok-4.3` (fallback `grok-4.20-0309-reasoning`) 
 - Per-preset запросы (granular failure). Real xAI Responses API `/responses` с `tools: [{type: 'x_search', max_search_results: 20}]`. Live Search вызывается ~9 раз за один Grok-запрос — критично для grounding (без mandate prompt'а Grok отвечает из training data → галлюцинирует свежий сленг).
 - **undici@6 long-timeout dispatcher** (`XAI_LONG_AGENT`, 15-min headers/body timeout) — обязательно, иначе UND_ERR_HEADERS_TIMEOUT валит запрос (default 5 min недостаточно для x_search reasoning loops).
 - **`tool_choice: 'required'` НЕ поддерживается** xAI Responses API — обрывает соединение (UND_ERR_SOCKET). Mandate сидит исключительно в system prompt («You MUST invoke x_search AT LEAST 3 times BEFORE writing JSON»).
-- **Variant-3 reality-check**: для каждой **новой** Twitter keyword group (skip already-existing) одна Apify probe `${group} min_faves:100 -is:retweet`, max 5 results. Если 0 — drop. Защита от Grok hallucinations на slang-anchor.
+- **Reality-check (двойной)**:
+  - **Reddit subs**: для каждого PROPOSED subreddit (skip already-existing) `GET https://www.reddit.com/r/<name>/about.json` (free public API, ~10 req/min unauth). 200+`kind:t5` → keep, 404/403/451 → drop с reason'ом. Throttle 6.5s между probe'ами. Bailout при 3+ consecutive network errors → pass-through (защита от случайной отрубки Reddit'а). User-Agent через `REDDIT_USER_AGENT` env.
+  - **Twitter keyword groups**: одна Apify probe `${group} min_faves:100 -is:retweet`, max 5 results. Если 0 — drop. Защита от Grok hallucinations на slang-anchor.
 - **Diff respecting locks**: locked tags из `presetTagsLocked` всегда добавляются в `kept` set, даже если Grok их не предложил. Apply пишет в `presetConfigsAuto` sparse blob — auto-overrides поверх defaults, manual поверх auto.
 - **Sparse twitter restoration**: при apply Grok возвращает только keyword-parts (без `min_faves`/`-is:retweet`). Refresher восстанавливает оригинальные `min_faves` для kept queries (из defaults), новым groups присваивает median из defaults.
+- **Admin Telegram digest**: после каждого `refreshAll()` (success или fail, scheduled или force) шлёт HTML-сводку всем `plan_name='admin'` юзерам. Формат: статус-emoji + per-preset diff (added/removed subs + tw, max 6 в строке + counter), total cost, elapsed, circuit-breaker warning при streak ≥ 3. HTML escape, trim до 3800 char. Best-effort — если telegram lacks instance или sendMessage упал, лог + skip, run не валится.
 
 **Failure modes**:
 - 5xx / `model_not_found` → fallback на `grok-4.20-0309-reasoning`
@@ -602,7 +611,7 @@ Phase + alert-type chips поддерживают **multi-select**. Хранят
 | `src/notifications/alert-dispatcher.js` | Shared alert dispatcher — used by scan-cycle и hot refresh |
 | `src/support/bot.js` | Support bot (forum-topics relay) |
 | `src/refresh/hot-metrics.js` | Hot trends refresh — heavy (12h, LLM rescore) + light (60min, metrics-only) |
-| `src/refresh/tag-refresher.js` | Weekly Grok-driven tag refresh — subreddits + Twitter keywords per preset, w/ Live Search + Apify reality-check + lock-mask |
+| `src/refresh/tag-refresher.js` | Weekly Grok-driven tag refresh — subreddits + Twitter keywords per preset, w/ Live Search + Reddit & Apify reality-check + lock-mask + admin Telegram digest |
 | `src/i18n/{ru,en}.js` | i18n maps для telegram + dashboard |
 | `DEPLOY.md` | Production deployment runbook |
 
@@ -614,7 +623,7 @@ Catalyst публично захощен на `https://catalystparser.io` (TLS, 
 - **nginx** (`/etc/nginx/sites-available/catalyst`) — reverse-proxy на `127.0.0.1:8080`. SSE-friendly (`proxy_buffering off`, `proxy_read_timeout 24h`). `Host/X-Real-IP/X-Forwarded-*` headers + Authorization passthrough. `set_real_ip_from 127.0.0.1` + `real_ip_header X-Forwarded-For`.
 - **Let's Encrypt cert** (R13) — auto-renew через `certbot.timer` (ежедневно). Покрывает `catalystparser.io` + `www.catalystparser.io`, 80→443 редирект.
 - **ufw**: default deny incoming, allow только 22 (SSH), 80, 443.
-- **Daily backup** (`/usr/local/bin/catalyst-backup.sh`): cron 03:30 UTC. Discover'ит mountpoint named volume `catalyst_data`, `sqlite3 .backup` (locking-aware), gzip → `/var/backups/catalyst/`. Retention 14 дней. **На том же VPS** — off-site copy (S3/Backblaze) пока нет.
+- **Daily backup** (`/usr/local/bin/catalyst-backup.sh`): cron 03:30 UTC. Discover'ит mountpoint named volume `catalyst_data`, `sqlite3 .backup` (locking-aware), gzip → `/var/backups/catalyst/`. Local retention 14 дней. **Off-site copy на Backblaze B2** (`b2:catalystparser-prod-backups`, ~$0.03/мес), скрипт после gzip пушит свежий `.db.gz` через `rclone copy`, лог в `/var/log/catalyst-backup-rclone.log`. B2 lifecycle: hide files after 30 days + delete 1 day later (auto-cleanup, не нужно чистить из скрипта). rclone config в `/root/.config/rclone/rclone.conf` (root-only).
 
 **Security headers (every response)**: HSTS `max-age=31536000`, X-Frame-Options DENY, X-Content-Type-Options nosniff, Referrer-Policy no-referrer. Через `buildHeaders(req)` + monkey-patch `res.writeHead` в `_handle()` — каждый response (включая binary, error paths, OPTIONS, SSE) автоматически инжектит defaults.
 
@@ -678,6 +687,8 @@ SQLite хранит `CURRENT_TIMESTAMP` как TEXT в формате `"YYYY-MM-
 - `SUPPORT_BOT_TOKEN` / `SUPPORT_BOT_USERNAME` / `SUPPORT_GROUP_ID` — support-бот (все 3 нужны)
 - `HOT_REFRESH_ENABLED` / `HOT_REFRESH_INTERVAL_MINUTES` (720) / `HOT_REFRESH_LIGHT_ENABLED` / `HOT_REFRESH_LIGHT_INTERVAL_MINUTES` (60)
 - `TAG_REFRESH_COOLDOWN_DAYS` (7) / `TAG_REFRESH_FORCE_COOLDOWN_HOURS` (24) / `XAI_TAG_REFRESH_MODEL` (`grok-4.3`) / `XAI_TAG_REFRESH_FALLBACK_MODEL` (`grok-4.20-0309-reasoning`)
+- `REDDIT_USER_AGENT` (default `Catalyst:tag-refresher:v1.0`) — для Reddit reality-check probes в tag-refresher. Reddit требует осмысленный UA для unauthenticated requests.
+- `DASHBOARD_PORT` (8080) / `ADMIN_PORT` (8081) — выровнены с Dockerfile EXPOSE и nginx upstream. .env.example синхронизирован 2026-05-07.
 
 **Production deployment** (см. `DEPLOY.md`):
 - `NODE_ENV=production` — hard-fail без `XAI_API_KEY` / `TELEGRAM_BOT_TOKEN` / `ADMIN_API_KEY`. В dev — warnings.

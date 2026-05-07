@@ -3527,16 +3527,17 @@ class DashboardServer {
 
     /* ── Badges ── */
     .badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 5px; font-size: 10px; font-weight: 600; white-space: nowrap; letter-spacing: .2px; }
-    .cat-meme        { background: rgba(162,155,254,.1); color: #a29bfe; border: 1px solid rgba(162,155,254,.18); }
-    .cat-elon        { background: rgba(116,185,255,.1); color: #74b9ff; border: 1px solid rgba(116,185,255,.18); }
-    .cat-animals     { background: rgba(85,239,196,.1);  color: #55efc4; border: 1px solid rgba(85,239,196,.18); }
-    .cat-tech_drama  { background: rgba(225,112,85,.1);  color: #e17055; border: 1px solid rgba(225,112,85,.18); }
-    .cat-degenerates { background: rgba(253,121,168,.1); color: #fd79a8; border: 1px solid rgba(253,121,168,.18); }
-    .cat-celebrity   { background: rgba(253,203,110,.1); color: #fdcb6e; border: 1px solid rgba(253,203,110,.18); }
-    .cat-sports_degen{ background: rgba(116,185,255,.1); color: #74b9ff; border: 1px solid rgba(116,185,255,.18); }
-    .cat-ai_drama    { background: rgba(129,236,236,.1); color: #81ecec; border: 1px solid rgba(129,236,236,.18); }
-    .cat-boring      { background: rgba(255,255,255,.04); color: var(--dim); border: 1px solid var(--border); }
-    .cat-other       { background: rgba(255,255,255,.04); color: var(--dim); border: 1px solid var(--border); }
+    .cat-meme          { background: rgba(162,155,254,.1); color: #a29bfe; border: 1px solid rgba(162,155,254,.18); }
+    .cat-celebrity     { background: rgba(253,203,110,.1); color: #fdcb6e; border: 1px solid rgba(253,203,110,.18); }
+    .cat-animals       { background: rgba(85,239,196,.1);  color: #55efc4; border: 1px solid rgba(85,239,196,.18); }
+    .cat-tech          { background: rgba(225,112,85,.1);  color: #e17055; border: 1px solid rgba(225,112,85,.18); }
+    .cat-gambling      { background: rgba(253,121,168,.1); color: #fd79a8; border: 1px solid rgba(253,121,168,.18); }
+    .cat-sports        { background: rgba(116,185,255,.1); color: #74b9ff; border: 1px solid rgba(116,185,255,.18); }
+    .cat-politics      { background: rgba(255,118,117,.12); color: #ff7675; border: 1px solid rgba(255,118,117,.22); }
+    .cat-entertainment { background: rgba(255,165,2,.12);   color: #ffa502; border: 1px solid rgba(255,165,2,.22); }
+    .cat-gaming        { background: rgba(0,206,201,.12);   color: #00cec9; border: 1px solid rgba(0,206,201,.22); }
+    .cat-boring        { background: rgba(255,255,255,.04); color: var(--dim); border: 1px solid var(--border); }
+    .cat-other         { background: rgba(255,255,255,.04); color: var(--dim); border: 1px solid var(--border); }
     .badge-manual    { background: rgba(180,140,255,.12); color: #b48cff; border: 1px solid rgba(180,140,255,.3); }
     /* Alert-type chips — orthogonal to category. event = warm red-orange,
        trend = green (movement), post = blue (single signal). */
@@ -4794,13 +4795,19 @@ class DashboardServer {
       border-color: rgba(var(--accent-rgb), .35);
       color: var(--accent2);
     }
+    /* Tooltip body — positioned BELOW the icon (not above, to avoid getting
+       clipped by the modal/viewport top edge), and anchored by the LEFT edge
+       (not centered, to avoid clipping when the icon is near the left side
+       of its container — which is where most of our labels live). The
+       .right modifier flips the horizontal anchor for icons near a right
+       edge (e.g. Alert tile in the modal-stat grid). */
     .term-help::before {
       content: attr(data-tooltip);
       position: absolute;
-      bottom: calc(100% + 8px);
-      left: 50%;
-      transform: translateX(-50%);
-      width: 240px;
+      top: calc(100% + 8px);
+      left: 0;
+      width: 220px;
+      max-width: calc(100vw - 40px);
       padding: 9px 11px;
       background: #16181c;
       border: 1px solid rgba(255,255,255,.10);
@@ -4820,11 +4827,10 @@ class DashboardServer {
     .term-help::after {
       content: '';
       position: absolute;
-      bottom: calc(100% + 2px);
-      left: 50%;
-      transform: translateX(-50%);
+      top: calc(100% + 2px);
+      left: 4px;
       border: 5px solid transparent;
-      border-top-color: rgba(255,255,255,.10);
+      border-bottom-color: rgba(255,255,255,.10);
       opacity: 0;
       pointer-events: none;
       transition: opacity 150ms;
@@ -4832,13 +4838,14 @@ class DashboardServer {
     .term-help:hover::before, .term-help:hover::after {
       opacity: 1;
     }
-    /* Right-edge fallback: when the icon is too close to the right edge,
-       the tooltip clips. The .term-help-right modifier flips the anchor. */
+    /* Right-edge variant: tooltip anchors to the right edge of the icon and
+       extends leftward. Used for icons near the right side of containers
+       (the Alert tile is the typical case). */
     .term-help.right::before {
-      left: auto; right: 0; transform: none;
+      left: auto; right: 0;
     }
     .term-help.right::after {
-      left: auto; right: 6px; transform: none;
+      left: auto; right: 4px;
     }
 
     /* ── Sparkline (alertScore evolution) ── */
@@ -7217,8 +7224,8 @@ const SOURCE_LOGOS = {
 // SourceMark isn't appropriate (or for unknown sources).
 const SOURCE_ICONS  = { reddit: 'R', google_trends: 'G', twitter: '𝕏', tiktok: '♪', x_trends: '#' };
 const SOURCE_LABELS = { reddit: 'Reddit', google_trends: 'Google', twitter: 'Twitter/X', tiktok: 'TikTok', x_trends: 'X Trends' };
-const CAT_ICONS     = { meme:'😂', elon:'🚀', animals:'🐾', tech_drama:'💻', degenerates:'🎰', celebrity:'⭐', sports_degen:'🏆', ai_drama:'🤖', boring:'😴', other:'📌' };
-const CAT_CLS       = { meme:'cat-meme', elon:'cat-elon', animals:'cat-animals', tech_drama:'cat-tech_drama', degenerates:'cat-degenerates', celebrity:'cat-celebrity', sports_degen:'cat-sports_degen', ai_drama:'cat-ai_drama', boring:'cat-boring', other:'cat-other' };
+const CAT_ICONS     = { meme:'😂', celebrity:'⭐', animals:'🐾', tech:'💻', gambling:'🎰', sports:'🏆', politics:'🏛️', entertainment:'🎬', gaming:'🎮', boring:'😴', other:'📌' };
+const CAT_CLS       = { meme:'cat-meme', celebrity:'cat-celebrity', animals:'cat-animals', tech:'cat-tech', gambling:'cat-gambling', sports:'cat-sports', politics:'cat-politics', entertainment:'cat-entertainment', gaming:'cat-gaming', boring:'cat-boring', other:'cat-other' };
 
 // Lifespan key → i18n token. Built from LIFESPAN_VALUES injected by the
 // server (see src/analysis/lifespan.js). Renaming a value there triggers

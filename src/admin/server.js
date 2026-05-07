@@ -261,8 +261,9 @@ class AdminServer {
   // Category enum mirrors STAGE1_RESPONSE_SCHEMA — keep in sync if either changes.
   _validateStage1Example(body, { partial = false } = {}) {
     if (!body || typeof body !== 'object') return 'Body must be an object';
-    const CATEGORY_ENUM = ['meme','elon','animals','tech_drama','degenerates',
-                            'celebrity','sports_degen','ai_drama','boring','other'];
+    const CATEGORY_ENUM = ['meme','celebrity','animals','tech','gambling',
+                            'sports','politics','entertainment','gaming',
+                            'boring','other'];
     const needsField = (key) => !partial || body[key] !== undefined;
 
     if (needsField('kind')) {
@@ -5186,8 +5187,9 @@ function spTile(label, value, cls) {
 //      rest of the line out of context. Use String.fromCharCode for whitespace
 //      and quote-only Unicode characters directly. See SESSION_CONTEXT.
 function ExamplesPage() {
-  const CATEGORIES = ['meme','elon','animals','tech_drama','degenerates',
-                       'celebrity','sports_degen','ai_drama','boring','other'];
+  const CATEGORIES = ['meme','celebrity','animals','tech','gambling',
+                       'sports','politics','entertainment','gaming',
+                       'boring','other'];
   const NL = String.fromCharCode(10);  // outer-template-safe newline
 
   const [items, setItems]         = useState([]);
