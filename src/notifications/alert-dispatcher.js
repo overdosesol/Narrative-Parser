@@ -213,6 +213,16 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
       const junkReasons = trend.clusterMetrics?.junkReasons?.join(',') || '';
       const sourceLc   = (trend.source || '').toLowerCase();
 
+      // Lip-sync hard skip — Gemini (Stage 0b vision) marks creators-miming-to-
+      // -audio videos with isLipSync=true. Those trends are sound-format
+      // participation, not story trends — bad memecoin candidates regardless of
+      // engagement. Hard-skip overrides everything else (no threshold can
+      // rescue them). Static-image trends always have isLipSync=false (forced
+      // in gemini-captioner.js OpenRouter fallback path), so this only ever
+      // fires on video content.
+      const isLipSync     = trend.preStage?.gemini?.isLipSync === true;
+      const lipsyncPass   = !isLipSync;
+
       const capPass       = !(maxAlertsPerCycle > 0 && alertsSentThisCycle >= maxAlertsPerCycle);
       const thresholdPass = alertScore >= effectiveAlertThreshold;
       const hardJunkPass  = !trend._alertHardJunk;
@@ -228,6 +238,7 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
 
       gates.push({ name: 'threshold',    passed: thresholdPass,    detail: `${alertScore} / ${effectiveAlertThreshold}` });
       gates.push({ name: 'hard_junk',    passed: hardJunkPass,     detail: `junk=${junkVal}${junkReasons ? ' (' + junkReasons + ')' : ''} < ${alertWeights.hardJunkStop}` });
+      gates.push({ name: 'lipsync',      passed: lipsyncPass,      detail: isLipSync ? 'gemini flagged: lip-sync / sound participation' : 'no lip-sync' });
       gates.push({ name: 'plan_source',  passed: planSourcePass,   detail: planSourcePass ? trend.source : `${trend.source} (not in ${user.plan_name || 'free'} plan)` });
       gates.push({ name: 'source',       passed: sourcePass,       detail: trend.source + (sourcePass ? '' : ' (muted)') });
       gates.push({ name: 'alert_type',   passed: alertTypePass,    detail: trendAlertType ? `${trendAlertType} ∈ [${userAlertTypes.join(',')}]` : 'no type (wildcard)' });
@@ -245,6 +256,8 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
       if (!allPassed) {
         if (firstFail.name === 'hard_junk') {
           logger.debug?.(`[HardJunk:${source}] SKIP "${trend.title?.substring(0, 50)}" junk=${junkVal} (${junkReasons})`);
+        } else if (firstFail.name === 'lipsync') {
+          logger.debug?.(`[LipSync:${source}] SKIP "${trend.title?.substring(0, 50)}" — Gemini flagged sound-participation`);
         }
         recordDecision({ ...decisionBase, decision: 'skipped', reason: firstFail.name, gates });
         totalSkipped++;

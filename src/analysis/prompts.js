@@ -239,7 +239,18 @@ For EACH trend, return a JSON object with these exact fields:
 - "title"             : trend title in ENGLISH (use original if already English, translate otherwise)
 - "viralityScore"     : internal base score 0-100 (pure virality, source-agnostic)
 - "memePotential"     : 0-100 (how likely degens launch a Solana token today). MUST be 0 for boring/politics/sports-results.
-- "category"          : one of [meme, elon, animals, tech_drama, degenerates, celebrity, sports_degen, ai_drama, boring, other]
+- "category"          : one of [meme, celebrity, animals, tech, gambling, sports, politics, entertainment, gaming, boring, other]
+                        • meme — already-formed meme/format/character; viral content with clear meme energy
+                        • celebrity — public figures (Elon, athletes, musicians, actors) at the center of the story
+                        • animals — viral animal content (cute / weird / iconic creatures)
+                        • tech — tech / AI / startup news, drama, product launches, AI model behavior
+                        • gambling — crypto degens, sports betting, prediction markets, pump.fun, WSB-style risk
+                        • sports — sports results, players, teams, leagues — highlight only when memeable
+                        • politics — political figures, elections, policy, geopolitics — almost always memePotential 0
+                        • entertainment — music drops, movies, TV, streaming, viral songs, concerts
+                        • gaming — video games, streamers, esports, game launches, gaming controversies
+                        • boring — non-meme news (corporate, policy, financial routine) — memePotential MUST be 0
+                        • other — genuine catch-all when nothing above fits
 - "alertType"         : one of [event, trend, post] — see ALERT TYPE rubric above. NOT the same as category.
 - "sentiment"         : one of [positive, negative, neutral, mixed]
 - "explanation"       : ONE short sentence (≤200 chars) WHY this is (or isn't) a great memecoin narrative — IN ENGLISH. Be terse: skip filler words like "this trend" / "is interesting because". State the reason directly.
@@ -307,8 +318,9 @@ export const STAGE1_RESPONSE_SCHEMA = {
           memePotential:          { type: 'integer', minimum: 0, maximum: 100 },
           category: {
             type: 'string',
-            enum: ['meme', 'elon', 'animals', 'tech_drama', 'degenerates',
-                   'celebrity', 'sports_degen', 'ai_drama', 'boring', 'other'],
+            enum: ['meme', 'celebrity', 'animals', 'tech', 'gambling',
+                   'sports', 'politics', 'entertainment', 'gaming',
+                   'boring', 'other'],
           },
           // Signal shape — orthogonal to category. event = concrete trigger,
           // trend = cross-platform narrative, post = single viral post.

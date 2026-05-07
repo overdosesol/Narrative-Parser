@@ -140,9 +140,10 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   topSource: 'Open',
   topTgPost: 'TG',
   topCatIcons: {
-    meme: '\u{1F923}', elon: '\u{1F680}', animals: '\u{1F43E}',
-    tech_drama: '\u{1F4BB}', degenerates: '\u{1F3B0}', celebrity: '\u{2B50}',
-    sports_degen: '\u{1F3C6}', ai_drama: '\u{1F916}', other: '\u{1F4CC}', boring: '\u{1F634}',
+    meme: '\u{1F923}', celebrity: '\u{2B50}', animals: '\u{1F43E}',
+    tech: '\u{1F4BB}', gambling: '\u{1F3B0}', sports: '\u{1F3C6}',
+    politics: '\u{1F3DB}\u{FE0F}', entertainment: '\u{1F3AC}', gaming: '\u{1F3AE}',
+    boring: '\u{1F634}', other: '\u{1F4CC}',
   },
   topLifeIcons: {
     // Keys derive from LIFESPAN_VALUES - see src/analysis/lifespan.js.
@@ -232,16 +233,15 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   // ── Categories ─────────────────────────────────────────────────────────
   categories: {
     meme: '\u{1F602} Meme',
-    elon: '\u{1F680} Elon',
-    animals: '\u{1F43E} Animals',
-    tech_drama: '\u{1F4BB} Tech/Crypto Drama',
-    degenerates: '\u{1F3B0} Degens',
-    boring: '\u{1F634} Boring',
-    news: '\u{1F4F0} News',
-    politics: '\u{1F3DB}\u{FE0F} Politics',
     celebrity: '\u{2B50} Celebrity',
-    sports_degen: '\u{1F3C6} Sports',
-    ai_drama: '\u{1F916} AI Drama',
+    animals: '\u{1F43E} Animals',
+    tech: '\u{1F4BB} Tech/AI',
+    gambling: '\u{1F3B0} Gambling',
+    sports: '\u{1F3C6} Sports',
+    politics: '\u{1F3DB}\u{FE0F} Politics',
+    entertainment: '\u{1F3AC} Entertainment',
+    gaming: '\u{1F3AE} Gaming',
+    boring: '\u{1F634} Boring',
     other: '\u{1F4CC} Other',
   },
 

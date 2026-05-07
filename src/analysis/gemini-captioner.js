@@ -29,6 +29,12 @@
  *     visualCaption:    "Factual 1-2 sentence description",
  *     visibleText:      "Text visible in the visual",
  *     mood:             "Short emotional tone tag",
+ *     isLipSync:        boolean — true when content is creators miming/dancing
+ *                                  to an audio track without narrative arc.
+ *                                  Used by alert-dispatcher.js to HARD-SKIP
+ *                                  the alert (lip-syncs are sound-format
+ *                                  participation, not story trends — bad
+ *                                  memecoin candidates).
  *     mediaType:        "image" | "video",
  *     videoSummary:     "Temporal description for video, empty for image",
  *     videoDurationSec: number | null,
@@ -52,6 +58,7 @@ For each input, return:
 - "visibleText":    Any text, captions, watermarks, or on-screen writing visible IN the visual. Empty string if none. Quote it directly. If there is a lot of text, summarize the gist — do not enumerate every word.
 - "mood":           SHORT phrase (1-3 words) describing emotional tone — absurd, wholesome, dramatic, surreal, humorous, ominous, mundane, etc.
 - "videoSummary":   For VIDEO: how the content unfolds over time, in 2-3 complete sentences. Empty string for static images.
+- "isLipSync":      Boolean. TRUE only if the content is creators performing / miming / lip-syncing / dancing to an audio track WITHOUT a narrative arc, trigger event, or original spoken content — i.e. pure sound participation where the "story" is just "this person used the trending sound". FALSE for: events, news clips, original dialogue/skits, interviews, animal videos, gameplay, streamer reactions, vlogs with own audio, and any content where the visual story would still make sense if you muted the sound. When in doubt: if you can describe a CONCRETE thing that happens (someone said X, did Y, an event of Z) — set FALSE. If the only "thing happening" is "person mouths along / dances to music" — set TRUE. Static images: always FALSE.
 
 CRITICAL LENGTH RULE: every field must be a COMPLETE thought ending with proper punctuation. Never cut mid-sentence or mid-word — finish what you started, then stop. Brevity over filler, but never truncate a sentence to save space.
 
@@ -66,8 +73,9 @@ const GOOGLE_RESPONSE_SCHEMA = {
     visibleText:   { type: 'string' },
     mood:          { type: 'string' },
     videoSummary:  { type: 'string' },
+    isLipSync:     { type: 'boolean' },
   },
-  required: ['visualCaption', 'visibleText', 'mood', 'videoSummary'],
+  required: ['visualCaption', 'visibleText', 'mood', 'videoSummary', 'isLipSync'],
 };
 
 export class GeminiCaptioner {
@@ -410,8 +418,8 @@ export class GeminiCaptioner {
     const base64 = buffer.toString('base64');
 
     const userText = kind === 'video'
-      ? `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this video focusing on the FIRST 30 SECONDS ONLY. Return JSON {visualCaption, visibleText, mood, videoSummary}.`
-      : `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image and return JSON {visualCaption, visibleText, mood, videoSummary} where videoSummary is empty string for static images.`;
+      ? `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this video focusing on the FIRST 30 SECONDS ONLY. Return JSON {visualCaption, visibleText, mood, videoSummary, isLipSync}.`
+      : `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image and return JSON {visualCaption, visibleText, mood, videoSummary, isLipSync} where videoSummary is empty string and isLipSync is false for static images.`;
 
     const apiUrl = `${this.googleBaseUrl}/models/${this.googleModel}:generateContent?key=${encodeURIComponent(this.googleKey)}`;
     const body = {
@@ -537,6 +545,10 @@ export class GeminiCaptioner {
         visibleText:   String(parsed.visibleText   || '').trim().slice(0, 600),
         mood:          String(parsed.mood          || '').trim().slice(0, 60),
         videoSummary:  String(parsed.videoSummary  || '').trim().slice(0, 800),
+        // Coerce: model may omit field on rare occasions, default to false
+        // (alert dispatcher uses === true, so missing/null/undefined never
+        // accidentally hard-skips a legitimate trend).
+        isLipSync:     parsed.isLipSync === true,
       };
     } catch (e) {
       this.logger?.warn?.(`[GeminiCaptioner] Google ${kind} call failed: ${e.message}`);
@@ -555,7 +567,7 @@ export class GeminiCaptioner {
         {
           role: 'user',
           content: [
-            { type: 'text', text: `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image and return JSON {visualCaption, visibleText, mood, videoSummary} where videoSummary must be empty string.` },
+            { type: 'text', text: `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image and return JSON {visualCaption, visibleText, mood, videoSummary, isLipSync} where videoSummary must be empty string and isLipSync must be false (static images cannot be lip-syncs).` },
             { type: 'image_url', image_url: { url: imageUrl } },
           ],
         },
@@ -608,6 +620,9 @@ export class GeminiCaptioner {
           visibleText:   String(parsed.visibleText   || '').trim().slice(0, 600),
           mood:          String(parsed.mood          || '').trim().slice(0, 60),
           videoSummary:  '',
+          // OpenRouter fallback runs on poster image (not video) → static
+          // image cannot be a lip-sync. Force false regardless of model output.
+          isLipSync:     false,
         };
       } finally {
         clearTimeout(timer);

@@ -144,9 +144,10 @@ const ru = {
   topSource: '\u041E\u0442\u043A\u0440\u044B\u0442\u044C',
   topTgPost: 'TG',
   topCatIcons: {
-    meme: '\u{1F923}', elon: '\u{1F680}', animals: '\u{1F43E}',
-    tech_drama: '\u{1F4BB}', degenerates: '\u{1F3B0}', celebrity: '\u{2B50}',
-    sports_degen: '\u{1F3C6}', ai_drama: '\u{1F916}', other: '\u{1F4CC}', boring: '\u{1F634}',
+    meme: '\u{1F923}', celebrity: '\u{2B50}', animals: '\u{1F43E}',
+    tech: '\u{1F4BB}', gambling: '\u{1F3B0}', sports: '\u{1F3C6}',
+    politics: '\u{1F3DB}\u{FE0F}', entertainment: '\u{1F3AC}', gaming: '\u{1F3AE}',
+    boring: '\u{1F634}', other: '\u{1F4CC}',
   },
   topLifeIcons: {
     // Keys derive from LIFESPAN_VALUES - see src/analysis/lifespan.js.
@@ -241,16 +242,15 @@ const ru = {
   // ── Categories ─────────────────────────────────────────────────────────
   categories: {
     meme: '\u{1F602} \u{041C}\u{0435}\u{043C}',
-    elon: '\u{1F680} \u{0418}\u{043B}\u{043E}\u{043D}',
-    animals: '\u{1F43E} \u{0416}\u{0438}\u{0432}\u{043E}\u{0442}\u{043D}\u{044B}\u{0435}',
-    tech_drama: '\u{1F4BB} \u{0414}\u{0440}\u{0430}\u{043C}\u{0430} \u{0432} IT/\u{041A}\u{0440}\u{0438}\u{043F}\u{0442}\u{0435}',
-    degenerates: '\u{1F3B0} \u{0414}\u{0435}\u{0433}\u{0435}\u{043D}\u{0435}\u{0440}\u{0430}\u{0442}\u{044B}',
-    boring: '\u{1F634} \u{0421}\u{043A}\u{0443}\u{043A}\u{043E}\u{0442}\u{0430}',
-    news: '\u{1F4F0} \u{041D}\u{043E}\u{0432}\u{043E}\u{0441}\u{0442}\u{0438}',
-    politics: '\u{1F3DB}\u{FE0F} \u{041F}\u{043E}\u{043B}\u{0438}\u{0442}\u{0438}\u{043A}\u{0430}',
     celebrity: '\u{2B50} \u{0417}\u{043D}\u{0430}\u{043C}\u{0435}\u{043D}\u{0438}\u{0442}\u{043E}\u{0441}\u{0442}\u{044C}',
-    sports_degen: '\u{1F3C6} \u{0421}\u{043F}\u{043E}\u{0440}\u{0442}',
-    ai_drama: '\u{1F916} AI \u{0414}\u{0440}\u{0430}\u{043C}\u{0430}',
+    animals: '\u{1F43E} \u{0416}\u{0438}\u{0432}\u{043E}\u{0442}\u{043D}\u{044B}\u{0435}',
+    tech: '\u{1F4BB} Tech/AI',
+    gambling: '\u{1F3B0} \u{0413}\u{044D}\u{043C}\u{0431}\u{043B}\u{0438}\u{043D}\u{0433}',
+    sports: '\u{1F3C6} \u{0421}\u{043F}\u{043E}\u{0440}\u{0442}',
+    politics: '\u{1F3DB}\u{FE0F} \u{041F}\u{043E}\u{043B}\u{0438}\u{0442}\u{0438}\u{043A}\u{0430}',
+    entertainment: '\u{1F3AC} \u{0420}\u{0430}\u{0437}\u{0432}\u{043B}\u{0435}\u{0447}\u{0435}\u{043D}\u{0438}\u{044F}',
+    gaming: '\u{1F3AE} \u{0418}\u{0433}\u{0440}\u{044B}',
+    boring: '\u{1F634} \u{0421}\u{043A}\u{0443}\u{043A}\u{043E}\u{0442}\u{0430}',
     other: '\u{1F4CC} \u{0420}\u{0430}\u{0437}\u{043D}\u{043E}\u{0435}',
   },
 
