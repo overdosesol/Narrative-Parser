@@ -3,6 +3,7 @@
  */
 import { getTranslations } from '../i18n/index.js';
 import { normalizeLifespan } from '../analysis/lifespan.js';
+import { collectSubjectNames, buildSubjectMatchRegex } from '../analysis/subject-names.js';
 
 const SCORE_EMOJI = (score) => {
   if (score >= 90) return '\u{1F525}\u{1F525}\u{1F525}';
@@ -19,6 +20,12 @@ const SCORE_EMOJI = (score) => {
 export function formatTelegramAlert(trend, lang = 'en') {
   const t = getTranslations(lang);
   const memePotential = trend.memePotential || 0;
+
+  // Subject names: collected once per alert, used to highlight in title /
+  // whyNow / aiExplanation. Title is already wrapped in <b>, so we use <u>
+  // there; whyNow + aiExplanation are plain text \u2192 <b>.
+  const subjects = collectSubjectNames(trend);
+  const subjectRegex = buildSubjectMatchRegex(subjects.aliases);
 
   const DIV = '\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501';
   // Alert-type chip \u2014 rendered above the header so it's the very first line
@@ -38,14 +45,16 @@ export function formatTelegramAlert(trend, lang = 'en') {
   // If we ever reintroduce translations, bring back a guarded bilingual branch
   // here — but gate it on a real `titleRu` field, not on inequality.
   const displayTitle = trend.title || trend.titleEn || trend.originalTitle || trend.original_title || '';
-  msg += `\u{1F4CC} <b>${escHtml(displayTitle)}</b>\n\n`;
+  // Title is in <b>; subject names get an additional <u> so they stand out
+  // INSIDE the bold header instead of blending in.
+  msg += `\u{1F4CC} <b>${highlightHtml(escHtml(displayTitle), subjectRegex, '<u>', '</u>')}</b>\n\n`;
 
   if (trend.whyNow) {
-    msg += `\u{1F525} <b>${t.alertTrigger}:</b> ${escHtml(trend.whyNow)}\n\n`;
+    msg += `\u{1F525} <b>${t.alertTrigger}:</b> ${highlightHtml(escHtml(trend.whyNow), subjectRegex, '<b>', '</b>')}\n\n`;
   }
 
   if (trend.aiExplanation) {
-    msg += `\u{1F916} <b>${t.alertAI}:</b> ${escHtml(trend.aiExplanation)}\n\n`;
+    msg += `\u{1F916} <b>${t.alertAI}:</b> ${highlightHtml(escHtml(trend.aiExplanation), subjectRegex, '<b>', '</b>')}\n\n`;
   }
 
   const sources = trend.sources ? trend.sources.join(', ') : trend.source;
@@ -219,6 +228,23 @@ function formatAlertTypeChip(alertType, t) {
 function escHtml(text) {
   if (!text) return '';
   return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * Wrap every regex match in `text` with `openTag`/`closeTag`. The input
+ * MUST already be HTML-escaped (we call escHtml first in the alert chain),
+ * so we don't need to re-escape and the inserted tags are safe. The regex
+ * may be null (no subjects found) → returns text unchanged.
+ *
+ * Critical: tags ('<b>', '<u>') are NOT in the escaped input, so they
+ * survive intact in the output. Tag literals must be raw '<b>' style, not
+ * already-escaped '&lt;b&gt;'.
+ */
+function highlightHtml(escapedText, regex, openTag, closeTag) {
+  if (!escapedText || !regex) return escapedText || '';
+  // Reset lastIndex defensively — regex was constructed with /g flag.
+  regex.lastIndex = 0;
+  return escapedText.replace(regex, (match) => `${openTag}${match}${closeTag}`);
 }
 
 function formatNumber(num) {

@@ -64,6 +64,7 @@ class TelegramNotifier {
     // (in-memory only — soft cap, not a security boundary).
     this._manualAnalysisHits = new Map();
     this._catalystHits       = new Map();
+    this._xAnalysisHits      = new Map();
 
     if (!this.botToken) {
       this.logger.warn('Telegram bot token not set - Telegram alerts disabled');
@@ -168,7 +169,7 @@ class TelegramNotifier {
       const user = this.db.getOrCreateUser(chatId, msg.from?.username);
       const t = getTranslations(user.language);
 
-      this.bot.sendMessage(chatId, t.menuTitle, {
+      this.bot.sendMessage(chatId, t.menuTitle(this._menuStatusInfo(user)), {
         parse_mode: 'HTML',
         reply_markup: this._mainMenuKeyboard(user),
       });
@@ -371,7 +372,7 @@ class TelegramNotifier {
       try {
         // ── Main menu actions ─────────────────
         if (data === 'menu') {
-          await this._editMessage(chatId, query.message.message_id, t.menuTitle, this._mainMenuKeyboard(user));
+          await this._editMessage(chatId, query.message.message_id, t.menuTitle(this._menuStatusInfo(user)), this._mainMenuKeyboard(user));
           await this.bot.answerCallbackQuery(query.id);
         }
 
@@ -458,7 +459,7 @@ class TelegramNotifier {
           user.language = lang;
           const newT = getTranslations(lang);
           await this.bot.answerCallbackQuery(query.id, { text: newT.languageSet(lang) });
-          await this._editMessage(chatId, query.message.message_id, newT.menuTitle, this._mainMenuKeyboard(user));
+          await this._editMessage(chatId, query.message.message_id, newT.menuTitle(this._menuStatusInfo(user)), this._mainMenuKeyboard(user));
         }
 
         // ── Threshold ─────────────────────────
@@ -471,7 +472,7 @@ class TelegramNotifier {
           this.db.updateUser(user.id, 'alert_threshold', val);
           user.alert_threshold = val;
           await this.bot.answerCallbackQuery(query.id, { text: t.thresholdSet(val) });
-          await this._editMessage(chatId, query.message.message_id, t.menuTitle, this._mainMenuKeyboard(user));
+          await this._editMessage(chatId, query.message.message_id, t.menuTitle(this._menuStatusInfo(user)), this._mainMenuKeyboard(user));
         }
         else if (data === 'threshold_custom') {
           // Set state: next plain text message from this user = threshold value
@@ -489,7 +490,7 @@ class TelegramNotifier {
           user.status = newStatus;
           const statusMsg = newStatus === 'active' ? t.resumed : t.paused;
           await this.bot.answerCallbackQuery(query.id, { text: statusMsg.replace(/<[^>]*>/g, '') });
-          await this._editMessage(chatId, query.message.message_id, statusMsg + '\n\n' + t.menuTitle, this._mainMenuKeyboard(user));
+          await this._editMessage(chatId, query.message.message_id, statusMsg + '\n\n' + t.menuTitle(this._menuStatusInfo(user)), this._mainMenuKeyboard(user));
         }
 
         // ── Subscription / Upgrade ────────────
@@ -537,10 +538,14 @@ class TelegramNotifier {
         }
 
         // ── X Analysis ────────────────────────
+        // Plan gate via entitlements: xAnalysis === 0 → blocked (Free).
+        // xAnalysis > 0 → daily cap enforced inside _handleXAnalysis.
+        // xAnalysis === -1 → unlimited (Pro/Admin).
         else if (data.startsWith('x_analysis:')) {
-          if (user.plan_name === 'test') {
+          const ent = getPlanEntitlements(user.plan_name);
+          if (ent.xAnalysis === 0) {
             await this.bot.answerCallbackQuery(query.id, {
-              text: t.xAnalysisLocked || 'X Analysis is locked for Test plan',
+              text: t.xAnalysisLocked || 'X Analysis is for Test/Pro plan',
               show_alert: true,
             });
             return;
@@ -554,7 +559,7 @@ class TelegramNotifier {
         }
         else if (data === 'x_locked') {
           await this.bot.answerCallbackQuery(query.id, {
-            text: t.xAnalysisLocked || 'X Analysis is locked for this plan',
+            text: t.xAnalysisLocked || 'X Analysis is for Test/Pro plan',
             show_alert: true,
           });
         }
@@ -581,10 +586,15 @@ class TelegramNotifier {
         }
 
         // ── X Analysis refresh (1h cooldown) ──────────────────────────────
+        // Same plan gate as initial analysis — Free blocked, Test capped,
+        // Pro/Admin unlimited. Refresh consumes a hit from the same daily
+        // bucket as the first call (handled inside _handleXRefresh via the
+        // shared cap path, see _handleXAnalysis).
         else if (data.startsWith('x_refresh:')) {
-          if (user.plan_name === 'test') {
+          const ent = getPlanEntitlements(user.plan_name);
+          if (ent.xAnalysis === 0) {
             await this.bot.answerCallbackQuery(query.id, {
-              text: t.xAnalysisLocked || 'X Analysis is locked for Test plan',
+              text: t.xAnalysisLocked || 'X Analysis is for Test/Pro plan',
               show_alert: true,
             });
             return;
@@ -714,10 +724,34 @@ class TelegramNotifier {
     };
   }
 
+  /**
+   * Build the status-info object for the live header line in the main menu.
+   * Used by `t.menuTitle(info)` to render "🟢 Active · Pro · 12d left" or
+   * "🟠 Paused · Free" etc.
+   *
+   * daysLeft is `null` for Free / no expiry / already-expired (the gate in
+   * dispatchAlerts handles silent downgrade). We never render a negative
+   * number — if expiry is in the past, daysLeft stays null and the header
+   * just shows plan name without the days suffix.
+   */
+  _menuStatusInfo(user) {
+    const paused = user.status === 'paused';
+    const plan   = user.plan_name || 'free';
+    let daysLeft = null;
+    if (user.subscription_expires_at) {
+      const expMs = new Date(user.subscription_expires_at).getTime();
+      const nowMs = Date.now();
+      if (Number.isFinite(expMs) && expMs > nowMs) {
+        daysLeft = Math.ceil((expMs - nowMs) / 86_400_000);
+      }
+    }
+    return { paused, plan, daysLeft };
+  }
+
   _mainMenuKeyboard(user) {
     const t = getTranslations(user.language);
 
-    // Live badges - show each setting's current value right on its tile so
+    // Live badges — show each setting's current value right on its tile so
     // the menu doubles as a status screen and saves a tap to peek inside.
     const ALL_SOURCES_COUNT = 5;
     const disabled = (() => { try { return JSON.parse(user.disabled_sources || '[]'); } catch { return []; } })();
@@ -726,10 +760,21 @@ class TelegramNotifier {
     const languageBadge   = t.badgeLanguage   ? t.badgeLanguage(user.language || 'en') : '';
     const alertTypesList  = (this.db?.getUserAlertTypes ? this.db.getUserAlertTypes(user.telegram_chat_id) : []) || [];
     const alertTypesBadge = t.badgeAlertTypes ? t.badgeAlertTypes(alertTypesList.length, 3) : '';
+    const status          = this._menuStatusInfo(user);
+    const planBadge       = t.badgePlan    ? t.badgePlan(status.plan, status.daysLeft) : '';
+    const submenuBadge    = t.badgeSubmenu ? t.badgeSubmenu() : '';
     const dashboardUrl    = process.env.PUBLIC_BASE_URL || 'https://catalystparser.io';
 
+    // Layout — three logical groups (header carries status):
+    //   1. Alert tuning: Sources + Threshold, AlertTypes + Language (2x2)
+    //   2. Account/Misc: Plan + Top Trends            (one row)
+    //   3. Actions:      Pause, Dashboard, Ask, Close (stacked)
+    // Top Trends sits with Plan because both are "odd-shaped" tiles that
+    // don't fit the alert-tuning grid (Plan is info-only, Top Trends is a
+    // submenu entry — neither is an in-place toggle).
     return {
       inline_keyboard: [
+        // ── Group 1: alert tuning ─────────────────────────────────────
         [
           { text: t.btnSources   + sourcesBadge,    callback_data: 'sources'   },
           { text: t.btnThreshold + thresholdBadge,  callback_data: 'threshold' },
@@ -738,13 +783,15 @@ class TelegramNotifier {
           { text: t.btnAlertTypes + alertTypesBadge, callback_data: 'alert_types' },
           { text: t.btnLanguage   + languageBadge,   callback_data: 'language'    },
         ],
+        // ── Group 2: account / submenu entries ────────────────────────
         [
-          { text: t.btnTop,          callback_data: 'top'          },
-          { text: t.btnSubscription, callback_data: 'subscription' },
+          { text: t.btnSubscription + planBadge,     callback_data: 'subscription' },
+          { text: t.btnTop          + submenuBadge,  callback_data: 'top'          },
         ],
-        [{ text: t.btnDashboard || '\u{1F310} Open Dashboard', url: dashboardUrl }],
+        // ── Group 3: actions ──────────────────────────────────────────
         [{ text: t.btnStartStop(user.status === 'paused'), callback_data: 'toggle_pause' }],
-        [{ text: t.btnAskQuestion || '💬 Ask a question', url: this._supportUrl() }],
+        [{ text: t.btnDashboard || '\u{1F4CA} Open Dashboard', url: dashboardUrl }],
+        [{ text: t.btnAskQuestion || '💬 Ask a question',       url: this._supportUrl() }],
         [{ text: t.btnClose, callback_data: 'close' }],
       ]
     };
@@ -1325,7 +1372,11 @@ class TelegramNotifier {
     const lang = typeof userOrLang === 'string' ? userOrLang : (userOrLang?.language || 'en');
     const plan = typeof userOrLang === 'object' ? userOrLang?.plan_name : null;
     const t = getTranslations(lang);
-    const isLocked = plan === 'test';
+    // X Analysis: blocked when xAnalysis cap is 0 (Free). Test gets the
+    // capped feature, Pro/Admin unlimited — both render as the active button
+    // and the daily cap is enforced in _handleXAnalysis.
+    const xEnt = plan ? getPlanEntitlements(plan).xAnalysis : 0;
+    const isLocked = xEnt === 0;
     const xText = isLocked ? (t.xAnalysisLockedBtn || '\u{1F512} X Analysis') : t.xAnalysisBtn;
     const xData = isLocked ? 'x_locked' : `x_analysis:${dbId}`;
 
@@ -1431,10 +1482,32 @@ class TelegramNotifier {
 
   async _handleXAnalysis(chatId, trendId, originalMsgId, user) {
     const t = getTranslations(user.language);
-    if (user.plan_name === 'test') {
-      return this.bot.sendMessage(chatId, t.xAnalysisLocked || '🔒 X Analysis is locked for this plan.', {
+
+    // Plan gate (defensive — also enforced at the callback router level).
+    // xAnalysis === 0 → Free, blocked entirely.
+    const ent = getPlanEntitlements(user.plan_name);
+    if (ent.xAnalysis === 0) {
+      return this.bot.sendMessage(chatId, t.xAnalysisLocked || '🔒 X Analysis is for Test/Pro plan.', {
         parse_mode: 'HTML',
       });
+    }
+
+    // Daily cap (in-memory rolling 24h, per-chat). Test = 10/day, Pro/Admin
+    // unlimited (xAnalysis === -1 → skip). Same shape as _catalystHits.
+    if (ent.xAnalysis > 0) {
+      const now = Date.now();
+      const dayMs = 24 * 60 * 60 * 1000;
+      const hits = (this._xAnalysisHits.get(String(chatId)) || []).filter(ts => now - ts < dayMs);
+      if (hits.length >= ent.xAnalysis) {
+        const txt = t.xAnalysisLimitReached
+          ? t.xAnalysisLimitReached(ent.xAnalysis)
+          : (user.language === 'ru'
+              ? `⛔ Дневной лимит X Analysis исчерпан (${ent.xAnalysis}/24ч).`
+              : `⛔ Daily X Analysis limit reached (${ent.xAnalysis} / 24h).`);
+        return this.bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+      }
+      hits.push(now);
+      this._xAnalysisHits.set(String(chatId), hits);
     }
 
     const trend = this.db?.getTrendById ? this.db.getTrendById(trendId) : null;
@@ -1521,6 +1594,27 @@ class TelegramNotifier {
         show_alert: false,
       }).catch(() => {});
       return;
+    }
+
+    // Daily cap (refresh shares the same bucket as initial analysis — both
+    // hit Apify). Free already filtered at callback router; here we enforce
+    // for Test (10/day). Pro/Admin (xAnalysis === -1) skip naturally.
+    const ent = getPlanEntitlements(user.plan_name);
+    if (ent.xAnalysis > 0) {
+      const now = Date.now();
+      const dayMs = 24 * 60 * 60 * 1000;
+      const hits = (this._xAnalysisHits.get(String(chatId)) || []).filter(ts => now - ts < dayMs);
+      if (hits.length >= ent.xAnalysis) {
+        const txt = t.xAnalysisLimitReached
+          ? t.xAnalysisLimitReached(ent.xAnalysis)
+          : (user.language === 'ru'
+              ? `⛔ Дневной лимит X Analysis исчерпан (${ent.xAnalysis}/24ч).`
+              : `⛔ Daily X Analysis limit reached (${ent.xAnalysis} / 24h).`);
+        await this.bot.answerCallbackQuery(cbId, { text: txt, show_alert: true }).catch(() => {});
+        return;
+      }
+      hits.push(now);
+      this._xAnalysisHits.set(String(chatId), hits);
     }
 
     await this.bot.answerCallbackQuery(cbId, {

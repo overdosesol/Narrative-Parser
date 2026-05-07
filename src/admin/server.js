@@ -1058,6 +1058,32 @@ class AdminServer {
         return json(res, 200, { ok: true });
       }
 
+      // ── TikTok hashtag source toggle (apify | grok) ─────────────────────
+      // GET returns the current source string. POST { source: 'apify'|'grok' }
+      // updates the DB setting that tiktok.js _getHashtags() reads on every
+      // collect cycle — switch is effectively immediate (next cycle picks it
+      // up). When switching to 'grok', we DON'T pre-warm any list; the
+      // collector falls back to presetConfigs / hardcoded defaults until
+      // tag-refresher.js next runs (manually via "Force refresh" or weekly).
+      if (path === '/api/tiktok-hashtag-source' && method === 'GET') {
+        const source = (this.db.getSetting('tiktokHashtagSource', 'apify') || 'apify').toLowerCase();
+        return json(res, 200, { source });
+      }
+      if (path === '/api/tiktok-hashtag-source' && method === 'POST') {
+        try {
+          const body = await parseBody(req);
+          const next = String(body?.source || '').toLowerCase();
+          if (next !== 'apify' && next !== 'grok') {
+            return json(res, 400, { error: 'source must be "apify" or "grok"' });
+          }
+          this.db.setSetting('tiktokHashtagSource', next);
+          this.logger?.info?.(`[Admin] tiktokHashtagSource → ${next}`);
+          return json(res, 200, { ok: true, source: next });
+        } catch (e) {
+          return json(res, 400, { error: e.message });
+        }
+      }
+
       // ── Junk-reason stats over last N hours (for observation panel) ──
       if (path === '/api/junk-stats' && method === 'GET') {
         const hours = parseInt(url.searchParams.get('hours') || '24', 10) || 24;
@@ -3895,10 +3921,148 @@ function DecisionsPage() {
                 }, isOpen ? '▴ свернуть' : '▾ детали')
               ),
               // Row 5: full math panel (when expanded)
-              d.breakdown && isOpen && MathPanel(d)
+              d.breakdown && isOpen && MathPanel(d),
+              // Row 6: Stage 0 PreStage block (Gemini visual+audio + chips + nano)
+              // — only when expanded. If preStage is null/empty (legacy trend
+              // scored before PreStage was wired, or text-only trend with no
+              // media for Gemini AND no nano result), show a dashed legacy
+              // chip so the missing block doesn't look like a render bug.
+              isOpen && DecisionPreStageBlock(d)
             );
           })
         )
+  );
+}
+
+// ── DecisionPreStageBlock — Stage 0 PreStage card for DecisionsPage ────────
+// Mirrors the block ManualResultCard shows for manual-analyzed trends, but
+// rendered against decision-record shape (d.preStage). Lives here (next to
+// DecisionsPage) instead of inline so the DecisionsPage row stays readable.
+//
+// Returns null when there is nothing to render except the legacy marker —
+// in that case we still emit the dashed chip so admins know it's not a bug.
+function DecisionPreStageBlock(d) {
+  const h = React.createElement;
+  const ps = d.preStage || null;
+  const hasNano = !!ps?.nano;
+  const hasGemini = !!ps?.gemini;
+
+  // Empty case → show legacy/no-data dashed chip and return.
+  if (!hasNano && !hasGemini) {
+    return h('div', {
+      style: {
+        fontSize: 11, color: 'var(--text2)', marginTop: 10,
+        padding: '6px 10px',
+        border: '1px dashed rgba(255,255,255,.12)',
+        borderRadius: 6,
+        display: 'inline-flex', alignItems: 'center', gap: 6,
+        background: 'rgba(255,255,255,.02)',
+      },
+      title: 'Этот тренд был заскорен до того, как у тебя включился Stage 0 PreStage (nano + gemini), либо у него не было ни текста для nano, ни картинки/видео для gemini. Hot-refresh не пересоздаёт preStage — данные останутся пустыми навсегда.'
+    },
+      h('span', null, '📭'),
+      h('span', null, 'No PreStage data (legacy trend)')
+    );
+  }
+
+  const g = ps.gemini || {};
+  const n = ps.nano || {};
+
+  return h('div', {
+    style: {
+      marginTop: 10, padding: '12px 14px',
+      background: 'rgba(124,58,237,.04)',
+      border: '1px solid rgba(124,58,237,.18)',
+      borderRadius: 8,
+      fontSize: 12, lineHeight: 1.55, color: 'var(--text)',
+    }
+  },
+    h('div', { style: { fontSize: 10, fontWeight: 700, color: 'var(--text2)', marginBottom: 8, letterSpacing: '.4px' } },
+      '🎨 STAGE 0 PRESTAGE'),
+
+    // Nano sub-block
+    hasNano && h('div', {
+      style: hasGemini ? { marginBottom: 10, paddingBottom: 10, borderBottom: '1px solid rgba(124,58,237,.18)' } : null
+    },
+      h('div', { style: { fontSize: 10, fontWeight: 700, color: 'var(--text2)', marginBottom: 4 } }, '📝 Nano (gpt-5.4-nano)'),
+      n.topicSummary && h('div', { style: { marginBottom: 4 } },
+        h('span', { style: { color: 'var(--text2)' } }, 'Тема: '), n.topicSummary
+      ),
+      Array.isArray(n.entityCanonical) && n.entityCanonical.length > 0 &&
+        h('div', { style: { marginBottom: 4 } },
+          h('span', { style: { color: 'var(--text2)' } }, 'Сущности: '),
+          n.entityCanonical.join(', ')
+        ),
+      n.slangDecoded && n.slangDecoded.trim() &&
+        h('div', { style: { marginBottom: 4, fontStyle: 'italic' } },
+          h('span', { style: { color: 'var(--text2)', fontStyle: 'normal' } }, 'Slang: '),
+          n.slangDecoded
+        ),
+      n.language && n.language !== 'en' &&
+        h('span', { style: { fontSize: 11, color: 'var(--text2)' } }, 'lang=' + n.language)
+    ),
+
+    // Gemini sub-block
+    hasGemini && h('div', null,
+      h('div', { style: { fontSize: 10, fontWeight: 700, color: 'var(--text2)', marginBottom: 4 } },
+        '🎬 Gemini (' + (g.mediaType || 'visual') + ')' +
+        (g.videoTruncated ? ' · poster fallback' :
+          (g.videoClipped ? ' · clipped to ' + (g.videoMaxSec || 30) + 's' : '')) +
+        (g.videoDurationSec ? ' · ' + g.videoDurationSec.toFixed(1) + 's' : '')
+      ),
+      g.visualCaption && h('div', { style: { marginBottom: 4 } },
+        h('span', { style: { color: 'var(--text2)' } }, 'Визуал: '), g.visualCaption
+      ),
+      g.videoSummary && g.videoSummary.trim() &&
+        h('div', { style: { marginBottom: 4 } },
+          h('span', { style: { color: 'var(--text2)' } }, 'Видео: '), g.videoSummary
+        ),
+      g.audioSummary && g.audioSummary.trim() &&
+        h('div', { style: { marginBottom: 4 } },
+          h('span', { style: { color: 'var(--text2)' } }, '🎤 Аудио: '), g.audioSummary
+        ),
+      g.spokenText && g.spokenText.trim() &&
+        h('div', { style: { marginBottom: 4 } },
+          h('span', { style: { color: 'var(--text2)' } }, '💬 Речь: '),
+          h('span', { style: { fontStyle: 'italic' } }, '"' + g.spokenText + '"')
+        ),
+      g.visibleText && g.visibleText.trim() &&
+        h('div', { style: { marginBottom: 4 } },
+          h('span', { style: { color: 'var(--text2)' } }, 'Текст в кадре: '),
+          h('span', { style: { fontStyle: 'italic' } }, '"' + g.visibleText + '"')
+        ),
+      // Scoring chips row (memeShape, narrative, subject, viralPattern,
+      // tickerSuggestion, subjectNames, lipsync, ambient flags).
+      (Number.isFinite(g.memeShapeStrength)
+          || typeof g.hasNarrative === 'boolean'
+          || typeof g.hasSubject === 'boolean'
+          || g.viralPattern
+          || (g.tickerSuggestion && g.tickerSuggestion.trim())
+          || (Array.isArray(g.subjectNames) && g.subjectNames.length > 0)
+          || g.isLipSync
+          || g.isAmbient) &&
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8, marginBottom: 4 } },
+          Number.isFinite(g.memeShapeStrength) &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10 } }, '🎯 memeShape ' + g.memeShapeStrength + '/100'),
+          typeof g.hasNarrative === 'boolean' &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10 } }, (g.hasNarrative ? '📖' : '🚫') + ' narrative'),
+          typeof g.hasSubject === 'boolean' &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10 } }, (g.hasSubject ? '👤' : '🚫') + ' subject'),
+          g.viralPattern &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10 } }, '🌀 ' + g.viralPattern),
+          g.tickerSuggestion && g.tickerSuggestion.trim() &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10, color: '#fdcb6e' } }, '$' + g.tickerSuggestion),
+          Array.isArray(g.subjectNames) && g.subjectNames.length > 0 &&
+            g.subjectNames.map((nm, i) =>
+              h('span', { key: 'subj-' + i, className: 'sp-chip', style: { fontSize: 10, color: '#fdcb6e' } }, '🏷️ ' + nm)
+            ),
+          g.isLipSync &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10, color: '#ff7675' } }, '🎤 lip-sync'),
+          g.isAmbient &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10, color: '#ff7675' } }, '😴 ambient')
+        ),
+      g.mood && h('span', { style: { fontSize: 11, color: 'var(--text2)' } }, 'mood: ' + g.mood)
+    )
   );
 }
 
@@ -4835,6 +4999,27 @@ function ManualResultCard({ result, comment, setComment, onAlertSent }) {
         t.marketStage && t.marketStage !== 'none' && React.createElement('span', { className: 'sp-chip' }, '📊 ' + t.marketStage)
       ),
 
+      // ── Legacy marker: trend was scored before PreStage existed (or
+      // PreStage was disabled at scoring time). Hot-refresh re-scores from
+      // DB but never recreates the preStage blob, so old trends keep their
+      // null preStage forever. Show a subtle dashed chip so admin doesn't
+      // mistake a missing block for a bug.
+      (!t.preStage || (!t.preStage.nano && !t.preStage.gemini)) &&
+        React.createElement('div', {
+          style: {
+            fontSize: 11, color: 'var(--text2)', marginTop: 6,
+            padding: '6px 10px',
+            border: '1px dashed rgba(255,255,255,.12)',
+            borderRadius: 6,
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            background: 'rgba(255,255,255,.02)',
+          },
+          title: 'Этот тренд был заскорен до того, как у тебя включился Stage 0 PreStage (nano + gemini), либо у него не было ни текста для nano, ни картинки/видео для gemini. Hot-refresh не пересоздаёт preStage — данные останутся пустыми навсегда.'
+        },
+          React.createElement('span', null, '📭'),
+          React.createElement('span', null, 'No PreStage data (legacy trend)')
+        ),
+
       // ── COLLAPSIBLE: PreStage (Stage 0 nano + gemini) ─────────────────
       t.preStage && (t.preStage.nano || t.preStage.gemini) &&
         React.createElement(Collapsible, { title: '🎨 Stage 0 PreStage (контекст для скорера)', accent: 'prestage', defaultOpen: false },
@@ -4922,6 +5107,10 @@ function ManualResultCard({ result, comment, setComment, onAlertSent }) {
                   React.createElement('span', { className: 'sp-chip', style: { fontSize: 10 } }, '🌀 ' + t.preStage.gemini.viralPattern),
                 t.preStage.gemini.tickerSuggestion && t.preStage.gemini.tickerSuggestion.trim() &&
                   React.createElement('span', { className: 'sp-chip', style: { fontSize: 10, color: '#fdcb6e' } }, '$' + t.preStage.gemini.tickerSuggestion),
+                Array.isArray(t.preStage.gemini.subjectNames) && t.preStage.gemini.subjectNames.length > 0 &&
+                  t.preStage.gemini.subjectNames.map((nm, i) =>
+                    React.createElement('span', { key: 'subj-' + i, className: 'sp-chip', style: { fontSize: 10, color: '#fdcb6e' } }, '🏷️ ' + nm)
+                  ),
                 t.preStage.gemini.isLipSync &&
                   React.createElement('span', { className: 'sp-chip', style: { fontSize: 10, color: '#ff7675' } }, '🎤 lip-sync'),
                 t.preStage.gemini.isAmbient &&
@@ -6438,6 +6627,11 @@ function TagRefreshPage() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
   const [msgKind, setMsgKind] = useState('ok');
+  // TikTok hashtag source (apify | grok). Stored as a separate DB setting,
+  // read on every TikTok scan cycle. Loaded alongside refresh-status so the
+  // toggle reflects current backend state without a second round-trip.
+  const [tiktokSource, setTiktokSource] = useState('apify');
+  const [tiktokSourceBusy, setTiktokSourceBusy] = useState(false);
 
   const flash = (m, kind) => {
     setMsg(m); setMsgKind(kind || 'ok');
@@ -6448,8 +6642,22 @@ function TagRefreshPage() {
     api('/api/tag-refresh/status')
       .then(d => setData(d))
       .catch(e => flash('Ошибка загрузки: ' + e.message, 'err'));
+    api('/api/tiktok-hashtag-source')
+      .then(d => setTiktokSource(d.source || 'apify'))
+      .catch(() => { /* tolerate — toggle just stays apify */ });
   };
   useEffect(load, []);
+
+  const switchTiktokSource = async (next) => {
+    if (next === tiktokSource) return;
+    setTiktokSourceBusy(true);
+    try {
+      const r = await api('/api/tiktok-hashtag-source', 'POST', { source: next });
+      setTiktokSource(r.source || next);
+      flash('TikTok hashtag source → ' + (r.source || next), 'ok');
+    } catch (e) { flash('Ошибка: ' + e.message, 'err'); }
+    finally { setTiktokSourceBusy(false); }
+  };
 
   const toggle = async () => {
     if (!data) return;
@@ -6547,6 +6755,36 @@ function TagRefreshPage() {
         h('div', null, h('div', { style: { color: 'var(--muted)' } }, 'Last run'), h('div', null, fmtTs(data.lastRunAt))),
         h('div', null, h('div', { style: { color: 'var(--muted)' } }, 'Next scheduled'), h('div', null, fmtTs(data.nextRunAt), ' (', remaining(data.nextRunAt), ')')),
         h('div', null, h('div', { style: { color: 'var(--muted)' } }, 'Force available after'), h('div', null, fmtTs(data.nextForceAt), ' (', remaining(data.nextForceAt), ')'))
+      )
+    ),
+
+    // ── TikTok hashtag source toggle ──────────────────────────────────────
+    // Switches between the live Apify Creative Center pool (default —
+    // "топовые но мусорные" tags) and the Grok-curated list refreshed
+    // weekly by tag-refresher.js into presetConfigs.tiktok.hashtags.
+    // When set to 'grok', the TikTok collector skips the Apify Creative
+    // Center call entirely. When set to 'apify', original behavior.
+    h('div', { className: 'card', style: { marginBottom: 18, padding: 16 } },
+      h('h3', { style: { marginTop: 0, marginBottom: 8 } }, '🎵 TikTok hashtag source'),
+      h('div', { style: { fontSize: 12, color: 'var(--muted)', marginBottom: 12, lineHeight: 1.5 } },
+        'Apify — топ-теги из TikTok Creative Center (refresh каждые 12ч). Включает много dance/lipsync/outfit-format мусора. ',
+        'Grok — кастомный список, обновляется этим tag-refresher-ом (раз в ' + String(data.cooldownDays) + ' дней). ',
+        'Переключение применится в следующем scan-цикле TikTok (по умолчанию каждые 30мин).'
+      ),
+      h('div', { style: { display: 'flex', gap: 8 } },
+        h('button', {
+          className: 'btn btn-' + (tiktokSource === 'apify' ? 'primary' : 'ghost') + ' btn-sm',
+          disabled: tiktokSourceBusy,
+          onClick: () => switchTiktokSource('apify'),
+        }, (tiktokSource === 'apify' ? '✓ ' : '') + 'Apify Creative Center'),
+        h('button', {
+          className: 'btn btn-' + (tiktokSource === 'grok' ? 'primary' : 'ghost') + ' btn-sm',
+          disabled: tiktokSourceBusy,
+          onClick: () => switchTiktokSource('grok'),
+        }, (tiktokSource === 'grok' ? '✓ ' : '') + 'Grok (auto-tags)'),
+      ),
+      tiktokSource === 'grok' && h('div', { style: { fontSize: 11, color: 'var(--muted)', marginTop: 10, fontStyle: 'italic' } },
+        '⚠ Если tag-refresher ещё не отрабатывал — TikTok будет использовать hardcoded fallback из preset-config.js (animals/culture/celebrities/events 3+3+3+3 теги). Жми "Force refresh now" сверху чтобы Grok сгенерил кастомные.'
       )
     ),
 

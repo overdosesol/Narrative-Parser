@@ -272,20 +272,46 @@ class TikTokCollector extends BaseCollector {
   }
 
   /**
-   * Resolve hashtag list for the active scan cycle. Priority:
-   *   1. customHashtags (env override TIKTOK_HASHTAGS) — escape hatch
-   *   2. Trending hashtags from TikTok Creative Center (live, refreshes daily)
-   *   3. Per-preset hardcoded list (preset-config.js) — fallback when trends
-   *      discovery is unavailable / failed / not yet fetched
-   *   4. Last-resort generic list — only if preset blob is corrupted
+   * Resolve hashtag list for the active scan cycle. Source switchable via
+   * the `tiktokHashtagSource` DB setting (default 'apify'):
    *
-   * Marked async because it triggers refresh-on-stale; in practice only one
-   * call per ~24h actually awaits the network.
+   *   'apify' (default) — original behavior:
+   *     1. customHashtags (env override TIKTOK_HASHTAGS)
+   *     2. Trending hashtags from TikTok Creative Center (live, refreshes 12h)
+   *     3. Per-preset list from getActivePresetConfig (fallback)
+   *     4. Last-resort generic list
+   *
+   *   'grok' — Grok-curated only:
+   *     1. customHashtags (env override TIKTOK_HASHTAGS) — escape hatch always wins
+   *     2. Per-preset list from getActivePresetConfig — refreshed weekly by
+   *        tag-refresher.js into presetConfigsAuto. Apify Creative Center
+   *        is INTENTIONALLY skipped on this path so A/B testing isolates
+   *        whether Apify-supplied trending tags are the source of low-quality
+   *        TikTok alerts (lipsync / dance / outfit-transition trends).
+   *     3. Hardcoded ultra-fallback (rare — only when DB blob is empty/corrupt
+   *        AND tag-refresher hasn't run yet on a fresh deploy).
+   *
+   * Marked async because the apify path triggers refresh-on-stale; in
+   * practice only one call per ~12h actually awaits the network.
    */
   async _getHashtags() {
     if (this.customHashtags) return this.customHashtags;
 
-    // Try live trending list first.
+    const source = (this.db?.getSetting?.('tiktokHashtagSource', 'apify') || 'apify').toLowerCase();
+
+    if (source === 'grok') {
+      // Grok-only path — bypass Apify Creative Center entirely.
+      let hashtags = [];
+      try { hashtags = getActivePresetConfig(this.db).sources?.tiktok?.hashtags || []; }
+      catch (_) { hashtags = []; }
+      if (hashtags.length === 0) hashtags = ['memecoin', 'viral', 'fyp'];
+      this.logger.info(
+        `[TikTok] hashtag source = grok (${hashtags.length} from presetConfigs auto+manual+defaults merge)`
+      );
+      return hashtags;
+    }
+
+    // Default 'apify' path — original behavior.
     await this._ensureTrendingHashtagsFresh();
     if (this._trendingHashtags && this._trendingHashtags.length > 0) {
       return this._trendingHashtags;

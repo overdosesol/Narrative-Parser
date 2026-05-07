@@ -201,6 +201,8 @@ export function buildAnalysisPrompt(trends) {
       if (g.viralPattern)                       scoringBits.push(`pattern=${g.viralPattern}`);
       if (g.tickerSuggestion && g.tickerSuggestion.trim())
                                                 scoringBits.push(`tickerHint=${g.tickerSuggestion}`);
+      if (Array.isArray(g.subjectNames) && g.subjectNames.length > 0)
+                                                scoringBits.push(`subjects=[${g.subjectNames.join(', ')}]`);
       if (g.isAmbient === true)                 scoringBits.push(`AMBIENT`);
       if (g.isLipSync === true)                 scoringBits.push(`LIPSYNC`);
       if (scoringBits.length > 0)           detail += `\n   GeminiScoring: ${scoringBits.join(', ')}`;

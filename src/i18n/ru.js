@@ -22,18 +22,26 @@ const ru = {
   welcomeBack: (plan) => `<b>Catalyst</b> \u00b7 \u043f\u043b\u0430\u043d: <b>${plan}</b>\n\n/menu - \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438\n/top - \u0442\u043e\u043f \u043d\u0430\u0440\u0440\u0430\u0442\u0438\u0432\u043e\u0432 \u0441\u0435\u0439\u0447\u0430\u0441`,
 
   // ── Main menu ──────────────────────────────────────────────────────────
-  menuTitle: '\u{2699}\u{FE0F} <b>Настройки</b>\n\nНажмите на пункт, чтобы изменить. Текущие значения показаны рядом с каждой кнопкой.',
+  // menuTitle — функция для live-статус строки в шапке.
+  menuTitle: (info = {}) => {
+    const dot      = info.paused ? '\u{1F7E0}' : '\u{1F7E2}';
+    const status   = info.paused ? 'На паузе' : 'Активно';
+    const planMap  = { free: 'Free', test: 'Test', pro: 'Pro', admin: 'Admin' };
+    const planCap  = planMap[info.plan] || 'Free';
+    const daysPart = (info.daysLeft != null) ? ` · ${info.daysLeft}д` : '';
+    return `\u{2699}\u{FE0F} <b>Настройки</b>\n${dot} ${status} · ${planCap}${daysPart}`;
+  },
   btnSources: '\u{1F4E1} \u{0418}\u{0441}\u{0442}\u{043E}\u{0447}\u{043D}\u{0438}\u{043A}\u{0438}',
   btnLanguage: '\u{1F310} \u{042F}\u{0437}\u{044B}\u{043A}',
-  btnThreshold: '\u{1F3AF} Порог',
-  btnSubscription: '\u{1F4B3} \u{041F}\u{043E}\u{0434}\u{043F}\u{0438}\u{0441}\u{043A}\u{0430}',
+  btnThreshold: '\u{1F39A}\u{FE0F} Порог',
+  btnSubscription: '\u{1F48E} План',
   // 🔔 Типы алертов
   btnAlertTypes: '\u{1F514} \u{0422}\u{0438}\u{043F}\u{044B} \u{0430}\u{043B}\u{0435}\u{0440}\u{0442}\u{043E}\u{0432}',
   btnTop: '\u{1F525} \u{0422}\u{043E}\u{043F} \u{0442}\u{0440}\u{0435}\u{043D}\u{0434}\u{043E}\u{0432}',
   btnStartStop: (paused) => paused ? '\u{25B6}\u{FE0F} \u{0412}\u{043E}\u{0437}\u{043E}\u{0431}\u{043D}\u{043E}\u{0432}\u{0438}\u{0442}\u{044C}' : '\u{23F8}\u{FE0F} \u{041F}\u{0430}\u{0443}\u{0437}\u{0430}',
   btnFollowX: '\u{1D54F} \u{041D}\u{0430}\u{0448} X: @Catalystparser',
   btnAskQuestion: '\u{1F4AC} \u{0417}\u{0430}\u{0434}\u{0430}\u{0442}\u{044C} \u{0432}\u{043E}\u{043F}\u{0440}\u{043E}\u{0441}',
-  btnDashboard: '\u{1F310} Открыть дашборд',
+  btnDashboard: '\u{1F4CA} Открыть дашборд',
   dashboardPrompt: (url) => `\u{1F310} <b>Веб-дашборд</b>\n\nПолный фид нарративов, фильтры по фазе / типу / источнику, ручной анализ ссылок (Pro). Вход через ваш Telegram-аккаунт.\n\n<a href="${url}">${url}</a>`,
   btnOpenMenu: '\u{2699}\u{FE0F} \u{041E}\u{0442}\u{043A}\u{0440}\u{044B}\u{0442}\u{044C} \u{043C}\u{0435}\u{043D}\u{044E}',
   btnBack: '\u{25C0}\u{FE0F} \u{041D}\u{0430}\u{0437}\u{0430}\u{0434}',
@@ -42,7 +50,16 @@ const ru = {
   badgeSources:    (enabled, total) => ` · ${enabled}/${total}`,
   badgeThreshold:  (val)            => ` · ${val}`,
   badgeLanguage:   (code)           => ` · ${code.toUpperCase()}`,
-  badgeAlertTypes: (count, total)   => (count === 0 || count === total) ? ' · все' : ` · ${count}/${total}`,
+  // Всегда показываем N/total — понятнее чем «все».
+  badgeAlertTypes: (count, total)   => ` · ${count === 0 ? total : count}/${total}`,
+  // Бэйдж плана: « · Pro · 12д» для платных, « · Free» для бесплатного.
+  badgePlan:       (plan, daysLeft) => {
+    const planMap = { free: 'Free', test: 'Test', pro: 'Pro', admin: 'Admin' };
+    const cap = planMap[plan] || 'Free';
+    return (daysLeft != null) ? ` · ${cap} · ${daysLeft}д` : ` · ${cap}`;
+  },
+  // Маркер «открывает подменю» (на кнопке Топ трендов).
+  badgeSubmenu:    () => ' ▸',
 
   // ── Sources ────────────────────────────────────────────────────────────
   sourcesTitle: '\u{1F4E1} <b>Источники данных</b>\n\nНажмите на платформу, чтобы включить или отключить её алерты.',
@@ -97,7 +114,7 @@ const ru = {
   planPro: 'Pro ($100 / 30 \u{0434}\u{043D}\u{0435}\u{0439})',
 
   // ── Payment ────────────────────────────────────────────────────────────
-  paymentTitle: '💰 <b>Выберите план:</b>\n\n🆓 <b>Free - бесплатно</b>\n• Источники: Reddit, Google Trends\n• Безлимит алертов\n• 🔒 Ручной анализ и Каталист недоступны\n\n🧪 <b>Test - $5 / 1 день (один раз)</b>\n• Все 5 источников (Reddit, Google, Twitter, TikTok, X Trends)\n• Безлимит алертов\n• Ручной анализ: 5/день\n• Каталист: 5/день\n\n🚀 <b>Pro - $100 / 30 дней</b>\n• Все 5 источников\n• Безлимит алертов\n• Ручной анализ: 100/день\n• Каталист: 100/день',
+  paymentTitle: '💰 <b>Выберите план:</b>\n\n🆓 <b>Free</b>\n• Источники: Reddit, Google Trends\n• Безлимит алертов\n• Ручной анализ: 🔒 недоступен\n• Каталист: 🔒 недоступен\n\n🧪 <b>Test - $5 / 1 день (один раз)</b>\n• Источники: Twitter(X), TikTok, Reddit, X Trends, Google Trends\n• Безлимит алертов\n• Ручной анализ: 5/день\n• Каталист: 5/день\n\n🚀 <b>Pro - $100 / 30 дней</b>\n• Источники: Twitter(X), TikTok, Reddit, X Trends, Google Trends\n• Безлимит алертов\n• Ручной анализ: Безлимит\n• Каталист: Безлимит',
   paymentMethod: '\u{1F4B0} <b>\u{041E}\u{043F}\u{043B}\u{0430}\u{0442}\u{0430}</b>\n\n\u{0412}\u{044B}\u{0431}\u{0435}\u{0440}\u{0438}\u{0442}\u{0435} \u{0441}\u{043F}\u{043E}\u{0441}\u{043E}\u{0431} \u{043E}\u{043F}\u{043B}\u{0430}\u{0442}\u{044B}:',
   btnPaySOL:  '\u{26A1} Оплатить через SOL',
   btnPayUSDC: '\u{1F4B5} Оплатить через USDC',
@@ -163,7 +180,8 @@ const ru = {
   xAnalysisBtn: '\u{1F426} X \u{0410}\u{043D}\u{0430}\u{043B}\u{0438}\u{0437}',
   btnAskGrok:   '\u{1F9E0} \u{0421}\u{043F}\u{0440}\u{043E}\u{0441}\u{0438}\u{0442}\u{044C} Grok',
   xAnalysisLockedBtn: '\u{1F512} X \u{0410}\u{043D}\u{0430}\u{043B}\u{0438}\u{0437} (\u{0437}\u{0430}\u{043A}\u{0440}\u{044B}\u{0442})',
-  xAnalysisLocked: '🔒 X анализ недоступен на Test plan. Обновитесь до Pro.',
+  xAnalysisLocked: '🔒 X Analysis доступен на Test/Pro. Обновись в /menu → План.',
+  xAnalysisLimitReached: (cap) => `⛔ Дневной лимит X Analysis исчерпан (${cap}/24ч). Обнови до Pro для безлимита.`,
   xAnalysisLoading: '\u{23F3} \u{0417}\u{0430}\u{0433}\u{0440}\u{0443}\u{0437}\u{043A}\u{0430}...',
   xAnalysisTitle: '\u{1F426} <b>X / Twitter \u{0410}\u{043D}\u{0430}\u{043B}\u{0438}\u{0437}</b>',
   xAnalysisQuery: '\u{0417}\u{0430}\u{043F}\u{0440}\u{043E}\u{0441}',

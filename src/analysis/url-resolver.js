@@ -238,6 +238,15 @@ export async function resolveTiktokUrl(url) {
   if (!videoIdMatch) throw new Error('Not a valid TikTok URL');
   const videoId = videoIdMatch[1];
 
+  // Normalize the URL before sending to apidojo: tracking query params
+  // (?is_from_webapp=1&sender_device=pc&...) and hash fragments confuse
+  // the actor — it sometimes returns a degraded record without video.url
+  // (the MP4 CDN link), which makes Gemini fall through to the poster
+  // and ultimately produces an empty preStage.gemini block. Stripping
+  // ?query and #hash gives apidojo the canonical /@author/video/<id>
+  // form which is what its scraper actually understands.
+  url = url.split('?')[0].split('#')[0];
+
   // Tier 1: apidojo — full engagement + video URL.
   // Token fallback chain matches the collector (`tiktok.js _activeActor`):
   //   APIFY_API_APIDOJO  — preferred, dedicated per-actor key

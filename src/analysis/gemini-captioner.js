@@ -43,10 +43,15 @@
  *                                  //   absurd, character, viral aesthetic, hook)
  *     hasNarrative:      boolean, // is there a story arc / something happens?
  *     hasSubject:        boolean, // is there a clear subject (person/animal/character)?
- *     viralPattern:      string,  // 'character' | 'reaction' | 'pov_skit' |
+ * *     viralPattern:      string,  // 'character' | 'reaction' | 'pov_skit' |
  *                                  // 'compilation' | 'sound_format' | 'gameplay' |
- *                                  // 'animal_action' | 'event' | 'other'
+ *                                  // 'animal_action' | 'event' | 'satisfying' |
+ *                                  // 'asmr' | 'tutorial' | 'process' |
+ *                                  // 'aesthetic' | 'other'
  *     tickerSuggestion:  string,  // short phonetic ticker candidate, "" if none
+ *     subjectNames:      string[], // 0-4 display-form proper nouns of the main
+ *                                  //   subject(s). [0] = primary. Used by
+ *                                  //   formatter.js + dashboard for highlight.
  *
  *     // ── Filter flags ───────────────────────────────────────────────────
  *     isLipSync:         boolean, // true → alert-dispatcher hard-skips the trend
@@ -100,16 +105,42 @@ Return these fields:
 - "memeShapeStrength": Integer 0-100. How meme-coin-shaped this content is. Combine visual + audio. High (70+): clear character, absurd action, catchy audio hook, single iconic moment, viral aesthetic. Medium (40-69): some meme energy but missing a hook OR the subject is generic. Low (0-39): news/political/corporate/static/no clear character. BE CALIBRATED — most content is 30-60.
 - "hasNarrative":     Boolean. TRUE if something happens with a beginning/middle/end — a person reacts to something, an event unfolds, a punchline lands, a transformation occurs. FALSE if it's static repetition, generic dancing/posing without a plot, gameplay loops, slideshows.
 - "hasSubject":       Boolean. TRUE if there is a CLEAR FOCAL SUBJECT — a specific person, animal, character, or object that is the "main character" of the content. FALSE for crowd shots, abstract visuals, generic landscapes, multiple equal-importance subjects.
-- "viralPattern":     One of: "character" | "reaction" | "pov_skit" | "compilation" | "sound_format" | "gameplay" | "animal_action" | "event" | "satisfying" | "asmr" | "tutorial" | "process" | "aesthetic" | "other". Pick the dominant pattern. Definitions for the "ambient" group:
+- "viralPattern":     One of: "character" | "reaction" | "pov_skit" | "compilation" | "sound_format" | "dance_challenge" | "outfit_transition" | "gameplay" | "animal_action" | "event" | "satisfying" | "asmr" | "tutorial" | "process" | "aesthetic" | "other". Pick the dominant pattern. Definitions for the "ambient / sound-format" group (these are auto-rejected on TikTok regardless of engagement):
+                      • "sound_format" — videos built around a trending audio/voiceover; creator participates in the format (lip-sync, sound bite reenactment, audio meme)
+                      • "dance_challenge" — choreographed dance moves performed to a trending song or sound (TikTok dance challenges, #renegade-style, paired dances)
+                      • "outfit_transition" — outfit reveal / glow-up / before-after / fashion transition cut to a beat drop (#wlw / #thegreatdivide / "tag yourself" formats)
                       • "satisfying" — slime / soap cutting / sand cutting / restoration / pressure washing / kinetic sand / pottery cutting (visual loops with no narrative)
                       • "asmr" — whispering / tapping / mukbang / eating sounds / quiet trigger sounds (audio-driven relaxation)
                       • "tutorial" — how-to walkthroughs (makeup / cooking / fitness / DIY / study technique) — instructional content, not narrative
                       • "process" — extended craft/build timelapses (cooking-from-scratch / woodworking / calligraphy / pottery building)
                       • "aesthetic" — vibe / mood content (study-with-me / "day in my life" / aesthetic vlogs / room ambience)
 - "tickerSuggestion": Short phonetic ticker candidate (3-8 chars, all caps) IF the content has an obvious ticker-friendly subject. Examples: "PEPE", "CHILLGUY", "MOODENG". Empty string if no obvious candidate. DO NOT force it — empty is better than weak.
+- "subjectNames":     Array of 0-4 proper-noun names of the MAIN subject(s) of the content, in display form as people would write them in normal text. First element = primary subject. Examples: ["Moo Deng"], ["Mr. Beast", "Logan Paul"], ["Chill Guy"], ["Pepe"], []. Rules:
+                      • Display form only (e.g. "Moo Deng", NOT "MOODENG" or "moo deng"). The downstream code generates lowercase / no-space / hashtag variants for matching.
+                      • Real names of characters, animals, projects, public figures who ARE the focal subject.
+                      • SKIP generic platform / country / big-tech names (TikTok, YouTube, Twitter, USA, China, Apple, Google, Microsoft, Amazon) — these are context, not subjects.
+                      • SKIP if there is no proper-noun subject (abstract concept, generic crowd, weather event without a named figure). Empty array is correct.
+                      • Cap each name at 32 chars. Cap array at 4 entries.
 
 ━━━ FILTER FLAGS ━━━
-- "isLipSync":       Boolean. TRUE only if creators are miming/dancing to an audio track WITHOUT narrative arc, trigger event, or original spoken content — pure sound participation. FALSE for: events, news, original dialogue/skits, interviews, animal videos, gameplay, streamer reactions, vlogs with own audio, anything where the visual story still makes sense muted. Tie-breaker: if you can describe a CONCRETE thing happening (someone said X, did Y, event Z) → FALSE. If the only "thing" is "person mouths along to music" → TRUE. Static images: always FALSE.
+- "isLipSync":       Boolean. TRUE for ANY form of sound-trend participation — videos where the creator is following a trending audio/format rather than telling their own story. This is broader than literal lip-syncing; it covers the entire family of "sound-driven format videos" that flood TikTok and never make memecoins.
+
+                     Set TRUE when ANY of these apply:
+                     • Lip-syncing / mouthing to a song, sound, or viral audio
+                     • Dance moves / dance challenges performed to a trending sound (TikTok dance videos like #thegreatdivide / #wlw / #renegade — dancing IS sound-participation, even though "something is happening" visually)
+                     • Outfit transitions, glow-ups, "before/after" reveals timed to a beat drop
+                     • POV setups where the visual "story" is just overlay text + a sticker subject + trending audio (no original spoken lines, no real event)
+                     • "Stitch" / "duet" responses where the participant adds NO original speech of their own
+                     • Acting out a sound bite (creator reenacts a meme audio with facial expressions but no original words)
+                     • Outfit/aesthetic loops cut to music (fashion/beauty trend videos)
+
+                     The unifying principle: if you MUTED the audio, the video would be "a person dancing / posing / transitioning outfits / pointing at overlay text" — there is no event, no original dialogue, no story. The creator is participating in a FORMAT defined by the sound, not telling something new.
+
+                     Set FALSE for: news clips, event recordings (concert footage / political rallies / sports plays), original dialogue / monologues / skits where the creator says their own words, interviews, animal action videos with an absurd specific action, gameplay with original commentary, streamer reactions with talking, vlogs with own narration, ASMR (those go to isAmbient). If the creator says/yells/laughs ORIGINAL words that drive the meaning of the video → FALSE. If they only mime / dance / pose / transition / point at overlay text to a sound → TRUE.
+
+                     Decisive heuristic — the "audio source" test: is the audio (music/voiceover) ORIGINAL to this creator (their own words / sounds / commentary) or a TRENDING SOUND that thousands of other creators are also using? Original audio → FALSE. Trending / borrowed sound with no original speech on top → TRUE.
+
+                     Static images: always FALSE.
 - "isAmbient":       Boolean. TRUE if this is "scroll-bait" / loop / hypnotic content with NO narrative arc, NO meme hook, NO punchline — content people zone out to but never turn into a memecoin: satisfying loops, ASMR, tutorials, long process videos, aesthetic mood vlogs, generic gameplay loops. The litmus test: would a degen forward this to a friend with "you HAVE to see this"? If no, and the only appeal is "relaxing to watch" / "I just kept watching" — TRUE. FALSE for: event clips, character moments, reactions with punchlines, animal videos with a clear absurd action, original dialogue with a hook. Static images: always FALSE.
 
 CRITICAL LENGTH RULE: every text field must be a COMPLETE thought ending with proper punctuation. Never cut mid-sentence or mid-word.
@@ -130,16 +161,21 @@ const GOOGLE_RESPONSE_SCHEMA = {
     hasSubject:        { type: 'boolean' },
     viralPattern:      { type: 'string' },
     tickerSuggestion:  { type: 'string' },
+    subjectNames:      { type: 'array', items: { type: 'string' } },
     isLipSync:         { type: 'boolean' },
     isAmbient:         { type: 'boolean' },
   },
-  required: [
-    'visualCaption', 'visibleText', 'videoSummary',
-    'audioSummary', 'spokenText',
-    'mood',
-    'memeShapeStrength', 'hasNarrative', 'hasSubject', 'viralPattern', 'tickerSuggestion',
-    'isLipSync', 'isAmbient',
-  ],
+  // Only the original captioner fields stay strictly required — they're
+  // what was working pre-Gemini-2.0 upgrade. The Gemini 2.0 additions
+  // (audioSummary / spokenText / scoring / filter flags / subjectNames) are
+  // OPTIONAL on the schema level: if the model skips one, JSON still
+  // validates, captioner returns the partial result, and downstream code
+  // applies safe defaults (=== true for booleans, clampInt fallback=0 for
+  // memeShapeStrength, normalizeViralPattern → 'other', empty array for
+  // subjectNames). Critical fix 2026-05-08: making all 14 fields required
+  // was crashing the response on tricky content — captioner fell back to
+  // null, so lipsync / tiktok_quality gates lost their input.
+  required: ['visualCaption', 'visibleText', 'videoSummary', 'mood'],
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,6 +187,11 @@ const GOOGLE_RESPONSE_SCHEMA = {
 const VIRAL_PATTERN_VALUES = new Set([
   'character', 'reaction', 'pov_skit', 'compilation',
   'sound_format', 'gameplay', 'animal_action', 'event',
+  // Sound-format participation group — added 2026-05-08 after dance/transition
+  // trends like #thegreatdivide / #wlw kept slipping through the lipsync
+  // gate (they technically have "movement happening" but the audio is the
+  // actual narrative). alert-dispatcher.js auto-skips these on TikTok.
+  'dance_challenge', 'outfit_transition',
   // "Ambient" group — scroll-bait / loop / hypnotic content. These pattern
   // tags exist primarily so alert-dispatcher.js can hard-skip TikTok trends
   // matching them (no narrative, no meme hook, just "relaxing to watch").
@@ -169,6 +210,45 @@ function clampInt(v, min, max, fallback) {
 function normalizeViralPattern(v) {
   const s = String(v || '').trim().toLowerCase().replace(/\s+/g, '_').replace(/-+/g, '_');
   return VIRAL_PATTERN_VALUES.has(s) ? s : 'other';
+}
+
+// Code-side blacklist of names Gemini should not return as subject. Catches
+// the case when the model ignores the prompt rule "skip platform/country/
+// big-tech". Keep lower-case, single-token. Multi-word context names are
+// handled by Gemini itself (the prompt is explicit about "TikTok" etc.).
+const SUBJECT_NAME_BLACKLIST = new Set([
+  // Platforms
+  'tiktok', 'youtube', 'twitter', 'x', 'reddit', 'instagram', 'facebook',
+  'meta', 'twitch', 'discord', 'telegram', 'whatsapp', 'snapchat', 'threads',
+  // Big tech (rarely the *subject* of a meme — usually context)
+  'apple', 'google', 'microsoft', 'amazon', 'samsung', 'sony', 'intel',
+  // Countries / regions (way too generic)
+  'usa', 'us', 'uk', 'eu', 'china', 'russia', 'india', 'japan', 'korea',
+  'america', 'europe', 'asia', 'africa',
+  // Devices / OS / generic tech
+  'iphone', 'ipad', 'android', 'windows', 'macos', 'ios',
+]);
+
+// Sanitize subjectNames array. Drops blacklisted, empty, too-long, and
+// duplicate entries. Caps array at 4. Returns array of trimmed display
+// strings.
+function normalizeSubjectNames(arr) {
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of arr) {
+    const s = String(raw || '').trim().slice(0, 32);
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    if (SUBJECT_NAME_BLACKLIST.has(key)) continue;
+    // Reject single-letter and pure-numeric noise.
+    if (s.length < 2 || /^\d+$/.test(s)) continue;
+    seen.add(key);
+    out.push(s);
+    if (out.length >= 4) break;
+  }
+  return out;
 }
 
 export class GeminiCaptioner {
@@ -492,9 +572,33 @@ export class GeminiCaptioner {
       );
       return null;
     }
-    const sniffedMime = kind === 'video'
+    let sniffedMime = kind === 'video'
       ? this._sniffVideoMime(buffer)
       : this._sniffImageMime(buffer);
+
+    // HEIC/HEIF posters (TikTok cover URLs ending in .heic) — Google doesn't
+    // accept them directly. Convert to JPEG via ffmpeg first, then proceed
+    // with the normal flow. Conversion ~50-300ms on a single-frame still.
+    if (sniffedMime === 'image/heic') {
+      const before = buffer.length;
+      const converted = await this._convertHeicToJpeg(buffer);
+      if (converted && converted.length > 0) {
+        buffer = converted;
+        sniffedMime = 'image/jpeg';
+        this.logger?.info?.(
+          `[GeminiCaptioner] HEIC→JPEG converted (${(before / 1024).toFixed(0)}KB → ${(buffer.length / 1024).toFixed(0)}KB)`
+        );
+      } else {
+        // ffmpeg failed (no libheif in build / source corrupt / OOM) → drop.
+        // OpenRouter image fallback would also reject HEIC, so there's no
+        // point fanning out. Caller treats null as "Gemini unavailable".
+        this.logger?.warn?.(
+          `[GeminiCaptioner] HEIC conversion failed — skipping image. url=${String(url).slice(0, 120)}`
+        );
+        return null;
+      }
+    }
+
     if (!sniffedMime) {
       const firstBytesHex = buffer.slice(0, 16).toString('hex');
       const firstBytesAscii = buffer.slice(0, 80).toString('utf8').replace(/[^\x20-\x7e]/g, '.');
@@ -511,8 +615,8 @@ export class GeminiCaptioner {
     const base64 = buffer.toString('base64');
 
     const userText = kind === 'video'
-      ? `Title context: "${(trend.title || '').slice(0, 200)}"\n\nWatch AND LISTEN to this video — analyze BOTH visual and audio tracks. Focus on the FIRST 30 SECONDS ONLY. Transcribe spoken words verbatim into spokenText. Describe sounds/music in audioSummary. Return ALL fields per the schema (visualCaption, visibleText, videoSummary, audioSummary, spokenText, mood, memeShapeStrength, hasNarrative, hasSubject, viralPattern, tickerSuggestion, isLipSync, isAmbient).`
-      : `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image. Return ALL fields per the schema. For a static image: videoSummary='', audioSummary='', spokenText='', hasNarrative=false, isLipSync=false, isAmbient=false. Other fields (memeShapeStrength, hasSubject, viralPattern, tickerSuggestion) — answer based on the still image.`;
+      ? `Title context: "${(trend.title || '').slice(0, 200)}"\n\nWatch AND LISTEN to this video — analyze BOTH visual and audio tracks. Focus on the FIRST 30 SECONDS ONLY. Transcribe spoken words verbatim into spokenText. Describe sounds/music in audioSummary. Return ALL fields per the schema (visualCaption, visibleText, videoSummary, audioSummary, spokenText, mood, memeShapeStrength, hasNarrative, hasSubject, viralPattern, tickerSuggestion, subjectNames, isLipSync, isAmbient).`
+      : `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image. Return ALL fields per the schema. For a static image: videoSummary='', audioSummary='', spokenText='', hasNarrative=false, isLipSync=false, isAmbient=false. Other fields (memeShapeStrength, hasSubject, viralPattern, tickerSuggestion, subjectNames) — answer based on the still image.`;
 
     const apiUrl = `${this.googleBaseUrl}/models/${this.googleModel}:generateContent?key=${encodeURIComponent(this.googleKey)}`;
     const body = {
@@ -537,7 +641,14 @@ export class GeminiCaptioner {
       generationConfig: {
         responseMimeType: 'application/json',
         responseSchema: GOOGLE_RESPONSE_SCHEMA,
-        maxOutputTokens: 1024,
+        // Bumped from 1024 → 3072 on 2026-05-08 after the Gemini 2.0 upgrade
+        // added audioSummary / spokenText / 5 scoring fields / subjectNames.
+        // The earlier ceiling was hitting truncation on rich video content
+        // (long spokenText + full visualCaption + videoSummary), causing the
+        // entire response to fail JSON parse → captioner returned null →
+        // preStage.gemini = null → lipsync / tiktok_quality gates lost their
+        // primary signal. 3072 gives ~3-4× headroom over the worst-case fields.
+        maxOutputTokens: 3072,
         // Gemini 2.5 Flash has dynamic thinking on by default — for a vision
         // captioner we don't need it, and the thinking budget can eat the
         // output budget (returning empty `text` while consuming tokens).
@@ -645,6 +756,7 @@ export class GeminiCaptioner {
         hasSubject:        parsed.hasSubject === true,
         viralPattern:      normalizeViralPattern(parsed.viralPattern),
         tickerSuggestion:  String(parsed.tickerSuggestion || '').trim().slice(0, 16),
+        subjectNames:      normalizeSubjectNames(parsed.subjectNames),
         // Coerce: model may omit field on rare occasions, default to false
         // (alert dispatcher uses === true, so missing/null/undefined never
         // accidentally hard-skips a legitimate trend).
@@ -734,6 +846,7 @@ export class GeminiCaptioner {
           hasSubject:        parsed.hasSubject === true,
           viralPattern:      normalizeViralPattern(parsed.viralPattern),
           tickerSuggestion:  String(parsed.tickerSuggestion || '').trim().slice(0, 16),
+          subjectNames:      normalizeSubjectNames(parsed.subjectNames),
         };
       } finally {
         clearTimeout(timer);
@@ -927,7 +1040,76 @@ export class GeminiCaptioner {
     if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return 'image/png';
     if (buffer.slice(0, 4).toString() === 'GIF8') return 'image/gif';
     if (buffer.slice(0, 4).toString() === 'RIFF' && buffer.slice(8, 12).toString() === 'WEBP') return 'image/webp';
+    // HEIC / HEIF (Apple iPhone format). TikTok cover URLs sometimes return
+    // .heic posters which neither Google nor OpenRouter accept directly.
+    // We return a synthetic 'image/heic' marker so the caller can spot it
+    // and run an ffmpeg conversion to JPEG before shipping. Brands per
+    // ISO/IEC 23008-12: heic / heix (HEIC), mif1 / msf1 (HEIF), heim / heis
+    // (multi-image / image-sequence variants — same conversion path).
+    if (buffer.slice(4, 8).toString() === 'ftyp') {
+      const brand = buffer.slice(8, 12).toString();
+      if (brand === 'heic' || brand === 'heix'
+          || brand === 'mif1' || brand === 'msf1'
+          || brand === 'heim' || brand === 'heis') {
+        return 'image/heic';
+      }
+    }
     return null;
+  }
+
+  /**
+   * Convert HEIC/HEIF bytes to JPEG via ffmpeg piped through stdin/stdout.
+   * Modern ffmpeg builds (Debian bookworm / Ubuntu 22.04+ / Alpine 3.18+)
+   * include libheif and decode HEIC out of the box. Older builds will fail
+   * the spawn with "Could not find tag for codec hevc" — we treat that as
+   * a soft fail (return null) so the caller falls back to OpenRouter.
+   *
+   * Returns Buffer (JPEG bytes) on success, null on any failure.
+   */
+  async _convertHeicToJpeg(buffer) {
+    return new Promise((resolve) => {
+      const proc = spawn('ffmpeg', [
+        '-y',
+        '-v', 'error',
+        '-i', 'pipe:0',
+        '-vframes', '1',          // single still — HEIC sequences pick first frame
+        '-f', 'mjpeg',            // JPEG-encoded MPEG container == raw JPEG bytes
+        '-q:v', '4',              // visually lossless-ish (1=best, 31=worst)
+        'pipe:1',
+      ]);
+      const chunks = [];
+      let stderrBuf = '';
+      let settled = false;
+      const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
+      proc.stdout.on('data', d => chunks.push(d));
+      proc.stderr.on('data', d => { stderrBuf += d.toString(); });
+      proc.on('error', (err) => {
+        this.logger?.warn?.(`[GeminiCaptioner] HEIC→JPEG ffmpeg spawn error: ${err.message}`);
+        finish(null);
+      });
+      proc.on('close', (code) => {
+        if (code !== 0 || chunks.length === 0) {
+          this.logger?.warn?.(
+            `[GeminiCaptioner] HEIC→JPEG ffmpeg failed (code=${code}, stderr=${stderrBuf.slice(0, 160)})`
+          );
+          return finish(null);
+        }
+        const out = Buffer.concat(chunks);
+        finish(out.length > 0 ? out : null);
+      });
+      try {
+        proc.stdin.write(buffer);
+        proc.stdin.end();
+      } catch (e) {
+        this.logger?.warn?.(`[GeminiCaptioner] HEIC→JPEG stdin write failed: ${e.message}`);
+        try { proc.kill('SIGKILL'); } catch {}
+        finish(null);
+      }
+      // Hard 10s ceiling — single-frame conversion is normally <500ms.
+      setTimeout(() => {
+        if (!settled) { try { proc.kill('SIGKILL'); } catch {} finish(null); }
+      }, 10_000);
+    });
   }
 
   _sniffVideoMime(buffer) {

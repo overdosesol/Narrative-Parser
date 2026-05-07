@@ -16,6 +16,7 @@ import path from 'path';
 import { LIFESPAN_VALUES, normalizeLifespan } from '../analysis/lifespan.js';
 import { runManualAnalysis, peekManualAnalysisCache } from '../analysis/manual-analysis.js';
 import { getActivePresetConfig } from '../analysis/preset-config.js';
+import { collectSubjectNames } from '../analysis/subject-names.js';
 import { getPlanEntitlements, shouldShowUsageCounter } from '../billing/entitlements.js';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -1927,6 +1928,7 @@ class DashboardServer {
         feedback:        { likes: 0, dislikes: 0, score: 0, userVote: 0, userReason: '' },
         // Manual-analysis-only extras (the SPA can show these in a debug panel)
         xSearchData:     t.xSearchData || null,
+        subjectAliases:  collectSubjectNames({ preStage: t.preStage || null, xSearchData: t.xSearchData || null }).aliases,
       };
       // Usage counter for plans that show it (test only). Skipped on cache
       // hits — those don't consume a daily slot.
@@ -2173,6 +2175,14 @@ class DashboardServer {
       // favSet is pre-fetched once per feed request (see _handleTrends) so
       // this is a single Set.has() check per row, not a per-row DB query.
       isFavorite: favSet ? favSet.has(row.id) : false,
+      // Subject-name highlight signals. Aliases are pre-computed server-side
+      // (Gemini visual+audio + Stage 2 Grok + nano text NER, with blacklist).
+      // The SPA highlights any alias inside the title / whyNow / aiExplanation
+      // with a CSS accent. Empty array → no highlighting (no overhead).
+      subjectAliases: collectSubjectNames({
+        preStage: metrics.preStage || null,
+        xSearchData: metrics.xSearchData || null,
+      }).aliases,
     };
   }
 
@@ -4525,6 +4535,13 @@ class DashboardServer {
     .modal-section-content { font-size: 12px; color: var(--text2); line-height: 1.55; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 11px 13px; }
     .modal-section-content.pump { color: var(--orange); border-color: rgba(var(--orange-rgb), .15); background: rgba(var(--orange-rgb), .05); }
     .modal-section-content.why-now { color: #ff6b6b; border-color: rgba(255, 107, 107, .18); background: rgba(255, 107, 107, .06); font-weight: 500; }
+    /* Subject-name highlight — the names extracted by Gemini / Stage 2 / nano
+       are wrapped in <span class="subject-hl"> so they pop in title and
+       summary text. Yellow accent matches the existing $TICKER chip color. */
+    .subject-hl { color: #fdcb6e; font-weight: 700; }
+    .modal-title .subject-hl { background: rgba(253, 203, 110, .14); padding: 0 3px; border-radius: 3px; }
+    .modal-section-content .subject-hl { background: rgba(253, 203, 110, .12); padding: 0 2px; border-radius: 2px; }
+    .feed-title .subject-hl { color: #fdcb6e; }
     /* .pref-chip* CSS removed 2026-04-27 with PersonalizationCard. */
     .modal-stats-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }
     .modal-stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; }
@@ -7227,6 +7244,56 @@ const SOURCE_LABELS = { reddit: 'Reddit', google_trends: 'Google', twitter: 'Twi
 const CAT_ICONS     = { meme:'😂', celebrity:'⭐', animals:'🐾', tech:'💻', gambling:'🎰', sports:'🏆', politics:'🏛️', entertainment:'🎬', gaming:'🎮', boring:'😴', other:'📌' };
 const CAT_CLS       = { meme:'cat-meme', celebrity:'cat-celebrity', animals:'cat-animals', tech:'cat-tech', gambling:'cat-gambling', sports:'cat-sports', politics:'cat-politics', entertainment:'cat-entertainment', gaming:'cat-gaming', boring:'cat-boring', other:'cat-other' };
 
+// Subject-name highlight helper. trend.subjectAliases is a sorted list
+// (longest-first) of name variants pre-computed by collectSubjectNames in
+// src/analysis/subject-names.js. Renders the input string as plain text
+// chunks plus span.subject-hl nodes for each alias hit. Returns either the
+// original string (no aliases / no matches) or an array of React children
+// safe to drop into any text container.
+//
+// Note: NO backticks in this comment block — outer SPA template literal
+// would close prematurely and eat the rest of the script. Keep all examples
+// in plain prose. (Trap #1 in SESSION_CONTEXT.)
+const _SUBJ_RE_CACHE = new WeakMap();
+function _subjRegexFor(aliases) {
+  if (!Array.isArray(aliases) || aliases.length === 0) return null;
+  const cached = _SUBJ_RE_CACHE.get(aliases);
+  if (cached) return cached;
+  // NOTE: regex char class deliberately avoids the dollar-curly substring —
+  // this is inside the outer SPA template literal, and dollar-curly...curly
+  // would be eaten by it as an interpolation slot. Same trap as Trap #2 in
+  // SESSION_CONTEXT — keep dollar at the end of the set, never adjacent to
+  // an opening curly brace.
+  const escaped = aliases
+    .filter(a => typeof a === 'string' && a.length >= 2)
+    .map(a => a.replace(/[.*+?^()|{}[\]\\$]/g, String.fromCharCode(92) + '$&'));
+  if (escaped.length === 0) return null;
+  const re = new RegExp(String.fromCharCode(92) + 'b(' + escaped.join('|') + ')' + String.fromCharCode(92) + 'b', 'gi');
+  _SUBJ_RE_CACHE.set(aliases, re);
+  return re;
+}
+function withSubjectHighlight(text, aliases) {
+  if (!text || typeof text !== 'string') return text;
+  const re = _subjRegexFor(aliases);
+  if (!re) return text;
+  re.lastIndex = 0;
+  const out = [];
+  let last = 0;
+  let m;
+  let key = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(h('span', { className: 'subject-hl', key: 'sh-' + (key++) }, m[0]));
+    last = m.index + m[0].length;
+    // Defensive: avoid infinite loops on zero-length matches (shouldn't
+    // happen with \b alternations, but cheap insurance).
+    if (m.index === re.lastIndex) re.lastIndex++;
+  }
+  if (last === 0) return text;
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
 // Lifespan key → i18n token. Built from LIFESPAN_VALUES injected by the
 // server (see src/analysis/lifespan.js). Renaming a value there triggers
 // loud failures upstream (i18n assertCoversLifespans + scorer normalize)
@@ -8345,7 +8412,7 @@ function FeedCard({ trend, onOpen, onHide, onFavToggle, canFavorite }) {
             h('span', { className: 'badge ' + catCls, title: t('feed.category_tip') }, catIco + ' ' + (trend.category || 'other'))
           )
         ),
-        h('div', { className: 'feed-title' }, trend.title)
+        h('div', { className: 'feed-title' }, withSubjectHighlight(trend.title, trend.subjectAliases))
         // originalTitle (raw post text in source language) used to render here
         // as a dim italic sub-line. Owner removed it — feed stays compact, the
         // original text is still visible in the modal under the title.
@@ -9220,7 +9287,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
         })(),
 
         // Title
-        h('div', { className: 'modal-title' }, trend.title),
+        h('div', { className: 'modal-title' }, withSubjectHighlight(trend.title, trend.subjectAliases)),
 
         // Original title
         trend.originalTitle && trend.originalTitle !== trend.title
@@ -9234,7 +9301,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
         // happened" before the forward-looking Catalyst forecast below.
         trend.whyNow ? h('div', { className: 'modal-section' },
           h('div', { className: 'modal-section-label' }, t('modal.trigger')),
-          h('div', { className: 'modal-section-content why-now' }, trend.whyNow)
+          h('div', { className: 'modal-section-content why-now' }, withSubjectHighlight(trend.whyNow, trend.subjectAliases))
         ) : null,
 
         // 🔮 Catalyst — forward-looking forecast from Grok reasoning + x_search.

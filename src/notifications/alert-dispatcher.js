@@ -40,7 +40,17 @@ import { computeAlertScore, feedbackBoostFromStats } from '../analysis/scorer.js
 //   • memeShapeStrength < FLOOR        → hard skip (TikTok-only quality bar)
 // Keeping these as module-level constants (not config knobs) per "хардкод"
 // directive — flip to admin sliders later if calibration needs tuning.
-const AMBIENT_PATTERNS = new Set(['satisfying', 'asmr', 'tutorial', 'process', 'aesthetic']);
+// Patterns that always hard-skip on TikTok regardless of engagement / score:
+// the original "ambient" group (satisfying / asmr / tutorial / process /
+// aesthetic — scroll-bait without narrative) PLUS the sound-format group
+// (sound_format / dance_challenge / outfit_transition — audio-driven trend
+// participation, not a story). The latter was added 2026-05-08 after dance
+// trends like #thegreatdivide / #wlw repeatedly slipped through the lipsync
+// gate even though Gemini correctly classified the pattern.
+const AMBIENT_PATTERNS = new Set([
+  'satisfying', 'asmr', 'tutorial', 'process', 'aesthetic',
+  'sound_format', 'dance_challenge', 'outfit_transition',
+]);
 const TIKTOK_MEME_SHAPE_FLOOR = 60;
 
 // PII masking for log lines. Long-term stdout (Docker / journald) shouldn't
@@ -218,6 +228,15 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
           replies:  em.replies  ?? null,
           upvotes:  em.upvotes  ?? null,
         },
+        // PreStage blob (Stage 0a nano + Stage 0b gemini) — passed through
+        // so DecisionsPage in admin can render the same Gemini chips/captions
+        // that ManualResultCard shows. Keeps the ring-buffer footprint
+        // bounded since preStage is at most ~2KB per trend (text fields
+        // are capped in gemini-captioner.js / nano-classifier.js).
+        // Falls back through metrics.preStage for hot-refresh trends where
+        // preStage was deserialized from raw_metrics back into the metrics
+        // namespace.
+        preStage: trend.preStage || trend.metrics?.preStage || null,
       };
 
       const gates = [];

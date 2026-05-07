@@ -22,17 +22,28 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   welcomeBack: (plan) => `<b>Catalyst</b> \u00b7 plan: <b>${plan}</b>\n\n/menu - settings\n/top - top narratives right now`,
 
   // ── Main menu ──────────────────────────────────────────────────────────
-  menuTitle: '\u{2699}\u{FE0F} <b>Settings</b>\n\nTap a tile to tweak it. Current values are shown next to each option.',
+  // menuTitle is now a function so the header doubles as a live status line:
+  //   "⚙️ Settings\n🟢 Active · Pro · 12d left".
+  // info shape: { paused: boolean, plan: 'free'|'test'|'pro'|'admin',
+  //               daysLeft: number|null }   // null for Free / no expiry
+  menuTitle: (info = {}) => {
+    const dot      = info.paused ? '\u{1F7E0}' : '\u{1F7E2}';
+    const status   = info.paused ? 'Paused' : 'Active';
+    const planMap  = { free: 'Free', test: 'Test', pro: 'Pro', admin: 'Admin' };
+    const planCap  = planMap[info.plan] || 'Free';
+    const daysPart = (info.daysLeft != null) ? ` · ${info.daysLeft}d left` : '';
+    return `\u{2699}\u{FE0F} <b>Settings</b>\n${dot} ${status} · ${planCap}${daysPart}`;
+  },
   btnSources: '\u{1F4E1} Sources',
   btnLanguage: '\u{1F310} Language',
-  btnThreshold: '\u{1F3AF} Threshold',
-  btnSubscription: '\u{1F4B3} Subscription',
+  btnThreshold: '\u{1F39A}\u{FE0F} Threshold',
+  btnSubscription: '\u{1F48E} Plan',
   btnAlertTypes: '\u{1F514} Alert Types',
   btnTop: '\u{1F525} Top Trends',
   btnStartStop: (paused) => paused ? '\u{25B6}\u{FE0F} Resume Alerts' : '\u{23F8}\u{FE0F} Pause Alerts',
   btnFollowX: '\u{1D54F} Follow @Catalystparser',
   btnAskQuestion: '\u{1F4AC} Ask a question',
-  btnDashboard: '\u{1F310} Open Dashboard',
+  btnDashboard: '\u{1F4CA} Open Dashboard',
   dashboardPrompt: (url) => `\u{1F310} <b>Web dashboard</b>\n\nFull narrative feed, filters by phase / type / source, manual link analysis (Pro). Sign in with your Telegram account.\n\n<a href="${url}">${url}</a>`,
   btnOpenMenu: '\u2699\uFE0F Open Menu',
   btnBack: '\u{25C0}\u{FE0F} Back',
@@ -42,7 +53,17 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   badgeSources:    (enabled, total) => ` \u00B7 ${enabled}/${total}`,
   badgeThreshold:  (val)            => ` \u00B7 ${val}`,
   badgeLanguage:   (code)           => ` \u00B7 ${code.toUpperCase()}`,
-  badgeAlertTypes: (count, total)   => (count === 0 || count === total) ? ' \u00B7 all' : ` \u00B7 ${count}/${total}`,
+  // Always render N/total. count===0 is treated as "all" by the alert gate
+  // (handler in src/index.js), so we display it as total/total for clarity.
+  badgeAlertTypes: (count, total)   => ` \u00B7 ${count === 0 ? total : count}/${total}`,
+  // Plan tile badge: " \u00B7 Pro \u00B7 12d" for paid, " \u00B7 Free" for free.
+  badgePlan:       (plan, daysLeft) => {
+    const planMap = { free: 'Free', test: 'Test', pro: 'Pro', admin: 'Admin' };
+    const cap = planMap[plan] || 'Free';
+    return (daysLeft != null) ? ` \u00B7 ${cap} \u00B7 ${daysLeft}d` : ` \u00B7 ${cap}`;
+  },
+  // Submenu marker for tiles that lead to a sub-screen (e.g. Top Trends).
+  badgeSubmenu:    () => ' \u25B8',
 
   // ── Sources ────────────────────────────────────────────────────────────
   sourcesTitle: '\u{1F4E1} <b>Data Sources</b>\n\nTap a platform to turn its alerts on or off.',
@@ -92,7 +113,7 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   planPro: 'Pro ($100 / 30 days)',
 
   // ── Payment ────────────────────────────────────────────────────────────
-  paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🆓 <b>Free - free forever</b>\n• Sources: Reddit, Google Trends\n• Unlimited alerts\n• 🔒 Manual analysis & Catalyst forecast not included\n\n🧪 <b>Test - $5 / 1 day (one-time)</b>\n• All 5 sources (Reddit, Google, Twitter, TikTok, X Trends)\n• Unlimited alerts\n• Manual analysis: 5/day\n• Catalyst forecast: 5/day\n\n🚀 <b>Pro - $100 / 30 days</b>\n• All 5 sources\n• Unlimited alerts\n• Manual analysis: 100/day\n• Catalyst forecast: 100/day',
+  paymentTitle: '\u{1F4B0} <b>Choose a plan:</b>\n\n🆓 <b>Free</b>\n• Sources: Reddit, Google Trends\n• Unlimited alerts\n• Manual analysis: 🔒 not included\n• Catalyst forecast: 🔒 not included\n\n🧪 <b>Test - $5 / 1 day (one-time)</b>\n• Sources: Twitter(X), TikTok, Reddit, X Trends, Google Trends\n• Unlimited alerts\n• Manual analysis: 5/day\n• Catalyst forecast: 5/day\n\n🚀 <b>Pro - $100 / 30 days</b>\n• Sources: Twitter(X), TikTok, Reddit, X Trends, Google Trends\n• Unlimited alerts\n• Manual analysis: Unlimited\n• Catalyst forecast: Unlimited',
   paymentMethod: '\u{1F4B0} <b>Payment</b>\n\nChoose payment method:',
   btnPaySOL: '\u{26A1} Pay with SOL',
   btnPayUSDC: '\u{1F4B5} Pay with USDC',
@@ -160,7 +181,8 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   xAnalysisBtn: '\u{1F426} X Analysis',
   btnAskGrok:   '\u{1F9E0} Ask Grok',
   xAnalysisLockedBtn: '\u{1F512} X Analysis (Locked)',
-  xAnalysisLocked: '\u{1F512} X Analysis is not available on Test plan. Upgrade to Pro.',
+  xAnalysisLocked: '\u{1F512} X Analysis is for Test/Pro plans. Upgrade in /menu → Plan.',
+  xAnalysisLimitReached: (cap) => `\u{26D4} Daily X Analysis limit reached (${cap} / 24h). Upgrade to Pro for unlimited.`,
   xAnalysisLoading: '\u{23F3} Loading...',
   xAnalysisTitle: '\u{1F426} <b>X / Twitter Analysis</b>',
   xAnalysisQuery: 'Query',
