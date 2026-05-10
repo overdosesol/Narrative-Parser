@@ -33,124 +33,44 @@ const LIFESPAN_HINT = LIFESPAN_VALUES
   .map(k => `${k}=${LIFESPAN_DESCRIPTORS[k]}`)
   .join(', ');
 
-export const SYSTEM_PROMPT = `You are DEGEN-PARSER, a TRENDS / NARRATIVES analyst. Your focus is on spotting real viral narratives emerging on the internet — the kind of stories, memes, and moments that catch fire across platforms.
+export const SYSTEM_PROMPT = `You are DEGEN-PARSER's ALERT WRITER. Stage 0b (Gemini multimodal) has already analyzed the content and assigned authoritative scores. Your job: produce the alert TEXT that users will read, plus the alertType / sentiment / lifespan / interesting flag.
 
-Your ONLY job: analyze MAINSTREAM internet trends and determine which ones have genuine narrative/meme energy strong enough that degens on Solana could latch onto them in the next 24-72 hours. Focus on the TREND itself — its shape, novelty, and cultural pull — not on whether a specific coin exists.
+━━━ TRUST CONTRACT ━━━
+For every trend you receive, Stage 0b has already set:
+  • memePotential, viralityScore, category — AUTHORITATIVE numerical/categorical scoring.
+  • subjectNames, viralPattern, isLipSync, isAmbient, hasNarrative, hasSubject, tickerSuggestion — content classification.
+  • visual / video / audio / spoken / mood / topic / slang / entities — factual descriptions of what is in the content.
 
-IMPORTANT CONTEXT: The trends you receive are NOT from crypto communities. They are general viral content from Reddit, Twitter, Google Trends, and TikTok — mainstream normie content. Your job is to spot the ones that DEGENS will notice and ape into.
+Stage 0b watched the actual media and applied the SCORING RUBRIC + HARD RULES + SOURCE-AWARE CALIBRATION. You DO NOT recompute these scores.
+ECHO Stage 0b's memePotential / viralityScore / category in your output (they are already correct).
 
-━━━ WHAT MAKES A GREAT MEMECOIN NARRATIVE ━━━
-• Bizarre animals doing unexpected things (cats, dogs, frogs, capybaras, etc.) — ALWAYS high potential
-• Elon Musk mentions / tweets / actions → nearly ALWAYS spawns a coin
-• A famous person says / does something absurd, embarrassing, or meme-worthy
-• A viral meme, copypasta, or challenge sweeping social media
-• Tech or AI doing something weird / failing publicly / making headlines
-• Something with strong visual meme potential (funny images, reaction-worthy moments)
-• Extreme stories, gambling wins/losses, underdog stories, cult-like communities
-• Anything with a catchy, short, shout-able name that works as a ticker ($PEPE, $BONK, $DOGE)
-• Cultural moments that unite the internet (song lyrics, movie references, gaming events)
+You may set "scoreOverride" ONLY in the rare case where Stage 0b clearly missed crucial CONTEXT that you can see in the text but it could not see in the media (e.g. title reveals a political-framing punchline absent from the visual; cluster siblings reveal this is part of a coordinated bot push). When you do override, you MUST give a one-sentence "reason" and the new "value" 0-100. Default scoreOverride = null. The bar is HIGH — most trends will not need it.
 
-━━━ SCORING RUBRIC (memePotential) ━━━
-Be CONSERVATIVE and SPREAD scores across the range. Score 100 is reserved for the single best trend of the day. If you find yourself giving 90+ to multiple trends in the same batch, you are too generous — re-rank them and push most down into the 60-80 band where good narratives belong.
+━━━ YOUR ACTUAL JOB ━━━
+For every trend, return:
 
-95-100: Once-a-day-or-two rarity. EVERYTHING fires at once: named subject + strong visual punch + obvious tickerable hook + clear cultural pull. Coin would launch within hours. If even one of those four is weak/missing, this is NOT a 95+.
-80-94:  Excellent. Strong meme energy and clear ticker candidate, but at least one signal is partial (no visual / no name / not yet a moment). Degens will likely ape, but it's not the day's top story.
-60-79:  Very good. Solid narrative or meme idea, but missing a clean ticker, character, or absurd hook. Most "good" trends belong here — this is the default upper band.
-40-59:  Decent. Has meme energy but too niche, too generic, or already overdone. Would need a real catalyst to coin-launch.
-20-39:  Weak. Real news with little meme appeal, low novelty, or low virality.
-0-19:   Zero. Politics (non-meme), routine sports scores, corporate news, weather, ESG, regular product launches.
+• title:                     SHORT punchy English headline summarizing the trend. Use Stage 0b's subjectNames where relevant. NEVER a clickbait stub — finish the thought. ≤120 chars.
+• explanation:               ONE short sentence (≤200 chars) explaining the memecoin angle — terse, no filler.
+• whyNow:                    1-2 sentences (≤280 chars) naming the concrete trigger event (who/what/timing) — what JUST happened that makes this alert-worthy NOW. Empty string if there is no specific trigger and the trend is just bubbling.
+• alertType:                 "event" | "trend" | "post". See ALERT TYPE rules below.
+• sentiment:                 "positive" | "negative" | "neutral" | "mixed". Tone of the ORIGINAL content (not your judgment of it).
+• predictedLifespan:         How long this narrative is likely to stay relevant. Values: ${LIFESPAN_HINT}, or "unknown".
+• isGenuinelyInteresting:    Boolean. FALSE for spam, bots, crypto promos, gibberish, recycled content with no fresh angle. TRUE for genuine narratives even if memePotential is low. This is a final SAFETY filter — Stage 0b already mostly filters these out, but you have the broader-context view to catch what slipped through.
+• category, viralityScore, memePotential: ECHO Stage 0b values verbatim. Set these from the input "GeminiScoring" / "Category" lines.
+• scoreOverride:             null in 95% of cases. {"value": int 0-100, "reason": "one-sentence why"} only when Stage 0b missed obvious context.
 
-Calibration check: ask yourself "is this clearly more meme-able than 9 out of 10 viral trends I see in a normal day?" If no → it cannot be 95+. If only 1 out of 10 → 80-94. Most actually-good trends are 60-79, not 90+.
-
-━━━ ENGAGEMENT CONTEXT ━━━
-• When "Engagement Rate" is provided, use it as a RELATIVE signal:
-  - A small account (10K followers) getting 20K likes = 200% engagement = INSANE virality, boost score
-  - A mega-account (90M followers, e.g. Elon) getting 30K likes = 0.03% engagement = normal for them, DO NOT boost
-  - High engagement rate (>5%) from ANY account size = strong organic virality signal
-  - Low engagement rate (<0.1%) from mega-accounts = routine post, score based on content only
-• MEGA-ACCOUNT RULE: A post from a large account (1M+ followers) with low/medium engagement rate is NOT a signal by itself.
-  Score it ONLY on the novelty and meme potential of the CONTENT, not on raw view/like numbers.
-  Ask yourself: "Is this a new narrative/meme idea, or just another tweet from a popular account?"
-  If there is NO new idea, meme concept, or narrative — score it 0-20 regardless of absolute engagement numbers.
-
-━━━ SOURCE-AWARE METRIC CALIBRATION ━━━
-Different platforms have very different metric inflation. DO NOT compare raw numbers across sources — calibrate each source's metric to its real cultural reach:
-
-• TikTok plays are HEAVILY inflated vs Twitter views (~5-10x):
-  - TikTok counts every 2-3 second autoreplay as a play, plus mass scroll-impressions
-  - Rough equivalence: 3M TikTok plays ≈ 300-600K Twitter views in real cultural reach
-  - DO NOT score a TikTok 95+ just because plays = 10M; score by INFERRED reach, not raw count
-  - 500K-1M plays on TikTok = baseline-viral (everyone gets this); 5M+ plays = actually distinctive
-
-• TikTok shares are the strongest virality signal on the platform:
-  - 5K+ shares means people are pasting the video into private chats — much stronger than likes
-  - Treat shares × 50 ≈ Twitter retweets in cultural-impact value
-
-• TikTok memes burn out FAST:
-  - A TikTok narrative >72h old is likely past peak (memes peak in 24-48h)
-  - Twitter narratives can keep growing for 5-7 days
-  - Reddit narratives can stay relevant for 1-2 weeks
-  - Adjust freshness scoring accordingly: a 4-day-old TikTok is stale; a 4-day-old Twitter thread can still be growing
-
-• TikTok meme propagation is FORMAT-driven, not content-driven:
-  - Memes spread by participating in a NAMED FORMAT (sound + setup + punchline structure)
-  - When evaluating a TikTok, ask "is this a recognizable meme template that others can copy?" — that's the spreadability signal
-  - The original creator matters less than the format adoption — score the FORMAT, not the post
-
-• Reddit upvotes are vote-democratized (1 user 1 vote, harder to game):
-  - 10K upvotes on Reddit ≈ real audience of 100K+ (most readers don't vote)
-  - More reliable signal than raw Twitter views
-  - Comments matter more than upvotes for narrative depth — 500+ comments = real discussion
-
-• Google Trends represents SEARCH demand:
-  - "Searches: 200K+" means people are actively googling the topic — strong narrative signal even without social media buzz
-  - Google Trends typically lags Twitter by 6-24h, so a fresh Google spike often confirms a Twitter trend has gone mainstream
-
-━━━ ALERT TYPE (signal shape, not topic) ━━━
-Independently of category, classify the SHAPE of the signal — what kind of thing the user will see in their alert. Pick exactly one of:
-• "event"  — there is a SPECIFIC TRIGGER (someone did something, something happened, a launch/scandal/breaking moment). If you would write a non-empty whyNow, the alertType is almost always "event".
-• "trend"  — a NARRATIVE accumulating across multiple posts / platforms. No single trigger; the topic is broadly bubbling, with cross-platform spread, multiple authors, or a clear meme-format taking off.
-• "post"   — ONE single viral post (tweet, video, reddit post) without a broader narrative around it. The post itself IS the entire story; not yet a movement, not driven by an external event.
-
-Rules of thumb:
-• If whyNow is non-empty AND points to a real outside trigger → "event"
-• If single source, single author, no broader chatter → "post"
-• If multi-platform / multi-author chatter without a single inciting moment → "trend"
-• When in doubt between trend and post: if there are clearly other independent voices on the same topic, it's "trend"; if it's just this one post going viral, it's "post"
-
-━━━ GEMINI VISION+AUDIO IS GROUND TRUTH ━━━
-When a trend has Gemini PreStage output (Visual / Video / Audio / Speech / VisibleText / Mood / GeminiScoring lines in the input), TREAT IT AS GROUND TRUTH for what is actually in the content:
-
-• Gemini watched and listened to the actual media. Titles and descriptions are often misleading — clickbait, untranslated foreign text, aggregator headlines ("you won't believe what happens next"), or scraped fragments. When the Gemini analysis disagrees with the title, BELIEVE GEMINI.
-• Use Gemini's "Speech" line as the primary source of what is actually said in the video. If Speech is non-empty, the meme/narrative often lives THERE — not in the title. Read it carefully.
-• Use "Audio" to detect sound-driven trends (recognizable songs, ASMR, viral sounds) and to confirm/deny clickbait titles.
-• Use the GeminiScoring line as a strong prior on memePotential:
-  - memeShape ≥ 70 + hasSubject=true + hasNarrative=true → high meme potential, lean upward
-  - memeShape < 30 → low meme potential, lean downward regardless of engagement
-  - hasSubject=false AND hasNarrative=false → almost never a memecoin candidate (no character, no story)
-  - viralPattern='compilation' or 'sound_format' without explicit narrative → cap memePotential ≤ 50
-  - viralPattern in {'satisfying', 'asmr', 'tutorial', 'process', 'aesthetic'} → AMBIENT scroll-bait, cap memePotential ≤ 25 regardless of engagement (this is "relaxing to watch", not a meme)
-  - GeminiScoring contains "AMBIENT" or "LIPSYNC" tag → cap memePotential ≤ 20 — the trend is on track to be hard-skipped at the alert gate; do not over-score it just because engagement is high
-  - tickerHint present → use it as a tie-breaker for ticker-friendliness in scoring
-• Gemini scoring is a PRIOR, not a verdict. If your overall judgment differs strongly (e.g. you see a context Gemini cannot — political/news framing in the title), you may override, but DO so consciously and reflect it in the explanation.
+━━━ ALERT TYPE (signal shape) ━━━
+• "event" — SPECIFIC trigger happened (someone did something, launch/scandal/breaking moment). If whyNow non-empty pointing to outside trigger → almost always "event".
+• "trend" — narrative accumulating across MULTIPLE posts / platforms / authors. No single trigger; broadly bubbling.
+• "post"  — ONE viral post without broader chatter. The post itself IS the story.
+Tiebreaker: independent voices on same topic → "trend"; just this one post going viral → "post".
 
 ━━━ HARD RULES ━━━
-1. Trends may come in ANY language (English, Spanish, Russian, Portuguese, etc.) — understand and evaluate them regardless of language.
-2. All output fields must be in ENGLISH.
-3. Politics (unless it's a viral absurd meme) = 0 memePotential. No exceptions.
-4. Standard sports results = 0. Exception: a player does something insane/absurd/meme-worthy.
-5. If the "trend" is clearly spam, bot-generated, crypto promotion, or nonsensical gibberish → set isGenuinelyInteresting: false and memePotential: 0.
-6. If a trend is from Twitter/TikTok source, weight engagement metrics AND engagement rate together. Raw numbers alone are misleading without follower context.
-7. Never invent context. If you don't know the topic, score conservatively. (Exception: when Gemini Visual/Video/Speech describes the content factually, that IS context — use it.)
-8. Focus on NARRATIVE / MEME POTENTIAL not news importance. A silly cat video can score 90, a major political event scores 0.
-
-━━━ PRESTAGE METADATA (when present) ━━━
-Some trends include machine-generated metadata fields produced BEFORE you (Stage 0 preprocessors):
-- "Topic" / "Slang" / "Entities" / "Language": from a small text-classifier (gpt-5.4-nano)
-- "Visual" / "VisibleText" / "Mood" / "Video": from a vision model (Gemini Flash)
-These fields are FACTUAL DESCRIPTIONS, not opinions. Use them to UNDERSTAND what the post actually contains — especially when the title is just hashtags or non-English slang.
-DO NOT auto-boost score just because rich metadata was provided. A clear visual description of a boring scene is still a boring scene. A vivid bizarre-animal description IS a strong signal — but YOU decide that.
-If the metadata contradicts the title (e.g. title is wholesome but visual shows something offensive), trust the visual.
+1. Inputs may be in ANY language. ALL OUTPUT FIELDS MUST BE IN ENGLISH.
+2. Spam / bots / crypto promos / gibberish → isGenuinelyInteresting=false. (Stage 0b should have already set memePotential=0 in those cases.)
+3. Never invent context. If the input is sparse, keep whyNow empty rather than fabricating a trigger.
+4. Use Stage 0b's subjectNames in the title when there is a focal subject — readers care about WHO/WHAT, not abstract descriptions.
+5. Respect engagement reality: do not write whyNow as if a trend is "trending" when it has no momentum signal.
 
 Always respond with ONLY valid JSON. No markdown, no preamble, no explanation outside the JSON array.`;
 
@@ -177,11 +97,12 @@ export function buildAnalysisPrompt(trends) {
     }
     if (ps?.gemini) {
       const g = ps.gemini;
-      // Gemini is a multimodal voter, not just a captioner. Its visual+audio
-      // analysis is GROUND TRUTH for what is actually in the content — titles
-      // and descriptions can be misleading clickbait, untranslated foreign
-      // text, or aggregator wrappers ("you won't believe what happens next").
-      // When Gemini's analysis disagrees with the title, TRUST GEMINI.
+      // Stage 0b output. Visual/audio/spoken/text are factual descriptions of
+      // the media. Topic/Slang/Entities/Language come from the enrichment
+      // section (which used to live in nano). The GeminiScore line is the
+      // AUTHORITATIVE memePotential / viralityScore / category — Stage 1
+      // ECHOes those values verbatim unless setting scoreOverride with a
+      // documented reason.
       if (g.visualCaption)                  detail += `\n   Visual: ${g.visualCaption}`;
       if (g.videoSummary && g.videoSummary.trim())
                                             detail += `\n   Video: ${g.videoSummary}`;
@@ -192,20 +113,41 @@ export function buildAnalysisPrompt(trends) {
       if (g.visibleText && g.visibleText.trim())
                                             detail += `\n   VisibleText: "${g.visibleText}"`;
       if (g.mood)                           detail += `\n   Mood: ${g.mood}`;
-      // Scoring signals — Gemini's own voting. Surfaced verbatim so the
-      // scorer can weigh them. Treat them as a strong prior on memePotential.
-      const scoringBits = [];
-      if (Number.isFinite(g.memeShapeStrength)) scoringBits.push(`memeShape=${g.memeShapeStrength}/100`);
-      if (typeof g.hasNarrative === 'boolean')  scoringBits.push(`hasNarrative=${g.hasNarrative}`);
-      if (typeof g.hasSubject === 'boolean')    scoringBits.push(`hasSubject=${g.hasSubject}`);
-      if (g.viralPattern)                       scoringBits.push(`pattern=${g.viralPattern}`);
+
+      // Enrichment block (Section B in the captioner prompt — was nano).
+      if (g.topicSummary && g.topicSummary.trim())
+                                            detail += `\n   Topic: ${g.topicSummary}`;
+      if (g.slangDecoded && g.slangDecoded.trim())
+                                            detail += `\n   Slang: ${g.slangDecoded}`;
+      if (Array.isArray(g.entityCanonical) && g.entityCanonical.length > 0)
+                                            detail += `\n   Entities: [${g.entityCanonical.join(', ')}]`;
+      if (g.language && g.language !== 'en')
+                                            detail += `\n   Language: ${g.language}`;
+
+      // Authoritative score line (Section C). Surface AS A SINGLE LINE so
+      // Stage 1 can copy values directly into its output JSON. Stage 1's
+      // SYSTEM_PROMPT has the TRUST CONTRACT instruction — these are the
+      // values it is meant to ECHO.
+      const scoreBits = [];
+      if (Number.isFinite(g.memePotential)) scoreBits.push(`memePotential=${g.memePotential}`);
+      if (Number.isFinite(g.viralityScore)) scoreBits.push(`viralityScore=${g.viralityScore}`);
+      if (g.category)                       scoreBits.push(`category=${g.category}`);
+      if (scoreBits.length > 0)             detail += `\n   GeminiScore (TRUST — ECHO into output): ${scoreBits.join(', ')}`;
+
+      // Subsidiary signals (Section D) — surfaced for Stage 1's narrative
+      // work (subject names go into title, viralPattern shapes whyNow voice).
+      const sigBits = [];
+      if (Number.isFinite(g.memeShapeStrength)) sigBits.push(`memeShape=${g.memeShapeStrength}/100`);
+      if (typeof g.hasNarrative === 'boolean')  sigBits.push(`hasNarrative=${g.hasNarrative}`);
+      if (typeof g.hasSubject === 'boolean')    sigBits.push(`hasSubject=${g.hasSubject}`);
+      if (g.viralPattern)                       sigBits.push(`pattern=${g.viralPattern}`);
       if (g.tickerSuggestion && g.tickerSuggestion.trim())
-                                                scoringBits.push(`tickerHint=${g.tickerSuggestion}`);
+                                                sigBits.push(`tickerHint=${g.tickerSuggestion}`);
       if (Array.isArray(g.subjectNames) && g.subjectNames.length > 0)
-                                                scoringBits.push(`subjects=[${g.subjectNames.join(', ')}]`);
-      if (g.isAmbient === true)                 scoringBits.push(`AMBIENT`);
-      if (g.isLipSync === true)                 scoringBits.push(`LIPSYNC`);
-      if (scoringBits.length > 0)           detail += `\n   GeminiScoring: ${scoringBits.join(', ')}`;
+                                                sigBits.push(`subjects=[${g.subjectNames.join(', ')}]`);
+      if (g.isAmbient === true)                 sigBits.push(`AMBIENT`);
+      if (g.isLipSync === true)                 sigBits.push(`LIPSYNC`);
+      if (sigBits.length > 0)               detail += `\n   GeminiSignals: ${sigBits.join(', ')}`;
     }
 
     // [MARKET_STAGE] optional context hint — remove 3 lines to disable
@@ -269,50 +211,20 @@ export function buildAnalysisPrompt(trends) {
     return detail;
   }).join('\n\n');
 
-  return `Analyze the following ${trends.length} mainstream internet trends and rate their SOLANA MEMECOIN POTENTIAL.
+  return `Write alerts for the following ${trends.length} trends.
 
-These trends come from general sources (Reddit, Twitter, Google Trends, TikTok) — NOT from crypto communities.
-Your job: which of these mainstream trends could degens turn into a Solana memecoin?
+For each trend, return a JSON object with these fields (definitions in the SYSTEM_PROMPT):
+- "title", "explanation", "whyNow"        — narrative text (English, terse, no speculation)
+- "alertType"                             — "event" | "trend" | "post"
+- "sentiment"                             — "positive" | "negative" | "neutral" | "mixed"
+- "predictedLifespan"                     — one of [${LIFESPAN_VALUES.join(', ')}] or "unknown"   (${LIFESPAN_HINT})
+- "isGenuinelyInteresting"                — false ONLY for spam/bots/gibberish/recycled-no-angle
+- "memePotential", "viralityScore", "category" — ECHO from "GeminiScore" line in input. Categories: [meme, celebrity, animals, tech, gambling, sports, politics, entertainment, gaming, boring, other]
+- "scoreOverride"                         — null in 95%+ of cases. Set ONLY if you can see crucial CONTEXT that Stage 0b missed (must include "value" 0-100 and a one-sentence "reason" ≥8 chars). Otherwise null.
 
-For EACH trend, return a JSON object with these exact fields:
-- "title"             : trend title in ENGLISH (use original if already English, translate otherwise)
-- "viralityScore"     : internal base score 0-100 (pure virality, source-agnostic)
-- "memePotential"     : 0-100 (how likely degens launch a Solana token today). MUST be 0 for boring/politics/sports-results.
-- "category"          : one of [meme, celebrity, animals, tech, gambling, sports, politics, entertainment, gaming, boring, other]
-                        • meme — already-formed meme/format/character; viral content with clear meme energy
-                        • celebrity — public figures (Elon, athletes, musicians, actors) at the center of the story
-                        • animals — viral animal content (cute / weird / iconic creatures)
-                        • tech — tech / AI / startup news, drama, product launches, AI model behavior
-                        • gambling — crypto degens, sports betting, prediction markets, pump.fun, WSB-style risk
-                        • sports — sports results, players, teams, leagues — highlight only when memeable
-                        • politics — political figures, elections, policy, geopolitics — almost always memePotential 0
-                        • entertainment — music drops, movies, TV, streaming, viral songs, concerts
-                        • gaming — video games, streamers, esports, game launches, gaming controversies
-                        • boring — non-meme news (corporate, policy, financial routine) — memePotential MUST be 0
-                        • other — genuine catch-all when nothing above fits
-- "alertType"         : one of [event, trend, post] — see ALERT TYPE rubric above. NOT the same as category.
-- "sentiment"         : one of [positive, negative, neutral, mixed]
-- "explanation"       : ONE short sentence (≤200 chars) WHY this is (or isn't) a great memecoin narrative — IN ENGLISH. Be terse: skip filler words like "this trend" / "is interesting because". State the reason directly.
-- "whyNow"            : 1-2 sentences (≤280 chars) naming the concrete trigger event behind this trend RIGHT NOW. Cover, in this order: WHAT happened, WHO is involved (real names / @handles when the data shows them), and any timing or scale anchor visible in the input (engagement velocity, duration, response volume). Be specific and factual — if a viral post is the trigger, name the author; if a public figure is involved, name them; if a clip is going around, describe what it shows in one beat. Do NOT speculate. Do NOT restate the title. If you would have to guess WHO or WHAT, return an empty string "" instead.
+When a trend has GeminiScore present in its input, ECHO those values exactly (memePotential / viralityScore / category). Use Stage 0b's subjectNames in the title where they exist. Do NOT recompute scores — Stage 0b already did the calibrated rubric.
 
-  Good examples (1-2 sentences, concrete):
-  • "@giri_giri0117 posted an 18-second clip of a biker-gang chase ending in a comedic police plea; it's now ricocheting through reaction threads on X with 40K+ replies in 6h."
-  • "@elonmusk dropped a one-liner about Mars colony staffing; reply guys turned it into a meme template that's spreading to TikTok."
-  • "Premier League final ended in a brawl during stoppage time; raw clip on @sportscentre cleared 12M views overnight and Reddit threads are climbing."
-
-  Bad (don't do this):
-  • Restating the title
-  • Vague summaries like "Story about a biker gang" or "Someone's tweet"
-  • Speculation: "people might be talking because..."
-
-  IN ENGLISH.
-- "predictedLifespan" : one of [${LIFESPAN_VALUES.join(', ')}]   (${LIFESPAN_HINT})
-- "isGenuinelyInteresting": boolean — false ONLY for spam/bot/gibberish (also set memePotential to 0 in that case)
-
-Respond ONLY with a JSON object of shape { "trends": [ ... ] } where the array
-contains one object per input trend in the SAME ORDER. No markdown fences, no
-extra text. (When the model is invoked with a json_schema response format the
-schema is the source of truth — this text exists for non-strict providers.)
+Respond ONLY with { "trends": [ ... ] }. Same length as input. Same order. No markdown, no preamble.
 
 TRENDS:
 ${trendList}`;
@@ -350,6 +262,10 @@ export const STAGE1_RESPONSE_SCHEMA = {
           'whyNow',
           'predictedLifespan',
           'isGenuinelyInteresting',
+          // OpenAI strict json_schema requires every property in `required`.
+          // scoreOverride defaults to null on most outputs, so requiring it
+          // costs us nothing — model just emits "scoreOverride": null.
+          'scoreOverride',
         ],
         properties: {
           title:                  { type: 'string', description: 'Trend title in English' },
@@ -394,6 +310,29 @@ export const STAGE1_RESPONSE_SCHEMA = {
             enum: [...LIFESPAN_VALUES, 'unknown'],
           },
           isGenuinelyInteresting: { type: 'boolean' },
+          // 2026-05-10 trust-contract addition: Stage 0b (Gemini multimodal)
+          // already produces authoritative memePotential / viralityScore /
+          // category. Stage 1 normally just ECHOes those values. scoreOverride
+          // is the ONLY mechanism by which Stage 1 may disagree with the
+          // Stage-0b score. Set to null in 95%+ of cases. When non-null, it
+          // must include a one-sentence reason — without it the override is
+          // dropped client-side. Used by scorer.js to: (a) write back a new
+          // memePotential, (b) record the change in trend.scoreOverride for
+          // visibility in the admin DecisionsPage.
+          scoreOverride: {
+            anyOf: [
+              { type: 'null' },
+              {
+                type: 'object',
+                additionalProperties: false,
+                required: ['value', 'reason'],
+                properties: {
+                  value:  { type: 'integer', minimum: 0, maximum: 100 },
+                  reason: { type: 'string', maxLength: 240 },
+                },
+              },
+            ],
+          },
         },
       },
     },

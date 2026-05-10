@@ -18,6 +18,7 @@ import GeminiCaptioner from './analysis/gemini-captioner.js';
 import PreStage from './analysis/pre-stage.js';
 import TelegramNotifier from './notifications/telegram.js';
 import { recomputeAlertScores, dispatchAlerts } from './notifications/alert-dispatcher.js';
+import { AlertScheduler } from './notifications/alert-scheduler.js';
 import SupportBot from './support/bot.js';
 import HotMetricsRefresher from './refresh/hot-metrics.js';
 import TagRefresher from './refresh/tag-refresher.js';
@@ -63,6 +64,16 @@ const triggerFinder = new TriggerFinder(config, logger);
 // ── Initialize Telegram Bot ─────────────────────────────────────────────────
 // scorer is passed for the pro/admin /analyze + bare-URL manual-analysis flow.
 const telegram = new TelegramNotifier(config, logger, db, null, triggerFinder, scorer); // solanaMonitor injected below
+
+// ── Alert scheduler (per-user FIFO cooldown queue) ──────────────────────────
+// Paces outgoing Telegram alerts so a single user doesn't get 5 pings/sec from
+// one scan cycle. Cooldown / cap / max-age are admin-tunable via DB settings
+// (tgAlertCooldown* keys). Scheduler reads them per-tick. Manual-submit path
+// in telegram.js (_handleSendAlert) intentionally does NOT route through here
+// — those alerts are user-triggered and must be instant.
+const alertScheduler = new AlertScheduler({ logger, db });
+alertScheduler.start();
+telegram.scheduler = alertScheduler;  // for pause-toggle dropQueue hook
 // Prune muxed video cache on startup (files older than 7 days)
 try { telegram.cleanupVideoCache(5); } catch {}
 
@@ -326,6 +337,7 @@ const admin = new AdminServer(config, logger, db, telegram.bot, appState, () => 
   triggerFinder,  // optional Grok deep-search; SubmitPage button → /api/trends/:id/trigger
   hotRefresher,   // status reads + manual trigger from admin /api/hot-refresh/*
   tagRefresher,   // weekly auto-refresh of source-tags (admin /api/tag-refresh/*)
+  alertScheduler, // per-user FIFO cooldown queue (config + live stats endpoints)
 });
 admin.start();
 
@@ -548,6 +560,7 @@ async function runScanCycle() {
         alertWeights, presetCfg: presetCfgForAlerts, globalAlertThreshold,
         normalizeThreshold,
         recordDecision: recordAlertDecision,
+        scheduler: alertScheduler,
       },
     });
 

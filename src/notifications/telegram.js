@@ -52,6 +52,11 @@ class TelegramNotifier {
     // Scorer for the pro/admin manual-analysis URL handler. Without it the
     // /analyze command and bare-URL handler reply with "feature unavailable".
     this.scorer = scorer;
+    // AlertScheduler — wired post-construction by index.js (see setScheduler).
+    // When the user toggles pause we ask the scheduler to drop their queued
+    // alerts immediately. Optional: if scheduler isn't wired, pause toggle
+    // simply does nothing extra (next-cycle filter takes over within minutes).
+    this.scheduler = null;
     this.twitterChecker = new TwitterChecker(config, logger, db);
     this.enabled = !!this.botToken;
     // Rate limiter: max 30 interactions per user per minute
@@ -488,6 +493,15 @@ class TelegramNotifier {
           const newStatus = user.status === 'active' ? 'paused' : 'active';
           this.db.updateUser(user.id, 'status', newStatus);
           user.status = newStatus;
+          // Drop any alerts already queued for this chat — if the user is
+          // pausing, they don't want them later; if they're resuming, those
+          // were stale anyway (queued before pause toggle). Scheduler is
+          // optional: silently noop when not wired.
+          if (this.scheduler && typeof this.scheduler.dropQueue === 'function') {
+            try { this.scheduler.dropQueue(chatId); } catch (e) {
+              this.logger?.warn?.(`[Telegram] scheduler.dropQueue failed: ${e.message}`);
+            }
+          }
           const statusMsg = newStatus === 'active' ? t.resumed : t.paused;
           await this.bot.answerCallbackQuery(query.id, { text: statusMsg.replace(/<[^>]*>/g, '') });
           await this._editMessage(chatId, query.message.message_id, statusMsg + '\n\n' + t.menuTitle(this._menuStatusInfo(user)), this._mainMenuKeyboard(user));

@@ -86,17 +86,26 @@ export class NanoClassifier {
   /**
    * Runtime kill switch read from the DB on each call. Allows admin UI to
    * flip nano on/off without restart. Returns true if the setting allows
-   * nano to run, false if admin disabled it. Defaults to true (enabled) if
-   * the DB read fails for any reason — we'd rather over-run than silently
-   * skip enrichment.
+   * nano to run, false if admin disabled it.
+   *
+   * DEFAULT FLIPPED 2026-05-09: nano is now OFF by default (was ON). After the
+   * Stage 1 model rework (Grok / Gemini-3.1-flash-lite), nano became dead
+   * weight — its three fields (topicSummary / entityCanonical / slangDecoded)
+   * are duplicated by the new Stage 1 model with much better quality. We keep
+   * the file alive so an operator can re-enable from the admin panel for A/B
+   * tests, but the production path skips it.
+   *
+   * If the DB read fails we now default to FALSE (skip nano) — opposite of
+   * the previous behaviour. Operators who want nano back must explicitly
+   * toggle it on in the admin UI.
    */
   _isAdminEnabled() {
-    if (!this.db?.getSetting) return true;
+    if (!this.db?.getSetting) return false;
     try {
-      const v = this.db.getSetting('nanoEnabled', '1');
-      return String(v) !== '0';
+      const v = this.db.getSetting('nanoEnabled', '0');
+      return String(v) === '1';
     } catch (_) {
-      return true;
+      return false;
     }
   }
 
