@@ -22,14 +22,25 @@ const ru = {
   welcomeBack: (plan) => `<b>Catalyst</b> \u00b7 \u043f\u043b\u0430\u043d: <b>${plan}</b>\n\n/menu - \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438\n/top - \u0442\u043e\u043f \u043d\u0430\u0440\u0440\u0430\u0442\u0438\u0432\u043e\u0432 \u0441\u0435\u0439\u0447\u0430\u0441`,
 
   // ── Main menu ──────────────────────────────────────────────────────────
-  // menuTitle — функция для live-статус строки в шапке.
+  // menuTitle — 3-строчный статус-блок шапки:
+  //   ⚙️ Настройки
+  //   ━━━━━━━━━━━━━━
+  //   🟢 Активно · 👑 Admin · ∞
+  // Иконки плана: 👑 Admin · 💎 Pro · 🎟 Test · 🆓 Free.
+  // Время: "Nд" для платных с днями, "∞" для free/admin/без срока.
   menuTitle: (info = {}) => {
-    const dot      = info.paused ? '\u{1F7E0}' : '\u{1F7E2}';
-    const status   = info.paused ? 'На паузе' : 'Активно';
-    const planMap  = { free: 'Free', test: 'Test', pro: 'Pro', admin: 'Admin' };
-    const planCap  = planMap[info.plan] || 'Free';
-    const daysPart = (info.daysLeft != null) ? ` · ${info.daysLeft}д` : '';
-    return `\u{2699}\u{FE0F} <b>Настройки</b>\n${dot} ${status} · ${planCap}${daysPart}`;
+    const dot     = info.paused ? '\u{1F7E0}' : '\u{1F7E2}';
+    const status  = info.paused ? 'На паузе' : 'Активно';
+    const planMap = {
+      free:  { name: 'Free',  icon: '\u{1F193}'           },
+      test:  { name: 'Test',  icon: '\u{1F39F}\u{FE0F}'   },
+      pro:   { name: 'Pro',   icon: '\u{1F48E}'           },
+      admin: { name: 'Admin', icon: '\u{1F451}'           },
+    };
+    const p        = planMap[info.plan] || planMap.free;
+    const timeSlot = (info.daysLeft != null) ? `${info.daysLeft}д` : '\u{221E}';
+    const divider  = '\u{2501}'.repeat(14);
+    return `\u{2699}\u{FE0F} <b>Настройки</b>\n${divider}\n${dot} ${status} · ${p.icon} ${p.name} · ${timeSlot}`;
   },
   btnSources: '\u{1F4E1} \u{0418}\u{0441}\u{0442}\u{043E}\u{0447}\u{043D}\u{0438}\u{043A}\u{0438}',
   btnLanguage: '\u{1F310} \u{042F}\u{0437}\u{044B}\u{043A}',

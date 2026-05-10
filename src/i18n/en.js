@@ -22,17 +22,27 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   welcomeBack: (plan) => `<b>Catalyst</b> \u00b7 plan: <b>${plan}</b>\n\n/menu - settings\n/top - top narratives right now`,
 
   // ── Main menu ──────────────────────────────────────────────────────────
-  // menuTitle is now a function so the header doubles as a live status line:
-  //   "⚙️ Settings\n🟢 Active · Pro · 12d left".
+  // menuTitle renders the header as a 3-line status block:
+  //   ⚙️ Settings
+  //   ━━━━━━━━━━━━━━
+  //   🟢 Active · 👑 Admin · ∞
   // info shape: { paused: boolean, plan: 'free'|'test'|'pro'|'admin',
   //               daysLeft: number|null }   // null for Free / no expiry
+  // Plan icons: 👑 Admin · 💎 Pro · 🎟 Test · 🆓 Free.
+  // Time slot: "Nd" for paid plans with days left, "∞" for free/admin/no-expiry.
   menuTitle: (info = {}) => {
-    const dot      = info.paused ? '\u{1F7E0}' : '\u{1F7E2}';
-    const status   = info.paused ? 'Paused' : 'Active';
-    const planMap  = { free: 'Free', test: 'Test', pro: 'Pro', admin: 'Admin' };
-    const planCap  = planMap[info.plan] || 'Free';
-    const daysPart = (info.daysLeft != null) ? ` · ${info.daysLeft}d left` : '';
-    return `\u{2699}\u{FE0F} <b>Settings</b>\n${dot} ${status} · ${planCap}${daysPart}`;
+    const dot     = info.paused ? '\u{1F7E0}' : '\u{1F7E2}';
+    const status  = info.paused ? 'Paused' : 'Active';
+    const planMap = {
+      free:  { name: 'Free',  icon: '\u{1F193}'           },
+      test:  { name: 'Test',  icon: '\u{1F39F}\u{FE0F}'   },
+      pro:   { name: 'Pro',   icon: '\u{1F48E}'           },
+      admin: { name: 'Admin', icon: '\u{1F451}'           },
+    };
+    const p        = planMap[info.plan] || planMap.free;
+    const timeSlot = (info.daysLeft != null) ? `${info.daysLeft}d` : '\u{221E}';
+    const divider  = '\u{2501}'.repeat(14);
+    return `\u{2699}\u{FE0F} <b>Settings</b>\n${divider}\n${dot} ${status} · ${p.icon} ${p.name} · ${timeSlot}`;
   },
   btnSources: '\u{1F4E1} Sources',
   btnLanguage: '\u{1F310} Language',

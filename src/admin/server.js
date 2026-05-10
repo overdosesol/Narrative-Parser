@@ -111,6 +111,11 @@ class AdminServer {
     this.triggerFinder = extras.triggerFinder || null;  // Grok deep-search for SubmitPage trigger button
     this.hotRefresher = extras.hotRefresher || null;    // periodic re-fetch + re-score loop (status + manual trigger)
     this.tagRefresher = extras.tagRefresher || null;    // weekly Grok call to refresh source-tags (Phase 1 stub)
+    // AlertScheduler instance — exposes /api/alert-scheduler GET (config+stats)
+    // and POST (config update). When null, the admin panel still renders the
+    // settings card but the live-stats block hides itself with "scheduler not
+    // wired" so dev-runs without index.js still work.
+    this.alertScheduler = extras.alertScheduler || null;
     this.port = parseInt(process.env.ADMIN_PORT || '8080');
     this.host = process.env.ADMIN_HOST || '127.0.0.1';
     this.adminKey = process.env.ADMIN_API_KEY || '';
@@ -499,35 +504,52 @@ class AdminServer {
   }
 
   _getAiConfig() {
-    const provider = (this.db.getSetting('aiProvider', 'xai') || 'xai').toLowerCase();
-    const xaiModel = this.db.getSetting('xaiModel', process.env.XAI_MODEL || 'grok-4-1-fast-non-reasoning');
-    const openaiModel = this.db.getSetting('openaiModel', process.env.OPENAI_MODEL || 'gpt-4.1-mini');
+    const VALID_PROVIDERS = ['xai', 'openai', 'gemini'];
+    const rawProvider = (this.db.getSetting('aiProvider', 'xai') || 'xai').toLowerCase();
+    const provider = VALID_PROVIDERS.includes(rawProvider) ? rawProvider : 'xai';
+
+    const xaiModel    = this.db.getSetting('xaiModel',    process.env.XAI_MODEL    || 'grok-4-1-fast-non-reasoning');
+    const openaiModel = this.db.getSetting('openaiModel', process.env.OPENAI_MODEL || 'gpt-5.4-mini');
+    // Gemini Stage 1: routes through Google's OpenAI-compat layer
+    // (/v1beta/openai/chat/completions). Reuses GOOGLE_AI_API_KEY (same key
+    // used by Stage 0b captioner) so a single Google key powers both stages.
+    const geminiModel = this.db.getSetting('geminiModel', process.env.GEMINI_STAGE1_MODEL || 'gemini-3.1-flash-lite');
+
     const stage2Enabled = String(this.db.getSetting('aiStage2Enabled', '1')) !== '0';
-    const currentModel = provider === 'openai' ? openaiModel : xaiModel;
+    const currentModel =
+      provider === 'openai' ? openaiModel :
+      provider === 'gemini' ? geminiModel :
+      xaiModel;
 
     return {
-      provider: ['xai', 'openai'].includes(provider) ? provider : 'xai',
+      provider,
       model: currentModel,
       xaiModel,
       openaiModel,
+      geminiModel,
       stage2Enabled,
-      hasXaiKey: !!process.env.XAI_API_KEY,
+      hasXaiKey:    !!process.env.XAI_API_KEY,
       hasOpenaiKey: !!process.env.OPENAI_API_KEY,
-      xaiBaseUrl: process.env.XAI_BASE_URL || 'https://api.x.ai/v1',
+      hasGeminiKey: !!process.env.GOOGLE_AI_API_KEY,
+      xaiBaseUrl:    process.env.XAI_BASE_URL    || 'https://api.x.ai/v1',
       openaiBaseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+      geminiBaseUrl: process.env.GEMINI_OPENAI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai',
     };
   }
 
   _setAiConfig({ provider, model, stage2Enabled }) {
     const safeProvider = String(provider || '').toLowerCase();
-    if (!['xai', 'openai'].includes(safeProvider)) {
+    if (!['xai', 'openai', 'gemini'].includes(safeProvider)) {
       throw new Error('Invalid AI provider');
     }
     this.db.setSetting('aiProvider', safeProvider);
 
     const cleanModel = String(model || '').trim();
     if (cleanModel.length > 0) {
-      const modelKey = safeProvider === 'openai' ? 'openaiModel' : 'xaiModel';
+      const modelKey =
+        safeProvider === 'openai' ? 'openaiModel' :
+        safeProvider === 'gemini' ? 'geminiModel' :
+        'xaiModel';
       this.db.setSetting(modelKey, cleanModel);
     }
 
@@ -540,7 +562,7 @@ class AdminServer {
 
   async _fetchProviderModels(provider) {
     const p = String(provider || '').toLowerCase();
-    if (!['xai', 'openai'].includes(p)) throw new Error('Invalid provider');
+    if (!['xai', 'openai', 'gemini'].includes(p)) throw new Error('Invalid provider');
 
     // Curated model sets for cleaner admin UX
     const curated = {
@@ -551,7 +573,24 @@ class AdminServer {
         'grok-3-mini',
       ],
       openai: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini', 'gpt-4o', 'gpt-5-mini', 'gpt-5'],
+      // Gemini list is hardcoded — Google's OpenAI-compat /v1beta/openai/models
+      // endpoint exposes hundreds of internal-only IDs that confuse the UI.
+      // These are the four variants we actually want to expose for Stage 1.
+      gemini: [
+        'gemini-3.1-flash-lite',
+        'gemini-3.1-flash-lite-preview',
+        'gemini-2.5-flash',
+        'gemini-2.5-flash-lite',
+      ],
     };
+
+    // Gemini: skip the live /models GET — return the curated list directly so
+    // the UI gets the expected entries even if Google rotates internal IDs.
+    if (p === 'gemini') {
+      const apiKey = process.env.GOOGLE_AI_API_KEY;
+      if (!apiKey) return { provider: p, models: curated.gemini, error: 'GOOGLE_AI_API_KEY is not configured' };
+      return { provider: p, models: curated.gemini };
+    }
 
     const apiKey = p === 'openai' ? process.env.OPENAI_API_KEY : process.env.XAI_API_KEY;
     const baseUrl = p === 'openai'
@@ -1120,11 +1159,12 @@ class AdminServer {
         if (provider) {
           return json(res, 200, await this._fetchProviderModels(provider));
         }
-        const [xai, openai] = await Promise.all([
+        const [xai, openai, gemini] = await Promise.all([
           this._fetchProviderModels('xai'),
           this._fetchProviderModels('openai'),
+          this._fetchProviderModels('gemini'),
         ]);
-        return json(res, 200, { xai, openai });
+        return json(res, 200, { xai, openai, gemini });
       }
 
       // ── Broadcast ──
@@ -1379,12 +1419,13 @@ class AdminServer {
       // Use this to A/B whether nano enrichment actually moves the needle
       // for our scoring + clustering quality.
       if (path === '/api/prestage/nano' && method === 'GET') {
-        const v = this.db.getSetting?.('nanoEnabled', '1');
-        return json(res, 200, { enabled: String(v) !== '0' });
+        // Default '0' (disabled) since 2026-05-09 — nano is now opt-in.
+        const v = this.db.getSetting?.('nanoEnabled', '0');
+        return json(res, 200, { enabled: String(v) === '1' });
       }
       if (path === '/api/prestage/nano/toggle' && method === 'POST') {
-        const cur = this.db.getSetting?.('nanoEnabled', '1');
-        const next = String(cur) === '0' ? '1' : '0';
+        const cur = this.db.getSetting?.('nanoEnabled', '0');
+        const next = String(cur) === '1' ? '0' : '1';
         try {
           this.db.setSetting('nanoEnabled', next);
         } catch (e) {
@@ -1394,6 +1435,65 @@ class AdminServer {
         const enabled = next !== '0';
         this.logger.info(`[Admin] PreStage nano ${enabled ? 'ENABLED' : 'DISABLED'}`);
         return json(res, 200, { enabled });
+      }
+
+      // ── Alert Scheduler (per-user FIFO cooldown) ──────────────────────────
+      // GET returns current settings (live from DB, refreshed by scheduler
+      // on each tick) + a stats snapshot from the in-memory scheduler.
+      // POST accepts any subset of {enabled, cooldownMs, cap, maxAgeMs} and
+      // persists into DB. Scheduler reads them on the next tick — no restart.
+      if (path === '/api/alert-scheduler' && method === 'GET') {
+        const cfg = {
+          enabled:     String(this.db.getSetting?.('tgAlertCooldownEnabled', '1')) !== '0',
+          cooldownMs:  parseInt(this.db.getSetting?.('tgAlertCooldownMs', '60000'), 10) || 60000,
+          cap:         parseInt(this.db.getSetting?.('tgAlertQueueCap', '20'), 10) || 20,
+          maxAgeMs:    parseInt(this.db.getSetting?.('tgAlertQueueMaxAgeMs', '1800000'), 10) || 1800000,
+        };
+        const stats = this.alertScheduler?.getStats?.() || null;
+        return json(res, 200, { cfg, stats });
+      }
+      if (path === '/api/alert-scheduler' && method === 'POST') {
+        const body = await readJsonBody(req);
+        try {
+          if (body.enabled !== undefined) {
+            const v = (body.enabled === true || body.enabled === 1 || body.enabled === '1' || body.enabled === 'true') ? '1' : '0';
+            this.db.setSetting('tgAlertCooldownEnabled', v);
+          }
+          if (body.cooldownMs !== undefined) {
+            const n = Math.max(0, Math.min(600_000, parseInt(body.cooldownMs, 10) || 0));
+            this.db.setSetting('tgAlertCooldownMs', String(n));
+          }
+          if (body.cap !== undefined) {
+            const n = Math.max(1, Math.min(500, parseInt(body.cap, 10) || 1));
+            this.db.setSetting('tgAlertQueueCap', String(n));
+          }
+          if (body.maxAgeMs !== undefined) {
+            const n = Math.max(60_000, Math.min(24 * 60 * 60_000, parseInt(body.maxAgeMs, 10) || 60_000));
+            this.db.setSetting('tgAlertQueueMaxAgeMs', String(n));
+          }
+        } catch (e) {
+          this.logger.error(`[Admin] Failed to persist alert-scheduler settings: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+        const cfg = {
+          enabled:     String(this.db.getSetting?.('tgAlertCooldownEnabled', '1')) !== '0',
+          cooldownMs:  parseInt(this.db.getSetting?.('tgAlertCooldownMs', '60000'), 10) || 60000,
+          cap:         parseInt(this.db.getSetting?.('tgAlertQueueCap', '20'), 10) || 20,
+          maxAgeMs:    parseInt(this.db.getSetting?.('tgAlertQueueMaxAgeMs', '1800000'), 10) || 1800000,
+        };
+        this.logger.info(
+          `[Admin] AlertScheduler updated: enabled=${cfg.enabled}, cooldown=${cfg.cooldownMs}ms, ` +
+          `cap=${cfg.cap}, maxAge=${cfg.maxAgeMs}ms`
+        );
+        return json(res, 200, { cfg, ok: true });
+      }
+      // Optional manual queue drop for a specific chat (admin force-flush).
+      if (path === '/api/alert-scheduler/drop' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const chatId = String(body.chatId || '').trim();
+        if (!chatId) return json(res, 400, { error: 'chatId required' });
+        const dropped = this.alertScheduler?.dropQueue?.(chatId) ?? 0;
+        return json(res, 200, { ok: true, chatId, dropped });
       }
 
       // Hot trends refresh — periodic re-fetch + re-score loop in index.js.
@@ -2596,6 +2696,18 @@ function ScannersPage() {
       )
     ),
 
+    // Telegram alert pacing — closed: tweaked occasionally
+    React.createElement('details', { className: 'pcfg-accordion' },
+      React.createElement('summary', { className: 'pcfg-accordion-summary' },
+        React.createElement('span', null, '📤 Telegram alert pacing'),
+        React.createElement('span', { style: { fontSize: 11, color: 'var(--text3)', fontWeight: 400 } },
+          'Per-user FIFO cooldown · 60s default')
+      ),
+      React.createElement('div', { className: 'pcfg-accordion-body' },
+        React.createElement(AlertSchedulerSection, null)
+      )
+    ),
+
     // Hot trends refresh — closed: status display + trigger button
     React.createElement('details', { className: 'pcfg-accordion' },
       React.createElement('summary', { className: 'pcfg-accordion-summary' },
@@ -2976,6 +3088,239 @@ function PreStageSection() {
         background: 'rgba(239,68,68,.1)', color: 'var(--red)', fontSize: 13
       }
     }, err)
+  );
+}
+
+
+// ── AlertSchedulerSection — per-user FIFO cooldown queue admin UI ───────────
+// Wraps the /api/alert-scheduler endpoints. Three knobs (enabled toggle,
+// cooldown seconds, queue cap) plus a live stats table that auto-refreshes
+// every 5 seconds while the section is mounted. The settings are persisted
+// in the DB (settings table) and the running scheduler reads them per-tick,
+// so changes take effect within ~5 seconds without a restart.
+function AlertSchedulerSection() {
+  const h = React.createElement;
+  const [data, setData]   = useState(null);   // { cfg, stats }
+  const [draft, setDraft] = useState(null);   // editable copy of cfg
+  const [busy, setBusy]   = useState(false);
+  const [err, setErr]     = useState('');
+  const [msg, setMsg]     = useState('');
+
+  const load = async () => {
+    try {
+      const d = await api('/api/alert-scheduler');
+      setData(d);
+      // Only seed draft from server on first load — otherwise we'd stomp the
+      // user's in-progress edits every time the auto-refresh tick fires.
+      setDraft(prev => prev || { ...d.cfg });
+    } catch (e) {
+      setErr('Не удалось загрузить: ' + e.message);
+    }
+  };
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  const save = async () => {
+    if (!draft) return;
+    setBusy(true); setErr(''); setMsg('');
+    try {
+      const d = await api('/api/alert-scheduler', 'POST', draft);
+      setData(prev => ({ ...(prev || {}), cfg: d.cfg }));
+      setDraft({ ...d.cfg });
+      setMsg('Сохранено');
+      setTimeout(() => setMsg(''), 2000);
+    } catch (e) {
+      setErr('Не удалось сохранить: ' + e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const flash = (text, color) => h('span', {
+    style: { fontSize: 11, color, marginLeft: 10, fontWeight: 600 }
+  }, text);
+
+  // Helper: format ms as human-readable.
+  const fmtMs = (ms) => {
+    if (!Number.isFinite(ms)) return '—';
+    if (ms < 1000) return ms + 'ms';
+    if (ms < 60_000) return Math.round(ms / 100) / 10 + 's';
+    if (ms < 3_600_000) return Math.round(ms / 6000) / 10 + 'min';
+    return Math.round(ms / 360_000) / 10 + 'h';
+  };
+
+  if (!data || !draft) {
+    return h('div', { style: { padding: 12, color: 'var(--text3)', fontSize: 13 } },
+      err || 'Загрузка...');
+  }
+
+  const stats = data.stats || null;
+  const dirty = JSON.stringify(draft) !== JSON.stringify(data.cfg);
+
+  return h('div', null,
+    h('p', {
+      style: { fontSize: 12, color: 'var(--text3)', marginBottom: 14, lineHeight: 1.5 }
+    },
+      'Очередь FIFO на каждого пользователя. Между алертами одному и тому же чату — кулдаун. ',
+      'Чужие очереди независимы. Manual-submit (кнопка "📨 Отправить" на SubmitPage) идёт мимо очереди — мгновенно.'
+    ),
+
+    // ── Settings card ──────────────────────────────────────────────────────
+    h('div', {
+      style: {
+        padding: '14px 16px', borderRadius: 10,
+        background: 'var(--bg2)', border: '1px solid var(--border)',
+        marginBottom: 12,
+      }
+    },
+      // Enabled toggle row
+      h('div', {
+        style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }
+      },
+        h('div', null,
+          h('div', { style: { fontWeight: 600, fontSize: 13 } }, 'Включён'),
+          h('div', { style: { fontSize: 11, color: 'var(--text3)', marginTop: 2 } },
+            'Когда выключен — алерты летят синхронно (старое поведение).')
+        ),
+        h('label', { className: 'toggle' },
+          h('input', {
+            type: 'checkbox',
+            checked: draft.enabled,
+            disabled: busy,
+            onChange: e => setDraft(prev => ({ ...prev, enabled: e.target.checked })),
+          }),
+          h('span', { className: 'toggle-slider' })
+        )
+      ),
+
+      // Sliders row
+      h('div', {
+        style: {
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+          gap: 14,
+          opacity: draft.enabled ? 1 : 0.4,
+          pointerEvents: draft.enabled ? 'auto' : 'none',
+        }
+      },
+        // Cooldown seconds
+        h('div', null,
+          h('div', { style: { fontSize: 12, color: 'var(--text2)', marginBottom: 6 } },
+            'Кулдаун: ', h('b', null, Math.round(draft.cooldownMs / 1000)), 's'
+          ),
+          h('input', {
+            type: 'range', min: 0, max: 300, step: 5,
+            value: Math.round(draft.cooldownMs / 1000),
+            disabled: busy,
+            onChange: e => setDraft(prev => ({ ...prev, cooldownMs: Number(e.target.value) * 1000 })),
+            style: { width: '100%' }
+          }),
+          h('div', { style: { fontSize: 10, color: 'var(--text3)', marginTop: 4 } },
+            '0 = без задержки. 60s = по умолчанию.')
+        ),
+        // Cap
+        h('div', null,
+          h('div', { style: { fontSize: 12, color: 'var(--text2)', marginBottom: 6 } },
+            'Макс. в очереди на юзера: ', h('b', null, draft.cap)
+          ),
+          h('input', {
+            type: 'range', min: 1, max: 100, step: 1,
+            value: draft.cap,
+            disabled: busy,
+            onChange: e => setDraft(prev => ({ ...prev, cap: Number(e.target.value) })),
+            style: { width: '100%' }
+          }),
+          h('div', { style: { fontSize: 10, color: 'var(--text3)', marginTop: 4 } },
+            'Сверх лимита — drop oldest. По умолчанию 20.')
+        ),
+        // Max age minutes
+        h('div', null,
+          h('div', { style: { fontSize: 12, color: 'var(--text2)', marginBottom: 6 } },
+            'Макс. возраст в очереди: ', h('b', null, Math.round(draft.maxAgeMs / 60_000)), 'min'
+          ),
+          h('input', {
+            type: 'range', min: 1, max: 120, step: 1,
+            value: Math.round(draft.maxAgeMs / 60_000),
+            disabled: busy,
+            onChange: e => setDraft(prev => ({ ...prev, maxAgeMs: Number(e.target.value) * 60_000 })),
+            style: { width: '100%' }
+          }),
+          h('div', { style: { fontSize: 10, color: 'var(--text3)', marginTop: 4 } },
+            'Старше — drop без отправки. По умолчанию 30 min.')
+        )
+      ),
+
+      // Save row
+      h('div', { style: { marginTop: 14, display: 'flex', alignItems: 'center', gap: 10 } },
+        h('button', {
+          className: 'btn ' + (dirty ? 'btn-primary' : 'btn-ghost'),
+          disabled: busy || !dirty,
+          onClick: save
+        }, busy ? 'Сохраняю...' : (dirty ? 'Сохранить' : 'Без изменений')),
+        dirty && h('button', {
+          className: 'btn btn-ghost btn-sm',
+          disabled: busy,
+          onClick: () => setDraft({ ...data.cfg })
+        }, 'Откатить'),
+        msg && flash('✓ ' + msg, 'var(--green)'),
+        err && flash('✗ ' + err, 'var(--red)')
+      )
+    ),
+
+    // ── Live stats card ─────────────────────────────────────────────────────
+    stats && h('div', {
+      style: {
+        padding: '14px 16px', borderRadius: 10,
+        background: 'var(--bg2)', border: '1px solid var(--border)',
+      }
+    },
+      h('div', { style: { fontSize: 12, fontWeight: 700, color: 'var(--text2)', marginBottom: 10, letterSpacing: '.3px' } },
+        '📊 LIVE STATS'),
+      h('div', {
+        style: {
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+          gap: 10, marginBottom: 12,
+        }
+      },
+        [
+          { label: 'В очереди',         val: stats.totalQueued },
+          { label: 'Активных юзеров',   val: stats.activeUsers },
+          { label: 'Sent',              val: stats.metrics?.sentTotal ?? 0 },
+          { label: 'Dropped (full)',    val: stats.metrics?.droppedFullTotal ?? 0 },
+          { label: 'Dropped (stale)',   val: stats.metrics?.droppedStaleTotal ?? 0 },
+          { label: 'Dropped (paused)',  val: stats.metrics?.droppedPausedTotal ?? 0 },
+          { label: 'Errors',            val: stats.metrics?.taskErrors ?? 0 },
+        ].map((s, i) => h('div', {
+          key: i,
+          style: { padding: '8px 12px', borderRadius: 6, background: 'rgba(255,255,255,.03)', textAlign: 'center' }
+        },
+          h('div', { style: { fontSize: 10, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '.4px' } }, s.label),
+          h('div', { style: { fontSize: 18, fontWeight: 700, marginTop: 4 } }, String(s.val))
+        ))
+      ),
+
+      stats.perUser && stats.perUser.length > 0 && h('div', null,
+        h('div', { style: { fontSize: 11, color: 'var(--text3)', marginBottom: 6 } },
+          'Per-user (top ' + stats.perUser.length + '):'),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+          stats.perUser.map(u => h('div', {
+            key: u.chatId,
+            style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '4px 8px', borderRadius: 4, background: 'rgba(255,255,255,.02)' }
+          },
+            h('span', { style: { fontFamily: 'monospace' } }, '@' + u.chatId),
+            h('span', null,
+              h('b', null, u.count), ' алерт(ов) · oldest ', fmtMs(u.oldestAgeMs),
+              ' · cooldown left ', fmtMs(u.cooldownLeftMs)
+            )
+          ))
+        )
+      )
+    )
   );
 }
 
@@ -3885,6 +4230,35 @@ function DecisionsPage() {
                 d.alertScore != null && h('span', null,
                   'score: ', h('b', null, d.alertScore), ' / ', d.threshold
                 ),
+                // Score-source chip (2026-05-10 trust-contract). Tells the
+                // admin at a glance which stage produced the final
+                // memePotential. Hover reveals the override reason when Stage
+                // 1 disagreed with Stage 0b.
+                d.scoreSource && (() => {
+                  const map = {
+                    stage0b_gemini: { icon: '🌟', label: 'Gemini',   color: '#00b894', bg: 'rgba(0,184,148,.10)', tip: 'memePotential от Stage 0b (Gemini multimodal) — authoritative' },
+                    stage1_override:{ icon: '🔄', label: 'Override', color: '#fdcb6e', bg: 'rgba(253,203,110,.12)', tip: 'Stage 1 переписал Gemini score' },
+                    stage1_fallback:{ icon: '🤖', label: 'Stage1',   color: '#74b9ff', bg: 'rgba(116,185,255,.10)', tip: 'Stage 1 сам скорил — Gemini не вернул memePotential (text-only тренд или fallback)' },
+                  };
+                  const m = map[d.scoreSource];
+                  if (!m) return null;
+                  const ov = d.scoreOverride;
+                  const lbl = (d.scoreSource === 'stage1_override' && ov)
+                    ? (m.icon + ' ' + m.label + ' ' + ov.from + '→' + ov.to)
+                    : (m.icon + ' ' + m.label);
+                  const tipText = (d.scoreSource === 'stage1_override' && ov)
+                    ? (m.tip + '\\n' + ov.from + ' → ' + ov.to + '\\n' + (ov.reason || ''))
+                    : m.tip;
+                  return h('span', {
+                    title: tipText,
+                    style: {
+                      fontSize: 11, padding: '2px 7px', borderRadius: 4,
+                      color: m.color, background: m.bg,
+                      border: '1px solid ' + m.color + '33',
+                      fontWeight: 600,
+                    }
+                  }, lbl);
+                })(),
                 d.preset && h('span', null, '🎯 ', h('b', null, d.preset)),
                 d.userChatId && h('span', null, '👤 @', d.userChatId)
               ),
@@ -3922,6 +4296,11 @@ function DecisionsPage() {
               ),
               // Row 5: full math panel (when expanded)
               d.breakdown && isOpen && MathPanel(d),
+              // Row 5b: Stage 1 score-override detail block (when expanded
+              // AND Stage 1 disagreed with Stage 0b). Shows from→to + reason
+              // verbatim so admins can spot Stage 1 overstepping its mandate.
+              isOpen && d.scoreSource === 'stage1_override' && d.scoreOverride &&
+                DecisionScoreOverrideBlock(d.scoreOverride),
               // Row 6: Stage 0 PreStage block (Gemini visual+audio + chips + nano)
               // — only when expanded. If preStage is null/empty (legacy trend
               // scored before PreStage was wired, or text-only trend with no
@@ -3931,6 +4310,51 @@ function DecisionsPage() {
             );
           })
         )
+  );
+}
+
+// ── DecisionScoreOverrideBlock — Stage 1 override detail card ──────────────
+// Rendered ONLY when Stage 1 disagreed with Stage 0b (scoreSource ===
+// 'stage1_override'). Shows the from/to delta + the reason Stage 1 gave
+// verbatim. The 2026-05-10 trust-contract makes Stage 0b authoritative; this
+// block exists so admins can audit the rare override path and catch a Stage 1
+// model that's overreaching its mandate (delta too big, reason too vague,
+// override on every trend, etc).
+function DecisionScoreOverrideBlock(ov) {
+  const h = React.createElement;
+  if (!ov || !Number.isFinite(ov.from) || !Number.isFinite(ov.to)) return null;
+  const delta = ov.to - ov.from;
+  const sign = delta > 0 ? '+' : '';
+  const direction = delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat';
+  const arrowColor = delta > 0 ? '#00b894' : delta < 0 ? '#ff7675' : 'var(--text2)';
+  return h('div', {
+    style: {
+      marginTop: 10, padding: '10px 14px',
+      background: 'rgba(253,203,110,.06)',
+      border: '1px solid rgba(253,203,110,.30)',
+      borderRadius: 8,
+      fontSize: 12, lineHeight: 1.5, color: 'var(--text)',
+    }
+  },
+    h('div', { style: { fontSize: 10, fontWeight: 700, color: 'var(--text2)', marginBottom: 6, letterSpacing: '.4px' } },
+      '🔄 STAGE 1 SCORE OVERRIDE'),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' } },
+      h('span', { style: { fontSize: 11, color: 'var(--text2)' } }, 'Gemini'),
+      h('span', { style: { fontWeight: 700 } }, ov.from),
+      h('span', { style: { fontSize: 14, color: arrowColor } }, '→'),
+      h('span', { style: { fontWeight: 700 } }, ov.to),
+      h('span', {
+        style: {
+          fontSize: 10, padding: '1px 7px', borderRadius: 4,
+          background: arrowColor + '22', color: arrowColor, fontWeight: 700,
+        }
+      }, sign + delta + ' (' + direction + ')'),
+      h('span', { style: { fontSize: 11, color: 'var(--text2)' } }, '· Stage 1 (' + (ov.stage || 'stage1') + ')')
+    ),
+    h('div', { style: { fontSize: 12, color: 'var(--text)', fontStyle: 'italic' } },
+      h('span', { style: { color: 'var(--text2)', fontStyle: 'normal' } }, 'Reason: '),
+      '"' + (ov.reason || '(no reason given — should not happen, validation should have dropped this)') + '"'
+    )
   );
 }
 
@@ -4031,8 +4455,40 @@ function DecisionPreStageBlock(d) {
           h('span', { style: { color: 'var(--text2)' } }, 'Текст в кадре: '),
           h('span', { style: { fontStyle: 'italic' } }, '"' + g.visibleText + '"')
         ),
-      // Scoring chips row (memeShape, narrative, subject, viralPattern,
-      // tickerSuggestion, subjectNames, lipsync, ambient flags).
+      // Section B (enrichment) — was nano, now lives inside Gemini after the
+      // 2026-05-10 trust-contract refactor. Surfaced verbatim so admins can
+      // see how Gemini interprets the post text.
+      g.topicSummary && g.topicSummary.trim() &&
+        h('div', { style: { marginBottom: 4 } },
+          h('span', { style: { color: 'var(--text2)' } }, 'Тема: '), g.topicSummary
+        ),
+      Array.isArray(g.entityCanonical) && g.entityCanonical.length > 0 &&
+        h('div', { style: { marginBottom: 4 } },
+          h('span', { style: { color: 'var(--text2)' } }, 'Сущности: '),
+          g.entityCanonical.join(', ')
+        ),
+      g.slangDecoded && g.slangDecoded.trim() &&
+        h('div', { style: { marginBottom: 4, fontStyle: 'italic' } },
+          h('span', { style: { color: 'var(--text2)', fontStyle: 'normal' } }, 'Slang: '),
+          g.slangDecoded
+        ),
+      // Section C (authoritative scoring) — these are the values Stage 1
+      // ECHOes by default. Highlighted differently from the subsidiary
+      // signals so it's obvious which numbers carry weight.
+      (Number.isFinite(g.memePotential) || Number.isFinite(g.viralityScore) || g.category) &&
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 } },
+          Number.isFinite(g.memePotential) &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10, fontWeight: 700, color: '#00b894', borderColor: 'rgba(0,184,148,.4)' } },
+              '🎯 memePotential ' + g.memePotential + '/100'),
+          Number.isFinite(g.viralityScore) &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10, fontWeight: 700, color: '#00b894', borderColor: 'rgba(0,184,148,.4)' } },
+              '🔥 viralityScore ' + g.viralityScore + '/100'),
+          g.category &&
+            h('span', { className: 'sp-chip', style: { fontSize: 10, fontWeight: 700, color: '#00b894', borderColor: 'rgba(0,184,148,.4)' } },
+              '📂 ' + g.category)
+        ),
+      // Section D (subsidiary signals) — meme shape, narrative, subject, viralPattern,
+      // tickerSuggestion, subjectNames, lipsync, ambient flags.
       (Number.isFinite(g.memeShapeStrength)
           || typeof g.hasNarrative === 'boolean'
           || typeof g.hasSubject === 'boolean'
@@ -4041,7 +4497,7 @@ function DecisionPreStageBlock(d) {
           || (Array.isArray(g.subjectNames) && g.subjectNames.length > 0)
           || g.isLipSync
           || g.isAmbient) &&
-        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8, marginBottom: 4 } },
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6, marginBottom: 4 } },
           Number.isFinite(g.memeShapeStrength) &&
             h('span', { className: 'sp-chip', style: { fontSize: 10 } }, '🎯 memeShape ' + g.memeShapeStrength + '/100'),
           typeof g.hasNarrative === 'boolean' &&
@@ -4061,7 +4517,12 @@ function DecisionPreStageBlock(d) {
           g.isAmbient &&
             h('span', { className: 'sp-chip', style: { fontSize: 10, color: '#ff7675' } }, '😴 ambient')
         ),
-      g.mood && h('span', { style: { fontSize: 11, color: 'var(--text2)' } }, 'mood: ' + g.mood)
+      // Mood + language footer
+      h('div', { style: { display: 'flex', gap: 12, marginTop: 4, flexWrap: 'wrap' } },
+        g.mood && h('span', { style: { fontSize: 11, color: 'var(--text2)' } }, 'mood: ' + g.mood),
+        g.language && g.language !== 'en' &&
+          h('span', { style: { fontSize: 11, color: 'var(--text2)' } }, 'lang=' + g.language)
+      )
     )
   );
 }
@@ -4207,7 +4668,7 @@ function BotPage() {
   const [broadcasts, setBroadcasts] = useState([]);
   const [aiCfg, setAiCfg] = useState(null);
   const [aiDraft, setAiDraft] = useState({ provider: 'xai', model: 'grok-4-1-fast-non-reasoning', stage2Enabled: true });
-  const [aiModels, setAiModels] = useState({ xai: [], openai: [] });
+  const [aiModels, setAiModels] = useState({ xai: [], openai: [], gemini: [] });
   const [aiModelsError, setAiModelsError] = useState('');
   const [editedPlans, setEditedPlans] = useState({});
   const [msg, setMsg] = useState('');
@@ -4251,11 +4712,17 @@ function BotPage() {
       setAiModels({
         xai: all?.xai?.models || [],
         openai: all?.openai?.models || [],
+        gemini: all?.gemini?.models || [],
       });
-      // Show only actionable errors (e.g. OpenAI key missing).
+      // Show only actionable errors (e.g. OpenAI / Gemini key missing).
       // Ignore xAI quota noise because xAI list is intentionally fixed.
-      const err = all?.openai?.error || '';
-      if (err && (all?.openai?.models || []).length === 0) setAiModelsError(err);
+      const errOpenai = all?.openai?.error || '';
+      const errGemini = all?.gemini?.error || '';
+      if (errOpenai && (all?.openai?.models || []).length === 0) {
+        setAiModelsError(errOpenai);
+      } else if (errGemini && (all?.gemini?.models || []).length === 0) {
+        setAiModelsError(errGemini);
+      }
     } catch (e) {
       setAiModelsError(e.message || 'Failed to load models');
     }
@@ -4413,10 +4880,17 @@ function BotPage() {
         React.createElement('select',{
           className:'filter',
           value:aiDraft.provider,
-          onChange:e=>setAiDraft(prev=>({ ...prev, provider: e.target.value, model: e.target.value === 'openai' ? 'gpt-4.1-mini' : 'grok-4-1-fast-non-reasoning' }))
+          onChange:e=>{
+            const next = e.target.value;
+            const dflt = next === 'openai' ? 'gpt-5.4-mini'
+                       : next === 'gemini' ? 'gemini-3.1-flash-lite'
+                       : 'grok-4-1-fast-non-reasoning';
+            setAiDraft(prev=>({ ...prev, provider: next, model: dflt }));
+          }
         },
           React.createElement('option',{value:'xai'},'xAI (Grok)'),
-          React.createElement('option',{value:'openai'},'OpenAI (GPT)')
+          React.createElement('option',{value:'openai'},'OpenAI (GPT)'),
+          React.createElement('option',{value:'gemini'},'Google (Gemini)')
         ),
         React.createElement('select',{
           className:'filter',
@@ -4429,7 +4903,12 @@ function BotPage() {
             : React.createElement('option',{value:aiDraft.model || ''},aiDraft.model || 'No models loaded')
         ),
         React.createElement('button',{className:'btn btn-ghost btn-sm',onClick:loadAiModels},'↻ Models'),
-        React.createElement('button',{className:'btn btn-ghost btn-sm',onClick:()=>setAiDraft(prev=>({ ...prev, model: prev.provider === 'openai' ? 'gpt-4.1-mini' : 'grok-4-1-fast-non-reasoning' }))},'Default')
+        React.createElement('button',{className:'btn btn-ghost btn-sm',onClick:()=>setAiDraft(prev=>{
+          const dflt = prev.provider === 'openai' ? 'gpt-5.4-mini'
+                     : prev.provider === 'gemini' ? 'gemini-3.1-flash-lite'
+                     : 'grok-4-1-fast-non-reasoning';
+          return { ...prev, model: dflt };
+        })},'Default')
       ),
 
       React.createElement('div',{style:{marginTop:12,marginBottom:8,fontSize:12,fontWeight:700,color:'var(--text2)'}},'Stage 2 — X Search (Grok only)'),
@@ -4450,7 +4929,8 @@ function BotPage() {
         'Текущий Stage 1: ' + aiCfg.provider + ':' + aiCfg.model +
         ' | Stage 2: ' + (aiCfg.stage2Enabled ? 'ON' : 'OFF') +
         ' | key xAI: ' + (aiCfg.hasXaiKey ? 'yes' : 'no') +
-        ' | key OpenAI: ' + (aiCfg.hasOpenaiKey ? 'yes' : 'no')
+        ' | key OpenAI: ' + (aiCfg.hasOpenaiKey ? 'yes' : 'no') +
+        ' | key Gemini: ' + (aiCfg.hasGeminiKey ? 'yes' : 'no')
       )
     ),
 

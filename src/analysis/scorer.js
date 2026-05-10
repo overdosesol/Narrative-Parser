@@ -293,6 +293,18 @@ class Scorer {
         // recognition of recent meme/celebrity references.
         defaultModel: process.env.OPENAI_MODEL || 'gpt-5.4-mini',
       },
+      // Gemini through Google's OpenAI-compatibility layer. Uses
+      // /v1beta/openai/chat/completions which accepts the standard
+      // {model, messages, response_format} shape and returns
+      // {choices:[{message:{content}}]}. Strict json_schema is not yet
+      // documented for this endpoint, so the gemini branch in _callResponsesAPI
+      // ships json_object mode and relies on the prompt to enforce shape.
+      // Same GOOGLE_AI_API_KEY is reused across Stage 0b and Stage 1.
+      gemini: {
+        apiKey: process.env.GOOGLE_AI_API_KEY || '',
+        baseUrl: process.env.GEMINI_OPENAI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai',
+        defaultModel: process.env.GEMINI_STAGE1_MODEL || 'gemini-3.1-flash-lite',
+      },
     };
 
     this.current = this._getRuntimeAiConfig();
@@ -342,22 +354,31 @@ class Scorer {
   }
 
   _getRuntimeAiConfig() {
+    const VALID_PROVIDERS = ['xai', 'openai', 'gemini'];
     const rawProvider = this.db?.getSetting('aiProvider', 'xai') || 'xai';
-    let provider = ['xai', 'openai'].includes(String(rawProvider).toLowerCase())
+    let provider = VALID_PROVIDERS.includes(String(rawProvider).toLowerCase())
       ? String(rawProvider).toLowerCase()
       : 'xai';
 
+    // Auto-fallback chain when the selected provider has no API key:
+    // try xai → openai → gemini (in that order) so an admin pick that
+    // happens to lack a key still produces a working scorer.
     let providerCfg = this.providers[provider] || this.providers.xai;
     if (!providerCfg.apiKey) {
-      if (provider !== 'xai' && this.providers.xai.apiKey) {
-        provider = 'xai';
-        providerCfg = this.providers.xai;
-      } else if (provider !== 'openai' && this.providers.openai.apiKey) {
-        provider = 'openai';
-        providerCfg = this.providers.openai;
+      const fallbackOrder = ['xai', 'openai', 'gemini'].filter(p => p !== provider);
+      for (const candidate of fallbackOrder) {
+        const cand = this.providers[candidate];
+        if (cand?.apiKey) {
+          provider = candidate;
+          providerCfg = cand;
+          break;
+        }
       }
     }
-    const modelSettingKey = provider === 'openai' ? 'openaiModel' : 'xaiModel';
+    const modelSettingKey =
+      provider === 'openai' ? 'openaiModel' :
+      provider === 'gemini' ? 'geminiModel' :
+      'xaiModel';
     const model = this.db?.getSetting(modelSettingKey, providerCfg.defaultModel) || providerCfg.defaultModel;
 
     return {
@@ -693,11 +714,57 @@ class Scorer {
       const originalEnTitle = trend.originalTitle || trend.title;
       const aiEnTitle       = a.title || originalEnTitle;
 
-      const adoption  = Number(a.memePotential) || 0;
+      // ── Score-source resolution (2026-05-10 trust-contract) ─────────────
+      // Priority order:
+      //   1. Stage 1 scoreOverride (rare, must include reason)
+      //   2. Stage 0b (preStage.gemini) — authoritative when present
+      //   3. Stage 1 echo / fallback (preStage absent OR Gemini didn't score)
+      //
+      // We use Number.isFinite to distinguish "Gemini scored 0" (legitimate
+      // — see baseball case) from "Gemini didn't return the field" (null/
+      // undefined). The captioner's clampInt(..., null) emits null when the
+      // model omits the field.
+      const g = trend.preStage?.gemini || null;
+      const geminiHasMeme    = g && Number.isFinite(g.memePotential);
+      const geminiHasViral   = g && Number.isFinite(g.viralityScore);
+      const geminiHasCat     = g && typeof g.category === 'string' && g.category.length > 0;
+
+      // Score-override path: Stage 1 explicitly disagrees with Stage 0b.
+      // Validate shape strictly — bad payloads are dropped silently. The
+      // override is recorded as `trend.scoreOverride` so the admin
+      // DecisionsPage can flag it visually.
+      let scoreOverrideRecord = null;
+      let overrideValue = null;
+      if (a.scoreOverride && typeof a.scoreOverride === 'object'
+          && Number.isFinite(a.scoreOverride.value)
+          && typeof a.scoreOverride.reason === 'string'
+          && a.scoreOverride.reason.trim().length >= 8) {
+        const clamped = Math.max(0, Math.min(100, Math.round(a.scoreOverride.value)));
+        const fromVal = geminiHasMeme ? g.memePotential : (Number(a.memePotential) || 0);
+        scoreOverrideRecord = {
+          from:   fromVal,
+          to:     clamped,
+          reason: a.scoreOverride.reason.trim().slice(0, 240),
+          stage:  'stage1',
+        };
+        overrideValue = clamped;
+      }
+
+      const adoption =
+        overrideValue !== null ? overrideValue
+        : geminiHasMeme         ? g.memePotential
+        : (Number(a.memePotential) || 0);
+
+      const viralityForAlert =
+        geminiHasViral ? g.viralityScore
+        : (Number(a.viralityScore) || this._heuristicScore(trend));
+
+      // category: trust Gemini when present, else fall back to Stage 1, else 'other'.
+      const categoryFinal = geminiHasCat ? g.category : (a.category || 'other');
+
       const emergence = trend.clusterMetrics?.emergenceScore ?? 0;
       const phase     = narrativePhase(emergence, adoption);
       const rankScore = narrativeRankScore(emergence, adoption);
-      const viralityForAlert = Number(a.viralityScore) || this._heuristicScore(trend);
       const alertProbe = computeAlertScore({
         memePotential: adoption,
         score: viralityForAlert,
@@ -721,7 +788,7 @@ class Scorer {
         rankScore,                     // combined sort score
         alertScore:       alertProbe.alertScore,
         alertBreakdown:   alertProbe.breakdown,
-        category:         a.category         || 'other',
+        category:         categoryFinal,
         sentiment:        a.sentiment         || 'neutral',
         aiExplanation:    a.explanation       || '',
         // Trigger event — only populated when the model found an explicit cause.
@@ -741,6 +808,13 @@ class Scorer {
         // appear from non-strict providers get folded back to bare keywords.
         predictedLifespan:normalizeLifespan(a.predictedLifespan) || 'unknown',
         isGenuinelyInteresting: a.isGenuinelyInteresting ?? true,
+        // Source-of-truth audit fields. scoreSource lets DecisionsPage show
+        // which stage produced the final memePotential. scoreOverride is the
+        // full record (from/to/reason/stage) when Stage 1 disagreed with 0b.
+        scoreSource:    overrideValue !== null ? 'stage1_override'
+                       : geminiHasMeme         ? 'stage0b_gemini'
+                       :                          'stage1_fallback',
+        scoreOverride:  scoreOverrideRecord,
       };
     });
   }
@@ -938,6 +1012,73 @@ class Scorer {
     return { inputTokens, outputTokens };
   }
 
+  // ─── Gemini Chat Completions (OpenAI-compat layer) ─────────────────────────
+  //
+  // Google's OpenAI compatibility endpoint exposes /chat/completions but NOT
+  // /responses, so Gemini-as-Stage-1 has its own caller. Returns the same
+  // {text, inputTokens, outputTokens} shape as _callResponsesAPI so the
+  // Stage 1 batch consumer stays provider-agnostic.
+  //
+  // Why json_object (not json_schema): Google's OpenAI-compat doesn't yet
+  // document strict json_schema; json_object is the safe baseline (every
+  // provider implements it the same way). The Stage 1 prompt already lists
+  // every required field with types — empirically Gemini follows it cleanly.
+  // If the response is malformed, _analyzeBatchStage1's try/catch falls back
+  // to heuristic scoring per trend, same as the existing xAI path.
+  async _callGeminiChatCompletions({ input, temperature, runtimeOverride = null }) {
+    const runtime = runtimeOverride || this.current;
+
+    // Responses-API "input" array uses {role, content} — same shape as
+    // Chat Completions "messages". Filter to known roles for safety; reject
+    // anything that came from a tool branch (Gemini doesn't see tools here).
+    const messages = (input || [])
+      .filter(m => ['system', 'user', 'assistant'].includes(m.role))
+      .map(m => ({ role: m.role, content: m.content }));
+
+    const body = {
+      model: runtime.model,
+      messages,
+      response_format: { type: 'json_object' },
+    };
+    if (temperature !== undefined) body.temperature = temperature;
+
+    const url = `${runtime.baseUrl}/chat/completions`;
+    let response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${runtime.apiKey}`,
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      throw new Error(`Gemini chat fetch error: ${err.message}`);
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      const err = new Error(`Gemini chat ${response.status}: ${errorText.substring(0, 300)}`);
+      err.status = response.status;
+      err.errorText = errorText;
+      throw err;
+    }
+
+    const data = await response.json();
+    const text = data?.choices?.[0]?.message?.content || '';
+    if (!text) {
+      throw new Error('Empty Gemini chat response (no choices[0].message.content)');
+    }
+
+    return {
+      text,
+      // Chat Completions usage block: {prompt_tokens, completion_tokens, total_tokens}
+      inputTokens:  data.usage?.prompt_tokens     || 0,
+      outputTokens: data.usage?.completion_tokens || 0,
+    };
+  }
+
   // ─── Responses API call ────────────────────────────────────────────────────
 
   /**
@@ -953,6 +1094,20 @@ class Scorer {
     reasoningEffort = null,       // 'minimal' | 'low' | 'medium' | 'high'
   }) {
     const runtime = runtimeOverride || this.current;
+
+    // Gemini uses Google's OpenAI-compat layer, which only ships /chat/completions
+    // (not /responses). Branch out to a Chat Completions caller that returns
+    // the same {text, inputTokens, outputTokens} shape so callers stay agnostic.
+    // Stage 2 always overrides runtime with provider='xai', so x_search calls
+    // will never accidentally reach this branch.
+    if (runtime.provider === 'gemini') {
+      return this._callGeminiChatCompletions({
+        input,
+        temperature,
+        runtimeOverride: runtime,
+      });
+    }
+
     const body = {
       model: runtime.model,
       input,

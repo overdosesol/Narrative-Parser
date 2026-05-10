@@ -230,13 +230,21 @@ class TagRefresher {
   }
 
   // ── Admin Telegram digest ────────────────────────────────────────────────
-  // Sent after every refreshAll() — success OR failure, force OR scheduled.
-  // Only admins (plan_name === 'admin') receive it. Best-effort: errors are
-  // logged but never propagate up. The message is HTML-formatted, capped at
-  // ~3500 chars so we don't hit Telegram's 4096 limit even if Grok proposed
-  // 50+ subs per preset.
+  // DISABLED 2026-05-10. Used to send a digest after every refreshAll() to
+  // every admin user — but the same info is already visible in the admin
+  // panel (Pipeline → Auto-tags), so the Telegram noise is duplication.
+  //
+  // Code kept (not deleted) so we can revive it if we ever decide to
+  // selectively notify only on circuit-breaker trips or force-refresh
+  // failures. To re-enable: remove the early return below.
+  //
+  // _formatAdminDigestHtml + _getAdminChatIds are still used by the admin
+  // panel diff view, so keeping them too.
   async _notifyAdmins({ results, totalCost, elapsedSec, anyFailure, isForce, newStreak }) {
-    if (!this.telegram?.bot) return;  // no bot wired — silent skip
+    return;  // intentionally no-op — admins watch the Pipeline page instead
+
+    /* eslint-disable no-unreachable */
+    if (!this.telegram?.bot) return;
     const admins = this._getAdminChatIds();
     if (admins.length === 0) {
       this.logger?.debug?.('[TagRefresher] no admins to notify (no plan_name=admin users)');
@@ -257,6 +265,7 @@ class TagRefresher {
         this.logger?.warn?.(`[TagRefresher] notify chat ${chatId} failed: ${e.message}`);
       }
     }
+    /* eslint-enable no-unreachable */
   }
 
   _getAdminChatIds() {

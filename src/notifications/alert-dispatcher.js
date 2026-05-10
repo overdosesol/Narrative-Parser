@@ -140,6 +140,11 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
     db, telegram, logger, config,
     alertWeights, presetCfg, globalAlertThreshold,
     normalizeThreshold, recordDecision,
+    // Optional — when wired by index.js, outgoing alerts go through a per-user
+    // FIFO cooldown queue (default 60s between alerts to the same chat). When
+    // omitted we fall back to direct synchronous send (old behaviour) so unit
+    // tests and isolated dev runs don't need to wire the scheduler.
+    scheduler = null,
   } = deps;
 
   if (!Array.isArray(trends) || trends.length === 0) {
@@ -237,6 +242,15 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
         // preStage was deserialized from raw_metrics back into the metrics
         // namespace.
         preStage: trend.preStage || trend.metrics?.preStage || null,
+        // Score-source audit trail (2026-05-10 trust-contract). scoreSource
+        // tells the admin which stage produced the final memePotential
+        // ('stage0b_gemini' | 'stage1_override' | 'stage1_fallback'); the
+        // override record carries from/to/reason when Stage 1 disagreed with
+        // Stage 0b. Used by DecisionsPage to render a small audit chip so
+        // calibration drift is visible at a glance.
+        scoreSource:   trend.scoreSource   || null,
+        scoreOverride: trend.scoreOverride || null,
+        memePotential: trend.memePotential ?? null,
       };
 
       const gates = [];
@@ -326,34 +340,80 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
         continue;
       }
 
-      const sent = await telegram.sendAlertToUser(trend, user);
-      if (sent) {
-        db.recordNotification(trend._dbId, 'telegram', user.id);
-        db.incrementAlertCount(user.id);
+      // ── Build the send-and-followups task ─────────────────────────────
+      // Wrapped in a closure so it can be either run inline (no scheduler
+      // wired) or handed to scheduler.enqueue() for cooldown-paced delivery.
+      // All DB writes that depend on a real send (recordNotification,
+      // incrementAlertCount, attachXButton, decision record with sent/skipped)
+      // happen INSIDE the task so they reflect what actually went out — not
+      // what was queued. Per-cycle counters (alertsSentThisCycle, totalSent)
+      // are bumped at enqueue time below since they govern cap enforcement,
+      // not actual delivery.
+      const baseGates = gates;  // freeze pre-send gate state for closure
+      const sendTask = async () => {
+        try {
+          const sent = await telegram.sendAlertToUser(trend, user);
+          if (sent) {
+            db.recordNotification(trend._dbId, 'telegram', user.id);
+            db.incrementAlertCount(user.id);
+            const finalGates = [...baseGates, { name: 'send', passed: true, detail: `msg ${sent.messageId || '-'}` }];
+            recordDecision({ ...decisionBase, decision: 'sent', reason: 'sent', gates: finalGates });
+
+            // Attach X Analysis button + persist tg message URL on first send.
+            if (sent.messageId) {
+              try {
+                await telegram.attachXButton(sent.chatId, sent.messageId, trend._dbId, user, trend);
+              } catch (e) {
+                logger.warn?.(`[Dispatch] attachXButton failed: ${e.message}`);
+              }
+              const existing = db.getTrendById(trend._dbId);
+              if (existing && !existing.tg_message_id) {
+                let msgUrl = '';
+                if (String(sent.chatId).startsWith('-100')) {
+                  msgUrl = `https://t.me/c/${String(sent.chatId).slice(4)}/${sent.messageId}`;
+                }
+                db.updateTgUrl(trend._dbId, msgUrl, sent.messageId);
+              }
+            }
+          } else {
+            const finalGates = [...baseGates, { name: 'send', passed: false, detail: 'telegram returned no result' }];
+            recordDecision({ ...decisionBase, decision: 'skipped', reason: 'send_failed', gates: finalGates });
+          }
+        } catch (e) {
+          logger.warn?.(`[Dispatch] sendAlertToUser threw for chat ${maskId(user.telegram_chat_id)}: ${e.message}`);
+          const finalGates = [...baseGates, { name: 'send', passed: false, detail: 'exception: ' + String(e.message || '').slice(0, 80) }];
+          recordDecision({ ...decisionBase, decision: 'skipped', reason: 'send_failed', gates: finalGates });
+        }
+      };
+
+      let dispatchStatus;
+      if (scheduler) {
+        dispatchStatus = scheduler.enqueue(user.telegram_chat_id, sendTask, {
+          label: (trend.title || '').slice(0, 50),
+        });
+      } else {
+        // No scheduler wired (tests / isolated dev) — fall back to direct send.
+        await sendTask();
+        dispatchStatus = 'sent';
+      }
+
+      if (dispatchStatus === 'dropped_full') {
+        // Cap reached — alert never fires. Record the drop for admin visibility.
+        const finalGates = [...baseGates, { name: 'queue', passed: false, detail: 'scheduler queue cap reached' }];
+        recordDecision({ ...decisionBase, decision: 'skipped', reason: 'queue_full', gates: finalGates });
+        totalSkipped++;
+      } else {
+        // Either sent immediately, queued for later, or bypassed (cooldown
+        // disabled). All three count toward the per-cycle cap — the user
+        // is in the pipeline regardless of when the chat actually beeps.
         alertsSentThisCycle++;
         totalSent++;
-        gates.push({ name: 'send', passed: true, detail: `msg ${sent.messageId || '-'}` });
-        recordDecision({ ...decisionBase, decision: 'sent', reason: 'sent', gates });
-
-        // Attach X Analysis button + persist tg message URL on first send.
-        if (sent.messageId) {
-          await telegram.attachXButton(sent.chatId, sent.messageId, trend._dbId, user, trend);
-          const existing = db.getTrendById(trend._dbId);
-          if (existing && !existing.tg_message_id) {
-            let msgUrl = '';
-            if (String(sent.chatId).startsWith('-100')) {
-              msgUrl = `https://t.me/c/${String(sent.chatId).slice(4)}/${sent.messageId}`;
-            }
-            db.updateTgUrl(trend._dbId, msgUrl, sent.messageId);
-          }
-        }
-
-        await new Promise(r => setTimeout(r, 300));
-      } else {
-        gates.push({ name: 'send', passed: false, detail: 'telegram returned no result' });
-        recordDecision({ ...decisionBase, decision: 'skipped', reason: 'send_failed', gates });
-        totalSkipped++;
       }
+
+      // Tiny inline pacing — keeps the for-loop from spinning faster than
+      // ~3 enqueues/sec even when the scheduler fast-paths everything. Cheap
+      // safety against accidental 100-trend bursts saturating Node.
+      await new Promise(r => setTimeout(r, 100));
     }
 
     if (alertsSentThisCycle > 0) {

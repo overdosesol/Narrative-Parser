@@ -6312,6 +6312,27 @@ function setLang(l) {
   langListeners.forEach(fn => { try { fn(l); } catch (e) {} });
 }
 function onLangChange(fn) { langListeners.add(fn); return () => langListeners.delete(fn); }
+
+// ── Grok prompt language ──────────────────────────────────────────────────
+// Separate from UI lang so a user with an English UI can still ask Grok in
+// Russian (and vice-versa). Saved value: 'en' | 'ru' | null. Null = follow
+// UI lang (default behavior). Read via getGrokLang() in the Ask Grok prompt
+// builder; written via setGrokLang() from SettingsView.
+const GROK_LANG_KEY = 'ts_grok_lang';
+function getGrokLang() {
+  try {
+    const saved = localStorage.getItem(GROK_LANG_KEY);
+    if (saved && SUPPORTED_LANGS.indexOf(saved) >= 0) return saved;
+  } catch (e) {}
+  return CURRENT_LANG;
+}
+const grokLangListeners = new Set();
+function setGrokLang(l) {
+  if (SUPPORTED_LANGS.indexOf(l) < 0) return;
+  try { localStorage.setItem(GROK_LANG_KEY, l); } catch (e) {}
+  grokLangListeners.forEach(fn => { try { fn(l); } catch (e) {} });
+}
+function onGrokLangChange(fn) { grokLangListeners.add(fn); return () => grokLangListeners.delete(fn); }
 try { document.documentElement.setAttribute('lang', CURRENT_LANG); } catch (e) {}
 
 // ── THEME ────────────────────────────────────────────────────────────────
@@ -6706,7 +6727,11 @@ const I18N = {
     'archive.loading': 'Loading…',
 
     'settings.language': '🌐 Language',
-    'settings.language_desc': 'Dashboard language. Bot stays in your Telegram language.',
+    'settings.language_desc': 'Dashboard language and Ask-Grok prompt language. Bot stays in your Telegram language.',
+    'settings.language_dashboard': 'Dashboard',
+    'settings.language_dashboard_hint': 'UI language',
+    'settings.grok_language': 'Ask Grok',
+    'settings.grok_language_hint': 'Prompt language for the "Ask Grok" button',
 
     'settings.theme': '🎨 Theme',
     'settings.theme_desc': 'Pick your vibe. All dark — no white allowed.',
@@ -7115,7 +7140,11 @@ const I18N = {
     'archive.loading': 'Загрузка…',
 
     'settings.language': '🌐 Язык',
-    'settings.language_desc': 'Язык дашборда. Бот остаётся на языке вашего Telegram.',
+    'settings.language_desc': 'Язык дашборда и промта для Ask Grok. Бот остаётся на языке вашего Telegram.',
+    'settings.language_dashboard': 'Дашборд',
+    'settings.language_dashboard_hint': 'Язык интерфейса',
+    'settings.grok_language': 'Ask Grok',
+    'settings.grok_language_hint': 'Язык промта для кнопки "Ask Grok"',
 
     'settings.theme': '🎨 Тема',
     'settings.theme_desc': 'Выбери настроение. Все тёмные — никакого белого.',
@@ -7191,6 +7220,17 @@ function useLang() {
   const [lang, setLangState] = useState(CURRENT_LANG);
   useEffect(() => onLangChange(setLangState), []);
   return lang;
+}
+function useGrokLang() {
+  // Subscribes to both UI-lang changes and explicit grok-lang changes —
+  // when grok-lang is unset (auto), it follows UI-lang in real time.
+  const [g, setG] = useState(getGrokLang);
+  useEffect(() => {
+    const off1 = onGrokLangChange(() => setG(getGrokLang()));
+    const off2 = onLangChange(() => setG(getGrokLang()));
+    return () => { off1 && off1(); off2 && off2(); };
+  }, []);
+  return g;
 }
 function localeTag() { return CURRENT_LANG === 'ru' ? 'ru-RU' : 'en-US'; }
 function useTheme() {
@@ -9334,10 +9374,15 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
               // the outer backtick before it reaches the browser (see Trap #2
               // in SESSION_CONTEXT, "Ловушка server.js").
               const NL = String.fromCharCode(10);
+              // Grok prompt language is separate from UI lang — user may
+              // prefer asking Grok in their native language while keeping
+              // the dashboard UI in English. Falls back to UI lang when
+              // not explicitly set in Settings → Grok language.
+              const grokLang = getGrokLang();
               const sourceLine = trend.url
-                ? (lang === 'ru' ? 'Источник: ' : 'Source: ') + trend.url
+                ? (grokLang === 'ru' ? 'Источник: ' : 'Source: ') + trend.url
                 : '';
-              const promptLines = lang === 'ru'
+              const promptLines = grokLang === 'ru'
                 ? [
                     'Проанализируй этот нарратив, используя свежие данные из X (твиты, треды, аккаунты последних 24-48 часов).',
                     '',
@@ -9345,7 +9390,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                     sourceLine,
                     '',
                     'Дай ответ строго по пунктам, кратко (1-3 предложения на пункт):',
-                    '1. Название нарратива — предложи 2-3 варианта, каждый короткий и ёмкий (2-5 слов). Маркируй буллетами.',
+                    '1. Название нарратива — предложи 2-3 варианта, каждый короткий и ёмкий (2-5 слов). Маркируй буллетами. ВСЕГДА давай минимум один вариант на английском. Не-английский вариант добавляй ТОЛЬКО когда нарратив географически привязан к не-англоязычной стране (например, японский мем — можно с японским вариантом, российское событие — с русским). По умолчанию — только английский.',
                     '2. Почему сейчас вирален — что зажгло, кто пушит (имена аккаунтов / комьюнити), сколько примерно постов/просмотров.',
                     '3. Почему может вырасти дальше — катализаторы на 24-72 часа (события, релизы, виральные хуки).',
                     '4. Потенциал роста — оценка 1-10 и обоснование одной строкой.',
@@ -9361,7 +9406,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                     sourceLine,
                     '',
                     'Answer strictly point-by-point, concise (1-3 sentences each):',
-                    '1. Narrative name — propose 2-3 options, each short and punchy (2-5 words). Bullet them.',
+                    '1. Narrative name — propose 2-3 options, each short and punchy (2-5 words). Bullet them. ALWAYS include at least one option in English. Add a non-English option ONLY when the narrative is geographically rooted in a non-English-speaking country (e.g. a Japan-based meme may include a Japanese option, a Russia-based event a Russian one). Default = English only.',
                     '2. Why it\\u2019s viral right now — what ignited it, who pushes it (account names / communities), rough post/view counts.',
                     '3. Why it could grow further — 24-72h catalysts (events, releases, viral hooks).',
                     '4. Growth potential — 1-10 score with one-line rationale.',
@@ -10242,6 +10287,7 @@ const Row = ({ icon, title, desc, control, stacked = false }) =>
 
 function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
   const lang = useLang();
+  const grokLang = useGrokLang();
   const theme = useTheme();
   const [prefs, setPrefs] = useState(loadPrefs);
   const [flash, setFlash] = useState('');
@@ -10276,15 +10322,32 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
       h('div', { className: 'settings-card-desc' },
         t('settings.language_desc')
       ),
+      // Dashboard / UI language
       h(Row, {
-        icon: '🌐', title: t('settings.language'),
-        desc: null,
+        icon: '🌐', title: t('settings.language_dashboard'),
+        desc: t('settings.language_dashboard_hint'),
         control: h('div', { className: 'seg-group seg-compact' },
           [{ v: 'en', l: '🇺🇸 EN' }, { v: 'ru', l: '🇷🇺 RU' }].map(o =>
             h('button', {
               key: o.v,
               className: 'seg-btn' + (lang === o.v ? ' active' : ''),
               onClick: () => setLang(o.v)
+            }, o.l)
+          )
+        )
+      }),
+      // Grok prompt language — independent from UI lang. Saved separately
+      // in localStorage (ts_grok_lang). Read by the Ask Grok prompt builder
+      // via getGrokLang() so EN-UI users can still send RU prompts.
+      h(Row, {
+        icon: '🧠', title: t('settings.grok_language'),
+        desc: t('settings.grok_language_hint'),
+        control: h('div', { className: 'seg-group seg-compact' },
+          [{ v: 'en', l: '🇺🇸 EN' }, { v: 'ru', l: '🇷🇺 RU' }].map(o =>
+            h('button', {
+              key: o.v,
+              className: 'seg-btn' + (grokLang === o.v ? ' active' : ''),
+              onClick: () => setGrokLang(o.v)
             }, o.l)
           )
         )

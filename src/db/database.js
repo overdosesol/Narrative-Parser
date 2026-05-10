@@ -612,6 +612,17 @@ class TrendDatabase {
   }
 
   /**
+   * Cheap pause check by chat ID. Used by AlertScheduler to drop pending
+   * alerts the moment a user toggles pause mid-queue (without waiting for
+   * the next scan cycle to filter them out).
+   * Returns true when user.status !== 'active' (paused/suspended/missing).
+   */
+  isUserPausedByChatId(chatId) {
+    const row = this.db.prepare(`SELECT status FROM users WHERE telegram_chat_id = ?`).get(String(chatId));
+    return !row || row.status !== 'active';
+  }
+
+  /**
    * Update user setting
    */
   updateUser(userId, field, value) {

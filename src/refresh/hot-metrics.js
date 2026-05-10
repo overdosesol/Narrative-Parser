@@ -308,6 +308,9 @@ export default class HotMetricsRefresher {
               globalAlertThreshold,
               normalizeThreshold:  this.normalizeThreshold,
               recordDecision:      this.recordDecision,
+              // Reuse the same scheduler instance index.js created — telegram
+              // notifier holds a reference to it (set right after construction).
+              scheduler:           this.telegram?.scheduler || null,
             },
           });
           result.alertsSent = dispatchResult.sent || 0;

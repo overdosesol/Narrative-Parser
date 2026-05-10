@@ -81,81 +81,144 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 
-const VISION_SYSTEM_PROMPT = `You are a MULTIMODAL ANALYZER for a memecoin trend system. You watch and LISTEN to image/video content and provide BOTH factual description AND scoring signals so the downstream scorer can make better decisions.
+const VISION_SYSTEM_PROMPT = `You are a MULTIMODAL ANALYZER + AUTHORITATIVE SCORER for a memecoin trend system.
 
-You do not filter (you never refuse to describe). But you ARE a downstream voter — your scoring fields directly influence whether this trend reaches alerts. Be honest and calibrated.
+You watch and listen to image/video content (or read title+description for text-only trends), enrich raw text with structured metadata, AND score the trend's memecoin potential. Your scoring is GROUND TRUTH — the next stage trusts your numbers and writes the alert text.
 
-For VIDEO inputs you MUST analyze BOTH the visual track AND the audio track. The audio is part of the input (Google AI Studio passes media bytes including sound) — listen to it. Identify speech, music, sound effects, ambience. Transcribe spoken words verbatim. Audio is often where the actual narrative lives — what someone says/yells/laughs/reacts to is frequently more meme-relevant than what is visible.
+For VIDEO inputs you MUST analyze BOTH visual and audio tracks. Audio is often where the narrative lives. First 30 seconds only.
+For IMAGE inputs: describe the still image; audio fields = ''.
+For TEXT-ONLY inputs (no media URL was passed): score from title + description + clusterSiblings; visual/audio fields = ''.
 
-Analyze the FIRST 30 SECONDS only — ignore anything past that.
+Return these fields in 4 sections:
 
-Return these fields:
+━━━ SECTION A — DESCRIBE WHAT YOU SEE/HEAR ━━━
+- "visualCaption":   1-2 complete sentences describing WHAT is visible (subjects, scene, art style). Concrete and factual. Tight — finish the thought, do not pad.
+- "visibleText":     Any text/captions/watermarks visible IN the visual. Quote directly. Empty if none.
+- "videoSummary":    For VIDEO: how the visual content unfolds over time, 2-3 sentences. '' for images.
+- "audioSummary":    For VIDEO: what is HEARD — speech context, music genre/recognizable songs, sound effects, ambient noise, laughter/yells. 1-2 sentences. '' for images.
+- "spokenText":      For VIDEO: VERBATIM transcript of speech in English (translate non-English; keep original only for meme-relevant gibberish). Cap ~400 chars. '' if no speech / image.
+- "mood":            SHORT 1-3 word emotional tone — absurd, wholesome, dramatic, surreal, humorous, ominous, mundane, etc.
 
-━━━ DESCRIPTION FIELDS ━━━
-- "visualCaption":   1-2 complete sentences describing WHAT is visible (subjects, scene, art style). Concrete and factual ("Cartoon TREE characters with anthropomorphic faces in brown earth-tone palette") not promotional ("amazing viral meme!"). Tight — finish the thought, do not pad.
-- "visibleText":     Any text, captions, watermarks, on-screen writing visible IN the visual. Empty string if none. Quote directly. If there is a lot, summarize the gist.
-- "videoSummary":    For VIDEO: how the visual content unfolds over time, in 2-3 complete sentences. Empty string for static images.
-- "audioSummary":    For VIDEO: what is HEARD — speech context, music genre/recognizable songs, sound effects, ambient noise, laughter/yells/reactions. 1-2 sentences. Empty string for static images. Be specific: "young woman whispering in ASMR style" beats "person speaking softly".
-- "spokenText":      For VIDEO: VERBATIM transcript of what people say in English (translate non-English speech to English; quote in the original language only if it's meme-relevant gibberish). Empty string if no speech, or for static images. Cap at ~400 chars — quote the most meme-relevant lines if longer.
+━━━ SECTION B — ENRICHMENT (raw text → structured) ━━━
+- "topicSummary":    ONE sentence in plain English describing what the post is about, ≤200 chars. Decode hashtags, expand slang, name the subject. If text is gibberish/empty, summarize that fact.
+- "entityCanonical": Array of canonical proper nouns mentioned (people, brands, products, places, characters). Empty array if none. Use English forms ("Илон Маск" → "Elon Musk").
+- "slangDecoded":    1-2 sentences explaining non-obvious slang/abbreviations/hashtag references. Empty string if all clear.
+- "language":        ISO 639-1 code of the primary language. Default "en" when unsure.
 
-━━━ MOOD ━━━
-- "mood":            SHORT phrase (1-3 words) describing emotional tone — absurd, wholesome, dramatic, surreal, humorous, ominous, mundane, etc. Take BOTH visual and audio into account.
+━━━ SECTION C — AUTHORITATIVE SCORING (you set these — Stage 1 trusts them) ━━━
 
-━━━ SCORING SIGNALS (you are now voting) ━━━
-- "memeShapeStrength": Integer 0-100. How meme-coin-shaped this content is. Combine visual + audio. High (70+): clear character, absurd action, catchy audio hook, single iconic moment, viral aesthetic. Medium (40-69): some meme energy but missing a hook OR the subject is generic. Low (0-39): news/political/corporate/static/no clear character. BE CALIBRATED — most content is 30-60.
-- "hasNarrative":     Boolean. TRUE if something happens with a beginning/middle/end — a person reacts to something, an event unfolds, a punchline lands, a transformation occurs. FALSE if it's static repetition, generic dancing/posing without a plot, gameplay loops, slideshows.
-- "hasSubject":       Boolean. TRUE if there is a CLEAR FOCAL SUBJECT — a specific person, animal, character, or object that is the "main character" of the content. FALSE for crowd shots, abstract visuals, generic landscapes, multiple equal-importance subjects.
-- "viralPattern":     One of: "character" | "reaction" | "pov_skit" | "compilation" | "sound_format" | "dance_challenge" | "outfit_transition" | "gameplay" | "animal_action" | "event" | "satisfying" | "asmr" | "tutorial" | "process" | "aesthetic" | "other". Pick the dominant pattern. Definitions for the "ambient / sound-format" group (these are auto-rejected on TikTok regardless of engagement):
-                      • "sound_format" — videos built around a trending audio/voiceover; creator participates in the format (lip-sync, sound bite reenactment, audio meme)
-                      • "dance_challenge" — choreographed dance moves performed to a trending song or sound (TikTok dance challenges, #renegade-style, paired dances)
-                      • "outfit_transition" — outfit reveal / glow-up / before-after / fashion transition cut to a beat drop (#wlw / #thegreatdivide / "tag yourself" formats)
-                      • "satisfying" — slime / soap cutting / sand cutting / restoration / pressure washing / kinetic sand / pottery cutting (visual loops with no narrative)
-                      • "asmr" — whispering / tapping / mukbang / eating sounds / quiet trigger sounds (audio-driven relaxation)
-                      • "tutorial" — how-to walkthroughs (makeup / cooking / fitness / DIY / study technique) — instructional content, not narrative
-                      • "process" — extended craft/build timelapses (cooking-from-scratch / woodworking / calligraphy / pottery building)
-                      • "aesthetic" — vibe / mood content (study-with-me / "day in my life" / aesthetic vlogs / room ambience)
-- "tickerSuggestion": Short phonetic ticker candidate (3-8 chars, all caps) IF the content has an obvious ticker-friendly subject. Examples: "PEPE", "CHILLGUY", "MOODENG". Empty string if no obvious candidate. DO NOT force it — empty is better than weak.
-- "subjectNames":     Array of 0-4 proper-noun names of the MAIN subject(s) of the content, in display form as people would write them in normal text. First element = primary subject. Examples: ["Moo Deng"], ["Mr. Beast", "Logan Paul"], ["Chill Guy"], ["Pepe"], []. Rules:
-                      • Display form only (e.g. "Moo Deng", NOT "MOODENG" or "moo deng"). The downstream code generates lowercase / no-space / hashtag variants for matching.
-                      • Real names of characters, animals, projects, public figures who ARE the focal subject.
-                      • SKIP generic platform / country / big-tech names (TikTok, YouTube, Twitter, USA, China, Apple, Google, Microsoft, Amazon) — these are context, not subjects.
-                      • SKIP if there is no proper-noun subject (abstract concept, generic crowd, weather event without a named figure). Empty array is correct.
-                      • Cap each name at 32 chars. Cap array at 4 entries.
+C1. "memePotential" — Integer 0-100. AUTHORITATIVE memecoin-narrative score.
+
+    Be CONSERVATIVE and SPREAD scores across the range. Score 100 is reserved for the single best trend of the day. If you would give 90+ to multiple trends in one batch, you are too generous.
+
+    Anchors:
+    • 95-100: Once-a-day rarity. EVERYTHING fires — named subject + visual punch + ticker hook + cultural pull.
+    • 80-94:  Excellent. Strong meme energy, ONE signal partial (no visual / no name / not yet a moment).
+    • 60-79:  Solid narrative. Most "good" trends belong HERE — default upper band.
+    • 40-59:  Decent meme energy but niche / generic / overdone.
+    • 20-39:  Weak — real news with little meme appeal, low novelty.
+    • 0-19:   Politics (non-meme) / routine sports scores / corporate news / weather / regular product launches.
+
+    Calibration check: "Is this clearly more meme-able than 9 of 10 viral trends in a normal day?" If no → not 95+. If 1-of-10 → 80-94. Most "good" actually-good trends are 60-79.
+
+    HARD RULES (apply BEFORE anchors):
+    • Politics (unless absurd viral meme) = 0.
+    • Standard sports results = 0. Exception: a player does something insane/absurd/meme-worthy.
+    • Spam, bots, crypto promos, gibberish → memePotential 0 + isGenuinelyInteresting=false.
+    • viralPattern in {satisfying, asmr, tutorial, process, aesthetic, dance_challenge, outfit_transition, sound_format} → cap memePotential at 25 regardless of engagement.
+    • isLipSync=true → cap at 15.
+    • hasSubject=false AND hasNarrative=false → cap at 30.
+
+    SOURCE-AWARE METRIC CALIBRATION (input metrics include source):
+    • TikTok plays inflated 5-10× vs Twitter views. 500K-1M = baseline-viral; 5M+ = distinctive. DO NOT score 95+ just because plays=10M.
+    • TikTok shares × 50 ≈ Twitter retweets in cultural impact. 5K+ shares = stronger than likes.
+    • TikTok memes burn out in 24-48h. >72h-old TikTok = past peak. Twitter 5-7 days. Reddit 1-2 weeks.
+    • Reddit upvotes vote-democratized: 10K upvotes ≈ 100K+ readers. 500+ comments = real discussion.
+    • Google Trends "Searches: 200K+" = active demand, strong narrative signal even without social buzz.
+    • Mega-account (1M+ followers) low engagement (<0.1%) = NOT a signal by itself; score on CONTENT novelty.
+
+    For TEXT-ONLY input: same anchors, but downweight uncertainty (without visual/audio confirmation, lean conservative).
+
+C2. "viralityScore" — Integer 0-100. Engagement-based virality (likes/retweets/views/upvotes weighted by velocity).
+    Lower than memePotential when meme shape is good but engagement lukewarm.
+    Higher when engagement is wildfire but meme shape is mediocre.
+
+C3. "category" — One of:
+    "meme" | "celebrity" | "animals" | "tech" | "gambling" | "sports" | "politics" | "entertainment" | "gaming" | "boring" | "other"
+
+━━━ SECTION D — SUBSIDIARY SIGNALS (also set — used by downstream gates and UI) ━━━
+
+- "memeShapeStrength": Integer 0-100. How meme-coin-shaped the FORMAT is — character + audio hook + visual aesthetic. Independent of memePotential (which weighs context too). Used by TikTok quality gate. Most content 30-60.
+- "hasNarrative":      Boolean. TRUE if something happens with a beginning/middle/end. FALSE for static repetition, generic dancing without plot, gameplay loops, slideshows.
+- "hasSubject":        Boolean. TRUE if there is a CLEAR FOCAL SUBJECT (specific person/animal/character/object). FALSE for crowd shots, abstract visuals, generic landscapes.
+- "viralPattern":      One of: "character" | "reaction" | "pov_skit" | "compilation" | "sound_format" | "dance_challenge" | "outfit_transition" | "gameplay" | "animal_action" | "event" | "satisfying" | "asmr" | "tutorial" | "process" | "aesthetic" | "other". Pick dominant. Ambient/sound-format group (auto-rejected on TikTok):
+                       • "sound_format" — built around trending audio/voiceover; creator participates (lip-sync, sound bite reenactment)
+                       • "dance_challenge" — choreographed dance to trending song/sound (#renegade-style)
+                       • "outfit_transition" — outfit reveal/glow-up/before-after cut to beat drop
+                       • "satisfying" — slime/soap-cutting/restoration/kinetic sand (visual loops, no narrative)
+                       • "asmr" — whispering/tapping/mukbang/quiet trigger sounds
+                       • "tutorial" — how-to walkthroughs (makeup/cooking/fitness/DIY)
+                       • "process" — extended craft/build timelapses
+                       • "aesthetic" — vibe/mood content (study-with-me / day-in-my-life / room ambience)
+- "tickerSuggestion":  Short phonetic ticker (3-8 chars, all caps) IF the content has an obvious ticker-friendly subject (PEPE, CHILLGUY, MOODENG). '' if no obvious candidate.
+- "subjectNames":      Array of 0-4 proper-noun names of MAIN subject(s) in display form. [0]=primary. Examples: ["Moo Deng"], ["Mr. Beast", "Logan Paul"], ["Chill Guy"], []. Rules:
+                       • Display form only ("Moo Deng" not "MOODENG"). Downstream generates variants for matching.
+                       • Real characters/animals/projects/public figures who ARE the focal subject.
+                       • SKIP generic platform/country/big-tech (TikTok, YouTube, USA, Apple, Google) — context, not subjects.
+                       • SKIP if no proper-noun subject (abstract concept, generic crowd). Empty array OK.
+                       • Cap each name 32 chars. Cap array 4.
 
 ━━━ FILTER FLAGS ━━━
-- "isLipSync":       Boolean. TRUE for ANY form of sound-trend participation — videos where the creator is following a trending audio/format rather than telling their own story. This is broader than literal lip-syncing; it covers the entire family of "sound-driven format videos" that flood TikTok and never make memecoins.
+- "isLipSync":       Boolean. TRUE for ANY sound-trend participation — videos where the creator follows a trending audio/format rather than telling their own story.
 
-                     Set TRUE when ANY of these apply:
-                     • Lip-syncing / mouthing to a song, sound, or viral audio
-                     • Dance moves / dance challenges performed to a trending sound (TikTok dance videos like #thegreatdivide / #wlw / #renegade — dancing IS sound-participation, even though "something is happening" visually)
-                     • Outfit transitions, glow-ups, "before/after" reveals timed to a beat drop
-                     • POV setups where the visual "story" is just overlay text + a sticker subject + trending audio (no original spoken lines, no real event)
-                     • "Stitch" / "duet" responses where the participant adds NO original speech of their own
-                     • Acting out a sound bite (creator reenacts a meme audio with facial expressions but no original words)
-                     • Outfit/aesthetic loops cut to music (fashion/beauty trend videos)
+                     Set TRUE when ANY apply:
+                     • Lip-syncing/mouthing to a song/sound/viral audio
+                     • Dance challenges to trending sound (TikTok #thegreatdivide / #wlw / #renegade — dancing IS sound-participation)
+                     • Outfit transitions/glow-ups/"before/after" cut to beat drop
+                     • POV setups where visual "story" is just overlay text + sticker + trending audio
+                     • Stitch/duet replies with NO original speech
+                     • Acting out a sound bite without original words
+                     • Outfit/aesthetic loops cut to music
 
-                     The unifying principle: if you MUTED the audio, the video would be "a person dancing / posing / transitioning outfits / pointing at overlay text" — there is no event, no original dialogue, no story. The creator is participating in a FORMAT defined by the sound, not telling something new.
+                     Decisive heuristic — the "audio source" test: is the audio ORIGINAL to this creator (own words/sounds/commentary) or a TRENDING SOUND used by thousands of others? Original → FALSE. Borrowed/trending sound with no original speech on top → TRUE.
 
-                     Set FALSE for: news clips, event recordings (concert footage / political rallies / sports plays), original dialogue / monologues / skits where the creator says their own words, interviews, animal action videos with an absurd specific action, gameplay with original commentary, streamer reactions with talking, vlogs with own narration, ASMR (those go to isAmbient). If the creator says/yells/laughs ORIGINAL words that drive the meaning of the video → FALSE. If they only mime / dance / pose / transition / point at overlay text to a sound → TRUE.
-
-                     Decisive heuristic — the "audio source" test: is the audio (music/voiceover) ORIGINAL to this creator (their own words / sounds / commentary) or a TRENDING SOUND that thousands of other creators are also using? Original audio → FALSE. Trending / borrowed sound with no original speech on top → TRUE.
+                     Set FALSE for: news clips, event recordings, original dialogue/monologues/skits, interviews, animal action with absurd specifics, gameplay with original commentary, streamer reactions with talking, vlogs with own narration, ASMR (those → isAmbient).
 
                      Static images: always FALSE.
-- "isAmbient":       Boolean. TRUE if this is "scroll-bait" / loop / hypnotic content with NO narrative arc, NO meme hook, NO punchline — content people zone out to but never turn into a memecoin: satisfying loops, ASMR, tutorials, long process videos, aesthetic mood vlogs, generic gameplay loops. The litmus test: would a degen forward this to a friend with "you HAVE to see this"? If no, and the only appeal is "relaxing to watch" / "I just kept watching" — TRUE. FALSE for: event clips, character moments, reactions with punchlines, animal videos with a clear absurd action, original dialogue with a hook. Static images: always FALSE.
+- "isAmbient":       Boolean. TRUE if this is "scroll-bait" / hypnotic loop with NO narrative arc, NO meme hook — satisfying loops, ASMR, tutorials, process videos, aesthetic mood vlogs, generic gameplay loops. Litmus: would a degen forward this with "you HAVE to see this"? If no, and only appeal is "relaxing to watch" → TRUE.
+                     FALSE for: event clips, character moments, reactions with punchlines, animal videos with absurd action, original dialogue with hook.
+                     Static images: always FALSE.
 
-CRITICAL LENGTH RULE: every text field must be a COMPLETE thought ending with proper punctuation. Never cut mid-sentence or mid-word.
-
-Respond with ONLY valid JSON. No markdown, no preamble.`;
+━━━ OUTPUT RULES ━━━
+- ONLY valid JSON. No markdown, no preamble, no explanation outside the JSON object.
+- Every text field a COMPLETE thought ending with proper punctuation. Never cut mid-sentence/word.
+- All text fields in English (translate spoken content; keep original only for meme-relevant gibberish quoted in spokenText).
+- For TEXT-ONLY input (no media URL): visual/audio/spoken fields = ''. Score from text + metadata.`;
 
 const GOOGLE_RESPONSE_SCHEMA = {
   type: 'object',
   properties: {
+    // SECTION A — describe what you see/hear
     visualCaption:     { type: 'string' },
     visibleText:       { type: 'string' },
     videoSummary:      { type: 'string' },
     audioSummary:      { type: 'string' },
     spokenText:        { type: 'string' },
     mood:              { type: 'string' },
+
+    // SECTION B — enrichment (this work used to live in Stage 0a / nano)
+    topicSummary:      { type: 'string' },
+    entityCanonical:   { type: 'array', items: { type: 'string' } },
+    slangDecoded:      { type: 'string' },
+    language:          { type: 'string' },
+
+    // SECTION C — authoritative scoring (Stage 1 trusts these unless it has a
+    // documented reason to override via scoreOverride)
+    memePotential:     { type: 'integer' },
+    viralityScore:     { type: 'integer' },
+    category:          { type: 'string' },
+
+    // SECTION D — subsidiary signals + filter flags
     memeShapeStrength: { type: 'integer' },
     hasNarrative:      { type: 'boolean' },
     hasSubject:        { type: 'boolean' },
@@ -165,16 +228,13 @@ const GOOGLE_RESPONSE_SCHEMA = {
     isLipSync:         { type: 'boolean' },
     isAmbient:         { type: 'boolean' },
   },
-  // Only the original captioner fields stay strictly required — they're
-  // what was working pre-Gemini-2.0 upgrade. The Gemini 2.0 additions
-  // (audioSummary / spokenText / scoring / filter flags / subjectNames) are
-  // OPTIONAL on the schema level: if the model skips one, JSON still
-  // validates, captioner returns the partial result, and downstream code
-  // applies safe defaults (=== true for booleans, clampInt fallback=0 for
-  // memeShapeStrength, normalizeViralPattern → 'other', empty array for
-  // subjectNames). Critical fix 2026-05-08: making all 14 fields required
-  // was crashing the response on tricky content — captioner fell back to
-  // null, so lipsync / tiktok_quality gates lost their input.
+  // Required list deliberately tiny (4 fields) — same defensive choice as
+  // before the 2026-05-09 expansion. Making the whole 18-field schema
+  // required was crashing responses on tricky content (captioner fell back
+  // to null and downstream gates lost their input). Now any field except
+  // the basic 4 may be omitted; the parser applies safe defaults for the
+  // rest (clampInt fallback=0, false for booleans, '' for strings, [] for
+  // arrays, normalizeViralPattern → 'other', normalizeCategory → 'other').
   required: ['visualCaption', 'visibleText', 'videoSummary', 'mood'],
 };
 
@@ -212,6 +272,21 @@ function normalizeViralPattern(v) {
   return VIRAL_PATTERN_VALUES.has(s) ? s : 'other';
 }
 
+// Stage 0b authoritative-scoring category enum. Mirrors the 11-category
+// taxonomy used in scorer / dashboard / admin (last reshuffled 2026-05-08).
+// If Gemini emits something off-list (it occasionally invents new buckets),
+// we fall back to 'other' so downstream code never sees an unknown category.
+const CATEGORY_VALUES = new Set([
+  'meme', 'celebrity', 'animals', 'tech', 'gambling',
+  'sports', 'politics', 'entertainment', 'gaming',
+  'boring', 'other',
+]);
+
+function normalizeCategory(v) {
+  const s = String(v || '').trim().toLowerCase().replace(/\s+/g, '_').replace(/-+/g, '_');
+  return CATEGORY_VALUES.has(s) ? s : 'other';
+}
+
 // Code-side blacklist of names Gemini should not return as subject. Catches
 // the case when the model ignores the prompt rule "skip platform/country/
 // big-tech". Keep lower-case, single-token. Multi-word context names are
@@ -228,6 +303,97 @@ const SUBJECT_NAME_BLACKLIST = new Set([
   // Devices / OS / generic tech
   'iphone', 'ipad', 'android', 'windows', 'macos', 'ios',
 ]);
+
+// Generic string-array sanitizer for entityCanonical. Same shape as
+// normalizeSubjectNames but without the platform/country blacklist (an
+// entity list legitimately contains "Apple" / "USA" / "TikTok" — they're
+// just not the SUBJECT). Caps array at 8 entries × 48 chars each.
+function normalizeEntityList(arr) {
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of arr) {
+    const s = String(raw || '').trim().slice(0, 48);
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    if (s.length < 2 || /^\d+$/.test(s)) continue;
+    seen.add(key);
+    out.push(s);
+    if (out.length >= 8) break;
+  }
+  return out;
+}
+
+// Compact human-readable engagement summary for Stage 0b context.
+// Consumed by _buildContextString — Gemini needs source + metrics for the
+// SOURCE-AWARE METRIC CALIBRATION block in VISION_SYSTEM_PROMPT (TikTok plays
+// inflation, mega-account engagement-rate rule, etc.). Outputs e.g.:
+//   "views=2.3M, likes=19K, shares=1.6K, comments=287"
+// Empty string when no useful metrics. Same number-pretty rules as the rest
+// of the codebase.
+function _fmtKbig(n) {
+  if (!Number.isFinite(n)) return '';
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1).replace(/\.0$/, '') + 'K';
+  return String(Math.round(n));
+}
+
+function _summarizeEngagement(metrics) {
+  const m = metrics || {};
+  const parts = [];
+  // Order matches what the prompt's source-calibration block references.
+  if (m.views     != null) parts.push(`views=${_fmtKbig(Number(m.views))}`);
+  if (m.plays     != null) parts.push(`plays=${_fmtKbig(Number(m.plays))}`);
+  if (m.likes     != null) parts.push(`likes=${_fmtKbig(Number(m.likes))}`);
+  if (m.shares    != null) parts.push(`shares=${_fmtKbig(Number(m.shares))}`);
+  if (m.retweets  != null) parts.push(`retweets=${_fmtKbig(Number(m.retweets))}`);
+  if (m.comments  != null) parts.push(`comments=${_fmtKbig(Number(m.comments))}`);
+  if (m.upvotes   != null) parts.push(`upvotes=${_fmtKbig(Number(m.upvotes))}`);
+  if (m.searchVolume != null) parts.push(`searches=${_fmtKbig(Number(m.searchVolume))}`);
+  if (m.followers != null) parts.push(`followers=${_fmtKbig(Number(m.followers))}`);
+  return parts.join(', ');
+}
+
+// Build the user-message context block that gives Gemini everything Stage 1
+// would normally see for scoring: source, engagement metrics, description,
+// cluster siblings. Without this block Gemini scores blind on the title +
+// media — and the SOURCE-AWARE METRIC CALIBRATION rules in the system
+// prompt have nothing to calibrate against.
+function _buildContextString(trend) {
+  const lines = [];
+  const title = String(trend.title || '').trim().slice(0, 200);
+  if (title) lines.push(`Title: "${title}"`);
+
+  const source = String(trend.source || trend.metrics?.source || '').trim();
+  if (source) lines.push(`Source: ${source}`);
+
+  const m = trend.metrics || {};
+  const author = m.author || m.username || null;
+  if (author) lines.push(`Author: @${String(author).slice(0, 32)}`);
+  if (m.subreddit) lines.push(`Subreddit: r/${String(m.subreddit).slice(0, 32)}`);
+  if (m.sourceHashtag) lines.push(`Hashtag: #${String(m.sourceHashtag).slice(0, 32)}`);
+
+  const engagement = _summarizeEngagement(m);
+  if (engagement) lines.push(`Metrics: ${engagement}`);
+
+  if (typeof m.ageHours === 'number' && Number.isFinite(m.ageHours)) {
+    lines.push(`AgeHours: ${m.ageHours.toFixed(1)}`);
+  }
+
+  const description = String(trend.description || '').trim();
+  if (description) lines.push(`Description: ${description.slice(0, 600)}`);
+
+  if (Array.isArray(trend.clusterSiblingTitles) && trend.clusterSiblingTitles.length > 0) {
+    const sibs = trend.clusterSiblingTitles
+      .slice(0, 5)
+      .map(s => `"${String(s || '').slice(0, 140)}"`)
+      .join(' | ');
+    lines.push(`RelatedPosts: ${sibs}`);
+  }
+
+  return lines.join('\n');
+}
 
 // Sanitize subjectNames array. Drops blacklisted, empty, too-long, and
 // duplicate entries. Caps array at 4. Returns array of trimmed display
@@ -256,16 +422,29 @@ export class GeminiCaptioner {
     this.logger = logger;
 
     // ── Primary: Direct Google AI Studio ────────────────────────────────────
+    // Default model bumped 2026-05-09: gemini-2.5-flash → gemini-3.1-flash-lite.
+    // 3.1-flash-lite is materially cheaper than 2.5-flash and Google positions
+    // it as "frontier-class performance at a fraction of the cost". Same
+    // multimodal capabilities (vision + audio) and same responseSchema support,
+    // so the captioner code path is unchanged. Operators can override via
+    // GOOGLE_AI_MODEL if they want to pin to 2.5-flash or jump to a future
+    // variant without redeploy.
     this.googleKey   = process.env.GOOGLE_AI_API_KEY || '';
     this.googleModel = process.env.GOOGLE_AI_MODEL
       || process.env.GOOGLE_AI_VIDEO_MODEL    // back-compat alias
-      || 'gemini-2.5-flash';
+      || 'gemini-3.1-flash-lite';
     this.googleBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
 
     // ── Fallback: OpenRouter ────────────────────────────────────────────────
+    // Same model upgrade on the OpenRouter side. The provider-prefixed slug
+    // (`google/gemini-3.1-flash-lite`) is OpenRouter's identifier — see
+    // https://openrouter.ai/google/gemini-3.1-flash-lite. If OpenRouter hasn't
+    // yet listed 3.1-flash-lite at deploy time, set OPENROUTER_VISION_MODEL=
+    // google/gemini-2.5-flash in env to fall back to the older model on the
+    // fallback path only.
     this.openRouterKey   = process.env.OPENROUTER_API_KEY || '';
-    this.openRouterModel = process.env.OPENROUTER_VISION_MODEL          || 'google/gemini-2.5-flash';
-    this.openRouterFallbackModel = process.env.OPENROUTER_VISION_MODEL_FALLBACK || 'google/gemini-2.5-flash';
+    this.openRouterModel = process.env.OPENROUTER_VISION_MODEL          || 'google/gemini-3.1-flash-lite';
+    this.openRouterFallbackModel = process.env.OPENROUTER_VISION_MODEL_FALLBACK || 'google/gemini-3.1-flash-lite';
     this.openRouterBaseUrl = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
 
     // ── Knobs ───────────────────────────────────────────────────────────────
@@ -614,9 +793,10 @@ export class GeminiCaptioner {
     const mimeType = sniffedMime;
     const base64 = buffer.toString('base64');
 
+    const ctx = _buildContextString(trend);
     const userText = kind === 'video'
-      ? `Title context: "${(trend.title || '').slice(0, 200)}"\n\nWatch AND LISTEN to this video — analyze BOTH visual and audio tracks. Focus on the FIRST 30 SECONDS ONLY. Transcribe spoken words verbatim into spokenText. Describe sounds/music in audioSummary. Return ALL fields per the schema (visualCaption, visibleText, videoSummary, audioSummary, spokenText, mood, memeShapeStrength, hasNarrative, hasSubject, viralPattern, tickerSuggestion, subjectNames, isLipSync, isAmbient).`
-      : `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image. Return ALL fields per the schema. For a static image: videoSummary='', audioSummary='', spokenText='', hasNarrative=false, isLipSync=false, isAmbient=false. Other fields (memeShapeStrength, hasSubject, viralPattern, tickerSuggestion, subjectNames) — answer based on the still image.`;
+      ? `${ctx}\n\nWatch AND LISTEN to this video — analyze BOTH visual and audio tracks. Focus on the FIRST 30 SECONDS ONLY. Transcribe spoken words verbatim into spokenText. Describe sounds/music in audioSummary. Return ALL fields per the schema (sections A/B/C/D in the system prompt — describe + enrichment + authoritative scoring + subsidiary signals). Apply HARD RULES and SOURCE-AWARE METRIC CALIBRATION using the metrics above.`
+      : `${ctx}\n\nDescribe this image and score it. For a static image: videoSummary='', audioSummary='', spokenText='', hasNarrative=false, isLipSync=false, isAmbient=false. Score memePotential / viralityScore / category from visual + title + metrics context. Return ALL fields per the schema (sections A/B/C/D).`;
 
     const apiUrl = `${this.googleBaseUrl}/models/${this.googleModel}:generateContent?key=${encodeURIComponent(this.googleKey)}`;
     const body = {
@@ -745,12 +925,26 @@ export class GeminiCaptioner {
       // formatting controls — generous enough to never clip a well-formed
       // response.
       return {
+        // Section A — describe
         visualCaption:     String(parsed.visualCaption || '').trim().slice(0, 800),
         visibleText:       String(parsed.visibleText   || '').trim().slice(0, 600),
         videoSummary:      String(parsed.videoSummary  || '').trim().slice(0, 800),
         audioSummary:      String(parsed.audioSummary  || '').trim().slice(0, 600),
         spokenText:        String(parsed.spokenText    || '').trim().slice(0, 800),
         mood:              String(parsed.mood          || '').trim().slice(0, 60),
+
+        // Section B — enrichment (was nano)
+        topicSummary:      String(parsed.topicSummary  || '').trim().slice(0, 240),
+        entityCanonical:   normalizeEntityList(parsed.entityCanonical),
+        slangDecoded:      String(parsed.slangDecoded  || '').trim().slice(0, 400),
+        language:          String(parsed.language      || '').trim().toLowerCase().slice(0, 5),
+
+        // Section C — authoritative scoring (Stage 1 trusts unless override)
+        memePotential:     clampInt(parsed.memePotential, 0, 100, null),
+        viralityScore:     clampInt(parsed.viralityScore, 0, 100, null),
+        category:          parsed.category != null ? normalizeCategory(parsed.category) : null,
+
+        // Section D — subsidiary signals
         memeShapeStrength: clampInt(parsed.memeShapeStrength, 0, 100, 0),
         hasNarrative:      parsed.hasNarrative === true,
         hasSubject:        parsed.hasSubject === true,
@@ -774,13 +968,14 @@ export class GeminiCaptioner {
   async _tryOpenRouterImage(imageUrl, trend) {
     if (!this.hasOpenRouter) return null;
 
+    const ctx = _buildContextString(trend);
     const payload = {
       messages: [
         { role: 'system', content: VISION_SYSTEM_PROMPT },
         {
           role: 'user',
           content: [
-            { type: 'text', text: `Title context: "${(trend.title || '').slice(0, 200)}"\n\nDescribe this image. Return ALL fields per the schema. For a static image: videoSummary='', audioSummary='', spokenText='', hasNarrative=false, isLipSync=false, isAmbient=false. Other fields (memeShapeStrength, hasSubject, viralPattern, tickerSuggestion) — answer based on the still image.` },
+            { type: 'text', text: `${ctx}\n\nDescribe this image and score it. For a static image: videoSummary='', audioSummary='', spokenText='', hasNarrative=false, isLipSync=false, isAmbient=false. Score memePotential / viralityScore / category from visual + title + metrics context. Return ALL fields per the schema (sections A/B/C/D).` },
             { type: 'image_url', image_url: { url: imageUrl } },
           ],
         },
@@ -829,6 +1024,7 @@ export class GeminiCaptioner {
         );
 
         return {
+          // Section A — describe
           visualCaption:     String(parsed.visualCaption || '').trim().slice(0, 800),
           visibleText:       String(parsed.visibleText   || '').trim().slice(0, 600),
           videoSummary:      '',
@@ -841,7 +1037,22 @@ export class GeminiCaptioner {
           isLipSync:         false,
           isAmbient:         false,
           mood:              String(parsed.mood          || '').trim().slice(0, 60),
-          // The model can still answer these from the still image.
+
+          // Section B — enrichment. Image-only, but the model can still
+          // answer most of these from title context + visible text.
+          topicSummary:      String(parsed.topicSummary || '').trim().slice(0, 240),
+          entityCanonical:   normalizeEntityList(parsed.entityCanonical),
+          slangDecoded:      String(parsed.slangDecoded || '').trim().slice(0, 400),
+          language:          String(parsed.language     || '').trim().toLowerCase().slice(0, 5),
+
+          // Section C — authoritative scoring. Possible from a still image,
+          // though calibration will be looser without audio/motion. Null
+          // signals downstream "Gemini didn't score this — fall back to Stage 1".
+          memePotential:     clampInt(parsed.memePotential, 0, 100, null),
+          viralityScore:     clampInt(parsed.viralityScore, 0, 100, null),
+          category:          parsed.category != null ? normalizeCategory(parsed.category) : null,
+
+          // Section D — subsidiary signals
           memeShapeStrength: clampInt(parsed.memeShapeStrength, 0, 100, 0),
           hasSubject:        parsed.hasSubject === true,
           viralPattern:      normalizeViralPattern(parsed.viralPattern),
