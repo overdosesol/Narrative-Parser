@@ -49,7 +49,12 @@ const XAI_LONG_AGENT = new Agent({
   connectTimeout: 30_000,
 });
 
-const TAG_REFRESH_COOLDOWN_DAYS = Number(process.env.TAG_REFRESH_COOLDOWN_DAYS) || 7;
+// Refresh cadence — was weekly (7d) until 2026-05-11. Bumped to 2-day default
+// because TikTok/Twitter throughput observably drops by mid-cycle: hashtag
+// trends turn over in 1-3 days, and 5-7 tags per preset get scraped dry well
+// before the weekly refresh fires again. Cost stays small (≈$0.13/refresh ×
+// ~15/мес = ~$2/мес). Override via env if needed.
+const TAG_REFRESH_COOLDOWN_DAYS = Number(process.env.TAG_REFRESH_COOLDOWN_DAYS) || 2;
 const TAG_REFRESH_FORCE_COOLDOWN_HOURS = Number(process.env.TAG_REFRESH_FORCE_COOLDOWN_HOURS) || 24;
 const TAG_REFRESH_MODEL_PRIMARY = process.env.XAI_TAG_REFRESH_MODEL || 'grok-4.3';
 const TAG_REFRESH_MODEL_FALLBACK = process.env.XAI_TAG_REFRESH_FALLBACK_MODEL || 'grok-4.20-0309-reasoning';
@@ -184,9 +189,22 @@ class TagRefresher {
 
     this.logger?.info?.(`[TagRefresher] starting refresh (force=${isForce}, model=${TAG_REFRESH_MODEL_PRIMARY})`);
 
-    for (const preset of PRESET_KEYS) {
+    // Order matters: themed presets refresh FIRST, general LAST. General uses
+    // curator-mode (variant B, 2026-05-11) which reads the freshly-refreshed
+    // themed pools and asks Grok to pick the best balanced mix — so themed
+    // pools must be up-to-date before general runs. PRESET_KEYS may be in any
+    // order; we sort general to the end explicitly.
+    const orderedPresets = PRESET_KEYS.slice().sort((a, b) => {
+      if (a === 'general') return 1;
+      if (b === 'general') return -1;
+      return 0;
+    });
+
+    for (const preset of orderedPresets) {
       try {
-        const result = await this._refreshPreset(preset);
+        const result = preset === 'general'
+          ? await this._refreshGeneralAsCurator()
+          : await this._refreshPreset(preset);
         totalCost += result.costUsd || 0;
         results.push({ preset, ...result });
       } catch (e) {
@@ -544,13 +562,32 @@ class TagRefresher {
     // "#" or "/", no spaces. We strip "#" defensively even though prompt
     // forbids it. Lowercased for stable dedup downstream.
     const validTiktokTag = (s) => /^[a-z0-9_]{2,40}$/.test(s);
+
+    // Hardskip post-filter — second line of defense behind SYSTEM_PROMPT's
+    // "HARD SKIP" rules. Grok occasionally ignores the prompt and returns
+    // k-pop fan tags, fandom-drama aggregators, or celebrity-gossip tags
+    // (e.g. `kpopfyp`, `fandomdrama`, `celebgossip`). Match anywhere in the
+    // tag because compounds like `kpopfyp` / `fandomdrama` are how they
+    // typically slip through. NOT anchored to start — `kdramafan` matches
+    // because it's a fan-tag pattern, while `kdrama` (the genre) does not
+    // (it's whitelisted via the explicit list approach: we ban prefixes/
+    // substrings that signal fan-aggregator intent, not the topic itself).
+    const TIKTOK_HARDSKIP_RE = /(?:^|_)(?:kpop|kpopfyp|kpopstan|kpoptiktok|kpopedits|fandom|fandomdrama|stantwitter|stantiktok|stanstwt|celebgossip|celebtea|hollywoodgossip|gossipgirl)(?:_|$)/i;
+
     const tiktok_hashtags = (Array.isArray(parsed.tiktok_hashtags) ? parsed.tiktok_hashtags : [])
       .map(item => {
         if (typeof item === 'string') return item;
         return String(item?.name || '').trim();
       })
       .map(s => s.replace(/^#+/, '').replace(/\s+/g, '').toLowerCase().trim())
-      .filter(s => validTiktokTag(s));
+      .filter(s => {
+        if (!validTiktokTag(s)) return false;
+        if (TIKTOK_HARDSKIP_RE.test(s)) {
+          this.logger?.info?.(`[TagRefresher] dropped TikTok hashtag '${s}' — matches kpop/fandom/celeb-gossip hardskip`);
+          return false;
+        }
+        return true;
+      });
 
     // Dedupe (case-insensitive for subs)
     const seenSubs = new Set();
@@ -745,6 +782,162 @@ class TagRefresher {
     ).filter(Boolean);
   }
 
+  _getCurrentTiktokHashtags(preset) {
+    // Effective TikTok hashtags for this preset (defaults + auto + manual layers).
+    // Lowercase + strip leading "#" defensively.
+    const effective = readPresetAutoOverrides(this.db)[preset]?.sources?.tiktok?.hashtags
+                    || readPresetOverrides(this.db)[preset]?.sources?.tiktok?.hashtags
+                    || DEFAULT_PRESET_CONFIGS[preset]?.sources?.tiktok?.hashtags
+                    || [];
+    return effective
+      .map(t => String(t || '').toLowerCase().replace(/^#+/, '').trim())
+      .filter(Boolean);
+  }
+
+  // ── General CURATOR mode: collect pools from 4 themed presets ────────────
+  // Reads the effective tag-lists for animals/culture/celebrities/events
+  // (auto-overrides take precedence over defaults — but defaults are the
+  // fallback so this is safe even on a fresh DB before any refresh has run).
+  // Used by _refreshGeneralAsCurator() to build the candidate pool that Grok
+  // picks from.
+  _collectThemedPools() {
+    const themes = ['animals', 'culture', 'celebrities', 'events'];
+    const pools = {};
+    for (const theme of themes) {
+      pools[theme] = {
+        subreddits: this._getCurrentSubreddits(theme),
+        twitter:    this._getCurrentTwitterKeywordParts(theme),
+        tiktok:     this._getCurrentTiktokHashtags(theme),
+      };
+    }
+    return pools;
+  }
+
+  // ── General refresh — CURATOR mode (variant B, 2026-05-11) ───────────────
+  // Replaces _refreshPreset('general'). Instead of asking Grok to come up
+  // with general-mix tags from scratch (which historically produced broad-
+  // firehose tags + pre-2025 slang anchors like skibidi/delulu/brainrot),
+  // we feed Grok the 4 themed pools and ask it to PICK the best balanced
+  // mix. After Grok returns, we sanitize as usual AND drop anything that
+  // isn't verbatim in the pools (defense against curator-mode invention).
+  //
+  // FALLBACK IDEA — variant A (not implemented): drop the Grok call entirely
+  // for general and compose programmatically (e.g. round-robin 2-3 picks
+  // per theme). Zero cost, zero hallucination risk, but no LLM judgment on
+  // balance/seasonality. Reach for this if curator-mode is still leaky.
+  async _refreshGeneralAsCurator() {
+    const preset = 'general';
+
+    // 1. Collect pools from the 4 themed presets (which were just refreshed
+    //    in the same refreshAll() pass — themed order is enforced upstream).
+    const pools = this._collectThemedPools();
+
+    // Sanity: if all pools are empty (fresh DB, never refreshed) — bail with
+    // a soft skip rather than calling Grok with empty input.
+    const poolTotal = Object.values(pools).reduce(
+      (sum, p) => sum + p.subreddits.length + p.twitter.length + p.tiktok.length, 0
+    );
+    if (poolTotal === 0) {
+      this.db.recordTagRefresh({
+        preset, sourceType: 'all', status: 'rejected_validation',
+        diff: null, errorMessage: 'all themed pools empty — skipping general curator',
+        model: TAG_REFRESH_MODEL_PRIMARY, costUsd: 0,
+      });
+      return { status: 'rejected_validation', costUsd: 0, model: TAG_REFRESH_MODEL_PRIMARY };
+    }
+
+    // 2. Build curator prompt + Grok call (NO x_search — pools are pre-verified)
+    const userPrompt = this._buildGeneralCuratorPrompt(pools);
+    const { parsed, model, costUsd, inputTokens, outputTokens, rawText } =
+      await this._callGrokCurator(userPrompt);
+
+    // 3. Sanitize standard structure
+    const sanitized = this._sanitizeResponse(parsed);
+
+    // 4. EXTRA: drop anything that isn't in the pools (curator-mode invariant).
+    //    Case-insensitive match for subs/twitter; exact for tiktok (already lowercased).
+    const poolSubsLc    = new Set(Object.values(pools).flatMap(p => p.subreddits.map(s => s.toLowerCase())));
+    const poolTwitterLc = new Set(Object.values(pools).flatMap(p => p.twitter.map(s => s.toLowerCase())));
+    const poolTiktokLc  = new Set(Object.values(pools).flatMap(p => p.tiktok));
+
+    const droppedSubs    = sanitized.subreddits.filter(s => !poolSubsLc.has(s.toLowerCase()));
+    const droppedTwitter = sanitized.twitter_keywords.filter(g => !poolTwitterLc.has(g.toLowerCase()));
+    const droppedTiktok  = sanitized.tiktok_hashtags.filter(t => !poolTiktokLc.has(t));
+    if (droppedSubs.length || droppedTwitter.length || droppedTiktok.length) {
+      this.logger?.info?.(
+        `[TagRefresher] general curator dropped ${droppedSubs.length} subs / ` +
+        `${droppedTwitter.length} twitter / ${droppedTiktok.length} tiktok ` +
+        `— not in themed pools (invention attempt)`
+      );
+    }
+    const filtered = {
+      subreddits:       sanitized.subreddits.filter(s => poolSubsLc.has(s.toLowerCase())),
+      twitter_keywords: sanitized.twitter_keywords.filter(g => poolTwitterLc.has(g.toLowerCase())),
+      tiktok_hashtags:  sanitized.tiktok_hashtags.filter(t => poolTiktokLc.has(t)),
+    };
+
+    if (filtered.subreddits.length === 0
+        && filtered.twitter_keywords.length === 0
+        && filtered.tiktok_hashtags.length === 0) {
+      this.db.recordTagRefresh({
+        preset, sourceType: 'all', status: 'rejected_validation',
+        diff: null,
+        errorMessage: `Empty after pool-membership filter. Raw head: ${rawText.substring(0, 200)}`,
+        model, costUsd,
+      });
+      return { status: 'rejected_validation', costUsd, model };
+    }
+
+    // 5. NO reality-check — items came from pools that were verified during
+    //    the themed refreshes that ran moments earlier in this same pass.
+
+    // 6. Diff + apply (same machinery as themed presets)
+    const diff = this._computeDiff(preset, filtered);
+    const status = this._applyAutoOverride(preset, diff);
+
+    this.db.recordTagRefresh({
+      preset, sourceType: 'all', status,
+      diff,
+      errorMessage: null,
+      model, costUsd,
+    });
+
+    return {
+      status, costUsd, model, inputTokens, outputTokens,
+      addedCount: diff.addedSubs.length + diff.addedTwitter.length + diff.addedTiktok.length,
+      diff,
+      curatorDropped: {
+        subs: droppedSubs.length, twitter: droppedTwitter.length, tiktok: droppedTiktok.length,
+      },
+    };
+  }
+
+  // ── Grok call for curator mode (no x_search, different system prompt) ────
+  async _callGrokCurator(userPrompt) {
+    const input = [
+      { role: 'system', content: TAG_REFRESH_GENERAL_CURATOR_PROMPT },
+      { role: 'user',   content: userPrompt },
+    ];
+    try {
+      return await this._callXaiResponses({
+        model: TAG_REFRESH_MODEL_PRIMARY,
+        input,
+        tools: [],          // explicit empty — no x_search for curator
+        temperature: 0.2,   // tighter than themed (0.3) — picking, not generating
+      });
+    } catch (e) {
+      const isTransient = e.status >= 500 || /model.*not.*found|not.*available|invalid.*model/i.test(e.message || '');
+      if (!isTransient) throw e;
+      this.logger?.warn?.(`[TagRefresher] curator primary model failed (${e.message}), falling back to ${TAG_REFRESH_MODEL_FALLBACK}`);
+      return await this._callXaiResponses({
+        model: TAG_REFRESH_MODEL_FALLBACK,
+        input,
+        tools: [],
+        temperature: 0.2,
+      });
+    }
+  }
+
   // ── EXISTING list across all 5 presets (anti-duplicate prompt input) ────
   _buildExistingList() {
     const allSubs = new Set();
@@ -845,16 +1038,49 @@ class TagRefresher {
     const finalTiktok = [...new Set([...diff.keptTiktok, ...diff.addedTiktok])]
       .map(t => String(t).toLowerCase().replace(/^#+/, ''));
 
-    // Read current auto-blob, merge this preset's slot
+    // Read current auto-blob, merge this preset's slot.
+    //
+    // Empty-array guard (2026-05-16): if Grok returned 0 items for a source,
+    // we used to write `{ queries: [] }` into auto-blob — which then REPLACED
+    // defaults via deepMerge top-layer-wins for arrays, leaving production
+    // with zero queries (collector silently no-ops). Now we SKIP empty lists
+    // entirely so defaults take over for that source. Caveat: this means
+    // "Grok actively decided this source has nothing this round" is
+    // indistinguishable from "Grok was lazy / hit a parse error" — but in
+    // both cases falling back to defaults is the safer behavior. The user
+    // can still explicitly disable a source via manual override.
     const auto = readPresetAutoOverrides(this.db);
     if (!auto[preset]) auto[preset] = {};
     if (!auto[preset].sources) auto[preset].sources = {};
-    auto[preset].sources.reddit = {
-      subreddits: finalSubs,
-      ...defaultRedditMeta,
-    };
-    auto[preset].sources.twitter = { queries: finalTwitter };
-    auto[preset].sources.tiktok = { hashtags: finalTiktok };
+    if (finalSubs.length > 0) {
+      auto[preset].sources.reddit = {
+        subreddits: finalSubs,
+        ...defaultRedditMeta,
+      };
+    } else {
+      delete auto[preset].sources.reddit;
+      this.logger?.warn?.(`[TagRefresher] preset=${preset} Grok returned 0 subreddits — skipping auto-override (defaults will be used)`);
+    }
+    if (finalTwitter.length > 0) {
+      auto[preset].sources.twitter = { queries: finalTwitter };
+    } else {
+      delete auto[preset].sources.twitter;
+      this.logger?.warn?.(`[TagRefresher] preset=${preset} Grok returned 0 twitter queries — skipping auto-override (defaults will be used)`);
+    }
+    if (finalTiktok.length > 0) {
+      auto[preset].sources.tiktok = { hashtags: finalTiktok };
+    } else {
+      delete auto[preset].sources.tiktok;
+      this.logger?.warn?.(`[TagRefresher] preset=${preset} Grok returned 0 tiktok hashtags — skipping auto-override (defaults will be used)`);
+    }
+    // If the preset's sources blob is now empty after the skips, drop the
+    // preset slot entirely to keep the auto-blob compact.
+    if (Object.keys(auto[preset].sources).length === 0) {
+      delete auto[preset].sources;
+    }
+    if (Object.keys(auto[preset]).length === 0) {
+      delete auto[preset];
+    }
 
     // Cleanup: if applied set equals defaults exactly, drop the auto-slot for this preset.
     // (Avoids polluting auto-blob with no-op overrides.)
@@ -923,7 +1149,7 @@ OUTPUT FORMAT — strict JSON only (no prose outside the object):
 }
 
 TIKTOK HASHTAG RULES — read carefully:
-- 5-7 hashtags per preset. Lowercase, no leading "#", no spaces, alphanumeric+underscore only.
+- 8-12 hashtags per preset. Lowercase, no leading "#", no spaces, alphanumeric+underscore only.
 - The system uses these hashtags to scrape TikTok video pages. The goal is to surface NAMED memeable moments — animals doing absurd things, characters with iconic phrases, viral events with a tickerable subject.
 - HARD SKIP these categories — they pollute the alerts with content that has no memecoin potential:
   • Generic firehose tags: fyp, foryou, foryoupage, viral, trending, tiktok, capcut, edit
@@ -956,7 +1182,8 @@ MIX REQUIREMENT for subreddits:
 EVIDENCE REQUIREMENT (use the x_search tool aggressively):
 - For each suggestion, verify it via x_search. If you can't find recent X posts/discussion confirming the source is active and producing viral content — exclude it.
 - For slang-anchor groups (current Q2 2026 slang), each individual term must be cited from real X posts dated Nov 2025-May 2026. NO PRE-2025 STAPLES (skibidi, rizz, delulu, brainrot, mewing, gyatt, sigma, mid, sus, pop off, serve, slay, ate, ick, main character, pick me, era, vibe, mood, tea, spill, drag, chopped, crashing out, aura farming, 404 coded, no cap, bet, cap, fr, lowkey, highkey).
-- Honesty over format compliance: an empty/short list with reason "weak evidence" is BETTER than a fabricated full slate.
+- Honesty over fabrication: NEVER pad the list with invented English words (e.g. "gumite", "solidcore") that look plausible but x_search returns nothing for.
+- HOWEVER — do not return short/empty lists either. The user message will list EXISTING verified items per preset; if you can't find 8 fresh ones, keep theme-relevant existing items + add however many fresh ones you can confidently verify. Minimum 6 items per source, target 8-10 (TikTok 8-12).
 
 Be focused on the requested preset's theme. Don't bleed themes (e.g. don't suggest sports subs for a celebrities preset).`;
 
@@ -974,23 +1201,103 @@ TagRefresher.prototype._buildPrompt = function _buildPrompt(preset, existing) {
   const existingTwCsv = existing.twitter_keywords.map(s => '"' + s + '"').join(', ');
   const existingTiktokCsv = existing.tiktok_hashtags.map(s => '"' + s + '"').join(', ');
 
-  return `Today is ${today}. Suggest fresh SOURCES for the "${preset}" preset.
+  return `Today is ${today}. Suggest a FINAL source list for the "${preset}" preset.
 
 PRESET THEME: ${presetTheme}
 
-OUTPUT TARGETS:
-- 8-10 subreddits (NO r/ prefix). Focus on the theme above.
-- 5-6 Twitter keyword groups. Behavior patterns / archetypes / fresh slang anchors. NOT named memes.
-- 5-7 TikTok hashtags. Topic-themed, NOT dance/outfit/lipsync/beauty/tutorial formats. See "TIKTOK HASHTAG RULES" in system prompt for the hard-skip list.
+OUTPUT TARGETS — MINIMUM 6 items per source, target 8-10 (TikTok 8-12). NEVER return an empty array.
+- subreddits (NO r/ prefix). Focus on the theme above.
+- Twitter keyword groups. Behavior patterns / archetypes / fresh slang anchors. NOT named memes.
+- TikTok hashtags. Topic-themed, NOT dance/outfit/lipsync/beauty/tutorial formats. See "TIKTOK HASHTAG RULES" in system prompt for the hard-skip list.
 
-EXISTING LIST (across ALL 5 presets — do NOT repeat any of these):
+EXISTING LIST (across ALL 5 presets — these are tried and verified):
 - subreddits: [${existingSubsCsv}]
 - twitter keyword groups: [${existingTwCsv}]
 - tiktok hashtags: [${existingTiktokCsv}]
 
-Use the x_search tool to verify each suggestion is currently active and producing viral content. Cite freshly-dated evidence for slang terms.
+HOW TO USE EXISTING LIST:
+- These are NOT off-limits — they're the verified baseline you can keep.
+- The output IS the final list = (existing items you want to keep for this preset) + (new items you add).
+- IF you can't find 8 fresh quality items for a source — KEEP the most relevant existing items for this preset's theme and supplement with however many new ones you can confidently verify. Total should hit the 8-10 / 8-12 target.
+- Do NOT return less than 6 items for any source. If you're tempted to return 0-5 → fill the gap with theme-relevant items from existing list.
 
-If you can only confidently suggest 5 subreddits instead of 10 — give 5. Quality over quota. Same for TikTok — empty/short list with reason "no good non-dance/non-outfit tags for this theme" is BETTER than fabricating sound-format tags.`;
+ANTI-HALLUCINATION RULES (HARD):
+- NEVER invent English words. Every keyword/hashtag/subreddit must be a real word (or established compound/slang) that x_search returns hits for. If x_search returns zero hits OR you're not sure it's a real word → DROP it, do NOT pad the list with fabricated terms (e.g. invented words like "gumite", "solidcore", "unbreakable" patterns that look plausible but aren't actually circulating).
+- For slang anchors — cite a freshly-dated tweet/post URL in evidence. Without evidence — drop it.
+- For subreddits — must be probe-verifiable (reality-check runs after your response).
+
+Use the x_search tool to verify each NEW suggestion is currently active and producing viral content. Existing items you reuse don't need re-verification.`;
+};
+
+// ── General preset CURATOR mode ─────────────────────────────────────────────
+// Added 2026-05-11. The default `_refreshPreset(general)` path was problematic:
+// Grok consistently fabricated broad-firehose tags + pre-2025 slang anchors
+// (skibidi, delulu, rizz, brainrot, mewing) despite SYSTEM_PROMPT's explicit
+// ban, because the "broad mix" theme gave it no concrete anchor. Solution:
+// curator-mode — Grok picks the best tags from the 4 themed presets' pools
+// instead of generating new ones. By the time refreshAll() hits 'general',
+// the 4 themed presets have already been refreshed in the same run, so the
+// pools are FRESH.
+//
+// ALTERNATIVE — variant A (kept as fallback idea if curator-mode is still
+// leaky): drop the Grok call entirely for general and do PROGRAMMATIC
+// composition (sample 2-3 tags from each themed preset, deterministic).
+// Zero hallucination risk, ~free, but loses LLM judgment on balance/
+// seasonality. Flip via the `_refreshGeneralAsCurator` body if needed.
+const TAG_REFRESH_GENERAL_CURATOR_PROMPT = `You are a CURATOR composing the "general" preset's source list. The "general" preset is a BALANCED MIX of 4 themed presets (animals / culture / celebrities / events). It is NOT a broad firehose.
+
+YOUR JOB:
+- Pick the BEST tags from the themed pools provided in the user message.
+- Form a balanced mix across all 4 themes — roughly 2-3 picks per theme per source type.
+- DO NOT invent new tags. DO NOT include items that are not in the pools below.
+
+OUTPUT TARGETS:
+- 8-10 subreddits (≈2-3 per theme)
+- 8-10 Twitter keyword groups (≈2-3 per theme)
+- 8-12 TikTok hashtags (≈2-3 per theme)
+
+SELECTION RUBRIC:
+- Prefer CROSS-CUTTING items — tags that surface stories with broad appeal beyond their home theme (e.g. an animal-themed subreddit that often goes viral in non-animal spaces beats a niche fan-sub).
+- For Twitter: prefer BEHAVIOR-PATTERN groups (rant / meltdown / wholesome / confession archetypes) over topic-specific keyword groups (named subjects, dated slang). Behavior patterns age slower.
+- For TikTok: prefer broad-creator-base hashtags over narrow fandom tags. Avoid sound-format / dance / outfit-transition tags (those should already be absent from the pools).
+- Anti-bias: do NOT pick 5 items from one theme + 1 from another. Aim for evenness.
+
+OUTPUT FORMAT — strict JSON only (no prose outside the object):
+{
+  "subreddits": [{"name": "ExampleSub", "why_source": "picked from <theme> — broad cross-appeal"}],
+  "twitter_keywords": [{"group": "(emotion1 OR emotion2 OR behavior)", "why_source": "picked from <theme> — timeless archetype"}],
+  "tiktok_hashtags": [{"name": "exampletag", "why_source": "picked from <theme> — wide creator base"}]
+}
+
+CRITICAL RULES:
+- ONLY pick from the pools provided. Any item not in the pools will be silently dropped.
+- NO x_search calls — the pools are pre-verified by the themed refreshes that ran moments earlier.
+- If a pool is empty or shallow, just skip it — fewer high-quality picks beat fabrication.`;
+
+TagRefresher.prototype._buildGeneralCuratorPrompt = function _buildGeneralCuratorPrompt(pools) {
+  const today = new Date().toISOString().slice(0, 10);
+
+  const fmtPool = (theme, p) => {
+    const subs = (p.subreddits || []).map(s => '"' + s + '"').join(', ') || '(empty)';
+    const tw   = (p.twitter   || []).map(s => '"' + s + '"').join(', ') || '(empty)';
+    const tt   = (p.tiktok    || []).map(s => '"' + s + '"').join(', ') || '(empty)';
+    return `POOL: ${theme}\n- subreddits: [${subs}]\n- twitter_keywords: [${tw}]\n- tiktok_hashtags: [${tt}]`;
+  };
+
+  const poolsText = Object.entries(pools).map(([theme, p]) => fmtPool(theme, p)).join('\n\n');
+
+  return `Today is ${today}. Compose the "general" preset mix from the 4 themed pools below.
+
+${poolsText}
+
+Pick:
+- 8-10 subreddits (≈2-3 per theme)
+- 8-10 Twitter keyword groups (≈2-3 per theme)
+- 8-12 TikTok hashtags (≈2-3 per theme)
+
+ABSOLUTE: only pick items that appear verbatim in the pools above. Do NOT invent. Do NOT modify. Do NOT add slang anchors that aren't in the Twitter pools. Items not from the pools will be silently dropped.
+
+Quality > quota. If a theme's pool is shallow, take fewer from it rather than padding with fabricated items.`;
 };
 
 export default TagRefresher;

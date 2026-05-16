@@ -141,7 +141,11 @@ Tap the menu below to pick your sources, set the alert volume, and grab a plan.
   paymentPending: '\u{23F3} Waiting for payment confirmation...',
 
   // ── Alerts ─────────────────────────────────────────────────────────────
+  // alertHeader takes alertScore (composite 0-100) \u2014 same number the admin
+  // DecisionsPage displays. memePotential is surfaced separately via
+  // alertMemeEnergy below when it diverges from alertScore by \u22658.
   alertHeader: (score) => `${scoreEmoji(score)} <b>${score}/100</b> \u00B7 TREND ALERT`,
+  alertMemeEnergy: (val) => `\u{1F3AF} Meme energy <b>${val}/100</b>`,
   alertTrigger: 'Trigger',
   // Alert-type labels (orthogonal to category - describes the SHAPE of the
   // signal). Rendered as a chip on the first line of every alert.
@@ -310,9 +314,17 @@ assertCoversLifespans('en.lifespans',    en.lifespans);
 
 export default en;
 
+// Emoji ladder calibrated for alertScore (composite 0-100, weighted sum
+// of meme/viral/emerg/feedback/twitter minus junk). 2026-05-10 rebalance
+// brought meme weight to 0.60, so a top-meme trend now scores ~75-85
+// instead of 55-65 — thresholds shifted down to match the new distribution:
+//   85+ → triple flame (top of the day)
+//   70+ → double flame (excellent)
+//   55+ → single flame (solid)
+//   else → chart (passed threshold but unremarkable)
 function scoreEmoji(score) {
-  if (score >= 90) return '\u{1F525}\u{1F525}\u{1F525}';
-  if (score >= 75) return '\u{1F525}\u{1F525}';
-  if (score >= 60) return '\u{1F525}';
+  if (score >= 85) return '\u{1F525}\u{1F525}\u{1F525}';
+  if (score >= 70) return '\u{1F525}\u{1F525}';
+  if (score >= 55) return '\u{1F525}';
   return '\u{1F4CA}';
 }

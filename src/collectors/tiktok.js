@@ -133,10 +133,27 @@ class TikTokCollector extends BaseCollector {
     // 1 hashtag per cycle = 48 searches/day; 24 hashtags rotated through
     // exactly 24 cycles = 12h = matches the trends-refresh window so each
     // hashtag is searched once per refresh window.
+    //
+    // Runtime-tunable since 2026-05-11: env value is the FALLBACK, DB setting
+    // `tiktokCycleIntervalMinutes` (set via admin slider, clamped 10-120)
+    // takes precedence. Read via _getCycleIntervalMinutes() each collect() so
+    // operator changes apply on the next cycle without restart.
     this.cycleIntervalMinutes = parseInt(process.env.TIKTOK_CYCLE_INTERVAL_MINUTES || '30', 10);
     this._lastCollectAt = 0;
 
     this._restoreCachedTrendingHashtags();
+  }
+
+  /**
+   * Pull the effective cycle interval (in minutes). DB setting
+   * `tiktokCycleIntervalMinutes` wins if present and in valid range [10, 120],
+   * otherwise the env-derived constructor value (this.cycleIntervalMinutes).
+   * Range clamp matches admin server `allowedInt` validator.
+   */
+  _getCycleIntervalMinutes() {
+    const fromDb = Number(this.db?.getSetting?.('tiktokCycleIntervalMinutes'));
+    if (Number.isFinite(fromDb) && fromDb >= 10 && fromDb <= 120) return fromDb;
+    return this.cycleIntervalMinutes;
   }
 
   /**
@@ -333,11 +350,17 @@ class TikTokCollector extends BaseCollector {
     // matches the global scan cadence by skipping every other cycle when
     // global = 15min and TikTok = 30min. First cycle after restart always
     // passes (lastCollectAt=0 → ageMinutes very large).
+    //
+    // Runtime-tunable: pull DB setting FIRST, fall back to env-derived
+    // constructor value. Clamped to [10, 120] minutes (matches admin slider
+    // validator). Picked up on every collect() — slider change applies
+    // immediately on the next scan-cycle pass.
+    const effectiveInterval = this._getCycleIntervalMinutes();
     const ageMinutes = (Date.now() - this._lastCollectAt) / 60_000;
-    if (ageMinutes < this.cycleIntervalMinutes) {
+    if (ageMinutes < effectiveInterval) {
       this.logger.info(
         `[TikTok] skipping cycle — last run ${Math.round(ageMinutes)}min ago ` +
-        `(interval=${this.cycleIntervalMinutes}min)`
+        `(interval=${effectiveInterval}min)`
       );
       return [];
     }
@@ -528,6 +551,19 @@ class TikTokCollector extends BaseCollector {
     const ageHours  = createdAt
       ? (Date.now() - createdAt.getTime()) / 3_600_000
       : 0;
+
+    // Max-age filter — TikTok's /tag/<x> page is editorially ranked, not
+    // chronological. Apify often returns evergreen videos from 2023-2024
+    // among current trending ones, which then pass engagement floors
+    // (because they've accumulated millions of views over years) and
+    // surface as fresh alerts. Mirror twitter.js's `twitterMaxAgeHours`.
+    // Setting `tiktokMaxAgeDays` (default 7); 0 disables the filter. Only
+    // applies when the video has a createdAt — videos with no timestamp
+    // pass through unchecked (rare, but don't blow up the firehose).
+    const maxAgeDays = Number(this.db?.getSetting?.('tiktokMaxAgeDays', 7) ?? 7) || 0;
+    if (createdAt && maxAgeDays > 0 && ageHours > maxAgeDays * 24) {
+      return null;
+    }
 
     const title = this._buildTitle(desc, hashtags, tickers, sourceHashtag);
 

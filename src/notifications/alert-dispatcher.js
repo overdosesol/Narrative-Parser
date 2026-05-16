@@ -35,11 +35,18 @@ import { computeAlertScore, feedbackBoostFromStats } from '../analysis/scorer.js
 // tutorials / process timelapses / aesthetic vlogs). They get massive
 // engagement but are NOT memecoin material. The gate runs ONLY for
 // source='tiktok' and uses Gemini PreStage signals:
+//   • NO Gemini data at all            → hard skip (legacy/failed PreStage,
+//                                          we cannot verify visual content)
 //   • viralPattern in AMBIENT_PATTERNS → hard skip (Gemini classified as scroll-bait)
 //   • isAmbient=true                   → hard skip (Gemini's own boolean judgment)
 //   • memeShapeStrength < FLOOR        → hard skip (TikTok-only quality bar)
 // Keeping these as module-level constants (not config knobs) per "хардкод"
 // directive — flip to admin sliders later if calibration needs tuning.
+// "No Gemini data" branch was added 2026-05-11 after compilation-style
+// trends ("Weird Sea Animals sounds trend" etc.) slipped through when
+// PreStage failed silently — without visual verification, we cannot
+// distinguish a real story trend from a generic sound-format compilation,
+// so fail-closed is the safer default for the TikTok firehose.
 // Patterns that always hard-skip on TikTok regardless of engagement / score:
 // the original "ambient" group (satisfying / asmr / tutorial / process /
 // aesthetic — scroll-bait without narrative) PLUS the sound-format group
@@ -273,15 +280,18 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
       // TikTok firehose drags in tons of "scroll-bait" — ASMR, satisfying
       // loops, tutorials, process timelapses, mood vlogs. They get massive
       // engagement (people zone out and watch) but are NOT memecoin material.
-      // Three sub-checks (any failure → hard skip):
+      // Four sub-checks (any failure → hard skip):
+      //   0) NO Gemini data at all (legacy/failed PreStage) — cannot verify
+      //      visual content, so we fail-closed for the TikTok firehose
       //   1) Gemini flagged isAmbient=true (its own judgment)
       //   2) viralPattern in the AMBIENT_PATTERNS set
       //   3) memeShapeStrength below TIKTOK_MEME_SHAPE_FLOOR
-      // Only fires when source='tiktok'. Old trends without Gemini fields
-      // pass naturally (memeShape undefined → not a number → no penalty).
-      // Reddit/Twitter/Google trends bypass this gate entirely.
+      // Only fires when source='tiktok'. Reddit/Twitter/Google trends bypass
+      // this gate entirely (their text-first nature makes the visual gate
+      // pointless and applying it would block legitimate text-only narratives).
       const isTikTok = sourceLc === 'tiktok';
       const gemini   = trend.preStage?.gemini;
+      const hasGemini        = !!gemini;
       const isAmbient        = gemini?.isAmbient === true;
       const ambientPattern   = AMBIENT_PATTERNS.has(gemini?.viralPattern);
       const memeShape        = gemini?.memeShapeStrength;
@@ -290,11 +300,25 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
 
       let tiktokQualityFail = null;
       if (isTikTok) {
-        if (isAmbient)             tiktokQualityFail = 'ambient flag (Gemini)';
+        if (!hasGemini)            tiktokQualityFail = 'no PreStage data (legacy/failed Stage 0b)';
+        else if (isAmbient)        tiktokQualityFail = 'ambient flag (Gemini)';
         else if (ambientPattern)   tiktokQualityFail = `pattern=${gemini.viralPattern}`;
         else if (memeShapeTooLow)  tiktokQualityFail = `memeShape=${memeShape}/100 < ${TIKTOK_MEME_SHAPE_FLOOR}`;
       }
       const tiktokQualityPass = !tiktokQualityFail;
+
+      // ai_score gate — block alerts where AI provider returned 5xx/timeout/
+      // parse error and we fell back to heuristic scoring (scorer._fallback
+      // sets aiExplanation to 'AI unavailable' or 'Parse error'). Without
+      // this gate users would receive "POST · 🤖 AI: AI unavailable" alerts
+      // with category=other/sentiment=neutral — useless. The trend is saved
+      // with pipeline_status='save_only' (see index.js), so isTrendSeen
+      // passes it through on the next scan → AI gets another shot. If the
+      // re-attempt succeeds, the same row is UPSERTed with real scores and
+      // pipeline_status='scored' → alert flows normally. Added 2026-05-12.
+      const aiUnavailable = trend.aiExplanation === 'AI unavailable'
+                         || trend.aiExplanation === 'Parse error';
+      const aiScorePass   = !aiUnavailable;
 
       const capPass       = !(maxAlertsPerCycle > 0 && alertsSentThisCycle >= maxAlertsPerCycle);
       const thresholdPass = alertScore >= effectiveAlertThreshold;
@@ -309,6 +333,7 @@ export async function dispatchAlerts({ trends, deps, source = 'scan' }) {
       const trendAlertType = trend.alertType || null;
       const alertTypePass  = !trendAlertType || userAlertTypes.includes(trendAlertType);
 
+      gates.push({ name: 'ai_score',     passed: aiScorePass,      detail: aiUnavailable ? `heuristic fallback (${trend.aiExplanation}) — will retry next scan` : 'AI verdict OK' });
       gates.push({ name: 'threshold',    passed: thresholdPass,    detail: `${alertScore} / ${effectiveAlertThreshold}` });
       gates.push({ name: 'hard_junk',    passed: hardJunkPass,     detail: `junk=${junkVal}${junkReasons ? ' (' + junkReasons + ')' : ''} < ${alertWeights.hardJunkStop}` });
       gates.push({ name: 'lipsync',      passed: lipsyncPass,      detail: isLipSync ? 'gemini flagged: lip-sync / sound participation' : 'no lip-sync' });

@@ -1030,8 +1030,17 @@ class DashboardServer {
     const phaseList   = phaseRaw.split(',')
       .map(s => s.trim())
       .filter(s => ['early','forming','strong','saturated'].includes(s));
-    const minMeme     = parseInt(url.searchParams.get('minMeme')     || '0',   10);
+    // minMeme was removed 2026-05-14 — sidebar Adoption filter was rarely used
+    // and confused users (the per-row Adoption bar in cards already conveys
+    // the score, no need to gate the feed by it). Param silently ignored if
+    // older clients still send it.
     const minEmergence = parseInt(url.searchParams.get('minEmergence') || '0', 10);
+    // Server-side feed search — added 2026-05-14. Client-side filter alone was
+    // unusable beyond 6h windows: the SPA only loads top-LIMIT (=25) trends per
+    // page, so any item ranked below #25 was invisible to search. Pushing the
+    // filter into SQL means `?q=...` searches the whole window, then LIMIT is
+    // applied to matches. Trimmed + capped to 80 chars to keep the query bound.
+    const qRaw = (url.searchParams.get('q') || '').trim().slice(0, 80);
     // minPlatforms was removed 2026-05-04 along with cross-platform aggregation.
     // The clusterer's cross-source matcher is unreliable, so we no longer
     // expose a "platforms ≥ N" filter — the param is silently ignored if older
@@ -1108,8 +1117,15 @@ class DashboardServer {
       query += ` AND JSON_EXTRACT(raw_metrics, '$.narrativePhase') IN (${placeholders})`;
       params.push(...phaseList);
     }
-    if (minMeme > 0)      { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.memePotential') AS INT) >= ?`;                            params.push(minMeme); }
     if (minEmergence > 0) { query += ` AND CAST(JSON_EXTRACT(raw_metrics, '$.emergenceScore') AS INT) >= ?`;                           params.push(minEmergence); }
+    if (qRaw) {
+      // Escape SQL LIKE wildcards (%, _, \) so user-typed punctuation is literal.
+      // Sqlite LIKE is case-insensitive for ASCII; Cyrillic case-folding requires
+      // ICU which we don't load — acceptable tradeoff (titles are mostly EN).
+      const like = '%' + qRaw.replace(/[\\%_]/g, c => '\\' + c) + '%';
+      query += ` AND (title LIKE ? ESCAPE '\\' OR original_title LIKE ? ESCAPE '\\' OR ai_explanation LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\')`;
+      params.push(like, like, like, like);
+    }
 
     query += ` ORDER BY ${orderBy} LIMIT ? OFFSET ?`;
     params.push(limit, offset);
@@ -1198,13 +1214,23 @@ class DashboardServer {
     // greyed out with an upgrade hint).
     const planSources = getPlanEntitlements(req.user?.plan_name).sources;
 
+    // Window filter uses last_seen_at (active-in-window), NOT first_seen_at
+    // (born-in-window). See _handleTrends for the long-form rationale — TL;DR:
+    // clusterer keeps pulling fresh posts into existing narratives so
+    // last_seen_at advances while first_seen_at stays pinned at birth.
+    // Counting on first_seen_at made the sidebar under-report dramatically
+    // for any source where the clusterer is doing its job — a still-hot
+    // narrative born 25h ago would not show up at 24h window even though the
+    // feed itself showed it (because the feed already used last_seen_at).
+    // Sidebar fix landed 2026-05-11 after Twitter showed `0` despite 7+
+    // active twitter trends in the feed.
     const result = sources.map(source => {
       const last = this.db.db.prepare(
-        `SELECT COUNT(*) as count, MAX(first_seen_at) as last FROM trends WHERE source = ? AND first_seen_at > ?`
+        `SELECT COUNT(*) as count, MAX(last_seen_at) as last FROM trends WHERE source = ? AND last_seen_at > ?`
       ).get(source, cutoff24);
 
       const lastHour = this.db.db.prepare(
-        `SELECT COUNT(*) as c FROM trends WHERE source = ? AND first_seen_at > ?`
+        `SELECT COUNT(*) as c FROM trends WHERE source = ? AND last_seen_at > ?`
       ).get(source, cutoff).c;
 
       const enabled = !this.appState.disabledCollectors?.has(source);
@@ -4029,9 +4055,17 @@ class DashboardServer {
       animation-duration: .001s !important; animation-delay: 0s !important;
       transition-duration: .001s !important;
     }
-    body.prefs-no-images .feed-card-media,
-    body.prefs-no-images .card-media,
-    body.prefs-no-images .trend-modal-media { display: none !important; }
+    /* Show-previews toggle — selectors fixed 2026-05-14. Earlier list referenced
+       .feed-card-media / .card-media / .trend-modal-media which don't exist
+       anywhere in the JSX, so the toggle was visually no-op. These are the
+       real preview classes (carousel/image/video, both feed cards and modal).
+       Note: display:none does NOT save bandwidth — <img src> still fetches.
+       The toggle is currently «declutter only» (description copy updated). */
+    body.prefs-no-images .feed-image-wrap,
+    body.prefs-no-images .feed-image,
+    body.prefs-no-images .feed-video-wrap,
+    body.prefs-no-images .feed-video,
+    body.prefs-no-images .img-carousel { display: none !important; }
     body.prefs-compact .feed-card { padding: 10px 12px; }
     body.prefs-compact .feed-card + .feed-card { margin-top: 6px; }
     body.prefs-compact .feed-list { gap: 6px; }
@@ -5609,6 +5643,38 @@ class DashboardServer {
        top-right .toast notification system (different purpose: actionable
        undo vs informational). 2026-05-02: bottom: 24 (was 64) since the
        statusbar strip is gone. Bottom-nav on mobile sits above this. */
+    /* Scroll-to-top — floating circular button bottom-right of the viewport.
+       Visible only when .main-feed scrolled past the threshold (state-driven
+       via showScrollTop). Sits above the feed but below modals/toasts. */
+    .scroll-to-top {
+      position: fixed;
+      right: 28px;
+      bottom: 28px;
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 1px solid var(--border3);
+      color: var(--text);
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.5), var(--gloss-top);
+      z-index: 900;
+      animation: scroll-to-top-in .18s ease-out;
+      transition: transform .12s ease, background .12s ease, border-color .12s ease;
+    }
+    .scroll-to-top:hover {
+      background: var(--surface-hover, var(--surface));
+      border-color: rgba(var(--accent-rgb), .5);
+      transform: translateY(-2px);
+    }
+    .scroll-to-top:active { transform: translateY(0); }
+    @keyframes scroll-to-top-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
     .undo-toast {
       position: fixed;
       bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -6497,6 +6563,7 @@ const I18N = {
     'feed.search_placeholder': 'Search narratives…',
     'feed.refresh_tip': 'Refresh (R)',
     'feed.refreshing': 'Refreshing…',
+    'feed.scroll_top': 'Scroll to top',
     'feed.loading': 'Loading narratives…',
     'feed.empty.no_match': 'No matches for "{q}"',
     'feed.empty.no_data': 'No narratives match these filters',
@@ -6533,7 +6600,6 @@ const I18N = {
     'sidebar.show_all': 'Show all',
     'sidebar.reset': 'Reset',
     'sidebar.window': '⏱ Window',
-    'sidebar.adoption': '💎 Adoption',
     'sidebar.category': '🏷️ Category',
     'sidebar.all_categories': 'All categories',
     'sidebar.sort': '🔀 Sort',
@@ -6682,7 +6748,7 @@ const I18N = {
     'stats.no_trend_data': 'No trend data yet',
 
     // Settings
-    'settings.title': '⚙️ Dashboard settings',
+    'settings.title': 'Dashboard settings',
     'settings.flash_reset': '✓ Settings reset',
     'settings.flash_sources_shown': '✓ All sources visible',
 
@@ -6693,13 +6759,11 @@ const I18N = {
     'settings.density.comfy': 'Comfy',
     'settings.density.compact': 'Compact',
     'settings.images': 'Show previews',
-    'settings.images_desc': 'Turn off to save bandwidth and declutter the feed.',
+    'settings.images_desc': 'Turn off to declutter the feed — hides image and video previews in cards and modals.',
     'settings.animations': 'UI animations',
     'settings.animations_desc': 'Turn off to reduce load on slower devices.',
     'settings.hover_preview': 'Hover preview',
     'settings.hover_preview_desc': 'Show tweet/post content card when hovering over a source link.',
-    'settings.font_size': 'Font size',
-    'settings.font_size_desc': 'Base text size across the dashboard.',
     'settings.col_left':  'Left column width',
     'settings.col_left_desc':  'Sidebar width — sources, phase, filters. Currently {px}px.',
     'settings.col_right': 'Right column width',
@@ -6747,10 +6811,9 @@ const I18N = {
     // Renamed 2026-05-01 to make scope explicit: this slider gates Telegram
     // pushes only, not the dashboard feed. Earlier wording suggested it
     // filtered everything, which it doesn't — the feed still shows all
-    // Stage-1-scored trends regardless. Sidebar's Adoption filter is the
-    // dashboard-side equivalent.
+    // Stage-1-scored trends regardless.
     'account.threshold': 'Telegram alert threshold',
-    'account.threshold_desc': 'Minimum alertScore for the bot to push you a Telegram alert. Higher = fewer, stronger alerts. Applies on top of the platform floor. Does NOT filter the dashboard feed — use the sidebar Adoption filter for that.',
+    'account.threshold_desc': 'Minimum alertScore for the bot to push you a Telegram alert. Higher = fewer, stronger alerts. Applies on top of the platform floor. Does NOT filter the dashboard feed.',
     'settings.logout': 'Log out',
     'settings.logout_desc': "Unlink this browser. You'll need a fresh bot code to sign back in.",
     'settings.logout_confirm': "Log out? You'll need to verify a fresh bot code to sign back in.",
@@ -6780,7 +6843,7 @@ const I18N = {
     'login.err_need_6': 'Enter the 6 digits from the bot message',
 
     // Toasts
-    'toast.refreshing': 'Refreshing…',
+    'toast.refreshing': 'Refreshed',
     'toast.copied': '📋 Copied!',
     'toast.copy_failed': 'Copy failed',
     'toast.all_sources_visible': '👁 All sources visible',
@@ -6910,6 +6973,7 @@ const I18N = {
     'feed.search_placeholder': 'Поиск нарративов…',
     'feed.refresh_tip': 'Обновить (R)',
     'feed.refreshing': 'Обновляю…',
+    'feed.scroll_top': 'Наверх',
     'feed.loading': 'Загружаю нарративы…',
     'feed.empty.no_match': 'Нет совпадений для «{q}»',
     'feed.empty.no_data': 'Под текущие фильтры ничего нет',
@@ -6946,7 +7010,6 @@ const I18N = {
     'sidebar.show_all': 'Показать все',
     'sidebar.reset': 'Сбросить',
     'sidebar.window': '⏱ Окно',
-    'sidebar.adoption': '💎 Adoption',
     'sidebar.category': '🏷️ Категория',
     'sidebar.all_categories': 'Все категории',
     'sidebar.sort': '🔀 Сортировка',
@@ -7095,7 +7158,7 @@ const I18N = {
     'stats.no_trend_data': 'Ещё нет данных по трендам',
 
     // Settings
-    'settings.title': '⚙️ Настройки дашборда',
+    'settings.title': 'Настройки дашборда',
     'settings.flash_reset': '✓ Настройки сброшены',
     'settings.flash_sources_shown': '✓ Все источники показаны',
 
@@ -7106,13 +7169,11 @@ const I18N = {
     'settings.density.comfy': 'Comfy',
     'settings.density.compact': 'Compact',
     'settings.images': 'Показывать превью',
-    'settings.images_desc': 'Отключи чтобы экономить трафик и разгрузить фид.',
+    'settings.images_desc': 'Отключи чтобы разгрузить фид — скрывает превью картинок и видео в карточках и модалках.',
     'settings.animations': 'Анимации интерфейса',
     'settings.animations_desc': 'Отключи для снижения нагрузки на слабых устройствах.',
     'settings.hover_preview': 'Превью при наведении',
     'settings.hover_preview_desc': 'Показывать карточку с содержимым твита/поста при наведении на ссылку источника.',
-    'settings.font_size': 'Размер шрифта',
-    'settings.font_size_desc': 'Базовый размер текста на дашборде.',
     'settings.col_left':  'Ширина левой колонки',
     'settings.col_left_desc':  'Сайдбар — источники, фаза, фильтры. Сейчас {px}px.',
     'settings.col_right': 'Ширина правой колонки',
@@ -7159,10 +7220,9 @@ const I18N = {
     'account.subscription_desc': 'Тариф активен до этой даты.',
     // Переименовано 2026-05-01 — слайдер управляет ТОЛЬКО TG-алертами,
     // на дашбод-фид не влияет. Старое имя «Чувствительность алертов»
-    // создавало впечатление общего фильтра. Для фильтрации фида в
-    // дашбоде — слайдер Adoption в сайдбаре.
+    // создавало впечатление общего фильтра.
     'account.threshold': 'Порог Telegram-алертов',
-    'account.threshold_desc': 'Минимальный alertScore, при котором бот пришлёт алерт в Telegram. Выше = строже (меньше, но сильнее). Действует поверх глобального floor платформы. На фид в дашбоде НЕ влияет — для этого есть фильтр Adoption в сайдбаре.',
+    'account.threshold_desc': 'Минимальный alertScore, при котором бот пришлёт алерт в Telegram. Выше = строже (меньше, но сильнее). Действует поверх глобального floor платформы. На фид в дашбоде НЕ влияет.',
     'settings.logout': 'Выйти',
     'settings.logout_desc': 'Отвязать этот браузер. Для повторного входа потребуется новый код из бота.',
     'settings.logout_confirm': 'Выйти из аккаунта? Нужно будет снова подтвердить код в Telegram.',
@@ -7192,7 +7252,7 @@ const I18N = {
     'login.err_need_6': 'Введите 6 цифр из сообщения бота',
 
     // Toasts
-    'toast.refreshing': 'Обновляю…',
+    'toast.refreshing': 'Обновлено',
     'toast.copied': '📋 Скопировано!',
     'toast.copy_failed': 'Не удалось скопировать',
     'toast.all_sources_visible': '👁 Все источники видимы',
@@ -9390,7 +9450,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                     sourceLine,
                     '',
                     'Дай ответ строго по пунктам, кратко (1-3 предложения на пункт):',
-                    '1. Название нарратива — предложи 2-3 варианта, каждый короткий и ёмкий (2-5 слов). Маркируй буллетами. ВСЕГДА давай минимум один вариант на английском. Не-английский вариант добавляй ТОЛЬКО когда нарратив географически привязан к не-англоязычной стране (например, японский мем — можно с японским вариантом, российское событие — с русским). По умолчанию — только английский.',
+                    '1. Название — НАЙДИ как уже называют в X за 24-48ч (хэштеги, повторяющиеся фразы). НЕ ПРИДУМЫВАЙ. 2-3 варианта буллетами с источником. Если нет устоявшегося — напиши «нет, чаще описывают как: ...». Минимум один на английском.',
                     '2. Почему сейчас вирален — что зажгло, кто пушит (имена аккаунтов / комьюнити), сколько примерно постов/просмотров.',
                     '3. Почему может вырасти дальше — катализаторы на 24-72 часа (события, релизы, виральные хуки).',
                     '4. Потенциал роста — оценка 1-10 и обоснование одной строкой.',
@@ -9406,7 +9466,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                     sourceLine,
                     '',
                     'Answer strictly point-by-point, concise (1-3 sentences each):',
-                    '1. Narrative name — propose 2-3 options, each short and punchy (2-5 words). Bullet them. ALWAYS include at least one option in English. Add a non-English option ONLY when the narrative is geographically rooted in a non-English-speaking country (e.g. a Japan-based meme may include a Japanese option, a Russia-based event a Russian one). Default = English only.',
+                    '1. Name — FIND how it\\u2019s called in X over 24-48h (hashtags, repeating phrases). Do NOT invent. 2-3 bullets with source. If no established name — say so, give short description. At least one in English.',
                     '2. Why it\\u2019s viral right now — what ignited it, who pushes it (account names / communities), rough post/view counts.',
                     '3. Why it could grow further — 24-72h catalysts (events, releases, viral hooks).',
                     '4. Growth potential — 1-10 score with one-line rationale.',
@@ -10167,7 +10227,6 @@ const DEFAULT_PREFS = {
   showImages:    true,
   animations:    true,
   hoverPreview:  true,  // hover-card with tweet/reddit content on link hover
-  fontSize:      14,   // 12..16
   colLeft:       240,  // left sidebar width in px (180..360)
   colRight:      300,  // right panel width in px (240..420)
 };
@@ -10202,7 +10261,6 @@ function applyPrefsToDOM(p) {
   b.classList.toggle('prefs-compact', p.density === 'compact');
   b.classList.toggle('prefs-no-images', !p.showImages);
   b.classList.toggle('prefs-no-anim',  !p.animations);
-  try { b.style.setProperty('--user-font-size', p.fontSize + 'px'); } catch (e) {}
   try {
     const root = document.documentElement;
     const left  = Math.max(180, Math.min(540, Number(p.colLeft)  || 240));
@@ -10317,11 +10375,11 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
     ),
 
     // ── Language ──
+    // Card title + desc removed 2026-05-14 — оператор счёл их избыточными,
+    // сами language-Row'ы достаточно self-explanatory. i18n keys
+    // settings.language / settings.language_desc остались в словарях на
+    // случай если решим вернуть, но в UI больше не рендерятся.
     h('div', { className: 'settings-card' },
-      h('div', { className: 'settings-card-title' }, t('settings.language')),
-      h('div', { className: 'settings-card-desc' },
-        t('settings.language_desc')
-      ),
       // Dashboard / UI language
       h(Row, {
         icon: '🌐', title: t('settings.language_dashboard'),
@@ -10410,19 +10468,10 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
         desc: t('settings.hover_preview_desc'),
         control: h(Toggle, { on: prefs.hoverPreview, onChange: v => update({ hoverPreview: v }) })
       }),
-      h(Row, {
-        icon: '🔠', title: t('settings.font_size'),
-        desc: t('settings.font_size_desc'),
-        control: h('div', { className: 'seg-group seg-compact' },
-          [{ v: 12, l: 'S' }, { v: 14, l: 'M' }, { v: 16, l: 'L' }].map(o =>
-            h('button', {
-              key: o.v,
-              className: 'seg-btn' + (prefs.fontSize === o.v ? ' active' : ''),
-              onClick: () => update({ fontSize: o.v })
-            }, o.l)
-          )
-        )
-      }),
+      // Font size setting removed 2026-05-14 — it set a --user-font-size
+      // CSS variable that no rule consumed (every selector hard-codes px),
+      // so the toggle was visually no-op. Re-adding it would require an
+      // em/rem refactor across the SPA CSS.
       h(Row, {
         icon: '◧', title: t('settings.col_left'),
         desc: t('settings.col_left_desc', { px: prefs.colLeft }),
@@ -11359,7 +11408,6 @@ function App() {
   const [category,   setCategory]   = useState('');
   const [source,     setSource]     = useState('');
   const [hours,      setHours]      = useState(24);
-  const [minMeme,    setMinMeme]    = useState(0);
   const [offset,     setOffset]     = useState(0);
   const [scanning,   setScanning]   = useState(false);
   const [sort,       setSort]       = useState('rank');
@@ -11386,6 +11434,18 @@ function App() {
   const [pendingUndo, setPendingUndo] = useState(null); // { trend, expiresAt }
   const undoTimerRef = useRef(null);
   const [search,     setSearch]     = useState('');
+  // Debounced mirror of "search" — drives server-side q-param fetches with
+  // 250ms throttle so we don't spam /api/trends per keystroke. The raw
+  // "search" state still updates immediately (controlled input + UI
+  // affordances like the "0 / N" counter / Reset chip / empty-state copy).
+  const [searchDebounced, setSearchDebounced] = useState('');
+  useEffect(() => {
+    const tid = setTimeout(() => setSearchDebounced(search), 250);
+    return () => clearTimeout(tid);
+  }, [search]);
+  // Reset pagination when the effective query changes so we always start on
+  // page 0 of the filtered result set, not the middle of the unfiltered one.
+  useEffect(() => { setOffset(0); }, [searchDebounced]);
   const [refreshAt,  setRefreshAt]  = useState(Date.now() + 90000);
   // Refresh pulse — stays on for at least MIN_PULSE_MS so the animation is visible
   // even when fetchData resolves in <200ms.
@@ -11431,11 +11491,47 @@ function App() {
   const mainFeedRef = useRef(null);
   const LIMIT = 25;
 
-  // addToast helper — auto-dismiss after 4s
+  // Scroll-to-top button — shown when user scrolls the main feed below
+  // SCROLL_TOP_THRESHOLD. Listener is attached to the .main-feed element
+  // (NOT window) because the feed has its own overflow-y:auto scroll root.
+  // Dep on "me" (auth) is critical: on first render the auth gate returns
+  // LoginScreen, so .main-feed isn't in the DOM yet and the ref is null.
+  // We need the effect to re-run once auth flips so it actually subscribes
+  // to scroll on the real element. "view" is included too because the main
+  // feed only mounts on the feed view — switching tabs remounts the node
+  // and the listener has to re-attach to the fresh DOM element.
+  const [showScrollTop, setShowScrollTop] = useState(false);
+  useEffect(() => {
+    if (!me) return;                       // not authed yet, main isn't mounted
+    const el = mainFeedRef.current;
+    if (!el) return;
+    const SCROLL_TOP_THRESHOLD = 400;
+    let ticking = false;
+    const onScroll = () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        setShowScrollTop((el.scrollTop || 0) > SCROLL_TOP_THRESHOLD);
+        ticking = false;
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    // Run once immediately in case feed is already scrolled (e.g. user
+    // navigated away and came back — browser preserves scrollTop).
+    onScroll();
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [me, view]);
+  const scrollFeedToTop = useCallback(() => {
+    const el = mainFeedRef.current;
+    if (!el) return;
+    el.scrollTo({ top: 0, behavior: 'smooth' });
+  }, []);
+
+  // addToast helper — auto-dismiss after 3s
   const addToast = useCallback((msg, type = 'info') => {
     const id = ++toastId.current;
     setToasts(prev => [...prev, { id, msg, type }]);
-    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4000);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3000);
   }, []);
 
   // ── Per-trend hide / undo ─────────────────────────────────────────────────
@@ -11543,7 +11639,7 @@ function App() {
         (category ? '&category=' + category : '') +
         (source   ? '&source='   + source   : '') +
         (phases   ? '&phase='    + phases   : '') +
-        (minMeme > 0 ? '&minMeme=' + minMeme : '') +
+        (searchDebounced.trim() ? '&q=' + encodeURIComponent(searchDebounced.trim()) : '') +
         (favoritesOnly ? '&favoritesOnly=1' : '');
 
       const [st, tr, sr] = await Promise.all([
@@ -11578,7 +11674,7 @@ function App() {
     const elapsed = Date.now() - started;
     const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
     setTimeout(() => setRefreshPulse(false), remaining);
-  }, [hours, category, source, phases, minMeme, offset, sort, favoritesOnly]);
+  }, [hours, category, source, phases, offset, sort, favoritesOnly, searchDebounced]);
 
   // Full refresh for SSE 'refresh' events and the manual refresh button.
   // Refetches from the top with a big enough limit to cover every page the
@@ -11597,7 +11693,7 @@ function App() {
         (category ? '&category=' + category : '') +
         (source   ? '&source='   + source   : '') +
         (phases   ? '&phase='    + phases   : '') +
-        (minMeme > 0 ? '&minMeme=' + minMeme : '') +
+        (searchDebounced.trim() ? '&q=' + encodeURIComponent(searchDebounced.trim()) : '') +
         (favoritesOnly ? '&favoritesOnly=1' : '');
       const [st, tr, sr] = await Promise.all([
         api('/stats?hours=' + hours),
@@ -11615,7 +11711,7 @@ function App() {
     const elapsed = Date.now() - started;
     const remaining = Math.max(0, MIN_PULSE_MS - elapsed);
     setTimeout(() => setRefreshPulse(false), remaining);
-  }, [hours, category, source, phases, minMeme, offset, sort, favoritesOnly]);
+  }, [hours, category, source, phases, offset, sort, favoritesOnly, searchDebounced]);
 
 
   // Resolve the authenticated user on load / whenever the token changes.
@@ -11697,7 +11793,8 @@ function App() {
   useEffect(() => {
     const node = sentinelRef.current;
     if (!node) return;
-    if (search.trim()) return;            // no auto-load during active search
+    // 2026-05-14: removed the "if (search.trim()) return" guard — server now
+    // paginates filtered results, so infinite scroll walks page 2+ of search.
     if (loading || loadingMore) return;   // don't stack requests
     if (trends.length === 0) return;      // nothing to page from yet
     if (trends.length >= total) return;   // loaded everything
@@ -11713,7 +11810,7 @@ function App() {
     });
     io.observe(node);
     return () => io.disconnect();
-  }, [search, loading, loadingMore, trends.length, total]);
+  }, [loading, loadingMore, trends.length, total]);
   useEffect(() => {
     const handleNavigate = (event) => {
       const nextView = event && event.detail ? event.detail.view : null;
@@ -11853,19 +11950,18 @@ function App() {
     addToast(t('toast.all_sources_visible'), 'info');
   };
   const resetFilters = () => {
-    setHours(24); setMinMeme(0); setCategory(''); setSource(''); setSort('rank'); setOffset(0);
+    setHours(24); setCategory(''); setSource(''); setSort('rank'); setOffset(0);
     addToast(t('toast.filters_reset'), 'info');
   };
 
   // Client-side search filter (doesn't reset pagination) + visual source filter
   const searchFiltered = search.trim()
-    ? trends.filter(t => {
-        const q = search.toLowerCase();
-        return (t.title || '').toLowerCase().includes(q)
-          || (t.originalTitle || '').toLowerCase().includes(q)
-          || (t.aiExplanation || '').toLowerCase().includes(q)
-          || (t.category || '').toLowerCase().includes(q);
-      })
+    // Search filtering moved server-side 2026-05-14 — client filter could
+    // only see top-LIMIT loaded trends, so items past page 1 became invisible
+    // at 24h+ windows. Server now applies the SQL filter, and pagination
+    // walks the filtered result set. Local var kept as pass-through to
+    // preserve the downstream consumer (visibleTrends) below.
+    ? trends
     : trends;
   let visibleTrends = hiddenSources.size
     ? searchFiltered.filter(t => !hiddenSources.has(t.source))
@@ -11935,6 +12031,16 @@ function App() {
         onClick: () => undoHide(pendingUndo.trend)
       }, t('toast.undo'))
     ) : null,
+
+    // Scroll-to-top button — appears bottom-right when user scrolls the
+    // main feed past the threshold. Click smooth-scrolls .main-feed to top.
+    showScrollTop ? h('button', {
+      type: 'button',
+      className: 'scroll-to-top',
+      onClick: scrollFeedToTop,
+      title: t('feed.scroll_top'),
+      'aria-label': t('feed.scroll_top'),
+    }, '↑') : null,
 
     // Bottom status bar removed 2026-05-02 — Live indicator + sources list
     // moved into RightPanel's Activity section so the dashboard reads as a
@@ -12167,7 +12273,10 @@ function App() {
             h('div', { className: 'sidebar-phase' },
               (function() {
                 const atypeArr = alertTypes ? alertTypes.split(',') : [];
-                const activeAll = atypeArr.length === 0;
+                // ALL is active only when NO axis is filtering — neither
+                // alert-type chips nor the Manual toggle. Otherwise the
+                // header lies (says "all" but feed is filtered).
+                const activeAll = atypeArr.length === 0 && !manualOnly;
                 const toggleAtype = (k) => {
                   const cur = alertTypes ? alertTypes.split(',') : [];
                   const next = cur.includes(k) ? cur.filter(x => x !== k) : [...cur, k];
@@ -12181,8 +12290,17 @@ function App() {
                     type: 'button',
                     className: 'phase-chip' + (activeAll ? ' active' : ''),
                     onClick: () => {
+                      // ALL = no filter on the type axis. Reset BOTH
+                      // alertTypes AND manualOnly so manual rows show up
+                      // alongside event/trend/post. Without the manualOnly
+                      // reset, a previously-enabled Manual chip kept the
+                      // feed locked to manual-only even after picking ALL.
                       setAlertTypes('');
                       try { localStorage.setItem('ts_alert_type_filter', ''); } catch (e) {}
+                      if (manualOnly) {
+                        setManualOnly(false);
+                        try { localStorage.setItem('ts_manual_only', '0'); } catch (e) {}
+                      }
                     }
                   }, h('span', { className: 'phase-chip-dot' }, '◆'),
                      h('span', { className: 'phase-chip-label' }, t('feed.filter.all'))
@@ -12226,7 +12344,7 @@ function App() {
 
             h('div', { className: 'sidebar-section' },
               h('span', null, t('sidebar.filters')),
-              (hours !== 24 || minMeme !== 0 || category || sort !== 'rank')
+              (hours !== 24 || category || sort !== 'rank')
                 ? h('span', { className: 'sidebar-section-link', onClick: resetFilters, title: t('tooltip.reset') }, t('sidebar.reset'))
                 : null
             ),
@@ -12258,22 +12376,9 @@ function App() {
                 )
               ),
 
-              // Adoption threshold (segmented)
-              h('div', { className: 'filter-group' },
-                h('div', { className: 'filter-label' },
-                  h('span', null, t('sidebar.adoption')),
-                  h('span', { className: 'filter-val' }, '≥ ' + minMeme)
-                ),
-                h('div', { className: 'seg-group seg-compact' },
-                  [0, 30, 50, 70, 85].map(v =>
-                    h('button', {
-                      key: v,
-                      className: 'seg-btn' + (minMeme === v ? ' active' : ''),
-                      onClick: () => { setMinMeme(v); setOffset(0); }
-                    }, v)
-                  )
-                )
-              ),
+              // Adoption threshold (segmented) — REMOVED 2026-05-14.
+              // The per-row Adoption bar in cards already conveys the score;
+              // gating the feed by it confused users more than it helped.
 
               // Category — custom styled dropdown (CategoryDropdown).
               // Replaced native <select> because chromium paints the option
