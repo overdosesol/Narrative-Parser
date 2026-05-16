@@ -14,6 +14,8 @@ import {
   validatePresetOverrides,
   readPresetTagsLocked,
   validatePresetTagsLocked,
+  readPresetAutoOverrides,
+  mergeOverrideBlobs,
 } from '../analysis/preset-config.js';
 import { runManualAnalysis } from '../analysis/manual-analysis.js';
 
@@ -319,6 +321,10 @@ class AdminServer {
       // Drop Twitter tweets older than this many hours before they enter the pipeline.
       // 0 disables the filter.
       twitterMaxAgeHours: 72,
+      // Drop TikTok videos older than this many days before they enter the pipeline.
+      // TikTok's /tag/<x> page is editorially ranked — Apify often surfaces 2023
+      // evergreen videos among current trends. 0 disables the filter. Default 7d.
+      tiktokMaxAgeDays: 7,
       // Cooldown for re-scoring already-scored items. If the same URL shows
       // up again AND was never alerted AND last_seen_at > this many hours ago,
       // the aggregator lets it through to AI again. 0 = disables re-analysis
@@ -327,6 +333,12 @@ class AdminServer {
       // AI Stage 2 gates — tune in UI to balance x_search cost vs coverage
       stage2Threshold: 60,
       stage2MaxCalls:  6,
+      // Cycle intervals — runtime-tunable since 2026-05-11. Defaults match
+      // env defaults (SCAN_INTERVAL_MINUTES=15, TIKTOK_CYCLE_INTERVAL_MINUTES=30).
+      // Picked up live: scan-cycle via self-rescheduling setTimeout in index.js,
+      // TikTok via _getCycleIntervalMinutes() each collect(). No restart needed.
+      scanIntervalMinutes:        15,
+      tiktokCycleIntervalMinutes: 30,
     };
     const merged = {};
     for (const [k, v] of Object.entries(numDefaults)) {
@@ -367,10 +379,17 @@ class AdminServer {
     // and live behind /api/preset-configs. Anything POSTed here gets silently
     // ignored if not in this list — clients should migrate.
     const allowedInt = {
-      twitterMaxAgeHours:     { min: 0, max: 720 },
-      rescoreCooldownHours:   { min: 0, max: 168 },
-      stage2Threshold:        { min: 0, max: 100 },
-      stage2MaxCalls:         { min: 0, max: 20  },
+      twitterMaxAgeHours:         { min: 0,  max: 720 },
+      tiktokMaxAgeDays:           { min: 0,  max: 60  },
+      rescoreCooldownHours:       { min: 0,  max: 168 },
+      stage2Threshold:            { min: 0,  max: 100 },
+      stage2MaxCalls:             { min: 0,  max: 20  },
+      // Cycle intervals — clamp ranges mirrored in index.js (readIntervalMs)
+      // and tiktok.js (_getCycleIntervalMinutes). Don't widen here without
+      // matching the runtime fallback paths — out-of-range DB values are
+      // silently ignored and the env default takes over.
+      scanIntervalMinutes:        { min: 5,  max: 60  },
+      tiktokCycleIntervalMinutes: { min: 10, max: 120 },
     };
     for (const [key, rules] of Object.entries(allowedInt)) {
       if (!(key in body)) continue;
@@ -462,10 +481,23 @@ class AdminServer {
       try { overrides = JSON.parse(raw) || {}; }
       catch (_) { overrides = {}; }
     }
+
+    // Effective config must mirror what production sees in `getActivePresetConfig`
+    // — that's `defaults → auto → manual` (3-layer). The pre-2026-05-12 admin UI
+    // only computed `defaults → manual`, completely ignoring the auto-tags
+    // layer. Result: after Wipe-manual the admin UI showed the hardcoded
+    // legacy tags (skibidi/dog-cat-animal/etc.) instead of the freshly
+    // refreshed Grok queries. Operator thought tag-refresh was broken,
+    // but really only the UI was lying — collectors on prod always merged
+    // all 3 layers correctly.
+    const autoOverrides = readPresetAutoOverrides(this.db);
+    const mergedForEffective = mergeOverrideBlobs(autoOverrides, overrides);
+
     return {
       defaults:    DEFAULT_PRESET_CONFIGS,
-      effective:   getEffectivePresetConfigs(overrides),
-      overrides,
+      effective:   getEffectivePresetConfigs(mergedForEffective),
+      overrides,        // manual layer — what the editing UI mutates
+      autoOverrides,    // auto layer — exposed for debug pane / future "Auto" inspector
       tagsLocked:  readPresetTagsLocked(this.db),
       fieldRanges: PRESET_FIELD_RANGES,
       presets:     PRESET_CONFIG_KEYS,
@@ -482,25 +514,57 @@ class AdminServer {
     const manualEmpty = Object.keys(cleaned).length === 0;
     const locksEmpty  = cleanedLocks !== null && Object.keys(cleanedLocks).length === 0;
 
-    // Clear-ALL panic semantics: manual overrides are empty AND lock-mask is
-    // also empty (or wasn't touched but client signals empty). Only then do
-    // we wipe the auto-overrides slot too. This means user can save just locks
-    // (with empty manual draft) without losing the auto-blob — locks-only save
-    // is a normal flow, not a panic.
-    const isPanicClear = manualEmpty && cleanedLocks !== null && locksEmpty;
-
+    // Manual layer save — empty draft just clears the slot. Auto-overrides
+    // and locks are independent slots; saving manual doesn't touch them.
+    // (Note: pre-2026-05-12 there was a "panic-clear" path here that wiped
+    // auto-overrides when both manual AND locks came in empty. Removed
+    // because we now have explicit "Wipe manual" + "Restore hardcoded"
+    // buttons in the UI — operator chooses intent, no implicit side effects.)
     if (manualEmpty) this.db.setSetting('presetConfigs', '');
     else             this.db.setSetting('presetConfigs', JSON.stringify(cleaned));
 
     if (cleanedLocks !== null) {
       this.db.setSetting('presetTagsLocked', locksEmpty ? '' : JSON.stringify(cleanedLocks));
     }
+  }
 
-    if (isPanicClear) {
-      // Panic-button — restore to known-good state if Grok auto-refresh
-      // produces bad tags or the whole concept fails.
-      this.db.setSetting('presetConfigsAuto', '');
+  // ── Restore hardcoded sources into manual layer ─────────────────────────
+  // Escape hatch: if Auto-tags goes off the rails (Grok hallucinations,
+  // bad reality-check, broken curator mode) — operator can one-click pin
+  // the hardcoded DEFAULT_PRESET_CONFIGS sources into manual layer. Since
+  // manual ALWAYS wins in merge order, this blocks any future auto-refresh
+  // from changing tags until operator clears manual again.
+  //
+  // Copies ONLY sources (reddit subreddits + twitter queries + tiktok
+  // hashtags) — not junk-penalties / alert-weights / cluster-similarity.
+  // Those manual overrides (if any) are preserved verbatim, only the
+  // sources sub-tree gets replaced. Locks untouched.
+  //
+  // Result: operator sees the legacy hardcoded tag-list (skibidi/delulu/
+  // dog-cat-animal/meme-viral/etc.) in effective config — known-good
+  // baseline, never silently mutated.
+  _restoreHardcodedPresetSources() {
+    let existingManual = {};
+    const raw = this.db.getSetting('presetConfigs', null);
+    if (raw) {
+      try { existingManual = JSON.parse(raw) || {}; }
+      catch (_) { existingManual = {}; }
     }
+
+    const next = JSON.parse(JSON.stringify(existingManual));
+    for (const preset of Object.keys(DEFAULT_PRESET_CONFIGS)) {
+      if (!next[preset]) next[preset] = {};
+      // Deep-clone the defaults.sources sub-tree so manual layer owns it
+      // and isn't a live reference into the imported constant.
+      next[preset].sources = JSON.parse(JSON.stringify(
+        DEFAULT_PRESET_CONFIGS[preset]?.sources || {}
+      ));
+    }
+
+    // Validate through the same path Save uses — guards against any
+    // accidental shape drift in DEFAULT_PRESET_CONFIGS.
+    const validated = validatePresetOverrides(next);
+    this.db.setSetting('presetConfigs', JSON.stringify(validated));
   }
 
   _getAiConfig() {
@@ -1060,6 +1124,19 @@ class AdminServer {
           return json(res, 400, { error: e.message });
         }
       }
+      // Restore hardcoded DEFAULT_PRESET_CONFIGS.sources into manual layer for
+      // ALL presets. Escape hatch when Auto-tags produces garbage or the
+      // operator wants to lock in the legacy known-good baseline. See
+      // `_restoreHardcodedPresetSources` for semantics. Does not touch
+      // auto-overrides or locks — only manual layer's sources sub-tree.
+      if (path === '/api/preset-configs/restore-hardcoded' && method === 'POST') {
+        try {
+          this._restoreHardcodedPresetSources();
+          return json(res, 200, { ok: true, ...this._getPresetConfigs() });
+        } catch (e) {
+          return json(res, 500, { error: e.message });
+        }
+      }
 
       // ── Tag auto-refresh — Grok-driven sources (subreddits + twitter keywords) ──
       // Phase 1: status / toggle / force-stub / circuit-breaker reset / history.
@@ -1453,7 +1530,7 @@ class AdminServer {
         return json(res, 200, { cfg, stats });
       }
       if (path === '/api/alert-scheduler' && method === 'POST') {
-        const body = await readJsonBody(req);
+        const body = await parseBody(req).catch(() => ({}));
         try {
           if (body.enabled !== undefined) {
             const v = (body.enabled === true || body.enabled === 1 || body.enabled === '1' || body.enabled === 'true') ? '1' : '0';
@@ -1489,7 +1566,7 @@ class AdminServer {
       }
       // Optional manual queue drop for a specific chat (admin force-flush).
       if (path === '/api/alert-scheduler/drop' && method === 'POST') {
-        const body = await readJsonBody(req);
+        const body = await parseBody(req).catch(() => ({}));
         const chatId = String(body.chatId || '').trim();
         if (!chatId) return json(res, 400, { error: 'chatId required' });
         const dropped = this.alertScheduler?.dropQueue?.(chatId) ?? 0;
@@ -2152,7 +2229,14 @@ async function api(path, method='GET', body=null) {
   const r = await fetch(BASE + path, opts);
   if (r.status === 401) throw Object.assign(new Error('Unauthorized'), { status: 401 });
   const data = await r.json();
-  if (!r.ok) throw new Error(data.error || 'API error');
+  if (!r.ok) {
+    // Surface server-side context (status + parsed body) on the thrown Error so
+    // callers can show rate-limit / cooldown details instead of generic "API
+    // error". Previously this swallowed 429s with reason='force_cooldown' into
+    // an uninformative flash — fixed 2026-05-16.
+    const msg = data.error || data.reason || ('HTTP ' + r.status);
+    throw Object.assign(new Error(msg), { status: r.status, body: data });
+  }
   return data;
 }
 
@@ -2908,6 +2992,27 @@ function ScannerConfigSection() {
       )
     ),
 
+    // Cycle intervals — runtime-tunable scan & TikTok cadence. Slider change
+    // applies on the NEXT cycle (no restart). Min/max clamps match the
+    // _setScannerConfig validator and runtime fallback paths in index.js +
+    // collectors/tiktok.js — keep them in sync if you widen here.
+    h('div', { className: 'scfg-section' },
+      h('h4', { className: 'scfg-h4' }, '⏱️ Интервалы циклов'),
+      h('p', { className: 'scfg-desc' },
+        'Как часто запускаются сборщики. Главный scan-cycle гонит collect → score → alerts ' +
+        'для Reddit / Twitter / Google / X Trends. TikTok идёт отдельным time-gated циклом ' +
+        '(дороже по Apify, поэтому реже). Изменения применяются на СЛЕДУЮЩЕМ цикле, без рестарта.'),
+      row('🔁 Главный scan-cycle (мин)', 'scanIntervalMinutes', 5, 60, 5,
+          cfg.scanIntervalMinutes + 'min'),
+      row('🎵 TikTok cycle (мин)',        'tiktokCycleIntervalMinutes', 10, 120, 5,
+          cfg.tiktokCycleIntervalMinutes + 'min'),
+      h('div', { style: { marginTop: 8, fontSize: 11, color: 'var(--muted)', lineHeight: 1.4 } },
+        '💡 5 мин scan — агрессивно, ловим хайп быстро, но Apify-расход ×3 от дефолта. ' +
+        '15 мин — рекомендуется. 30+ мин — экономия, но риск пропустить короткоживущие тренды. ' +
+        'TikTok 10 мин — дорого ($2/1K у clockworks). 30 мин — дефолт. 60+ мин — экономия для тихих ниш.'
+      ),
+    ),
+
     // Twitter age filter — orthogonal collector knob, stays global.
     h('div', { className: 'scfg-section' },
       h('h4', { className: 'scfg-h4' }, '🐦 Twitter — фильтр по возрасту'),
@@ -2917,6 +3022,19 @@ function ScannerConfigSection() {
         'не засоряем пайплайн старьём.'),
       row('⏳ Макс. возраст твита (часов)', 'twitterMaxAgeHours', 0, 720, 12,
           cfg.twitterMaxAgeHours === 0 ? '0 (off)' : cfg.twitterMaxAgeHours + 'h'),
+    ),
+
+    // TikTok age filter — TikTok /tag/<x> page surfaces evergreen videos
+    // alongside fresh trends, so we cap age explicitly. Default 7d.
+    h('div', { className: 'scfg-section' },
+      h('h4', { className: 'scfg-h4' }, '🎵 TikTok — фильтр по возрасту'),
+      h('p', { className: 'scfg-desc' },
+        'Видео старше указанного числа дней отбрасываются на входе. ' +
+        '0 = фильтр выключен. Рекомендуется 7 — TikTok тег-страница часто ' +
+        'подсовывает evergreen-ролики 2023 года, они проходят engagement-floor ' +
+        'и прилетают как свежий тренд.'),
+      row('⏳ Макс. возраст видео (дней)', 'tiktokMaxAgeDays', 0, 60, 1,
+          cfg.tiktokMaxAgeDays === 0 ? '0 (off)' : cfg.tiktokMaxAgeDays + 'd'),
     ),
 
     h('div', { className: 'scfg-section' },
@@ -6323,9 +6441,20 @@ function PresetConfigsPage() {
   };
 
   const getDefault = (preset, path) => walk(data?.defaults?.[preset], path);
+  // Mirror production's 3-layer merge (draft → auto → defaults) so the admin
+  // UI shows what collectors actually see. BEFORE 2026-05-16 this only walked
+  // draft → defaults, hiding the auto-overrides layer. That made the chip
+  // lists look empty when a user wiped manual edits but autoOverrides were
+  // populated — leading the operator to remove chips one-by-one, each removal
+  // writing an explicit empty array into draft that then REPLACED auto on save
+  // (deepMerge top-layer-wins for arrays). End result: collectors got zero
+  // queries for the active preset until manual got wiped via the Wipe-manual
+  // button.
   const getEffective = (preset, path) => {
     const fromDraft = walk(draft[preset], path);
     if (fromDraft !== undefined) return fromDraft;
+    const fromAuto = walk(data?.autoOverrides?.[preset], path);
+    if (fromAuto !== undefined) return fromAuto;
     return getDefault(preset, path);
   };
   const isOverridden = (preset, path) => walk(draft[preset], path) !== undefined;
@@ -6392,16 +6521,50 @@ function PresetConfigsPage() {
     flash('Сброшен пресет ' + preset, 'ok');
   };
 
-  const clearAll = () => {
+  // Wipe manual layer for ALL presets (lets Auto-tags work freely).
+  // Auto-overrides + locks stay intact — only the manual draft is cleared.
+  // Effective config falls back to auto+defaults until next manual edit.
+  const wipeManualAll = () => {
     setDraft({});
-    setLocked({});
-    flash('Все overrides и locks будут удалены при Save', 'ok');
+    flash('Manual слой будет очищен для всех пресетов при Save → auto+defaults станут effective', 'ok');
+  };
+
+  // Restore hardcoded DEFAULT_PRESET_CONFIGS.sources into manual layer.
+  // Escape hatch when Auto-tags produces garbage. Manual ALWAYS wins in
+  // merge order — so this pins legacy known-good tags and blocks any
+  // future auto-refresh from changing them. Direct backend call (immediate)
+  // rather than draft+save flow, because the action is destructive enough
+  // to warrant an explicit confirm dialog with no "preview" intermediate.
+  const restoreHardcoded = async () => {
+    // NB outer file is a template-literal-served SPA — newline-escape
+    // literals inside would break the parser. Use runtime fromCharCode(10)
+    // for newlines in user-facing strings here. See CLAUDE.md SPA trap.
+    const NL = String.fromCharCode(10) + String.fromCharCode(10);
+    if (!window.confirm(
+      'Восстановить hardcoded sources (subreddits / twitter queries / tiktok hashtags) ' +
+      'в manual слой для ВСЕХ пресетов?' + NL +
+      'После этого manual слой перекроет auto-tags для sources. Junk / alerts / cluster ' +
+      'overrides не задеваются. Locks тоже сохраняются.' + NL +
+      'Используй когда auto-tags сошёл с ума и нужен known-good baseline.'
+    )) return;
+    setSaving(true);
+    try {
+      const res = await api('/api/preset-configs/restore-hardcoded', 'POST', {});
+      setData(res);
+      setDraft(res.overrides || {});
+      setLocked(res.tagsLocked || {});
+      flash('Hardcoded sources восстановлены в manual слой', 'ok');
+    } catch (e) {
+      flash('Ошибка: ' + e.message, 'err');
+    } finally { setSaving(false); }
   };
 
   // ── Lock-mask mutators ─────────────────────────────────────────────────
-  // sourceType: 'reddit' | 'twitter'. For twitter, lockKey should be the
-  // keyword-part (без min_faves/-is:retweet) — the chip rendering layer
-  // computes this before passing to toggleLock.
+  // sourceType: 'reddit' | 'twitter' | 'tiktok'. The chip rendering layer
+  // (PChips) normalizes lockKey per sourceType before calling toggleLock:
+  //   reddit  — subreddit name as-is
+  //   twitter — keyword-part (без min_faves/-is:retweet)
+  //   tiktok  — lowercased hashtag, no leading "#"
   const toggleLock = (preset, sourceType, lockKey) => {
     setLocked(prev => {
       const next = JSON.parse(JSON.stringify(prev));
@@ -6565,6 +6728,11 @@ function PresetConfigsPage() {
           .replace(/\s*min_faves:\d+\s*/g, '')
           .replace(/\s*-is:retweet\s*/g, '')
           .trim();
+      } else if (path[1] === 'tiktok' && path[2] === 'hashtags') {
+        lockSourceType = 'tiktok';
+        // Lowercase + strip leading "#" — match the shape stored in
+        // presetConfigsAuto.sources.tiktok.hashtags by tag-refresher.
+        toLockKey = (item) => String(item || '').toLowerCase().replace(/^#+/, '').trim();
       }
     }
 
@@ -6673,9 +6841,18 @@ function PresetConfigsPage() {
       h('button', {
         className: 'btn btn-ghost btn-sm',
         disabled: saving,
-        onClick: clearAll,
-        title: 'Очистить overrides ВСЕХ пресетов',
-      }, '🗑 Clear ALL'),
+        onClick: wipeManualAll,
+        title: 'Очистить manual слой во всех пресетах → auto-tags + defaults станут effective. ' +
+               'Auto-overrides и locks НЕ задеваются. Используй для нормальной работы Auto-tags.',
+      }, '🧹 Wipe manual'),
+      h('button', {
+        className: 'btn btn-ghost btn-sm',
+        disabled: saving,
+        onClick: restoreHardcoded,
+        title: 'Записать hardcoded DEFAULT sources (subreddits / twitter queries / tiktok hashtags) ' +
+               'в manual слой ВСЕХ пресетов. Это перекроет auto-tags и зафиксирует legacy теги. ' +
+               'Используй когда auto-tags выдаёт мусор и нужен known-good baseline.',
+      }, '↩ Restore hardcoded'),
       msg ? h('div', { className: 'pcfg-status ' + msgKind }, msg) : null,
     ),
 
@@ -7155,15 +7332,21 @@ function TagRefreshPage() {
     if (!data) return;
     if (!confirm('Запустить refresh сейчас? Он съест ~$0.13 на токены grok-4.3 и пойдёт по всем 5 пресетам. Force-cooldown ' + data.forceCooldownHours + 'h.')) return;
     setBusy(true);
+    flash('Refresh запущен — ждём Grok-а по 5 пресетам, это может занять 5-20 мин. Не давай повторно.', 'ok');
     try {
       const r = await api('/api/tag-refresh/force', 'POST', {});
-      if (r.ok) {
-        flash('Refresh запущен — ' + r.results.length + ' пресетов обработано за ' + r.elapsedSec + 'с', 'ok');
-      } else {
-        flash('Заблокировано: ' + r.reason + (r.remainingMinutes ? ' (ещё ' + r.remainingMinutes + ' мин)' : ''), 'err');
-      }
+      // api() throws on !r.ok now — this success branch only fires on 200.
+      flash('Refresh готов — ' + r.results.length + ' пресетов обработано за ' + r.elapsedSec + 'с', 'ok');
       load();
-    } catch (e) { flash('Ошибка: ' + e.message, 'err'); }
+    } catch (e) {
+      // 429 = cooldown. body.remainingMinutes set by server.
+      if (e.status === 429 && e.body) {
+        const mins = e.body.remainingMinutes;
+        flash('Заблокировано: ' + e.body.reason + (mins ? ' (ещё ' + mins + ' мин до разблокировки)' : ''), 'err');
+      } else {
+        flash('Ошибка: ' + e.message, 'err');
+      }
+    }
     finally { setBusy(false); }
   };
 

@@ -72,6 +72,32 @@ Tiebreaker: independent voices on same topic → "trend"; just this one post goi
 4. Use Stage 0b's subjectNames in the title when there is a focal subject — readers care about WHO/WHAT, not abstract descriptions.
 5. Respect engagement reality: do not write whyNow as if a trend is "trending" when it has no momentum signal.
 
+━━━ FALLBACK SCORING (when GeminiScore line is MISSING) ━━━
+When the input has NO "GeminiScore (TRUST — ECHO into output)" line, Stage 0b
+either failed or was disabled for this trend. You must score conservatively
+because you cannot see the actual media — you only have the text.
+
+In this fallback mode, apply these CAPS on memePotential:
+  • Generic group-label titles ("Sea Animals sounds", "Farm Animal sounds",
+    "Herbivore Sounds", "Cute Pets Compilation", "Funny [Animals/Cats/Dogs]
+    Compilation", "[Topic] Sounds Trend", "Weird [Group] Sounds", etc.) —
+    these describe a CATEGORY of content, not a specific narrative. Cap
+    memePotential at 25. They are sound-format / compilation participation
+    plays, not story trends.
+  • TikTok source with no concrete subject named in title (no person, no
+    animal name, no event, no $TICKER) — cap memePotential at 35. Without
+    visual verification we cannot rule out scroll-bait.
+  • If the title has a concrete focal subject (named person / specific
+    animal with name / specific event / $TICKER) — score normally per the
+    rubric, but stay in the conservative band 35-65 unless engagement is
+    extraordinary AND the text reveals a clear story hook.
+  • In ALL fallback cases: explicitly note in "explanation" that Stage 0b
+    visual analysis was unavailable. This is an audit-trail signal for the
+    operator, not a user-facing apology.
+
+Numerical scores in fallback mode are YOUR judgment from the text alone —
+scoreOverride does not apply (there is no Stage 0b score to override).
+
 Always respond with ONLY valid JSON. No markdown, no preamble, no explanation outside the JSON array.`;
 
 export function buildAnalysisPrompt(trends) {

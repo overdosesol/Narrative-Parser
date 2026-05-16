@@ -19,7 +19,14 @@ const SCORE_EMOJI = (score) => {
  */
 export function formatTelegramAlert(trend, lang = 'en') {
   const t = getTranslations(lang);
-  const memePotential = trend.memePotential || 0;
+  // 2026-05-10 rebalance: header now leads with `alertScore` (composite \u2014
+  // the same number the admin DecisionsPage shows next to the threshold),
+  // not raw memePotential. memePotential is surfaced as a sub-line right
+  // below \u2014 labelled "Meme energy" \u2014 so the user still sees the meme-shape
+  // score that earned the alert, but doesn't mistake "97/100 meme energy"
+  // for "97/100 alert score".
+  const alertScore    = Math.round(trend.alertScore ?? 0);
+  const memePotential = Math.round(trend.memePotential || 0);
 
   // Subject names: collected once per alert, used to highlight in title /
   // whyNow / aiExplanation. Title is already wrapped in <b>, so we use <u>
@@ -33,7 +40,14 @@ export function formatTelegramAlert(trend, lang = 'en') {
   const typeChip = formatAlertTypeChip(trend.alertType, t);
   let msg = '';
   if (typeChip) msg += typeChip + '\n';
-  msg += t.alertHeader(memePotential) + '\n';
+  msg += t.alertHeader(alertScore) + '\n';
+  // Meme-energy hint \u2014 only when memePotential differs from alertScore by
+  // more than a few points (otherwise the line is redundant). Helps explain
+  // why a "47/100 ALERT" trend can still be on a top meme: the format itself
+  // is strong, just the engagement/emergence stack is mediocre.
+  if (Math.abs(memePotential - alertScore) >= 8 && t.alertMemeEnergy) {
+    msg += t.alertMemeEnergy(memePotential) + '\n';
+  }
   msg += DIV + '\n';
 
   // Single-line title. Historical note: earlier prompts returned both `title`

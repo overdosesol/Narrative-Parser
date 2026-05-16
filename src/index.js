@@ -509,8 +509,17 @@ async function runScanCycle() {
       (t.score || 0) >= minScoreToSave || (t.memePotential || 0) >= minScoreToSave
     );
     for (const trend of allToSave) {
-      // Mark as 'scored' so they are never re-sent through the AI pipeline
-      const trendId = db.saveTrend({ ...trend, pipelineStatus: 'scored' });
+      // pipeline_status governs isTrendSeen behaviour on the NEXT scan:
+      //   'scored'     → blocked (within rescoreCooldownHours) — AI got a real verdict
+      //   'save_only'  → always pass through — needs another shot at AI
+      //
+      // _aiUnavailable flag is set by scorer._fallback when the LLM provider
+      // returned 5xx / timeout / parse-error and we had to use heuristic
+      // scoring. We mark such trends 'save_only' so next scan re-attempts
+      // the AI call (and the alert-dispatcher.ai_score gate suppresses
+      // the bogus heuristic-only alert in the meantime).
+      const status = trend._aiUnavailable ? 'save_only' : 'scored';
+      const trendId = db.saveTrend({ ...trend, pipelineStatus: status });
       trend._dbId = trendId;
     }
     appState.cycleInProgress.save = allToSave.length;
@@ -594,16 +603,38 @@ async function runScanCycle() {
 }
 
 /**
- * Scheduler — runs scan cycle at configured interval
+ * Scheduler — runs scan cycle at configured interval.
+ *
+ * Runtime-tunable: reads `scanIntervalMinutes` from DB before each tick, so
+ * admin slider changes take effect on the NEXT cycle without restart. Falls
+ * back to `config.scanIntervalMinutes` (from SCAN_INTERVAL_MINUTES env, default
+ * 15) if DB setting is missing/invalid. Clamped to [5, 60] mins — see admin
+ * server `allowedInt` validator for the source-of-truth range.
+ *
+ * Replaced naive `setInterval` 2026-05-11 — that version locked the cadence
+ * to startup-time env; ползунок в админке требует self-rescheduling loop.
  */
 function startScheduler() {
-  const intervalMs = config.scanIntervalMinutes * 60 * 1000;
-  logger.info(`Scheduler started — scanning every ${config.scanIntervalMinutes} minutes`);
+  const readIntervalMs = () => {
+    const fromDb = Number(db.getSetting('scanIntervalMinutes'));
+    const minutes = Number.isFinite(fromDb) && fromDb >= 5 && fromDb <= 60
+      ? fromDb
+      : config.scanIntervalMinutes;
+    return minutes * 60 * 1000;
+  };
 
-  // Run immediately on startup
-  runScanCycle().then(() => {
-    setInterval(runScanCycle, intervalMs);
-  });
+  const initialMin = Math.round(readIntervalMs() / 60_000);
+  logger.info(`Scheduler started — scanning every ${initialMin} minutes (runtime-tunable via admin)`);
+
+  const scheduleNext = () => {
+    setTimeout(async () => {
+      try { await runScanCycle(); } catch (e) { logger.error(`Scheduled scan failed: ${e.message}`); }
+      scheduleNext();  // re-reads interval AFTER cycle finishes — picks up slider change
+    }, readIntervalMs());
+  };
+
+  // Run immediately on startup, then begin the self-rescheduling loop
+  runScanCycle().then(() => { scheduleNext(); });
 
   // Daily cleanup + reset alert counts at midnight
   const scheduleDailyTasks = () => {

@@ -793,18 +793,23 @@ export function readPresetTagsLocked(db) {
  * Sanitize a presetTagsLocked blob — strip unknown presets / sourceTypes,
  * coerce tags to string array, dedupe. Throws on outright-malformed input.
  *
- * Allowed sourceTypes: 'reddit', 'twitter'. (TikTok hashtags are NOT
- * locked-trackable in the current design — they're managed via live-discovery
- * + per-preset fallback list, not via tag-refresher.)
+ * Allowed sourceTypes: 'reddit', 'twitter', 'tiktok'.
+ * TikTok lock-mask added 2026-05-11 — Grok occasionally proposes k-pop fan
+ * tags / fandom-drama hashtags despite SYSTEM_PROMPT bans. Operator can now
+ * pin curated tags so they survive auto-refresh.
  *
- * For 'twitter' lock keys: callers should pass the keyword-part of the query
- * (without `min_faves:N` and `-is:retweet`) — that's how tag-refresher.js
- * matches locks against current/proposed Twitter keyword groups.
+ * Lock-key normalization per sourceType:
+ *  - 'reddit'  → subreddit name as-is (validatePresetTagsLocked is case-insensitive
+ *                but tag-refresher matches lowercase, so use lowercase keys).
+ *  - 'twitter' → keyword-part of the query (without `min_faves:N` and
+ *                `-is:retweet`) — tag-refresher's normalization.
+ *  - 'tiktok'  → lowercased hashtag, no leading "#" — same shape as
+ *                stored in `presetConfigsAuto.sources.tiktok.hashtags`.
  */
 export function validatePresetTagsLocked(input) {
   if (input == null) return {};
   if (!isObj(input)) throw new Error('presetTagsLocked: must be an object');
-  const allowedSourceTypes = new Set(['reddit', 'twitter']);
+  const allowedSourceTypes = new Set(['reddit', 'twitter', 'tiktok']);
   const out = {};
   for (const [preset, sourceMap] of Object.entries(input)) {
     if (!PRESET_KEYS.includes(preset)) continue;  // silently drop unknown presets
@@ -855,7 +860,7 @@ export function getActivePresetConfig(db, opts = {}) {
  * absent in BOTH simply don't appear in the merged result, and resolvePresetConfig
  * fills them from DEFAULT_PRESET_CONFIGS.
  */
-function mergeOverrideBlobs(auto, manual) {
+export function mergeOverrideBlobs(auto, manual) {
   const out = {};
   for (const preset of PRESET_KEYS) {
     const a = auto?.[preset];

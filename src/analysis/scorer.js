@@ -89,11 +89,22 @@ export function narrativeRankScore(e, a, feedbackBias = 0) {
  * is in line with this default.
  */
 export const DEFAULT_ALERT_WEIGHTS = {
-  weightMemePotential:  0.45, // AI-assessed meme quality (dominant signal)
+  // 2026-05-10 rebalance: meme bumped 0.45 → 0.60 so a top-meme trend (e.g.
+  // memePotential=97) doesn't get washed out by lukewarm side-signals on the
+  // way to alertScore. Was producing the "97 in TG, 58 in admin" disconnect:
+  // meme=97 × 0.45 only contributed +43.7 to alertScore, leaving the rest
+  // (engagement / emergence / feedback) to determine whether the alert fires
+  // — even though the user reads "97/100" in Telegram and expects top-tier.
+  // Now meme=97 × 0.60 = +58.2 carries most of the way; engagement/emergence
+  // refine on top. emergence 0.15→0.10 and feedback 0.15→0.05 absorb the
+  // shift; virality and twitter stay (0.20 / 0.05). Per-preset overrides
+  // still apply (`events` keeps meme low + emergence high — events care
+  // about timing, not meme-shape). Sum of positive weights ≈ 1.00 (was 1.00).
+  weightMemePotential:  0.60, // AI-assessed meme quality (dominant signal)
   weightVirality:       0.20, // AI/heuristic virality score
-  weightEmergence:      0.15, // cluster velocity + spread + ideaBoost
+  weightEmergence:      0.10, // cluster velocity + spread + ideaBoost
   weightTwitter:        0.05, // on-platform X signal
-  weightFeedback:       0.15, // global 👍/👎 bias on this trend (50 = neutral)
+  weightFeedback:       0.05, // global 👍/👎 bias on this trend (50 = neutral)
   weightJunk:           0.50, // subtracted: junk × this
   staleDecayPerHour:    2,    // points subtracted per hour of age (after grace)
   staleDecayGraceHours: 24,   // no stale penalty for trends younger than this
@@ -444,29 +455,47 @@ class Scorer {
       // already represents "high-signal" feedback. `topReason` is the highest-
       // weight reason text among voters (admin/pro win when multiple exist).
       // Reasons can be in any language; SYSTEM_PROMPT enforces English output.
+      //
+      // 2026-05-11: now also surfaces `aiExplanation` (the same 🤖 AI: line
+      // the voter saw in Telegram at vote time). Without it the model only
+      // saw a bare title like "Cow Fursuit Viral Warning" — which is a weak
+      // training signal because the title alone doesn't reveal the actual
+      // meme/topic shape. Echoing the AI blurb gives the model the same
+      // context the human had → fairer learning.
       const liked    = this.db.getLikedNarratives(7, 8);
       const disliked = this.db.getDislikedNarratives(7, 8);
 
       // Cap reason length per item — long rants would crowd out the rubric.
-      const fmtReason = (r) => {
-        if (!r) return '';
-        const clean = String(r).replace(/\s+/g, ' ').trim();
-        return clean.length > 120 ? ` — "${clean.slice(0, 117)}..."` : ` — "${clean}"`;
+      const truncate = (s, max) => {
+        if (!s) return '';
+        const clean = String(s).replace(/\s+/g, ' ').trim();
+        if (!clean) return '';
+        return clean.length > max ? clean.slice(0, max - 3) + '...' : clean;
+      };
+
+      // Multi-line entry: title+category on the head line, then optional
+      // AI/reason sub-lines. Indented so the structure stays readable when
+      // pasted into the system prompt. Skips sub-lines that are empty so old
+      // rows without ai_explanation just look like the previous format.
+      const fmtEntry = (sign, t) => {
+        const head = `  ${sign} "${t.title}" [${t.category}]`;
+        const subs = [];
+        const ai = truncate(t.aiExplanation, 160);
+        if (ai) subs.push(`      AI: ${ai}`);
+        const reason = truncate(t.topReason, 120);
+        if (reason) subs.push(`      reason: "${reason}"`);
+        return [head, ...subs].join('\n');
       };
 
       let ctx = '';
       if (liked.length > 0) {
         ctx += '\n\n━━━ USER PREFERENCES (apply these) ━━━';
         ctx += '\nUSER LIKED (boost similar narratives):';
-        ctx += '\n' + liked.map(t =>
-          `  + "${t.title}" [${t.category}]${fmtReason(t.topReason)}`
-        ).join('\n');
+        ctx += '\n' + liked.map(t => fmtEntry('+', t)).join('\n');
       }
       if (disliked.length > 0) {
         ctx += '\nUSER DISLIKED (penalize similar narratives):';
-        ctx += '\n' + disliked.map(t =>
-          `  - "${t.title}" [${t.category}]${fmtReason(t.topReason)}`
-        ).join('\n');
+        ctx += '\n' + disliked.map(t => fmtEntry('-', t)).join('\n');
       }
       return ctx;
     } catch (e) {
@@ -1291,6 +1320,14 @@ class Scorer {
         predictedLifespan:'unknown',
         isGenuinelyInteresting: true,
         alertType:        deriveAlertType(t),
+        // Mark this trend as "AI score is heuristic fallback, NOT real LLM
+        // output". Downstream uses this to:
+        //   (a) save with pipeline_status='save_only' instead of 'scored'
+        //       → isTrendSeen pass-through on next scan → re-attempt AI
+        //   (b) alert-dispatcher ai_score gate blocks alerts with no real
+        //       AI verdict (no "🤖 AI: AI unavailable" alerts in TG)
+        // Together: provider 503/timeout → skip alert + retry next cycle.
+        _aiUnavailable: true,
       };
     });
   }

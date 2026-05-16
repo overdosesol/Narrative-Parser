@@ -2114,8 +2114,17 @@ class TrendDatabase {
   // Schema returned: { title, category, user_feedback, topReason | null }
   getLikedNarratives(days = 7, limit = 10, minWeight = 0.5) {
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    // 2026-05-11: ai_explanation + why_now joined into the result so the
+    // scorer's feedback-context block can show the AI's own description of
+    // each narrative, not just title+category. Reason: a vote on
+    // "Cow Fursuit Viral Warning" without context is a weak training signal —
+    // models can't tell if the user liked the format, the topic, or the meme.
+    // Echoing the same blurb the user saw in Telegram (alertHeader → 🤖 AI:
+    // line) closes that gap.
     return this.db.prepare(`
       SELECT t.title, t.category, t.user_feedback,
+        t.ai_explanation AS aiExplanation,
+        t.why_now AS whyNow,
         (SELECT fv.reason FROM feedback_votes fv
          WHERE fv.trend_id = t.id AND fv.vote > 0 AND fv.reason IS NOT NULL AND TRIM(fv.reason) != ''
          ORDER BY fv.weight DESC, fv.created_at DESC LIMIT 1) AS topReason
@@ -2136,6 +2145,8 @@ class TrendDatabase {
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     return this.db.prepare(`
       SELECT t.title, t.category, t.user_feedback,
+        t.ai_explanation AS aiExplanation,
+        t.why_now AS whyNow,
         (SELECT fv.reason FROM feedback_votes fv
          WHERE fv.trend_id = t.id AND fv.vote < 0 AND fv.reason IS NOT NULL AND TRIM(fv.reason) != ''
          ORDER BY fv.weight DESC, fv.created_at DESC LIMIT 1) AS topReason
