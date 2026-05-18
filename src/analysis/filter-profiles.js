@@ -31,7 +31,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         30,
     celebNoisePenalty:   20,
     noMemeShapePenalty:  15,
-    noContentPenalty:     5,  // small nudge against text-only posts
+    noContentPenalty:    12,  // text-only nudge — stacked AFTER safe-override (2026-05-19)
     safeOverrideDivisor: 3,
     memeShapeBoost:      10,
   },
@@ -42,7 +42,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         40,
     celebNoisePenalty:   30,
     noMemeShapePenalty:  10,  // animals are already a meme-shape signal
-    noContentPenalty:     8,  // animal posts without media = stock-text noise
+    noContentPenalty:    15,  // animal posts without media = stock-text noise (no visual cute-factor)
     safeOverrideDivisor: 3,
     memeShapeBoost:      14,  // animal/absurd match → strong promotion to LLM
   },
@@ -53,7 +53,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         10,  // stan culture IS part of internet culture
     celebNoisePenalty:   20,
     noMemeShapePenalty:  25,  // meme-shape is required here
-    noContentPenalty:     6,
+    noContentPenalty:    12,
     safeOverrideDivisor: 3,
     memeShapeBoost:      12,
   },
@@ -64,7 +64,7 @@ export const FILTER_PROFILES = {
     kpopPenalty:         15,
     celebNoisePenalty:    0,  // ← celeb noise is the whole point
     noMemeShapePenalty:  20,
-    noContentPenalty:     5,
+    noContentPenalty:    10,
     safeOverrideDivisor: 3,
     memeShapeBoost:       6,  // celeb content rarely needs meme-shape promotion
   },

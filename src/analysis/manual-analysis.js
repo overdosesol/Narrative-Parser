@@ -29,8 +29,19 @@ import { resolveUrlToTrend } from './url-resolver.js';
 // persistence and a fresh process should not inherit stale analyses.
 
 const RESULT_CACHE = new Map();              // cacheKey → { trend, pipeline, ts, savedDbId|null }
-const CACHE_TTL_MS = 60 * 60 * 1000;         // 1 hour
+// TTL bumped 1h → 6h on 2026-05-17. Manual analysis now runs the FULL pipeline
+// (PreStage + clustered emergence + forced Stage 2) — Grok x-search alone is
+// ~$0.05 per call. 6h cache window lets the operator re-open AnalyzePanel
+// throughout a working day without paying twice for the same URL.
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000;     // 6 hours
 const CACHE_MAX_ENTRIES = 200;               // LRU-ish soft cap, expired entries swept on every miss
+
+// SQLite stores CURRENT_TIMESTAMP as 'YYYY-MM-DD HH:MM:SS' (space, no T).
+// Local helper avoids importing from dashboard/server.js. Keep in sync with
+// sqliteCutoff() in dashboard if the storage format ever changes.
+function sqliteCutoff(msAgo) {
+  return new Date(Date.now() - msAgo).toISOString().slice(0, 19).replace('T', ' ');
+}
 
 function cacheKeyFor(url) {
   // Lowercase trim — different cases / trailing whitespace are the same URL.
@@ -106,9 +117,13 @@ export function peekManualAnalysisCache(url) {
  *   cacheAgeMs: number,      0 on miss, otherwise milliseconds since the cached run
  * }>}
  */
-export async function runManualAnalysis({ scorer, db, url, save = false, useCache = true, logger = null, actorId = null }) {
+export async function runManualAnalysis({ scorer, db, url, clusterer = null, save = false, useCache = true, logger = null, actorId = null }) {
   if (!scorer) throw new Error('scorer is required');
   if (!db)     throw new Error('db is required');
+  // clusterer is OPTIONAL — when absent, emergence stays 0 (legacy behaviour).
+  // When provided (production path: all 3 call sites pass it from index.js),
+  // we compute emergence via clusterer.computeSingleTrendEmergence using the
+  // same formula scanner uses (breakout + ideaBoost + novelty path).
   const rawUrl = String(url || '').trim();
   if (!rawUrl) throw new Error('url is required');
 
@@ -164,9 +179,90 @@ export async function runManualAnalysis({ scorer, db, url, save = false, useCach
   const synthetic = await resolveUrlToTrend(rawUrl);
   if (!synthetic) throw new Error('Could not resolve URL metadata');
 
-  // Full scorer pipeline — Stage 1 batch + Stage 2 deep-dive when threshold met.
-  // PreStage is opportunistic (idempotency guard inside scorer).
-  const scored = await scorer.scoreTrends([synthetic]);
+  // ── PreStage (explicit) ───────────────────────────────────────────────────
+  // Normally scorer.scoreTrends auto-runs PreStage via its idempotency guard.
+  // We run it HERE explicitly so we have entityCanonical available for the
+  // DB lookup (novelty check) that drives emergence — those need to happen
+  // BEFORE scoring so clusterMetrics is set on the trend.
+  if (scorer.preStage && scorer.preStage.enabled) {
+    try {
+      await scorer.preStage.enrichBatch([synthetic]);
+    } catch (e) {
+      logger?.warn?.(`${tag} PreStage failed, continuing: ${e.message}`);
+    }
+  }
+
+  // ── Emergence computation (Variant A: lookup-based) ───────────────────────
+  // Scanner gets emergence from clusterer.route() which compares the trend
+  // against the rest of the batch + recent DB rows. Manual is single-trend
+  // and has no batch, so we approximate:
+  //   - Pull entityCanonical (PreStage output) or fall back to title-keywords
+  //   - Count similar trends in the last 6h via LIKE search on title + raw_metrics
+  //   - Pass count + isNovel flag to clusterer.computeSingleTrendEmergence,
+  //     which uses the same formula (breakout + ideaBoost + novelty path)
+  //     scanner uses — so a viral post hits the same score in manual as it
+  //     would in scanner. Spread inputs we can't measure (velocity, author
+  //     diversity) default to 0 — single-post viral content scores via the
+  //     breakout path, not spread.
+  if (clusterer && typeof clusterer.computeSingleTrendEmergence === 'function') {
+    let dbRecentCount = 0;
+    try {
+      const entity = synthetic.preStage?.nano?.entityCanonical;
+      // Use entityCanonical when available (PreStage gave us the canonical
+      // form). Fall back to longest meaningful word from the title — better
+      // than nothing for trends where nano is disabled or whiffs.
+      let needle = (entity && typeof entity === 'string' && entity.trim()) || '';
+      if (!needle) {
+        const words = String(synthetic.title || '')
+          .split(/\s+/)
+          .filter(w => w.length >= 5 && !/^https?$/i.test(w));
+        words.sort((a, b) => b.length - a.length);
+        needle = words[0] || '';
+      }
+      if (needle) {
+        const cutoff = sqliteCutoff(6 * 3600 * 1000);
+        const safe = needle.replace(/[\\%_]/g, c => '\\' + c);
+        const like = '%' + safe + '%';
+        const row = db.db.prepare(
+          `SELECT COUNT(*) as c FROM trends
+            WHERE last_seen_at > ?
+              AND (title LIKE ? ESCAPE '\\' OR raw_metrics LIKE ? ESCAPE '\\')`
+        ).get(cutoff, like, like);
+        dbRecentCount = Number(row?.c) || 0;
+      }
+    } catch (e) {
+      logger?.warn?.(`${tag} emergence lookup failed: ${e.message}`);
+    }
+    // isNovel matches scanner's threshold pattern: <=3 similar = novel territory.
+    const isNovel = dbRecentCount <= 3;
+    const emergenceScore = clusterer.computeSingleTrendEmergence(synthetic, {
+      isNovel, dbRecentCount,
+    });
+    // Set clusterMetrics so scorer picks it up at scorer.js:808 and stamps
+    // emergence on the final trend object identically to scanner output.
+    synthetic.clusterMetrics = {
+      ...(synthetic.clusterMetrics || {}),
+      emergenceScore,
+      isNovel,
+      dbRecentCount,
+      batchSize: 1,
+      batchAuthors: 1,
+      velocity: 0,
+      textVariation: 0,
+    };
+    logger?.info?.(`${tag} emergence=${emergenceScore} (isNovel=${isNovel}, dbRecentCount=${dbRecentCount})`);
+  }
+
+  // Full scorer pipeline — Stage 1 batch + Stage 2 deep-dive.
+  // PreStage already ran above, scorer's idempotency guard makes it a no-op.
+  //
+  // forceStage2:true bypasses the threshold/novelty gates so a user-pasted
+  // URL ALWAYS gets the full Grok x-search dive — even on low-meme posts.
+  // Manual path is single-trend + per-user daily cap (entitlements.manualAnalyze),
+  // so cost is bounded; running a guaranteed Stage 2 here is the whole
+  // point of "Analyze a post" (otherwise Story score is always 0 on weak
+  // memes, which makes the panel useless — operator's exact complaint).
+  const scored = await scorer.scoreTrends([synthetic], { forceStage2: true });
   const trend = scored[0] || synthetic;
 
   let dbId = null;

@@ -24,6 +24,48 @@
 
 import { DEFAULT_PROFILE, resolveProfile } from './filter-profiles.js';
 
+// ── Visual-content detection ────────────────────────────────────────────────
+//
+// Used by:
+//   1. junk-filter itself — `noContentPenalty` adds a junk score when a cluster
+//      has zero visual media.
+//   2. scorer.js — applies a memePotential/score multiplier when a single trend
+//      lacks media (the junk-filter signal alone only nudges alertScore, doesn't
+//      touch the meme/viral numbers shown in the dashboard).
+//
+// Inputs can be either:
+//   - cluster items   (have `.metrics.thumbnailUrl/imageUrl/videoUrl/imageUrls`,
+//                      plus defensive fallback at the item root)
+//   - a single trend  (same shape — clusterer copies item.metrics into trend)
+//
+// Returns true if ANY item in the array has at least one visual signal.
+export function hasVisualContent(items) {
+  if (!Array.isArray(items) || items.length === 0) return false;
+  return items.some(i => {
+    const m = i.metrics || {};
+    return Boolean(
+      m.thumbnailUrl
+      || m.imageUrl
+      || m.videoUrl
+      || (Array.isArray(m.imageUrls) && m.imageUrls.length > 0)
+      // Some collectors put image refs at the item root too — defensive.
+      || i.imageUrl
+      || i.videoUrl
+      || (Array.isArray(i.imageUrls) && i.imageUrls.length > 0)
+    );
+  });
+}
+
+// Sources that legitimately carry no media — penalty must not fire here.
+// google_trends is search-interest signal (bare keywords), no post body to
+// attach pictures to. Adding entries here is a deliberate "this source is
+// text-by-design" declaration.
+const TEXTLESS_SOURCES = new Set(['google_trends']);
+
+export function isTextlessSource(source) {
+  return TEXTLESS_SOURCES.has(String(source || '').toLowerCase());
+}
+
 // ── Pattern library ──────────────────────────────────────────────────────────
 
 const RE_POLITICS = /\b(election|elections|president|presidential|government|parliament|minister|senate|senator|congress|congressman|congresswoman|vote|voting|ballot|protest|protesters|protest(?:ing|ers)|war|warfare|military|coup|regime|chancellor|cabinet|diplomat|diplomacy|sanctions|treaty|nato|un\s+security|white\s+house|kremlin|capitol|legislation|lawmakers|lawmaker|judiciary|supreme\s+court|geopolitics|ceasefire|occupation|referendum)\b/i;
@@ -109,36 +151,29 @@ export function calculateJunkPenalty(items, clusterMetrics = {}, preset = null, 
   }
 
   // ── Penalty: text-only (no visual content) ────────────────────────
-  // Small nudge against posts that arrived without picture/video. The
-  // assumption: visual posts spread further on social media; pure-text
-  // posts in the modern feed are usually news copypasta or low-effort
-  // shower-thought tweets. Penalty stacks with others before safe-override.
+  // Posts that arrived without picture/video. Visual posts spread further
+  // on social media; pure-text posts in the modern feed are usually news
+  // copypasta or low-effort shower-thought tweets.
   //
   // Skipped when ALL items in the cluster are from sources that don't carry
   // media by design (google_trends — search-interest signal, no post body).
   // That keeps the penalty surgical: it targets twitter/reddit/tiktok where
   // a missing image IS a quality signal, not platform shape.
+  //
+  // IMPORTANT (2026-05-19): text-only is NOT folded into `raw` and therefore
+  // NOT divided by safeOverrideDivisor below. Reasoning: even if the text
+  // contains absurd/animal/meme regex hits, the FACT that the post lacks
+  // visual media doesn't disappear. Previously a tweet with the word "chaos"
+  // would trigger safe-override(÷3) and shrink the text-only penalty to ~2,
+  // making the signal cosmetic. Now text-only contributes its full value
+  // directly to the final junkPenalty, AFTER safe-override has been applied
+  // to the other penalty buckets.
+  let textOnlyAddition = 0;
   if (profile.noContentPenalty > 0) {
-    const textlessSource = (s) => s === 'google_trends';
-    const allTextlessByDesign = items.length > 0 && items.every(i => textlessSource(i.source));
-    if (!allTextlessByDesign) {
-      const hasVisual = items.some(i => {
-        const m = i.metrics || {};
-        return Boolean(
-          m.thumbnailUrl
-          || m.imageUrl
-          || m.videoUrl
-          || (Array.isArray(m.imageUrls) && m.imageUrls.length > 0)
-          // Some collectors put image refs at the item root too — defensive.
-          || i.imageUrl
-          || i.videoUrl
-          || (Array.isArray(i.imageUrls) && i.imageUrls.length > 0)
-        );
-      });
-      if (!hasVisual) {
-        raw += profile.noContentPenalty;
-        reasons.push('text-only');
-      }
+    const allTextlessByDesign = items.length > 0 && items.every(i => isTextlessSource(i.source));
+    if (!allTextlessByDesign && !hasVisualContent(items)) {
+      textOnlyAddition = profile.noContentPenalty;
+      reasons.push('text-only');
     }
   }
 
@@ -161,12 +196,16 @@ export function calculateJunkPenalty(items, clusterMetrics = {}, preset = null, 
   // ── Safe-signal override ───────────────────────────────────────────
   // Strong meme signals heavily offset the junk penalty.
   // E.g. "weird goat at government event" → politics penalty but animal overrides.
+  // Excludes text-only — that bucket is added AFTER this division.
   if (raw > 0 && hasMemeShape) {
     const baseDiv = profile.safeOverrideDivisor || 3;
     const divisor = signalCount >= 2 ? baseDiv + 1 : baseDiv;
     raw = Math.round(raw / divisor);
     reasons.push(`safe-override(÷${divisor})`);
   }
+
+  // ── Add text-only AFTER safe-override (intentional — see comment above) ─
+  raw += textOnlyAddition;
 
   return {
     junkPenalty:      Math.min(raw, 100),

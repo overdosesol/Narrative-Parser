@@ -276,7 +276,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 40, kpopPenalty: 30, celebNoisePenalty: 20,
-      noMemeShapePenalty: 20, noContentPenalty: 5, safeOverrideDivisor: 3, memeShapeBoost: 10,
+      noMemeShapePenalty: 20, noContentPenalty: 12, safeOverrideDivisor: 3, memeShapeBoost: 10,
     },
     alerts: {
       thresholds: { alertThreshold: 60, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 70 },
@@ -333,7 +333,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 60, kpopPenalty: 40, celebNoisePenalty: 30,
-      noMemeShapePenalty: 15, noContentPenalty: 8, safeOverrideDivisor: 3, memeShapeBoost: 14,
+      noMemeShapePenalty: 15, noContentPenalty: 15, safeOverrideDivisor: 3, memeShapeBoost: 14,
     },
     alerts: {
       thresholds: { alertThreshold: 55, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 70 },
@@ -409,7 +409,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 30, kpopPenalty: 10, celebNoisePenalty: 20,
-      noMemeShapePenalty: 25, noContentPenalty: 6, safeOverrideDivisor: 3, memeShapeBoost: 12,
+      noMemeShapePenalty: 25, noContentPenalty: 12, safeOverrideDivisor: 3, memeShapeBoost: 12,
     },
     alerts: {
       thresholds: { alertThreshold: 60, minScoreToSave: 10, maxAlertsPerCycle: 5, alertHardJunkStop: 75 },
@@ -466,7 +466,7 @@ export const DEFAULT_PRESET_CONFIGS = Object.freeze({
     },
     junk: {
       politicsPenalty: 40, kpopPenalty: 15, celebNoisePenalty: 0,
-      noMemeShapePenalty: 25, noContentPenalty: 5, safeOverrideDivisor: 3, memeShapeBoost: 10,
+      noMemeShapePenalty: 25, noContentPenalty: 10, safeOverrideDivisor: 3, memeShapeBoost: 10,
     },
     alerts: {
       thresholds: { alertThreshold: 70, minScoreToSave: 0, maxAlertsPerCycle: 5, alertHardJunkStop: 70 },

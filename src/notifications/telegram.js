@@ -82,7 +82,7 @@ function buildGrokUrl(trend, lang = 'en') {
  * Each user has their own language, sources, threshold, and subscription.
  */
 class TelegramNotifier {
-  constructor(config, logger, db, solanaMonitor = null, triggerFinder = null, scorer = null) {
+  constructor(config, logger, db, solanaMonitor = null, triggerFinder = null, scorer = null, clusterer = null) {
     this.logger = logger;
     this.botToken = config.telegram.botToken;
     this.db = db;
@@ -92,6 +92,9 @@ class TelegramNotifier {
     // Scorer for the pro/admin manual-analysis URL handler. Without it the
     // /analyze command and bare-URL handler reply with "feature unavailable".
     this.scorer = scorer;
+    // NarrativeClusterer — used by manual-analysis to compute emergence via
+    // lookup-based path (same formula scanner uses). null falls back to 0.
+    this.clusterer = clusterer;
     // AlertScheduler — wired post-construction by index.js (see setScheduler).
     // When the user toggles pause we ask the scheduler to drop their queued
     // alerts immediately. Optional: if scheduler isn't wired, pause toggle
@@ -1184,6 +1187,7 @@ class TelegramNotifier {
       const result = await runManualAnalysis({
         scorer: this.scorer,
         db: this.db,
+        clusterer: this.clusterer,
         url,
         save: false,                          // private - don't pollute global feed
         logger: this.logger,

@@ -426,6 +426,10 @@ class DashboardServer {
     // Scorer powers the pro/admin manual-analysis endpoint; without it the
     // endpoint replies 503 instead of crashing.
     this.scorer        = extras.scorer || null;
+    // NarrativeClusterer — used by manual-analysis to compute emergence via
+    // lookup-based path (same formula scanner uses, see clusterer.js
+    // computeSingleTrendEmergence). null falls back to legacy 0-emergence.
+    this.clusterer     = extras.clusterer || null;
     this.server        = null;
     this.started       = Date.now();
     this.sseClients    = new Set();  // active Server-Sent Event subscribers
@@ -1897,8 +1901,18 @@ class DashboardServer {
       const result = await runManualAnalysis({
         scorer: this.scorer,
         db: this.db,
+        clusterer: this.clusterer,
         url: rawUrl,
-        save: false,                          // private to caller, don't pollute global feed
+        // save:true so dashboard Analyze submissions land in the shared
+        // feed (same as admin's manual-submit path in admin/server.js).
+        // Previously save:false made the result private to the caller —
+        // operator complained that Analyze from dashboard never showed up
+        // in feed while admin manual-analysis did. Both paths now persist;
+        // the TG-broadcast on top of save still gates to the admin path
+        // (_submitNarrative) — dashboard never spams TG, just adds to feed.
+        // Rows get manualSubmitted=true → '🧪 MANUAL' badge in feed cards,
+        // so it's visually distinct from collector-found trends.
+        save: true,
         logger: this.logger,
         actorId: userId,
       });
@@ -1962,6 +1976,13 @@ class DashboardServer {
       if (!result.fromCache && shouldShowUsageCounter(planName) && ent.manualAnalyze > 0) {
         const used = (this._manualAnalysisHits.get(userId) || []).length;
         usage = { used, cap: ent.manualAnalyze, left: Math.max(0, ent.manualAnalyze - used) };
+      }
+      // Notify all connected dashboards that the feed changed — manual
+      // submissions now persist (save:true above), so other tabs / SSE
+      // clients should refetch to surface the new trend. Skip on cache
+      // hits where no new row was inserted.
+      if (!result.fromCache) {
+        try { this.broadcast('refresh', { at: Date.now() }); } catch (e) {}
       }
       return json(res, 200, {
         ok: true,
@@ -3711,6 +3732,71 @@ class DashboardServer {
       border: 1px dashed var(--border);
       border-radius: 12px;
     }
+    /* Stage loader — shown during /api/manual-analysis fetch. The pipeline
+       runs PreStage → Stage 1 → Stage 2 → finalize; backend doesn't stream
+       progress, so we advance the label client-side on a timer (rough
+       estimates per stage). Looks alive, sets honest expectations. */
+    .analyze-loader {
+      display: flex; flex-direction: column; align-items: center;
+      gap: 14px; padding: 36px 20px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(var(--accent-rgb), .05), rgba(var(--accent-rgb), .01));
+    }
+    .analyze-loader-spinner {
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      border: 3px solid rgba(var(--accent-rgb), .15);
+      border-top-color: rgba(var(--accent-rgb), .85);
+      animation: analyze-spin .9s linear infinite;
+    }
+    @keyframes analyze-spin { to { transform: rotate(360deg); } }
+    .analyze-loader-text {
+      font-size: 14px; font-weight: 700;
+      color: var(--text);
+      letter-spacing: .2px;
+      display: flex; align-items: center; gap: 4px;
+    }
+    /* Animated ellipsis — three dots that fade in/out one after another.
+       Renders inside the loader text to give a "thinking" cue without
+       reflowing layout (fixed width via inline-block). */
+    .analyze-loader-dots { display: inline-block; width: 22px; text-align: left; }
+    .analyze-loader-dots span {
+      display: inline-block;
+      opacity: 0;
+      animation: analyze-dot 1.2s ease-in-out infinite;
+    }
+    .analyze-loader-dots span:nth-child(2) { animation-delay: .15s; }
+    .analyze-loader-dots span:nth-child(3) { animation-delay: .30s; }
+    @keyframes analyze-dot {
+      0%, 80%, 100% { opacity: 0; }
+      40%           { opacity: 1; }
+    }
+    .analyze-loader-sub {
+      font-size: 11px; color: var(--dim);
+      letter-spacing: .3px;
+    }
+    /* Tiny per-stage breadcrumb under the main label — passive trail of
+       the 4 stages so the user can see roughly where in the pipeline we are
+       (current = accent dot, past = filled-dim, upcoming = outlined). */
+    .analyze-loader-trail {
+      display: flex; gap: 8px; margin-top: 4px;
+    }
+    .analyze-loader-trail-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: transparent;
+      border: 1px solid rgba(var(--accent-rgb), .25);
+      transition: background .25s ease, border-color .25s ease, transform .25s ease;
+    }
+    .analyze-loader-trail-dot.done {
+      background: rgba(var(--accent-rgb), .35);
+      border-color: rgba(var(--accent-rgb), .35);
+    }
+    .analyze-loader-trail-dot.active {
+      background: rgba(var(--accent-rgb), .85);
+      border-color: rgba(var(--accent-rgb), .85);
+      transform: scale(1.2);
+    }
     .analyze-result {
       background: linear-gradient(180deg, rgba(255,255,255,.025), rgba(255,255,255,.005));
       border: 1px solid var(--border);
@@ -3742,30 +3828,35 @@ class DashboardServer {
     .analyze-hero-title { font-size: 16px; font-weight: 800; color: var(--text); line-height: 1.3; margin-bottom: 4px; word-break: break-word; }
     .analyze-hero-meta { font-size: 11px; color: var(--dim); margin-bottom: 10px; }
     .analyze-hero-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    .analyze-trace { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 16px 0; }
-    .analyze-pill {
-      display: inline-flex; align-items: center;
-      padding: 3px 10px; border-radius: 999px;
-      font-size: 11px; font-weight: 700;
-      border: 1px solid var(--border);
-      background: rgba(255,255,255,.03);
-      color: var(--dim);
+    /* Verdict banner — top of the result card, biggest signal first.
+       Three flavours (high/mid/low) chosen from max(meme, adoption). Each
+       has a tinted gradient + coloured left-bar so the user gets the
+       headline answer ("will it go viral?") before scanning numbers. */
+    .analyze-verdict {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: 3px;
     }
-    .analyze-pill.ok {
-      color: var(--green);
-      border-color: color-mix(in srgb, var(--green) 38%, transparent);
-      background: color-mix(in srgb, var(--green) 12%, transparent);
+    .analyze-verdict.high {
+      background: linear-gradient(135deg, color-mix(in srgb, var(--green) 16%, transparent), color-mix(in srgb, var(--green) 3%, transparent));
+      border-left: 4px solid var(--green);
     }
-    .analyze-pill.warn {
-      color: var(--yellow);
-      border-color: color-mix(in srgb, var(--yellow) 38%, transparent);
-      background: color-mix(in srgb, var(--yellow) 10%, transparent);
+    .analyze-verdict.mid {
+      background: linear-gradient(135deg, color-mix(in srgb, var(--yellow) 16%, transparent), color-mix(in srgb, var(--yellow) 3%, transparent));
+      border-left: 4px solid var(--yellow);
     }
+    .analyze-verdict.low {
+      background: linear-gradient(135deg, rgba(255,120,73,.12), rgba(255,120,73,.02));
+      border-left: 4px solid #ff7849;
+    }
+    .analyze-verdict-title { font-size: 15px; font-weight: 800; color: var(--text); }
+    .analyze-verdict-sub   { font-size: 12px; color: var(--dim); line-height: 1.5; }
+
     .analyze-scores {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
       gap: 8px;
-      padding: 12px 16px;
+      padding: 14px 16px;
     }
     .analyze-score {
       background: var(--bg2);
@@ -3778,6 +3869,45 @@ class DashboardServer {
     .analyze-score.high .analyze-score-value { color: var(--green); }
     .analyze-score.mid  .analyze-score-value { color: var(--yellow); }
     .analyze-score.low  .analyze-score-value { color: #ff7849; }
+    /* Score progress bar — visual context for the bare number. */
+    .analyze-score-bar {
+      margin-top: 8px;
+      height: 4px;
+      background: rgba(255,255,255,.06);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .analyze-score-bar-fill {
+      height: 100%;
+      background: var(--blue);
+      transition: width .35s ease;
+    }
+    .analyze-score.high .analyze-score-bar-fill { background: var(--green); }
+    .analyze-score.mid  .analyze-score-bar-fill { background: var(--yellow); }
+    .analyze-score.low  .analyze-score-bar-fill { background: #ff7849; }
+    /* Qualitative tag (Low/Medium/High) — gives the bare number a verbal anchor
+       for users who don't know what 20/100 means at a glance. */
+    .analyze-score-tag {
+      margin-top: 6px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .3px;
+      text-transform: uppercase;
+      color: var(--dim);
+    }
+    .analyze-score.high .analyze-score-tag { color: var(--green); }
+    .analyze-score.mid  .analyze-score-tag { color: var(--yellow); }
+    .analyze-score.low  .analyze-score-tag { color: #ff7849; }
+
+    /* Footer — tiny technical note (deep-analysis status). Replaces the
+       old big "Stage 1 ✓ / Stage 2 ⏭ memePotential 20 < threshold 70"
+       pills which leaked engineer terminology onto the user surface. */
+    .analyze-footer {
+      padding: 10px 16px;
+      border-top: 1px solid var(--border);
+      background: rgba(255,255,255,.015);
+    }
+    .analyze-footer-text { font-size: 11px; color: var(--dim); }
     .analyze-explain {
       padding: 12px 16px 16px;
       border-top: 1px solid var(--border);
@@ -5643,23 +5773,28 @@ class DashboardServer {
        top-right .toast notification system (different purpose: actionable
        undo vs informational). 2026-05-02: bottom: 24 (was 64) since the
        statusbar strip is gone. Bottom-nav on mobile sits above this. */
-    /* Scroll-to-top — floating circular button bottom-right of the viewport.
-       Visible only when .main-feed scrolled past the threshold (state-driven
-       via showScrollTop). Sits above the feed but below modals/toasts. */
+    /* Scroll-to-top — floating circular button centered over the .main-feed
+       column (not the viewport — sidebars shift the visual middle).
+       Inline left value is set from JS (feedCenterX) and translateX(-50%)
+       here finishes the centering. Visible only when feed scrolled past
+       threshold. Hover/active transforms preserve translateX(-50%) so the
+       button doesn't jump horizontally on interaction. */
     .scroll-to-top {
       position: fixed;
-      right: 28px;
-      bottom: 28px;
-      width: 44px;
-      height: 44px;
+      top: 60px;
+      transform: translateX(-50%);
+      width: 22px;
+      height: 22px;
       border-radius: 50%;
       background: var(--surface);
       border: 1px solid var(--border3);
       color: var(--text);
       cursor: pointer;
       display: flex; align-items: center; justify-content: center;
-      font-size: 18px;
-      box-shadow: 0 6px 20px rgba(0,0,0,.5), var(--gloss-top);
+      font-size: 11px;
+      line-height: 1;
+      padding: 0;
+      box-shadow: 0 4px 12px rgba(0,0,0,.45), var(--gloss-top);
       z-index: 900;
       animation: scroll-to-top-in .18s ease-out;
       transition: transform .12s ease, background .12s ease, border-color .12s ease;
@@ -5667,12 +5802,12 @@ class DashboardServer {
     .scroll-to-top:hover {
       background: var(--surface-hover, var(--surface));
       border-color: rgba(var(--accent-rgb), .5);
-      transform: translateY(-2px);
+      transform: translate(-50%, -2px);
     }
-    .scroll-to-top:active { transform: translateY(0); }
+    .scroll-to-top:active { transform: translate(-50%, 0); }
     @keyframes scroll-to-top-in {
-      from { opacity: 0; transform: translateY(8px); }
-      to   { opacity: 1; transform: translateY(0); }
+      from { opacity: 0; transform: translate(-50%, -8px); }
+      to   { opacity: 1; transform: translate(-50%, 0); }
     }
 
     .undo-toast {
@@ -6467,16 +6602,32 @@ const I18N = {
     'nav.account': 'Account',
     'nav.analyze': 'Analyze',
     'nav.saved': 'Saved',
-    'analyze.title': 'Manual analysis',
-    'analyze.intro': 'Paste a Twitter / Reddit / TikTok / og:image URL — we will run it through the full pipeline (Stage 1 + Stage 2 Grok) and show the result. Pro only.',
-    'analyze.url_label': 'Post URL',
-    'analyze.url_placeholder': 'https://twitter.com/user/status/12345',
+    'analyze.title': 'Analyze a post',
+    'analyze.intro': "Paste a link to any X / Reddit / TikTok post (or any page with a preview image). We compare it to today's trends and tell you if it has viral potential.",
+    'analyze.url_label': 'Post link',
+    'analyze.url_placeholder': 'https://x.com/user/status/...',
     'analyze.run_btn': 'Analyze',
     'analyze.running': 'Analyzing...',
     'analyze.subtitle': 'Usually takes 10-30 seconds',
     'analyze.locked': 'Manual analysis is a Test/Pro feature.',
     'analyze.locked_tooltip': 'Available on Test/Pro plan',
     'analyze.locked_toast': '🔒 Manual analysis is available on Test/Pro',
+    'analyze.verdict_high':     '🔥 Strong viral potential',
+    'analyze.verdict_mid':      '📈 Some traction',
+    'analyze.verdict_low':      '💤 Unlikely to take off',
+    'analyze.verdict_sub_high': 'This post matches the patterns we see in narratives that explode.',
+    'analyze.verdict_sub_mid':  'There is a signal here, but the post has not broken out yet.',
+    'analyze.verdict_sub_low':  'Weak narrative signal and low engagement — probably not going viral.',
+    'analyze.score_meme':       'Viral potential',
+    'analyze.score_emerge':     'Emergence',
+    'analyze.score_adopt':      'Adoption',
+    'analyze.score_story':      'Story',
+    'analyze.score_low':        'Low',
+    'analyze.score_mid':        'Medium',
+    'analyze.score_high':       'High',
+    'analyze.why_label':        'Why this score',
+    'analyze.deep_ran':         'Deep analysis: completed',
+    'analyze.deep_skipped':     'Deep analysis: skipped (low signal — saved you a Grok call)',
     'fav.add_tooltip': 'Save to favorites',
     'fav.remove_tooltip': 'Remove from favorites',
     'fav.locked_tooltip': 'Favorites is a Pro feature',
@@ -6495,9 +6646,14 @@ const I18N = {
     'analyze.daily_cap': 'Daily limit reached (20 / 24h).',
     'analyze.error_prefix': 'Analysis failed: ',
     'analyze.open_full': 'Open full view',
-    'analyze.empty': 'Paste a URL above to run analysis.',
+    'analyze.empty': 'Paste a link above and hit Analyze to get started.',
     'analyze.from_cache': 'from cache · {min} min ago',
-    'analyze.fresh_run': 'fresh · {sec}s',
+    'analyze.fresh_run': 'analysed in {sec}s',
+    'analyze.open_link':  'Open original',
+    'analyze.stage_fetch':    'Fetching post metadata',
+    'analyze.stage_ai':       'Running AI analysis',
+    'analyze.stage_deep':     'Deep search via Grok',
+    'analyze.stage_finalize': 'Finalizing scores',
 
     // Time
     'time.just_now': 'just now',
@@ -6879,16 +7035,32 @@ const I18N = {
     'nav.account': 'Аккаунт',
     'nav.analyze': 'Анализ',
     'nav.saved': 'Избранное',
-    'analyze.title': 'Ручной анализ',
-    'analyze.intro': 'Закинь URL поста (Twitter / Reddit / TikTok / любой сайт с og:image) — прогоним через полный пайплайн (Stage 1 + Stage 2 Grok). Доступно только Pro.',
-    'analyze.url_label': 'URL поста',
-    'analyze.url_placeholder': 'https://twitter.com/user/status/12345',
+    'analyze.title': 'Анализ поста',
+    'analyze.intro': 'Вставь ссылку на пост из X / Reddit / TikTok (или любую страницу с превью-картинкой). Сравним с трендами сегодняшнего дня и скажем, есть ли шанс уйти в вирус.',
+    'analyze.url_label': 'Ссылка на пост',
+    'analyze.url_placeholder': 'https://x.com/user/status/...',
     'analyze.run_btn': 'Анализ',
-    'analyze.running': 'Анализ идёт...',
+    'analyze.running': 'Анализирую...',
     'analyze.subtitle': 'Обычно 10-30 секунд',
     'analyze.locked': 'Ручной анализ — на Test/Pro плане.',
     'analyze.locked_tooltip': 'Доступно на Test/Pro',
     'analyze.locked_toast': '🔒 Ручной анализ — на Test/Pro',
+    'analyze.verdict_high':     '🔥 Высокий вирусный потенциал',
+    'analyze.verdict_mid':      '📈 Есть потенциал',
+    'analyze.verdict_low':      '💤 Вряд ли разлетится',
+    'analyze.verdict_sub_high': 'Пост попадает в паттерны нарративов, которые взрываются.',
+    'analyze.verdict_sub_mid':  'Сигнал есть, но пост пока не пробил.',
+    'analyze.verdict_sub_low':  'Слабый нарратив и низкая вовлечённость — вирусности ждать не стоит.',
+    'analyze.score_meme':       'Вирусность',
+    'analyze.score_emerge':     'Emergence',
+    'analyze.score_adopt':      'Adoption',
+    'analyze.score_story':      'Story',
+    'analyze.score_low':        'Низкий',
+    'analyze.score_mid':        'Средний',
+    'analyze.score_high':       'Высокий',
+    'analyze.why_label':        'Почему такая оценка',
+    'analyze.deep_ran':         'Глубокий анализ: выполнен',
+    'analyze.deep_skipped':     'Глубокий анализ: пропущен (слабый сигнал — сэкономили Grok-запрос)',
     'fav.add_tooltip': 'В избранное',
     'fav.remove_tooltip': 'Убрать из избранного',
     'fav.locked_tooltip': 'Избранное — только на Pro',
@@ -6907,9 +7079,14 @@ const I18N = {
     'analyze.daily_cap': 'Лимит на сегодня исчерпан (20 / 24ч).',
     'analyze.error_prefix': 'Ошибка: ',
     'analyze.open_full': 'Открыть карточку',
-    'analyze.empty': 'Вставь URL выше чтобы запустить анализ.',
+    'analyze.empty': 'Вставь ссылку выше и нажми Анализ.',
     'analyze.from_cache': 'из кэша · {min} мин назад',
-    'analyze.fresh_run': 'свежий · {sec}с',
+    'analyze.fresh_run': 'анализ за {sec}с',
+    'analyze.open_link':  'Открыть оригинал',
+    'analyze.stage_fetch':    'Получаю данные поста',
+    'analyze.stage_ai':       'Запускаю AI-анализ',
+    'analyze.stage_deep':     'Глубокий поиск через Grok',
+    'analyze.stage_finalize': 'Финализирую скоры',
 
     // Time
     'time.just_now': 'только что',
@@ -8418,10 +8595,12 @@ function FeedCard({ trend, onOpen, onHide, onFavToggle, canFavorite }) {
 
   const avatarCls = SOURCE_ICONS[trend.source] ? (trend.source) : 'default';
 
-  // meta parts for sub row
+  // meta parts for sub row.
+  // Velocity removed from feed cards 2026-05-16 — it cluttered the row and
+  // the same number is available in the modal's Metrics section for users
+  // who want the per-hour growth rate. Velocity calc/update logic stays
+  // intact (modal still consumes trend.velocity).
   const metaParts = [];
-  const vel = fmtVelocity(velocity);
-  if (vel) metaParts.push(vel);
 
   // "Fresh" indicator — trends seen within the last 60 minutes get a tiny
   // pulse dot. Helps the eye lock onto what's actually new during a refresh.
@@ -8484,7 +8663,9 @@ function FeedCard({ trend, onOpen, onHide, onFavToggle, canFavorite }) {
             onClick: (e) => { e.stopPropagation(); onFavToggle(trend, e.currentTarget); }
           }, trend.isFavorite ? '★' : '☆') : null,
           h('span', { className: 'feed-user' }, srcLbl),
-          h('span', { className: 'feed-handle' }, handle),
+          // Handle (e.g. @twitter_x) removed from feed card 2026-05-16 — was
+          // synthetic per-source, not the real author handle, and added noise
+          // next to the platform label. Variable kept for ref by tools/grep.
           h('span', { className: 'feed-dot' }),
           h('span', { className: 'feed-time' }, fmtTime(recencyTs)),
           // Inline meta-hint (platforms / velocity) — replaced the fake-button
@@ -10001,6 +10182,21 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
+  // Stage index for the loader breadcrumb (0..3). Backend doesn't stream
+  // progress, so we advance on a client-side timer with estimates that
+  // roughly match real pipeline timing (PreStage ~3s, Stage 1 ~8-15s,
+  // Stage 2 ~30-50s, finalize ~1s). Resets to 0 on each run().
+  const [stageIdx, setStageIdx] = useState(0);
+  useEffect(() => {
+    if (!loading) { setStageIdx(0); return; }
+    setStageIdx(0);
+    // Estimated time-per-stage in ms — last stage sticks until response arrives.
+    const stops = [3000, 12000, 45000];
+    const timers = stops.map((ms, i) =>
+      setTimeout(() => setStageIdx(Math.min(i + 1, 3)), ms)
+    );
+    return () => timers.forEach(clearTimeout);
+  }, [loading]);
 
   const run = async () => {
     const clean = url.trim();
@@ -10033,7 +10229,25 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
   };
 
   const tr = result?.trend;
-  const memeCls = tr ? (tr.memePotential >= 70 ? 'high' : tr.memePotential >= 40 ? 'mid' : 'low') : '';
+  // Verdict level — driven by max(memePotential, adoptionScore). Buckets:
+  // high ≥70 / mid ≥40 / low. This is what powers the headline banner so
+  // the user gets a one-line answer ("will it go viral?") before scanning
+  // numbers. Same buckets reused per-score for the qualitative tags below.
+  const bucketOf = (v) => (v >= 70 ? 'high' : v >= 40 ? 'mid' : 'low');
+  const verdictLvl = tr
+    ? bucketOf(Math.max(tr.memePotential || 0, tr.adoptionScore || 0))
+    : 'low';
+
+  // Score cards spec — kept in data so the JSX below is just a .map().
+  // Three cards: Emergence / Adoption / Story (operator picked these 3 over
+  // the previous "Viral potential / Trending / Reach growth" trio).
+  // Story always rendered now — bar going to 0 reads as "no signal yet"
+  // which is the honest answer when Stage 2 hasn't run.
+  const scoreSpecs = tr ? [
+    { k: 'emerge', v: tr.emergenceScore || 0, icon: '🌊' },
+    { k: 'adopt',  v: tr.adoptionScore  || 0, icon: '🔥' },
+    { k: 'story',  v: tr.storyScore     || 0, icon: '📖' },
+  ] : [];
 
   return h('div', { className: 'analyze-panel' },
     h('div', { className: 'settings-header' },
@@ -10057,15 +10271,46 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
         h('button', { className: 'btn btn-primary', onClick: run, disabled: loading || !url.trim() },
           loading ? t('analyze.running') : ('🚀 ' + t('analyze.run_btn'))
         ),
-        loading ? h('span', { className: 'analyze-hint' }, t('analyze.subtitle')) : null,
         error ? h('span', { className: 'analyze-error' }, '⚠ ' + error) : null
       )
     ),
 
+    // Loading state — animated stage loader. Replaces the old single-line
+    // "Usually takes 10-30 seconds" hint. Stage label advances on a timer
+    // (PreStage → AI → Grok deep-dive → Finalize) plus a trailing 4-dot
+    // breadcrumb so the user sees roughly where the pipeline is.
+    loading ? (() => {
+      const stageKey = ['analyze.stage_fetch', 'analyze.stage_ai', 'analyze.stage_deep', 'analyze.stage_finalize'][stageIdx] || 'analyze.stage_finalize';
+      return h('div', { className: 'analyze-loader' },
+        h('div', { className: 'analyze-loader-spinner' }),
+        h('div', { className: 'analyze-loader-text' },
+          t(stageKey),
+          h('span', { className: 'analyze-loader-dots' },
+            h('span', null, '.'),
+            h('span', null, '.'),
+            h('span', null, '.')
+          )
+        ),
+        h('div', { className: 'analyze-loader-trail' },
+          [0, 1, 2, 3].map(i => {
+            const cls = i < stageIdx ? 'done' : (i === stageIdx ? 'active' : '');
+            return h('div', { key: i, className: 'analyze-loader-trail-dot ' + cls });
+          })
+        )
+      );
+    })() : null,
+
     !result && !loading && !error ? h('div', { className: 'analyze-empty' }, t('analyze.empty')) : null,
 
     result && tr ? h('div', { className: 'analyze-result' },
-      // Hero strip
+      // Verdict banner — top-of-card headline answer. Drives the user's
+      // entire takeaway before they scan individual scores. Coloured
+      // strip + gradient picks the level (high/mid/low).
+      h('div', { className: 'analyze-verdict ' + verdictLvl },
+        h('div', { className: 'analyze-verdict-title' }, t('analyze.verdict_' + verdictLvl)),
+        h('div', { className: 'analyze-verdict-sub' },   t('analyze.verdict_sub_' + verdictLvl))
+      ),
+      // Hero strip — thumbnail + title + quick actions.
       h('div', { className: 'analyze-hero' },
         tr.imageUrl
           ? h('img', { src: tr.imageUrl, alt: '', loading: 'lazy', className: 'analyze-thumb' })
@@ -10075,60 +10320,51 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
         h('div', { className: 'analyze-hero-body' },
           h('div', { className: 'analyze-hero-title' }, tr.title),
           h('div', { className: 'analyze-hero-meta' },
-            tr.source +
+            (SOURCE_LABELS[tr.source] || tr.source) +
             ' · ' + (result.fromCache
               ? t('analyze.from_cache', { min: Math.max(1, Math.round((result.cacheAgeMs || 0) / 60000)) })
               : t('analyze.fresh_run', { sec: (result.elapsedMs / 1000).toFixed(1) })) +
             (tr.category ? ' · ' + tr.category : '')
           ),
           h('div', { className: 'analyze-hero-actions' },
-            tr.url ? h('a', { href: tr.url, target: '_blank', rel: 'noopener', className: 'btn btn-ghost btn-sm' }, '🔗 ' + tr.source) : null,
+            tr.url ? h('a', { href: tr.url, target: '_blank', rel: 'noopener', className: 'btn btn-ghost btn-sm' }, '🔗 ' + t('analyze.open_link')) : null,
             h('button', { className: 'btn btn-primary btn-sm', onClick: () => onOpenTrend(tr) }, '👁 ' + t('analyze.open_full'))
           )
         )
       ),
-      // Pipeline trace
-      result.pipeline ? h('div', { className: 'analyze-trace' },
-        h('span', { className: 'analyze-pill ' + (result.pipeline.stage1Ran ? 'ok' : 'warn') },
-          (result.pipeline.stage1Ran ? '✓' : '✗') + ' Stage 1'
-        ),
-        h('span', {
-          className: 'analyze-pill ' + (result.pipeline.stage2Ran ? 'ok' : 'warn'),
-          title: result.pipeline.stage2SkipReason || 'Stage 2 ran',
-        }, (result.pipeline.stage2Ran ? '✓' : '⏭') + ' Stage 2' + (result.pipeline.stage2SkipReason ? ' — ' + result.pipeline.stage2SkipReason : ''))
+      // Score grid — number + progress bar. The bar gives spatial context
+      // (20/100 is clearly tiny). Qualitative tag (Low/Med/High) removed
+      // 2026-05-17 per operator — bar already does that job visually.
+      h('div', { className: 'analyze-scores' },
+        scoreSpecs.map(s => {
+          const lvl = bucketOf(s.v);
+          return h('div', { key: s.k, className: 'analyze-score ' + lvl },
+            h('div', { className: 'analyze-score-label' }, s.icon + ' ' + t('analyze.score_' + s.k)),
+            h('div', { className: 'analyze-score-value' }, (s.v || 0) + '/100'),
+            h('div', { className: 'analyze-score-bar' },
+              h('div', { className: 'analyze-score-bar-fill', style: { width: (s.v || 0) + '%' } })
+            )
+          );
+        })
+      ),
+      // AI explanation — relabelled from "AI" to "Why this score" so the
+      // section's job is obvious to a non-engineer reading the panel.
+      tr.aiExplanation ? h('div', { className: 'analyze-explain' },
+        h('div', { className: 'analyze-explain-label' }, '🤖 ' + t('analyze.why_label')),
+        h('div', { className: 'analyze-explain-body' }, tr.aiExplanation)
       ) : null,
-      // Test-plan usage counter — only set when server returned one (cache
-      // hits and non-test plans omit it). Tiny dim line, doesn't compete
-      // with the result content.
+      // Deep-analysis footer removed 2026-05-17 — even the trimmed one-liner
+      // ("Deep analysis: skipped — saved you a Grok call") was internal-talk
+      // that bored users. Verdict banner + score cards convey everything a
+      // non-engineer needs. Modal still has full pipeline trace for debugging.
+
+      // Test-plan usage counter — tiny line, only when server returned one
+      // (cache hits and non-test plans omit it).
       result.usage
         ? h('div', {
-            style: { marginTop: 8, fontSize: 11, color: 'var(--muted, #71767b)' }
+            style: { padding: '8px 16px 16px', fontSize: 11, color: 'var(--muted, #71767b)' }
           }, t('usage.test_left', { used: result.usage.used, cap: result.usage.cap, left: result.usage.left }))
-        : null,
-      // Score grid
-      h('div', { className: 'analyze-scores' },
-        h('div', { className: 'analyze-score ' + memeCls },
-          h('div', { className: 'analyze-score-label' }, '💎 Meme'),
-          h('div', { className: 'analyze-score-value' }, (tr.memePotential || 0) + '/100')
-        ),
-        h('div', { className: 'analyze-score' },
-          h('div', { className: 'analyze-score-label' }, '🌊 Emergence'),
-          h('div', { className: 'analyze-score-value' }, (tr.emergenceScore || 0) + '/100')
-        ),
-        h('div', { className: 'analyze-score' },
-          h('div', { className: 'analyze-score-label' }, '🔥 Adoption'),
-          h('div', { className: 'analyze-score-value' }, (tr.adoptionScore || 0) + '/100')
-        ),
-        (tr.storyScore || 0) > 0 ? h('div', { className: 'analyze-score' },
-          h('div', { className: 'analyze-score-label' }, '📖 Story'),
-          h('div', { className: 'analyze-score-value' }, tr.storyScore + '/100')
-        ) : null
-      ),
-      // AI explanation
-      tr.aiExplanation ? h('div', { className: 'analyze-explain' },
-        h('div', { className: 'analyze-explain-label' }, '🤖 AI'),
-        h('div', { className: 'analyze-explain-body' }, tr.aiExplanation)
-      ) : null
+        : null
     ) : null
   );
 }
@@ -11501,6 +11737,12 @@ function App() {
   // feed only mounts on the feed view — switching tabs remounts the node
   // and the listener has to re-attach to the fresh DOM element.
   const [showScrollTop, setShowScrollTop] = useState(false);
+  // Horizontal center of the .main-feed column in viewport-px. Used as
+  // inline "left" on the scroll-to-top button so it sits over the feed's
+  // visual middle, not the viewport's (sidebars are wide + draggable).
+  // Tracks via ResizeObserver on the feed element + window resize, so the
+  // button re-centers when the column resizer is dragged.
+  const [feedCenterX, setFeedCenterX] = useState(null);
   useEffect(() => {
     if (!me) return;                       // not authed yet, main isn't mounted
     const el = mainFeedRef.current;
@@ -11515,11 +11757,28 @@ function App() {
         ticking = false;
       });
     };
+    const recomputeCenter = () => {
+      const r = el.getBoundingClientRect();
+      setFeedCenterX(r.left + r.width / 2);
+    };
     el.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', recomputeCenter);
+    // ResizeObserver fires when the column resizer drags the sidebar and
+    // changes .main-feed's width without a window resize event.
+    let ro = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(recomputeCenter);
+      ro.observe(el);
+    }
     // Run once immediately in case feed is already scrolled (e.g. user
     // navigated away and came back — browser preserves scrollTop).
     onScroll();
-    return () => el.removeEventListener('scroll', onScroll);
+    recomputeCenter();
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', recomputeCenter);
+      if (ro) ro.disconnect();
+    };
   }, [me, view]);
   const scrollFeedToTop = useCallback(() => {
     const el = mainFeedRef.current;
@@ -12032,11 +12291,16 @@ function App() {
       }, t('toast.undo'))
     ) : null,
 
-    // Scroll-to-top button — appears bottom-right when user scrolls the
-    // main feed past the threshold. Click smooth-scrolls .main-feed to top.
-    showScrollTop ? h('button', {
+    // Scroll-to-top button — appears at the horizontal center of the feed
+    // column (not viewport) when user scrolls past the threshold. Click
+    // smooth-scrolls .main-feed to top. Inline left value from feedCenterX,
+    // updated by the scroll/resize/ResizeObserver effect above. While
+    // feedCenterX is null (very first paint before effect fires), suppress
+    // render — otherwise the button briefly flashes at left:0 viewport edge.
+    (showScrollTop && feedCenterX !== null) ? h('button', {
       type: 'button',
       className: 'scroll-to-top',
+      style: { left: feedCenterX + 'px' },
       onClick: scrollFeedToTop,
       title: t('feed.scroll_top'),
       'aria-label': t('feed.scroll_top'),
@@ -12168,7 +12432,23 @@ function App() {
                 ? h('span', { className: 'sidebar-section-link', onClick: showAllSources, title: t('tooltip.show_all') }, t('sidebar.show_all'))
                 : null
             ),
-            ...sources.map(s => {
+            // Sort sources by current 24h alert count (desc) so the busiest
+            // platform sits on top — operator's eye lands there first. Ties
+            // keep the original server order via stable Array.sort + original
+            // index as secondary key (Reddit > Google > Twitter/X > TikTok >
+            // X Trends — same as before when counts equal). Copy via slice()
+            // so we don't mutate React state (would cause hard-to-debug
+            // re-render loops with the SSE subscriber).
+            ...sources
+              .map((s, i) => ({ s, i }))
+              .sort((a, b) => {
+                const ca = a.s.last24h || 0;
+                const cb = b.s.last24h || 0;
+                if (cb !== ca) return cb - ca;
+                return a.i - b.i;
+              })
+              .map(({ s }) => s)
+              .map(s => {
               const visible = !hiddenSources.has(s.source);
               const cnt = s.last24h || 0;
               // Locked source = not in user's plan (Free can't toggle premium

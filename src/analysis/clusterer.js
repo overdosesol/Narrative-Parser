@@ -765,6 +765,38 @@ class NarrativeClusterer {
    * @param {object} m       — cluster-level metrics (spread signals)
    * @param {Array}  items   — raw cluster items (for breakout + ideaBoost signals)
    */
+  /**
+   * Public wrapper for the single-trend emergence path — used by
+   * runManualAnalysis() to score a user-pasted URL using the SAME formula
+   * scanner uses (so manual ≈ scanner on identical input).
+   *
+   * Spread inputs we can't actually measure in single-trend mode get
+   * conservative defaults: velocity=0 (no DB history), batchSize=1,
+   * textVariation=0, batchAuthors=1. Caller supplies isNovel + dbRecentCount
+   * derived from a DB lookup against entityCanonical / title (see
+   * manual-analysis.js — Variant A from the redesign plan). Breakout +
+   * ideaBoost then drive the bulk of the score from the trend's metrics.
+   *
+   * @param {object}  trend                  — single trend (with .metrics)
+   * @param {object}  [opts]
+   * @param {boolean} [opts.isNovel=true]     — DB says no similar narrative recently
+   * @param {number}  [opts.dbRecentCount=0]  — count of similar trends in last 6h
+   * @returns {number} emergence score 0–100
+   */
+  computeSingleTrendEmergence(trend, opts = {}) {
+    const isNovel = opts.isNovel !== false;
+    const dbRecentCount = Math.max(0, Number(opts.dbRecentCount) || 0);
+    const m = {
+      velocity:      0,
+      batchSize:     1,
+      textVariation: 0,
+      isNovel,
+      dbRecentCount,
+      batchAuthors:  1,
+    };
+    return this._computeEmergenceScore(m, [trend]);
+  }
+
   _computeEmergenceScore(m, items = []) {
     // ── Path 1: spread-based ──────────────────────────────────────────────
     let spreadScore = 0;

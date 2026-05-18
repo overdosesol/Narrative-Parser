@@ -63,7 +63,7 @@ const triggerFinder = new TriggerFinder(config, logger);
 
 // ── Initialize Telegram Bot ─────────────────────────────────────────────────
 // scorer is passed for the pro/admin /analyze + bare-URL manual-analysis flow.
-const telegram = new TelegramNotifier(config, logger, db, null, triggerFinder, scorer); // solanaMonitor injected below
+const telegram = new TelegramNotifier(config, logger, db, null, triggerFinder, scorer, clusterer); // solanaMonitor injected below; clusterer used by manual-analysis emergence path
 
 // ── Alert scheduler (per-user FIFO cooldown queue) ──────────────────────────
 // Paces outgoing Telegram alerts so a single user doesn't get 5 pings/sec from
@@ -327,12 +327,13 @@ try {
 }
 
 // ── Initialize dashboard ────────────────────────────────────────────────────
-const dashboard = new DashboardServer(config, logger, db, appState, () => runScanCycle(), telegram, triggerFinder, { scorer });
+const dashboard = new DashboardServer(config, logger, db, appState, () => runScanCycle(), telegram, triggerFinder, { scorer, clusterer });
 dashboard.start();
 
 // ── Initialize admin panel ──────────────────────────────────────────────────
 const admin = new AdminServer(config, logger, db, telegram.bot, appState, () => runScanCycle(), {
   scorer,
+  clusterer,      // used by manual-submit to compute emergence (same formula as scanner)
   telegram,       // full wrapper — needed for sendAlertToUser + attachXButton
   triggerFinder,  // optional Grok deep-search; SubmitPage button → /api/trends/:id/trigger
   hotRefresher,   // status reads + manual trigger from admin /api/hot-refresh/*
@@ -597,6 +598,11 @@ async function runScanCycle() {
     appState.cycleStartedAt = null;
     setPipelineStage('idle');
     appState.scanRunning = false;
+    // Persist the wall-clock timestamp of this completion so a deploy/restart
+    // doesn't trigger an immediate scan — the scheduler reads this on boot
+    // and waits out the remaining slice of the interval instead of kicking
+    // off a fresh full cycle (which was wasteful after every deploy).
+    try { db.setSetting('lastScanCompletedAt', String(Date.now())); } catch (e) {}
     // Notify all connected dashboard clients that fresh data is available
     try { dashboard.broadcast('refresh', { at: Date.now() }); } catch (e) {}
   }
@@ -633,8 +639,32 @@ function startScheduler() {
     }, readIntervalMs());
   };
 
-  // Run immediately on startup, then begin the self-rescheduling loop
-  runScanCycle().then(() => { scheduleNext(); });
+  // Deploy-aware boot: if a previous run completed less than `interval` ago,
+  // wait out the REMAINING slice instead of running a fresh scan immediately.
+  // Keeps the cadence stable across deploys — restart no longer burns a full
+  // collector+scorer cycle every time we ship code. Saved on every cycle's
+  // finally block (see runScanCycle). Missing/zero → first boot ever → scan now.
+  const lastScanAt = Number(db.getSetting('lastScanCompletedAt', '0')) || 0;
+  const intervalMs = readIntervalMs();
+  const sinceLast  = Date.now() - lastScanAt;
+  if (lastScanAt > 0 && sinceLast >= 0 && sinceLast < intervalMs) {
+    const remaining = intervalMs - sinceLast;
+    const ageMin    = Math.round(sinceLast / 60_000);
+    const waitMin   = Math.max(1, Math.round(remaining / 60_000));
+    logger.info(`Resuming after restart — last scan ${ageMin}m ago, next in ~${waitMin}m`);
+    setTimeout(async () => {
+      try { await runScanCycle(); } catch (e) { logger.error(`Scheduled scan failed: ${e.message}`); }
+      scheduleNext();
+    }, remaining);
+  } else {
+    // First boot OR interval already elapsed while down — run a scan now and
+    // start the self-rescheduling loop. `sinceLast < 0` (clock skew → future
+    // timestamp) also falls here, treated as "stale, scan now".
+    if (lastScanAt > 0) {
+      logger.info(`Interval elapsed during downtime (${Math.round(sinceLast/60_000)}m since last scan) — scanning now`);
+    }
+    runScanCycle().then(() => { scheduleNext(); });
+  }
 
   // Daily cleanup + reset alert counts at midnight
   const scheduleDailyTasks = () => {

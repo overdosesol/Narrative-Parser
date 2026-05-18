@@ -33,6 +33,60 @@ export function deriveAlertType(trend) {
 }
 // [MARKET_STAGE] optional import — remove this line + applyStage2MarketPatch call to disable
 import { applyStage2MarketPatch } from './market-stage.js';
+import { hasVisualContent, isTextlessSource } from './junk-filter.js';
+
+// ─── Text-only meme/viral multiplier (post-Stage 2) ───────────────────────────
+//
+// junk-filter's `noContentPenalty` only flows into `junkPenalty` → alertScore
+// arithmetic. It does NOT touch `memePotential` or `score` — the two numbers
+// users actually see on the card. So a text-only viral tweet would still show
+// `meme=100 viral=100` even after junk firing, which is confusing.
+//
+// This multiplier closes that loop. After Stage 1+2 finalize, if the trend
+// comes from a social source AND has no visual media AND its platform isn't
+// textless-by-design (e.g. google_trends), we knock memePotential & score down
+// by 35%. Rationale: a text-only tweet/reddit post is materially less
+// "memeable" — nothing to screenshot or repost — even if the wording slaps.
+//
+// Mirrors the existing Stage 2 `penaltyMult` block in shape, but runs for
+// EVERY trend (Stage 1 + Stage 2) so the signal hits regardless of whether
+// Stage 2 actually ran. Stored on `trend.textOnlyPenalty` for admin/UI surfacing.
+const TEXT_ONLY_MEME_MULT = 0.65;
+const SOCIAL_SOURCES_FOR_TEXT_ONLY = new Set([
+  'twitter', 'reddit', 'tiktok', 'instagram', 'threads', 'bluesky',
+]);
+
+function applyTextOnlyMultiplier(trend, logger = null) {
+  const src = String(trend?.source || '').toLowerCase();
+  if (!SOCIAL_SOURCES_FOR_TEXT_ONLY.has(src)) return;
+  if (isTextlessSource(src)) return; // belt-and-suspenders
+  // Check visual presence on the trend itself; if it was clustered, also
+  // inspect items so we don't penalize a thread where the lead post is
+  // text but a sibling has the picture.
+  const candidates = [trend];
+  if (Array.isArray(trend.items) && trend.items.length > 0) {
+    candidates.push(...trend.items);
+  }
+  if (hasVisualContent(candidates)) return;
+
+  const beforeMeme  = Number(trend.memePotential) || 0;
+  const beforeViral = Number(trend.score) || 0;
+  if (beforeMeme === 0 && beforeViral === 0) return;
+
+  trend.memePotential = Math.round(beforeMeme  * TEXT_ONLY_MEME_MULT);
+  trend.score         = Math.round(beforeViral * TEXT_ONLY_MEME_MULT);
+  trend.textOnlyPenalty = {
+    multiplier: TEXT_ONLY_MEME_MULT,
+    memeBefore:  beforeMeme,
+    memeAfter:   trend.memePotential,
+    viralBefore: beforeViral,
+    viralAfter:  trend.score,
+  };
+  logger?.info?.(
+    `Text-only penalty "${trend.title}": ×${TEXT_ONLY_MEME_MULT} ` +
+    `meme ${beforeMeme}→${trend.memePotential} viral ${beforeViral}→${trend.score}`
+  );
+}
 
 // ─── Emergence + Adoption helpers (used by scorer and server) ─────────────────
 
@@ -510,8 +564,14 @@ class Scorer {
    * Stage 1: base AI scoring (no tools) in sub-batches of 8
    * Stage 2: x_search deep-dive for trends with memePotential >= 78 (max 3 per cycle)
    */
-  async scoreTrends(trends) {
+  // opts.forceStage2 — bypass the 3 Stage 2 gates (memePotential threshold,
+  // google_trends skip, isNovel !== false). Used by manual-analysis path
+  // so a user-pasted URL ALWAYS gets the full Grok x-search deep-dive,
+  // even on a slow/low-meme post. Scanner path leaves this off — gates
+  // matter there for cost control across 100s of trends per cycle.
+  async scoreTrends(trends, opts = {}) {
     if (trends.length === 0) return trends;
+    const forceStage2 = opts && opts.forceStage2 === true;
 
     const runtime = this._getRuntimeAiConfig();
     const changed = !this.current ||
@@ -602,12 +662,20 @@ class Scorer {
     const stage2MaxCalls  = readNum('stage2MaxCalls',  this.stage2MaxCalls);
 
     // ── Stage 2: x_search deep-dive for high-potential trends ──
-    // Gates: threshold (default 60), max (default 6), skip google_trends, novelty gate
+    // Gates: threshold (default 60), max (default 6), skip google_trends, novelty gate.
+    // forceStage2 (manual-analysis path) bypasses the threshold and novelty
+    // gates so a user-pasted URL always gets Story score even on low-meme
+    // posts. The google_trends skip stays even with force — Stage 2 needs an
+    // article/post URL to x_search, gtrends entries are bare keywords and
+    // Grok can't deep-dive them. stage2MaxCalls cap also still applies;
+    // manual is single-trend so cap-vs-1 doesn't matter in practice.
     const stage2Candidates = stage1Results
       .filter(t =>
-        t.memePotential >= stage2Threshold &&
         t.source?.toLowerCase() !== 'google_trends' &&
-        t.clusterMetrics?.isNovel !== false
+        (forceStage2 || (
+          t.memePotential >= stage2Threshold &&
+          t.clusterMetrics?.isNovel !== false
+        ))
       )
       .slice(0, stage2MaxCalls);
 
@@ -676,6 +744,14 @@ class Scorer {
       stage2Provider:  'xai',
       stage2Model:     this.stage2Model,
     };
+
+    // ── Post-pass: text-only meme/viral multiplier ─────────────────────────
+    // Runs for every trend (Stage 1 + Stage 2) AFTER all AI stages have
+    // finalized memePotential/score. See applyTextOnlyMultiplier docblock.
+    for (const t of stage1Results) {
+      try { applyTextOnlyMultiplier(t, this.logger); }
+      catch (e) { this.logger?.warn?.(`textOnly multiplier threw for "${t?.title}": ${e.message}`); }
+    }
 
     return stage1Results;
   }

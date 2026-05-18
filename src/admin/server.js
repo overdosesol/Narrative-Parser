@@ -109,6 +109,7 @@ class AdminServer {
     // Injected components for the manual-submit feature (POST /api/submit-narrative).
     // All optional — handlers return 503 when missing.
     this.scorer = extras.scorer || null;
+    this.clusterer = extras.clusterer || null;   // NarrativeClusterer instance — used by manual-submit to compute emergence (lookup-based path) so manual ≈ scanner on identical input.
     this.telegram = extras.telegram || null;
     this.triggerFinder = extras.triggerFinder || null;  // Grok deep-search for SubmitPage trigger button
     this.hotRefresher = extras.hotRefresher || null;    // periodic re-fetch + re-score loop (status + manual trigger)
@@ -5730,8 +5731,9 @@ function ManualResultCard({ result, comment, setComment, onAlertSent }) {
             '🏷 Subject: ', React.createElement('b', { style: { color: 'var(--text)' } }, '"' + t.xSearchData.subjectName + '"'),
             ' · strength ', React.createElement('b', { style: { color: 'var(--text)' } }, t.xSearchData.nameStrength)
           ),
-          (t.stage2Penalty || t.stage2StoryBonus || t.stage2NameBonus) && React.createElement('div', { style: { fontSize: 11, color: 'var(--text2)', marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(56,189,248,.18)' } },
-            t.stage2Penalty && t.stage2Penalty.mult < 1 && React.createElement('div', null, '⛔ Penalty ×' + t.stage2Penalty.mult.toFixed(2) + (t.stage2Penalty.reasons?.length ? ' (' + t.stage2Penalty.reasons.join(', ') + ')' : '')),
+          (t.stage2Penalty || t.stage2StoryBonus || t.stage2NameBonus || t.textOnlyPenalty) && React.createElement('div', { style: { fontSize: 11, color: 'var(--text2)', marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(56,189,248,.18)' } },
+            t.stage2Penalty && t.stage2Penalty.multiplier < 1 && React.createElement('div', null, '⛔ Penalty ×' + t.stage2Penalty.multiplier.toFixed(2) + (t.stage2Penalty.reasons?.length ? ' (' + t.stage2Penalty.reasons.join(', ') + ')' : '')),
+            t.textOnlyPenalty && t.textOnlyPenalty.multiplier < 1 && React.createElement('div', null, '📝 Text-only ×' + t.textOnlyPenalty.multiplier.toFixed(2) + ' — meme ' + t.textOnlyPenalty.memeBefore + '→' + t.textOnlyPenalty.memeAfter + ', viral ' + t.textOnlyPenalty.viralBefore + '→' + t.textOnlyPenalty.viralAfter),
             t.stage2StoryBonus && t.stage2StoryBonus.bonus > 0 && React.createElement('div', null, '📖 Story bonus +' + t.stage2StoryBonus.bonus + ' (story score ' + t.stage2StoryBonus.storyScore + ')'),
             t.stage2NameBonus  && t.stage2NameBonus.bonus  > 0 && React.createElement('div', null, '🏷 Name bonus +'  + t.stage2NameBonus.bonus  + ' (strength '   + t.stage2NameBonus.nameStrength + ')')
           )
@@ -7588,6 +7590,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
     const result = await runManualAnalysis({
       scorer: this.scorer,
       db: this.db,
+      clusterer: this.clusterer,
       url: rawUrl,
       save: true,           // admin path → adds the trend to the global feed
       logger: this.logger,
@@ -7718,6 +7721,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
       stage2Penalty:    metrics.stage2Penalty    || null,
       stage2StoryBonus: metrics.stage2StoryBonus || null,
       stage2NameBonus:  metrics.stage2NameBonus  || null,
+      textOnlyPenalty:  metrics.textOnlyPenalty  || null,
       // Cluster routing inputs (snapshot at scoring time).
       clusterMetrics:   metrics.clusterMetrics   || null,
       // Stage 1 viralityScore lives in raw_metrics for non-current rows; the
@@ -7769,6 +7773,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
       stage2Penalty: trend.stage2Penalty || null,
       stage2StoryBonus: trend.stage2StoryBonus || null,
       stage2NameBonus: trend.stage2NameBonus || null,
+      textOnlyPenalty: trend.textOnlyPenalty || null,
       clusterMetrics: trend.clusterMetrics || null,
       memeShapeSignals: trend.metrics?.memeShapeSignals || trend.memeShapeSignals || null,
       junkReasons: trend.clusterMetrics?.junkReasons || trend.metrics?.junkReasons || trend.junkReasons || [],
