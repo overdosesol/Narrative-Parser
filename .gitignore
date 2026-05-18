@@ -8,3 +8,4 @@ logs/
 
 # Claude Code worktrees (temporary isolated copies, not for version control)
 .claude/worktrees/
+.superpowers/
