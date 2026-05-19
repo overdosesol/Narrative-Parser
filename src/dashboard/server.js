@@ -2814,7 +2814,7 @@ class DashboardServer {
       /* Bumped 28→38 (2026-05-01) — at 28px the cat-outline artwork was
          too small to read in the nav. 38 fits comfortably in the 50px
          nav bar (50−2×6 padding = ample headroom). */
-      width: 38px; height: 38px; border-radius: 10px;
+      width: 38px; height: 38px; border-radius: var(--r1);
       background: linear-gradient(135deg, rgba(var(--accent-rgb), .25), rgba(var(--accent-rgb), .06));
       border: 1px solid rgba(var(--accent-rgb), .32);
       box-shadow: 0 2px 12px rgba(var(--accent-rgb), .22), inset 0 1px 0 rgba(255,255,255,.06);
@@ -2848,7 +2848,7 @@ class DashboardServer {
       padding: 5px 10px 5px 6px;
       background: rgba(255,255,255,.025);
       border: 1px solid var(--border2);
-      border-radius: 999px;
+      border-radius: var(--r1);
       color: var(--text2);
       font-size: 11px; font-weight: 600;
       cursor: pointer;
@@ -2917,7 +2917,7 @@ class DashboardServer {
       display: flex; align-items: center; gap: 7px;
       background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015));
       border: 1px solid var(--border2);
-      border-radius: 999px; padding: 4px 11px 4px 9px;
+      border-radius: var(--r1); padding: 4px 11px 4px 9px;
       font-size: 10px; color: var(--text2); font-weight: 700;
       letter-spacing: .4px; text-transform: uppercase;
       transition: border-color .2s, background .2s;
@@ -2935,7 +2935,7 @@ class DashboardServer {
     .status-dot.paused { background: var(--red2); box-shadow: 0 0 6px var(--red); animation: none; }
     .nav-time {
       font-size: 10px; color: var(--dim); font-family: 'JetBrains Mono', monospace; font-weight: 500;
-      padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
+      padding: 4px 10px; border-radius: var(--r1); border: 1px solid var(--border);
       background: rgba(255,255,255,.015); letter-spacing: .3px;
     }
 
@@ -4349,7 +4349,7 @@ class DashboardServer {
     .search-input {
       width: 100%; background: rgba(255,255,255,.03); border: 1px solid var(--border2);
       color: var(--text); padding: 5px 10px 5px 27px;
-      border-radius: var(--radius-xs); font-size: 11px;
+      border-radius: var(--r1); font-size: 11px;
       outline: none; font-family: 'Inter', sans-serif; transition: border-color .15s;
     }
     .search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-glow); }
