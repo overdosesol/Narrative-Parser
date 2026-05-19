@@ -7535,7 +7535,7 @@ const I18N = {
     // Login
     'login.idle_desc': 'Войди через нашего Telegram-бота. Получишь 6-значный код, чтобы ввести его здесь.',
     'login.idle_btn': 'Войти через Telegram',
-    'login.code_desc': 'Открой чат с ботом и нажми Start. Он пришлёт шестизначный код. Введи его ниже:',
+    'login.code_desc': 'Открой чат с ботом и нажми Start. Он пришлёт 6-значный код. Введи его ниже:',
     'login.bot_unavailable': 'Бот временно недоступен. Попробуйте позже.',
     'login.reopen_bot': 'Открыть бота снова',
     'login.verify_btn': 'Войти',
@@ -11259,8 +11259,9 @@ function AccountPanel({ onBack, user, onLogout }) {
 //   2. User clicks Sign in -> bot issues a 6-digit code
 //   3. User enters code -> POST /api/auth/verify -> token + user
 //
-// EN-only by design (top-level pre-auth surface). Strings are hardcoded —
-// language switcher lives inside the app, accessible after sign-in.
+// Translatable via I18N (login.* keys). Language picked up from localStorage
+// or browser via detectLang() at module load — the switcher itself only
+// appears post-auth, so language is locked in for the duration of LoginScreen.
 function LoginScreen({ onLoggedIn }) {
   const [phase, setPhase]       = useState('idle');        // idle | code
   const [session, setSession]   = useState(null);
