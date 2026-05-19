@@ -9384,7 +9384,7 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
               );
             })
           : h('div', { className: 'empty-feed', style: { padding: '22px 10px' } },
-              h('div', { className: 'empty-feed-icon' }, '📭'),
+              h('div', { className: 'empty-feed-icon' }, icon('inbox', { size: 44 })),
               h('div', { className: 'empty-feed-text' }, t('right.no_signals'))
             )
       )
@@ -9439,7 +9439,7 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
               return h('span', { key: s.source, className: cls, title: ttl },
                 h('span', { className: 'right-sources-dot' }),
                 h('span', { className: 'right-sources-glyph' },
-                  locked ? '🔒' : icon(SOURCE_ICONS[s.source] || 'hash', { size: 12 })
+                  locked ? icon('lock', { size: 11 }) : icon(SOURCE_ICONS[s.source] || 'hash', { size: 12 })
                 )
               );
             })
@@ -9656,7 +9656,7 @@ function TriggerSection({ trend, lang, me }) {
                 border: '1px solid rgba(var(--accent-rgb), 0.18)',
                 fontSize: 16, lineHeight: 1, flexShrink: 0,
               }
-            }, '🔒'),
+            }, icon('lock', { size: 18 })),
             h('div', { style: { flex: 1, minWidth: 0 } },
               h('div', {
                 style: { fontSize: 13, fontWeight: 600, color: 'var(--text, #e7e9ea)' }
@@ -13053,7 +13053,7 @@ function App() {
                 h('span', { className: 'source-icon' }, h(SourceMark, { src: s.source, fallback: '·' })),
                 h('span', { className: 'source-name' }, SOURCE_LABELS[s.source] || s.source),
                 locked
-                  ? h('span', { className: 'source-lock', title: t('source.locked_tooltip') }, '🔒')
+                  ? h('span', { className: 'source-lock', title: t('source.locked_tooltip') }, icon('lock', { size: 11 }))
                   : h('span', { className: 'source-count' + (cnt >= 50 ? ' hot' : '') }, cnt)
               );
             }),
@@ -13258,23 +13258,23 @@ function App() {
                 })
               ),
 
-              // Sort order (segmented icons)
+              // Sort order (segmented icons) — 2026-05-20 R4 — icon-name keys.
               h('div', { className: 'filter-group' },
                 h('div', { className: 'filter-label' }, h('span', null, t('sidebar.sort'))),
                 h('div', { className: 'seg-group seg-compact' },
                   [
-                    { v: 'rank',      l: '⚡', tip: t('sort.rank') },
-                    { v: 'meme',      l: '💎', tip: t('sort.meme') },
-                    { v: 'emergence', l: '🌊', tip: t('sort.emergence') },
-                    { v: 'time',      l: '🕐', tip: t('sort.time') },
-                    { v: 'virality',  l: '📊', tip: t('sort.virality') },
+                    { v: 'rank',      i: 'zap',          tip: t('sort.rank') },
+                    { v: 'meme',      i: 'gem',          tip: t('sort.meme') },
+                    { v: 'emergence', i: 'waves',        tip: t('sort.emergence') },
+                    { v: 'time',      i: 'clock',        tip: t('sort.time') },
+                    { v: 'virality',  i: 'bar-chart-3',  tip: t('sort.virality') },
                   ].map(o =>
                     h('button', {
                       key: o.v,
                       title: o.tip,
                       className: 'seg-btn' + (sort === o.v ? ' active' : ''),
                       onClick: () => { setSort(o.v); setOffset(0); }
-                    }, o.l)
+                    }, icon(o.i, { size: 13 }))
                   )
                 )
               )
@@ -13291,7 +13291,7 @@ function App() {
 
           // ── Main feed ──
           h('main', { className: 'main-feed', ref: mainFeedRef },
-            error ? h('div', { className: 'error-bar', style: { marginBottom: 12 } }, '⚠️ ', error) : null,
+            error ? h('div', { className: 'error-bar', style: { marginBottom: 12 } }, icon('alert-triangle', { size: 13 }), ' ', error) : null,
 
             h('div', { className: 'feed-panel' + (refreshPulse && trends.length > 0 ? ' is-refreshing' : '') },
 
@@ -13320,7 +13320,7 @@ function App() {
                   ),
                   h('div', { className: 'feed-panel-actions' },
                     h('div', { className: 'feed-search' },
-                      h('span', { className: 'feed-search-icon' }, '🔍'),
+                      h('span', { className: 'feed-search-icon' }, icon('search', { size: 13 })),
                       h('input', {
                         type: 'text',
                         placeholder: t('feed.search_placeholder'),
@@ -13349,7 +13349,7 @@ function App() {
                   )
                 : visibleTrends.length === 0
                   ? h('div', { className: 'empty-feed' },
-                      h('div', { className: 'empty-feed-icon' }, '🔍'),
+                      h('div', { className: 'empty-feed-icon' }, icon('search-x', { size: 44 })),
                       h('div', { className: 'empty-feed-text' },
                         search.trim()
                           ? t('feed.empty.no_match', { q: search })
