@@ -2580,6 +2580,7 @@ class DashboardServer {
       /* body[data-theme="ink"] below for users who prefer it.                 */
       --bg:          #000000;
       --surface:     #0a0a0a;
+      --surface2:    #16181c;
       --card:        #16181c;
       --card2:       #1c1f24;
       --card3:       #232730;
@@ -2626,6 +2627,10 @@ class DashboardServer {
       --teal:        #00ba7c;
       --purple:      #8b5cf6;
 
+      /* Radius scale — sharp (new) */
+      --r1:          2px;
+      --r2:          3px;
+      --r3:          4px;
       --radius:      10px;
       --radius-sm:   8px;
       --radius-xs:   6px;
@@ -2644,6 +2649,7 @@ class DashboardServer {
     body[data-theme="ink"] {
       --bg:          #000000;
       --surface:     #0a0a0a;
+      --surface2:    #16181c;
       --card:        #16181c;
       --card2:       #1c1f24;
       --card3:       #232730;
@@ -2688,6 +2694,10 @@ class DashboardServer {
       --teal:        #00ba7c;
       --purple:      #8b5cf6;
 
+      /* Radius scale — sharp (new) */
+      --r1:          2px;
+      --r2:          3px;
+      --r3:          4px;
       --radius:      10px;
       --radius-sm:   8px;
       --radius-xs:   6px;
