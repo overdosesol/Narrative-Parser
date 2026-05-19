@@ -6658,10 +6658,11 @@ try { document.documentElement.setAttribute('lang', CURRENT_LANG); } catch (e) {
 // migration needed.
 const THEME_KEY = 'ts_theme';
 const SUPPORTED_THEMES = ['pulse', 'ink', 'tide'];
+// 2026-05-20 R4 — icon-name keys (resolved via icon()) instead of emoji.
 const THEME_META = {
-  pulse: { icon: '⚡', labelEn: 'Pulse', labelRu: 'Импульс' },
-  ink:   { icon: '⬛', labelEn: 'Ink',   labelRu: 'Чернила' },
-  tide:  { icon: '🌊', labelEn: 'Tide',  labelRu: 'Прилив' },
+  pulse: { icon: 'zap',     labelEn: 'Pulse', labelRu: 'Импульс' },
+  ink:   { icon: 'droplet', labelEn: 'Ink',   labelRu: 'Чернила' },
+  tide:  { icon: 'waves',   labelEn: 'Tide',  labelRu: 'Прилив' },
 };
 function detectTheme() {
   try {
@@ -7960,6 +7961,140 @@ const ICONS = {
     h('path', { d: 'M10 2v7.527a2 2 0 0 1-.211.896L4.72 20.55a1 1 0 0 0 .9 1.45h12.76a1 1 0 0 0 .9-1.45l-5.069-10.127A2 2 0 0 1 14 9.527V2' }),
     h('path', { d: 'M8.5 2h7' }),
     h('path', { d: 'M7 16h10' })
+  ),
+  // — Settings + Account icons (R4 Task 5) — Phosphor exception: settings —
+  settings: makeIcon('0 0 256 256', false,
+    h('path', { d: 'M128 80a48 48 0 1 0 48 48 48 48 0 0 0-48-48Zm0 80a32 32 0 1 1 32-32 32 32 0 0 1-32 32Zm88-29.84q.06-2.16 0-4.32l14.92-18.64a8 8 0 0 0 1.48-7.06 107.21 107.21 0 0 0-10.88-26.25 8 8 0 0 0-6-3.93l-23.72-2.64q-1.48-1.56-3-3L186 40.54a8 8 0 0 0-3.94-6 107.71 107.71 0 0 0-26.25-10.87 8 8 0 0 0-7.06 1.49L130.16 40Q128 40 125.84 40L107.2 25.11a8 8 0 0 0-7.06-1.48 107.6 107.6 0 0 0-26.25 10.88 8 8 0 0 0-3.93 6l-2.64 23.76q-1.56 1.49-3 3L40.54 70a8 8 0 0 0-6 3.94 107.71 107.71 0 0 0-10.87 26.25 8 8 0 0 0 1.49 7.06L40 125.84Q40 128 40 130.16L25.11 148.8a8 8 0 0 0-1.48 7.06 107.21 107.21 0 0 0 10.88 26.25 8 8 0 0 0 6 3.93l23.72 2.64q1.49 1.56 3 3L70 215.46a8 8 0 0 0 3.94 6 107.71 107.71 0 0 0 26.25 10.87 8 8 0 0 0 7.06-1.49L125.84 216q2.16.06 4.32 0l18.64 14.92a8 8 0 0 0 7.06 1.48 107.21 107.21 0 0 0 26.25-10.88 8 8 0 0 0 3.93-6l2.64-23.72q1.56-1.48 3-3L215.46 186a8 8 0 0 0 6-3.94 107.71 107.71 0 0 0 10.87-26.25 8 8 0 0 0-1.49-7.06Zm-16.1-6.5a73.93 73.93 0 0 1 0 8.68 8 8 0 0 0 1.74 5.48l14.19 17.73a91.57 91.57 0 0 1-6.23 15L187 173.11a8 8 0 0 0-5.1 2.64 74.11 74.11 0 0 1-6.14 6.14 8 8 0 0 0-2.64 5.1l-2.51 22.58a91.32 91.32 0 0 1-15 6.23l-17.74-14.19a8 8 0 0 0-5-1.75h-.48a73.93 73.93 0 0 1-8.68 0 8 8 0 0 0-5.48 1.74l-17.78 14.2a91.57 91.57 0 0 1-15-6.23L82.89 187a8 8 0 0 0-2.64-5.1 74.11 74.11 0 0 1-6.14-6.14 8 8 0 0 0-5.1-2.64l-22.58-2.51a91.32 91.32 0 0 1-6.23-15l14.19-17.74a8 8 0 0 0 1.74-5.48 73.93 73.93 0 0 1 0-8.68 8 8 0 0 0-1.74-5.48L40.2 100.45a91.57 91.57 0 0 1 6.23-15L69 82.89a8 8 0 0 0 5.1-2.64 74.11 74.11 0 0 1 6.14-6.14A8 8 0 0 0 82.89 69l2.51-22.58a91.32 91.32 0 0 1 15-6.23l17.74 14.19a8 8 0 0 0 5.48 1.74 73.93 73.93 0 0 1 8.68 0 8 8 0 0 0 5.48-1.74l17.77-14.19a91.57 91.57 0 0 1 15 6.23L173.11 69a8 8 0 0 0 2.64 5.1 74.11 74.11 0 0 1 6.14 6.14 8 8 0 0 0 5.1 2.64l22.58 2.51a91.32 91.32 0 0 1 6.23 15l-14.19 17.74a8 8 0 0 0-1.71 5.48Z' })
+  ),
+  palette: makeIcon('0 0 24 24', true,
+    h('circle', { cx: 13.5, cy: 6.5, r: 0.5, fill: 'currentColor' }),
+    h('circle', { cx: 17.5, cy: 10.5, r: 0.5, fill: 'currentColor' }),
+    h('circle', { cx: 8.5, cy: 7.5, r: 0.5, fill: 'currentColor' }),
+    h('circle', { cx: 6.5, cy: 12.5, r: 0.5, fill: 'currentColor' }),
+    h('path', { d: 'M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z' })
+  ),
+  globe: makeIcon('0 0 24 24', true,
+    h('circle', { cx: 12, cy: 12, r: 10 }),
+    h('line', { x1: 2, y1: 12, x2: 22, y2: 12 }),
+    h('path', { d: 'M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z' })
+  ),
+  user: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2' }),
+    h('circle', { cx: 12, cy: 7, r: 4 })
+  ),
+  'refresh-ccw': makeIcon('0 0 24 24', true,
+    h('path', { d: 'M3 12a9 9 0 0 1 15-6.7L21 8' }),
+    h('path', { d: 'M21 3v5h-5' }),
+    h('path', { d: 'M21 12a9 9 0 0 1-15 6.7L3 16' }),
+    h('path', { d: 'M8 16H3v5' })
+  ),
+  archive: makeIcon('0 0 24 24', true,
+    h('rect', { x: 2, y: 4, width: 20, height: 5, rx: 2 }),
+    h('path', { d: 'M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9' }),
+    h('line', { x1: 10, y1: 13, x2: 14, y2: 13 })
+  ),
+  'radio-tower': makeIcon('0 0 24 24', true,
+    h('path', { d: 'M4.9 16.1C1 12.2 1 5.8 4.9 1.9' }),
+    h('path', { d: 'M7.8 4.7a6.14 6.14 0 0 0-.8 7.5' }),
+    h('circle', { cx: 12, cy: 9, r: 2 }),
+    h('path', { d: 'M16.2 4.8c2 2 2.26 5.11.8 7.47' }),
+    h('path', { d: 'M19.1 1.9a9.96 9.96 0 0 1 0 14.1' }),
+    h('path', { d: 'M9.5 18h5l3 4h-11Z' })
+  ),
+  bell: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9' }),
+    h('path', { d: 'M10.3 21a1.94 1.94 0 0 0 3.4 0' })
+  ),
+  sparkles: makeIcon('0 0 24 24', true,
+    h('path', { d: 'm12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z' }),
+    h('path', { d: 'M5 3v4' }),
+    h('path', { d: 'M19 17v4' }),
+    h('path', { d: 'M3 5h4' }),
+    h('path', { d: 'M17 19h4' })
+  ),
+  rows: makeIcon('0 0 24 24', true,
+    h('rect', { x: 3, y: 3, width: 18, height: 18, rx: 2 }),
+    h('line', { x1: 3, y1: 9, x2: 21, y2: 9 }),
+    h('line', { x1: 3, y1: 15, x2: 21, y2: 15 })
+  ),
+  'log-out': makeIcon('0 0 24 24', true,
+    h('path', { d: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4' }),
+    h('polyline', { points: '16 17 21 12 16 7' }),
+    h('line', { x1: 21, y1: 12, x2: 9, y2: 12 })
+  ),
+  activity: makeIcon('0 0 24 24', true,
+    h('polyline', { points: '22 12 18 12 15 21 9 3 6 12 2 12' })
+  ),
+  gem: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M6 3h12l4 6-10 13L2 9Z' }),
+    h('path', { d: 'M11 3 8 9l4 13 4-13-3-6' }),
+    h('path', { d: 'M2 9h20' })
+  ),
+  bot: makeIcon('0 0 24 24', true,
+    h('rect', { x: 3, y: 11, width: 18, height: 10, rx: 2 }),
+    h('circle', { cx: 12, cy: 5, r: 2 }),
+    h('path', { d: 'M12 7v4' }),
+    h('line', { x1: 8, y1: 16, x2: 8, y2: 16 }),
+    h('line', { x1: 16, y1: 16, x2: 16, y2: 16 })
+  ),
+  clock: makeIcon('0 0 24 24', true,
+    h('circle', { cx: 12, cy: 12, r: 10 }),
+    h('polyline', { points: '12 6 12 12 16 14' })
+  ),
+  'bar-chart-3': makeIcon('0 0 24 24', true,
+    h('path', { d: 'M3 3v18h18' }),
+    h('path', { d: 'M18 17V9' }),
+    h('path', { d: 'M13 17V5' }),
+    h('path', { d: 'M8 17v-3' })
+  ),
+  zap: makeIcon('0 0 24 24', true,
+    h('polygon', { points: '13 2 3 14 12 14 11 22 21 10 12 10 13 2' })
+  ),
+  calendar: makeIcon('0 0 24 24', true,
+    h('rect', { x: 3, y: 4, width: 18, height: 18, rx: 2, ry: 2 }),
+    h('line', { x1: 16, y1: 2, x2: 16, y2: 6 }),
+    h('line', { x1: 8, y1: 2, x2: 8, y2: 6 }),
+    h('line', { x1: 3, y1: 10, x2: 21, y2: 10 })
+  ),
+  'calendar-days': makeIcon('0 0 24 24', true,
+    h('rect', { x: 3, y: 4, width: 18, height: 18, rx: 2, ry: 2 }),
+    h('line', { x1: 16, y1: 2, x2: 16, y2: 6 }),
+    h('line', { x1: 8, y1: 2, x2: 8, y2: 6 }),
+    h('line', { x1: 3, y1: 10, x2: 21, y2: 10 }),
+    h('path', { d: 'M8 14h.01' }),
+    h('path', { d: 'M12 14h.01' }),
+    h('path', { d: 'M16 14h.01' }),
+    h('path', { d: 'M8 18h.01' }),
+    h('path', { d: 'M12 18h.01' }),
+    h('path', { d: 'M16 18h.01' })
+  ),
+  'calendar-range': makeIcon('0 0 24 24', true,
+    h('rect', { x: 3, y: 4, width: 18, height: 18, rx: 2, ry: 2 }),
+    h('line', { x1: 16, y1: 2, x2: 16, y2: 6 }),
+    h('line', { x1: 8, y1: 2, x2: 8, y2: 6 }),
+    h('line', { x1: 3, y1: 10, x2: 21, y2: 10 }),
+    h('path', { d: 'M17 14h-6' }),
+    h('path', { d: 'M13 18H7' }),
+    h('path', { d: 'M7 14h.01' }),
+    h('path', { d: 'M17 18h.01' })
+  ),
+  brain: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z' }),
+    h('path', { d: 'M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z' })
+  ),
+  target: makeIcon('0 0 24 24', true,
+    h('circle', { cx: 12, cy: 12, r: 10 }),
+    h('circle', { cx: 12, cy: 12, r: 6 }),
+    h('circle', { cx: 12, cy: 12, r: 2 })
+  ),
+  // — Theme picker icons (R4 Task 5) —
+  droplet: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M12 2.69 5.64 9.05a8.99 8.99 0 0 0 0 12.72c1.76 1.76 4.1 2.73 6.36 2.73s4.6-.97 6.36-2.73a8.99 8.99 0 0 0 0-12.72L12 2.69z' })
+  ),
+  waves: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M2 6c.6.5 1.2 1 2.5 1C7 7 7 5 9.5 5c2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1' }),
+    h('path', { d: 'M2 12c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1' }),
+    h('path', { d: 'M2 18c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1' })
   ),
 };
 
@@ -10445,11 +10580,13 @@ function NavClock({ refreshAt }) {
 // ── ControlPanel ──────────────────────────────────────────────────────────────
 function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }) {
   useLang();
+  // 2026-05-20 R4 — icon-name keys instead of emoji glyphs. Reload uses
+  // refresh-ccw (counter-clockwise) — same semantic as legacy ↻.
   const CONTROL_BUTTONS = [
-    { id: 'scan',   icon: '⚡', label: t('control.scan'),   action: 'scan',   disabled: scanning },
-    { id: 'health', icon: '🏥', label: t('control.health'), action: 'health', disabled: false },
-    { id: 'reload', icon: '↻',  label: t('control.reload'), action: 'reload', disabled: false },
-    { id: 'stats',  icon: '📊', label: t('control.stats'),  action: 'stats',  disabled: false },
+    { id: 'scan',   icon: 'zap',          label: t('control.scan'),   action: 'scan',   disabled: scanning },
+    { id: 'health', icon: 'activity',     label: t('control.health'), action: 'health', disabled: false },
+    { id: 'reload', icon: 'refresh-ccw',  label: t('control.reload'), action: 'reload', disabled: false },
+    { id: 'stats',  icon: 'bar-chart-3',  label: t('control.stats'),  action: 'stats',  disabled: false },
   ];
 
   const handleAction = async (action) => {
@@ -10483,7 +10620,7 @@ function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }
           disabled: btn.disabled,
           title: btn.label,
         },
-          h('span', { className: 'control-icon' }, btn.icon),
+          h('span', { className: 'control-icon' }, icon(btn.icon, { size: 16 })),
           h('span', { className: 'control-label' }, btn.label),
           btn.id === 'scan' && scanning
             ? h('span', { className: 'control-status' })
@@ -10884,7 +11021,10 @@ try { applyPrefsToDOM(loadPrefs()); } catch (e) {}
 // Account and Stats views. Close via Esc, backdrop click, or the ✕ button.
 // Sheet — centered modal with blurred backdrop. The "narrow" flag tightens
 // max-width for forms (Analyze, Account) so the content doesn't sprawl.
-function Sheet({ title, icon, onClose, children, narrow = false }) {
+// 2026-05-20 R4 — icon prop accepts icon-NAME string (resolved via icon())
+// or null/empty. Legacy emoji-glyph callers should be migrated to icon-name.
+// No backticks in this comment — SPA trap.
+function Sheet({ title, icon: iconName, onClose, children, narrow = false }) {
   useEffect(() => {
     const fn = (e) => { if (e.key === 'Escape') onClose(); };
     document.addEventListener('keydown', fn);
@@ -10902,7 +11042,7 @@ function Sheet({ title, icon, onClose, children, narrow = false }) {
   },
     h('div', { className: 'sheet' + (narrow ? ' sheet-narrow' : ''), role: 'dialog', 'aria-modal': 'true' },
       h('div', { className: 'sheet-head' },
-        icon ? h('span', { className: 'sheet-title-ico' }, icon) : null,
+        iconName ? h('span', { className: 'sheet-title-ico' }, ICONS[iconName] ? icon(iconName, { size: 16 }) : iconName) : null,
         h('span', { className: 'sheet-title' }, title),
         h('button', {
           type: 'button',
@@ -10931,10 +11071,21 @@ const Toggle = ({ on, onChange }) =>
 // stacked:true for controls that need full row width (e.g. multi-toggle
 // groups like AlertTypesRow). Stacked rows put the label/desc on top and
 // the control below at full width.
-const Row = ({ icon, title, desc, control, stacked = false }) =>
+// 2026-05-20 R4 — icon prop is now an icon-NAME string (resolved via icon()).
+// Legacy callers may still pass an emoji glyph; we detect that and render
+// the raw text so the migration can land progressively. After R4 Task 8 the
+// emoji-fallback branch should be unreachable.
+const Row = ({ icon: iconName, title, desc, control, stacked = false }) =>
   h('div', { className: 'setting-row' + (stacked ? ' setting-row-stacked' : '') },
     h('div', { className: 'setting-label' },
-      h('span', { className: 'setting-name' }, icon ? (icon + ' ') : '', title),
+      h('span', { className: 'setting-name' },
+        iconName
+          ? (ICONS[iconName]
+              ? h('span', { className: 'setting-name-ico', style: { marginRight: 6, color: 'var(--muted)' } }, icon(iconName, { size: 14 }))
+              : (iconName + ' '))
+          : null,
+        title
+      ),
       desc ? h('span', { className: 'setting-hint' }, desc) : null
     ),
     h('div', { className: 'setting-control' }, control)
@@ -10990,10 +11141,10 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
     h('div', { className: 'settings-card' },
       // Dashboard / UI language
       h(Row, {
-        icon: '🌐', title: t('settings.language_dashboard'),
+        icon: 'globe', title: t('settings.language_dashboard'),
         desc: t('settings.language_dashboard_hint'),
         control: h('div', { className: 'seg-group seg-compact' },
-          [{ v: 'en', l: '🇺🇸 EN' }, { v: 'ru', l: '🇷🇺 RU' }].map(o =>
+          [{ v: 'en', l: 'EN' }, { v: 'ru', l: 'RU' }].map(o =>
             h('button', {
               key: o.v,
               className: 'seg-btn' + (lang === o.v ? ' active' : ''),
@@ -11006,10 +11157,10 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
       // in localStorage (ts_grok_lang). Read by the Ask Grok prompt builder
       // via getGrokLang() so EN-UI users can still send RU prompts.
       h(Row, {
-        icon: '🧠', title: t('settings.grok_language'),
+        icon: 'brain', title: t('settings.grok_language'),
         desc: t('settings.grok_language_hint'),
         control: h('div', { className: 'seg-group seg-compact' },
-          [{ v: 'en', l: '🇺🇸 EN' }, { v: 'ru', l: '🇷🇺 RU' }].map(o =>
+          [{ v: 'en', l: 'EN' }, { v: 'ru', l: 'RU' }].map(o =>
             h('button', {
               key: o.v,
               className: 'seg-btn' + (grokLang === o.v ? ' active' : ''),
@@ -11038,7 +11189,7 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
             h('span', { className: 'theme-swatch-dot theme-swatch-dot-bg' }),
             h('span', { className: 'theme-swatch-dot theme-swatch-dot-accent' }),
             h('span', { className: 'theme-swatch-dot theme-swatch-dot-card' }),
-            h('span', { className: 'theme-swatch-label' }, meta.icon + ' ' + label)
+            h('span', { className: 'theme-swatch-label' }, icon(meta.icon, { size: 11 }), ' ', label)
           );
         })
       )
@@ -11049,7 +11200,7 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
       h('div', { className: 'settings-card-title' }, t('settings.appearance')),
       h('div', { className: 'settings-card-desc' }, t('settings.appearance_desc')),
       h(Row, {
-        icon: '📐', title: t('settings.density'),
+        icon: 'rows', title: t('settings.density'),
         desc: t('settings.density_desc'),
         control: h('div', { className: 'seg-group seg-compact' },
           [{ v: 'comfortable', l: t('settings.density.comfy') }, { v: 'compact', l: t('settings.density.compact') }].map(o =>
@@ -11062,12 +11213,12 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
         )
       }),
       h(Row, {
-        icon: '🖼️', title: t('settings.images'),
+        icon: 'image', title: t('settings.images'),
         desc: t('settings.images_desc'),
         control: h(Toggle, { on: prefs.showImages, onChange: v => update({ showImages: v }) })
       }),
       h(Row, {
-        icon: '✨', title: t('settings.animations'),
+        icon: 'sparkles', title: t('settings.animations'),
         desc: t('settings.animations_desc'),
         control: h(Toggle, { on: prefs.animations, onChange: v => update({ animations: v }) })
       }),
@@ -11125,7 +11276,7 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
       h('div', { className: 'settings-card-title' }, t('settings.behavior')),
       h('div', { className: 'settings-card-desc' }, t('settings.behavior_desc')),
       h(Row, {
-        icon: '👁', title: t('settings.hidden'),
+        icon: 'eye-off', title: t('settings.hidden'),
         desc: hiddenSourcesCount
           ? t('settings.hidden_count', { n: hiddenSourcesCount })
           : t('settings.hidden_none'),
@@ -11290,7 +11441,7 @@ function AlertSensitivityRow({ initial }) {
 
   return h(Row, {
     // ✈ paper-plane evokes Telegram, hints that this knob is TG-scoped.
-    icon: '✈️',
+    icon: 'send',
     title: t('account.threshold'),
     desc: t('account.threshold_desc'),
     control: h('div', { className: 'slider-row', style: { gap: 10 } },
@@ -11371,7 +11522,7 @@ function AlertTypesRow({ initial }) {
   };
 
   return h(Row, {
-    icon: '🔔',
+    icon: 'bell',
     title: t('account.alert_types'),
     desc: t('account.alert_types_desc'),
     // Stacked layout — three full-width toggles read better as a vertical
@@ -11455,18 +11606,18 @@ function AccountPanel({ onBack, user, onLogout }) {
       h('div', { className: 'settings-card-title' }, t('settings.account')),
       h('div', { className: 'settings-card-desc' }, t('settings.account_desc')),
       h(Row, {
-        icon: '💬', title: t('settings.tg'),
+        icon: 'message-circle', title: t('settings.tg'),
         desc: user?.username ? ('@' + user.username) : t('settings.tg_chatid', { id: user?.chatId || '—' }),
         control: h('span', { className: 'pref-value' }, user?.chatId || '—')
       }),
       h(Row, {
-        icon: '💎', title: t('settings.plan'),
+        icon: 'gem', title: t('settings.plan'),
         desc: t('settings.plan_desc'),
         control: h('span', { className: 'pref-value' }, planLabels[user?.plan] || user?.plan || '—')
       }),
       subExpiry
         ? h(Row, {
-            icon: '📅', title: t('account.subscription'),
+            icon: 'calendar', title: t('account.subscription'),
             desc: t('account.subscription_desc'),
             control: h('span', { className: 'pref-value' }, subExpiry)
           })
@@ -11479,7 +11630,7 @@ function AccountPanel({ onBack, user, onLogout }) {
       // applied server-side in the alert pipeline.
       h(AlertTypesRow, { initial: user?.alertTypes || ['event','trend','post'] }),
       h(Row, {
-        icon: '🚪', title: t('settings.logout'),
+        icon: 'log-out', title: t('settings.logout'),
         desc: t('settings.logout_desc'),
         control: h('button', { className: 'btn btn-ghost', onClick: doLogout }, t('settings.logout'))
       })
@@ -13169,7 +13320,7 @@ function App() {
     // ── Modal sheets (Settings / Account / Stats) ──
     view === 'settings' ? h(Sheet, {
       title: t('settings.title'),
-      icon: '⚙️',
+      icon: 'settings',
       onClose: () => setView('trends'),
     },
       h(SettingsPanel, {
@@ -13181,7 +13332,7 @@ function App() {
 
     view === 'account' ? h(Sheet, {
       title: t('nav.account'),
-      icon: '👤',
+      icon: 'user',
       narrow: true,
       onClose: () => setView('trends'),
     },
@@ -13197,7 +13348,7 @@ function App() {
 
     view === 'analyze' ? h(Sheet, {
       title: t('analyze.title'),
-      icon: '🧪',
+      icon: 'flask-conical',
       narrow: true,
       onClose: () => setView('trends'),
     },
