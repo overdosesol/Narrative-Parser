@@ -13319,23 +13319,28 @@ function App() {
                 })
               ),
 
-              // Sort order (segmented icons) — 2026-05-20 R4 — icon-name keys.
+              // Sort order — 2026-05-20 R5 — vertical chip list with full
+              // labels. Each option is a sort-chip styled like phase-badge;
+              // active chip uses .badge-catalyst accent-fill tokens. Virality
+              // option dropped: it duplicated rank (composite score DESC).
               h('div', { className: 'filter-group' },
                 h('div', { className: 'filter-label' }, h('span', null, t('sidebar.sort'))),
-                h('div', { className: 'seg-group seg-compact' },
+                h('div', { className: 'sort-list' },
                   [
-                    { v: 'rank',      i: 'zap',          tip: t('sort.rank') },
-                    { v: 'meme',      i: 'gem',          tip: t('sort.meme') },
-                    { v: 'emergence', i: 'waves',        tip: t('sort.emergence') },
-                    { v: 'time',      i: 'clock',        tip: t('sort.time') },
-                    { v: 'virality',  i: 'bar-chart-3',  tip: t('sort.virality') },
+                    { v: 'rank',      i: 'zap',   label: t('sort.rank') },
+                    { v: 'meme',      i: 'gem',   label: t('sort.meme') },
+                    { v: 'emergence', i: 'waves', label: t('sort.emergence') },
+                    { v: 'time',      i: 'clock', label: t('sort.time') },
                   ].map(o =>
                     h('button', {
                       key: o.v,
-                      title: o.tip,
-                      className: 'seg-btn' + (sort === o.v ? ' active' : ''),
+                      title: o.label,
+                      className: 'sort-chip' + (sort === o.v ? ' active' : ''),
                       onClick: () => { setSort(o.v); setOffset(0); }
-                    }, icon(o.i, { size: 13 }))
+                    },
+                      icon(o.i, { size: 14 }),
+                      h('span', null, o.label)
+                    )
                   )
                 )
               )
