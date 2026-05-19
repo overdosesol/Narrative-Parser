@@ -3679,7 +3679,7 @@ class DashboardServer {
     .cat-gaming        { background: rgba(0,206,201,.12);   color: #00cec9; border: 1px solid rgba(0,206,201,.22); }
     .cat-boring        { background: rgba(255,255,255,.04); color: var(--dim); border: 1px solid var(--border); }
     .cat-other         { background: rgba(255,255,255,.04); color: var(--dim); border: 1px solid var(--border); }
-    .badge-manual    { background: rgba(180,140,255,.12); color: #b48cff; border: 1px solid rgba(180,140,255,.3); }
+    .badge-manual    { background: rgba(var(--secondary-rgb),.10); color: var(--secondary); border: 1px solid rgba(var(--secondary-rgb),.30); }
     /* Alert-type chips — orthogonal to category. event = warm red-orange,
        trend = green (movement), post = blue (single signal). */
     .badge-atype-event { background: rgba(255,107,107,.12); color: #ff8a65; border: 1px solid rgba(255,107,107,.3); font-weight: 600; }
@@ -3698,6 +3698,7 @@ class DashboardServer {
     .phase-chip.atype-chip-event.active { border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.10); color: #ff8a65; }
     .phase-chip.atype-chip-trend.active { border-color: rgba(46,213,115,.5);  background: rgba(46,213,115,.10);  color: #2ed573; }
     .phase-chip.atype-chip-post.active  { border-color: rgba(116,185,255,.5); background: rgba(116,185,255,.10); color: #74b9ff; }
+    .phase-chip.atype-chip-manual.active { border-color: rgba(var(--secondary-rgb),.30); background: rgba(var(--secondary-rgb),.10); color: var(--secondary); }
 
     /* ── Source chip ── */
     .source-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--dim); white-space: nowrap; padding: 2px 7px; border-radius: 5px; background: rgba(255,255,255,.04); }
