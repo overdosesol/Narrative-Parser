@@ -3012,10 +3012,13 @@ class DashboardServer {
       box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), .1);
     }
     .phase-chip.active .phase-chip-count { color: var(--accent2); }
-    .phase-chip-early.active    { background: rgba(59,130,246,.15); border-color: rgba(59,130,246,.4); color: #93c5fd; }
-    .phase-chip-forming.active  { background: rgba(234,179,8,.15);  border-color: rgba(234,179,8,.45);  color: #fde047; }
-    .phase-chip-strong.active   { background: rgba(34,197,94,.15);  border-color: rgba(34,197,94,.45);  color: #86efac; }
-    .phase-chip-saturated.active{ background: rgba(239,68,68,.15);  border-color: rgba(239,68,68,.45);  color: #fca5a5; }
+    /* Phase chip colour schema (spec 4.2):
+       EARLY=muted, FORMING=white, STRONG=accent, SATURATED=warn.
+       Only strong/saturated get colour emphasis; early/forming stay neutral. */
+    .phase-chip-early.active    { background: rgba(255,255,255,.04);    border-color: var(--border2);                  color: var(--muted); }
+    .phase-chip-forming.active  { background: rgba(255,255,255,.06);    border-color: rgba(255,255,255,.20);           color: var(--text); }
+    .phase-chip-strong.active   { background: rgba(var(--accent-rgb),.10); border-color: rgba(var(--accent-rgb),.30);  color: var(--accent); }
+    .phase-chip-saturated.active{ background: rgba(var(--warn-rgb),.10);   border-color: rgba(var(--warn-rgb),.30);    color: var(--warn); }
 
     /* ── Source items (brand-colored, feed-like rows) ── */
     .source-item {
