@@ -7601,24 +7601,14 @@ const api = (path, opts = {}) => {
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
-// Inline SVG logos — real brand marks (Snoo, multicolor-G shape, X glyph,
-// TikTok music note, hashtag for trends). Sourced from simpleicons.org
-// public-domain paths, single-color (fill: currentColor) so the chip's CSS
-// color: <brand> tint paints them. SourceMark component below picks SVG
-// when available, falls back to SOURCE_ICONS letter-marks otherwise.
-const SOURCE_LOGOS = {
-  reddit: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0zm5.01 4.744c.688 0 1.25.561 1.25 1.249a1.25 1.25 0 0 1-2.499.056l-2.597-.547-.8 3.747c1.824.07 3.48.632 4.674 1.488.308-.309.73-.491 1.207-.491.968 0 1.754.786 1.754 1.754 0 .716-.435 1.333-1.01 1.614a3.111 3.111 0 0 1 .042.52c0 2.694-3.13 4.87-7.004 4.87-3.874 0-7.004-2.176-7.004-4.87 0-.183.015-.366.043-.534A1.748 1.748 0 0 1 4.028 12.5c0-.968.786-1.754 1.754-1.754.463 0 .898.196 1.207.49 1.207-.883 2.878-1.43 4.744-1.487l.885-4.182a.342.342 0 0 1 .14-.197.35.35 0 0 1 .238-.042l2.906.617a1.214 1.214 0 0 1 1.108-.701zM9.25 12c-.69 0-1.25.56-1.25 1.25 0 .687.561 1.248 1.25 1.248.687 0 1.248-.561 1.248-1.249 0-.688-.561-1.249-1.249-1.249zm5.5 0c-.687 0-1.248.561-1.248 1.25 0 .687.561 1.248 1.249 1.248.688 0 1.249-.561 1.249-1.249 0-.687-.562-1.249-1.25-1.249zm-5.466 3.99a.327.327 0 0 0-.231.094.33.33 0 0 0 0 .463c.842.842 2.484.913 2.961.913.477 0 2.105-.056 2.961-.913a.361.361 0 0 0 .029-.463.33.33 0 0 0-.464 0c-.547.533-1.684.73-2.512.73-.828 0-1.979-.196-2.512-.73a.326.326 0 0 0-.232-.095z"/></svg>',
-  google_trends: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z"/></svg>',
-  twitter: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>',
-  tiktok: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-5.2 1.74 2.89 2.89 0 0 1 2.31-4.64 2.93 2.93 0 0 1 .88.13V9.4a6.84 6.84 0 0 0-1-.05A6.33 6.33 0 0 0 5.8 20.1a6.34 6.34 0 0 0 10.86-4.43v-7a8.16 8.16 0 0 0 4.77 1.52v-3.4a4.85 4.85 0 0 1-1.84-.1z"/></svg>',
-  x_trends: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5.41 21l.71-4H2.41l.36-2h3.71l1.06-6H3.83l.36-2h3.71l.71-4h2l-.71 4h6l.71-4h2l-.71 4h3.71l-.36 2h-3.71l-1.06 6h3.71l-.36 2h-3.71l-.71 4h-2l.71-4h-6l-.71 4h-2zM9.53 9l-1.06 6h6l1.06-6h-6z"/></svg>'
-};
+// 2026-05-20 R4 — SOURCE_LOGOS removed; SourceMark now goes through the
+// central ICONS registry via icon(SOURCE_ICONS[src]).
 
-// Letter-mark fallbacks for inline text contexts (top-narratives meta,
-// telegram keyboard rendering, Markov contexts). Brand-coded but
-// single-character so they don't blow up the line-height. Used wherever
-// SourceMark isn't appropriate (or for unknown sources).
-const SOURCE_ICONS  = { reddit: 'R', google_trends: 'G', twitter: '𝕏', tiktok: '♪', x_trends: '#' };
+// 2026-05-20 R4 — values are ICON-KEY strings (resolved through icon()).
+// Was letter-mark glyphs (R/G/𝕏/♪/#) until iconography sweep. Every consumer
+// must render via icon(SOURCE_ICONS[src], { size }) — raw string render shows
+// the literal "reddit"/"twitter" word.
+const SOURCE_ICONS  = { reddit: 'reddit', google_trends: 'google', twitter: 'twitter', tiktok: 'tiktok', x_trends: 'hash' };
 const SOURCE_LABELS = { reddit: 'Reddit', google_trends: 'Google', twitter: 'Twitter/X', tiktok: 'TikTok', x_trends: 'X Trends' };
 const CAT_ICONS     = { meme:'😂', celebrity:'⭐', animals:'🐾', tech:'💻', gambling:'🎰', sports:'🏆', politics:'🏛️', entertainment:'🎬', gaming:'🎮', boring:'😴', other:'📌' };
 const CAT_CLS       = { meme:'cat-meme', celebrity:'cat-celebrity', animals:'cat-animals', tech:'cat-tech', gambling:'cat-gambling', sports:'cat-sports', politics:'cat-politics', entertainment:'cat-entertainment', gaming:'cat-gaming', boring:'cat-boring', other:'cat-other' };
@@ -7759,7 +7749,7 @@ function makeIcon(viewBox, stroke, ...children) {
 }
 
 const ICONS = {
-  // — smoke-test entries; populated incrementally by R4 Tasks 2-7 —
+  // — Core (used by multiple tasks) —
   search: makeIcon('0 0 24 24', true,
     h('circle', { cx: 11, cy: 11, r: 8 }),
     h('line', { x1: 21, y1: 21, x2: 16.65, y2: 16.65 })
@@ -7767,6 +7757,25 @@ const ICONS = {
   x: makeIcon('0 0 24 24', true,
     h('line', { x1: 18, y1: 6, x2: 6, y2: 18 }),
     h('line', { x1: 6, y1: 6, x2: 18, y2: 18 })
+  ),
+  // — Brand sources (R4 Task 2) — monochrome glyphs, currentColor —
+  reddit: makeIcon('0 0 24 24', false,
+    h('path', { d: 'M12 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0zm5.01 4.744c.688 0 1.25.561 1.25 1.249a1.25 1.25 0 0 1-2.498.056l-2.597-.547-.8 3.747c1.824.07 3.48.632 4.674 1.488.308-.309.73-.491 1.207-.491.968 0 1.754.786 1.754 1.754 0 .716-.435 1.333-1.01 1.614a3.111 3.111 0 0 1 .042.52c0 2.694-3.13 4.87-7.004 4.87-3.874 0-7.004-2.176-7.004-4.87 0-.183.015-.366.043-.534A1.748 1.748 0 0 1 4.028 12c0-.968.786-1.754 1.754-1.754.463 0 .898.196 1.207.49 1.207-.883 2.878-1.43 4.744-1.487l.885-4.182a.342.342 0 0 1 .14-.197.35.35 0 0 1 .238-.042l2.906.617a1.214 1.214 0 0 1 1.108-.701zM9.25 12C8.561 12 8 12.562 8 13.25c0 .687.561 1.248 1.25 1.248.687 0 1.248-.561 1.248-1.249 0-.688-.561-1.249-1.249-1.249zm5.5 0c-.687 0-1.248.561-1.248 1.25 0 .687.561 1.248 1.249 1.248.688 0 1.249-.561 1.249-1.249 0-.687-.562-1.249-1.25-1.249zm-5.466 3.99a.327.327 0 0 0-.231.094.33.33 0 0 0 0 .463c.842.842 2.484.913 2.961.913.477 0 2.105-.056 2.961-.913a.361.361 0 0 0 .029-.463.33.33 0 0 0-.464 0c-.547.533-1.684.73-2.512.73-.828 0-1.979-.196-2.512-.73a.326.326 0 0 0-.232-.095z' })
+  ),
+  twitter: makeIcon('0 0 24 24', false,
+    h('path', { d: 'M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z' })
+  ),
+  google: makeIcon('0 0 24 24', false,
+    h('path', { d: 'M12.545 10.239v3.821h5.445c-.712 2.315-2.647 3.972-5.445 3.972a6.033 6.033 0 1 1 0-12.064c1.498 0 2.866.549 3.921 1.453l2.814-2.814A9.969 9.969 0 0 0 12.545 2C7.021 2 2.543 6.477 2.543 12s4.478 10 10.002 10c8.396 0 10.249-7.85 9.426-11.748l-9.426-.013z' })
+  ),
+  tiktok: makeIcon('0 0 24 24', false,
+    h('path', { d: 'M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-5.2 1.74 2.89 2.89 0 0 1 2.31-4.64 2.93 2.93 0 0 1 .88.13V9.4a6.84 6.84 0 0 0-1-.05A6.33 6.33 0 0 0 5.8 20.1a6.34 6.34 0 0 0 10.86-4.43v-7a8.16 8.16 0 0 0 4.77 1.52v-3.4a4.85 4.85 0 0 1-1.84-.1z' })
+  ),
+  hash: makeIcon('0 0 24 24', true,
+    h('line', { x1: 4, y1: 9, x2: 20, y2: 9 }),
+    h('line', { x1: 4, y1: 15, x2: 20, y2: 15 }),
+    h('line', { x1: 10, y1: 3, x2: 8, y2: 21 }),
+    h('line', { x1: 16, y1: 3, x2: 14, y2: 21 })
   ),
 };
 
@@ -7834,20 +7843,18 @@ function ScoreBar({ value, label, sub, color }) {
   );
 }
 
-// SourceMark — renders a real brand SVG logo inside any chip-style icon
-// container (.source-icon, .feed-avatar, etc). Falls back to the
-// SOURCE_ICONS letter-mark when the source has no SVG, and to a generic
-// '·' when the source is unknown.
-function SourceMark({ src, fallback }) {
-  const svg = SOURCE_LOGOS[src];
-  if (svg) {
-    return h('span', {
-      className: 'src-mark-svg',
-      'aria-hidden': 'true',
-      dangerouslySetInnerHTML: { __html: svg }
-    });
+// 2026-05-20 R4 — collapsed to icon() helper. Was dual-path (inline-SVG
+// string via dangerouslySetInnerHTML + letter-mark fallback). Now resolves
+// SOURCE_ICONS[src] → icon-name → icon() renderer. Unknown source falls
+// through to a centred dot.
+function SourceMark({ src, fallback, size }) {
+  const key = SOURCE_ICONS[src];
+  const sz = size != null ? size : 16;
+  if (key) {
+    return h('span', { className: 'src-mark-svg', 'aria-hidden': 'true' },
+      icon(key, { size: sz }));
   }
-  return h('span', { className: 'src-mark-text' }, SOURCE_ICONS[src] || fallback || '·');
+  return h('span', { className: 'src-mark-text' }, fallback || '·');
 }
 
 // Custom category dropdown — replaces native <select> in the sidebar.
@@ -7957,7 +7964,7 @@ function MarketStageBadge({ stage }) {
 function ImageThumb({ trend, size = 80 }) {
   const [imgUrl, setImgUrl] = useState(trend.imageUrl || null);
   const [tried, setTried] = useState(!!trend.imageUrl);
-  const srcIco = SOURCE_ICONS[trend.source] || '📡';
+  const srcIco = SOURCE_ICONS[trend.source] || 'hash';
 
   useEffect(() => {
     if (!tried && !imgUrl && trend.url) {
@@ -7976,7 +7983,7 @@ function ImageThumb({ trend, size = 80 }) {
           onError: () => setImgUrl(null),
           loading: 'lazy',
         })
-      : h('div', { className: 'card-image-placeholder' }, srcIco)
+      : h('div', { className: 'card-image-placeholder' }, icon(srcIco, { size: 32 }))
   );
 }
 
@@ -8210,7 +8217,7 @@ function TweetHoverPreview({ state, onMouseEnter, onMouseLeave }) {
               }, '@' + a.screenName)
             : h('div', { className: 'tw-prev-handle' }, '@' + (a.screenName || ''))
         ),
-        h('div', { className: 'tw-prev-x' }, '𝕏')
+        h('div', { className: 'tw-prev-x' }, icon('twitter', { size: 12 }))
       ),
       data.text && h('div', { className: 'tw-prev-text', key: 'text' }, data.text),
       (photo || video) && h('div', { className: 'tw-prev-media', key: 'media' },
@@ -8718,7 +8725,7 @@ function FeedCard({ trend, onOpen, onHide, onFavToggle, canFavorite }) {
   useLang();
   const catCls = CAT_CLS[trend.category] || 'cat-other';
   const catIco = CAT_ICONS[trend.category] || '📌';
-  const srcIco = SOURCE_ICONS[trend.source] || '📡';
+  const srcIco = SOURCE_ICONS[trend.source] || 'hash';
   const srcLbl = SOURCE_LABELS[trend.source] || trend.source;
   const linkLabel = SOURCE_LINK_LABELS[trend.source] || t('feed.open_source');
 
@@ -8805,7 +8812,7 @@ function FeedCard({ trend, onOpen, onHide, onFavToggle, canFavorite }) {
     }, '✕') : null,
     h('div', { className: 'feed-card-head' },
       h('div', { className: 'feed-avatar ' + avatarCls },
-        SOURCE_LOGOS[trend.source] ? h(SourceMark, { src: trend.source }) : srcIco
+        h(SourceMark, { src: trend.source, fallback: '·', size: 20 })
       ),
       h('div', { className: 'feed-meta' },
         h('div', { className: 'feed-user-row' },
@@ -8966,7 +8973,7 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
                 h('div', { className: 'top-item-info' },
                   h('div', { className: 'top-item-title', title: tr.title }, tr.title),
                   h('div', { className: 'top-item-meta' },
-                    h('span', null, SOURCE_ICONS[tr.source] || '📡'),
+                    h('span', null, icon(SOURCE_ICONS[tr.source] || 'hash', { size: 11 })),
                     tr.narrativePhase ? h('span', null, PHASE_DOT[tr.narrativePhase] + ' ' + (PHASE_META[tr.narrativePhase] || {}).label) : null,
                     h('span', null, (tr.score || tr.virality || 0) + ' ' + t('right.score.vrl'))
                   )
@@ -9030,7 +9037,7 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
               return h('span', { key: s.source, className: cls, title: ttl },
                 h('span', { className: 'right-sources-dot' }),
                 h('span', { className: 'right-sources-glyph' },
-                  locked ? '🔒' : (SOURCE_ICONS[s.source] || '📡')
+                  locked ? '🔒' : icon(SOURCE_ICONS[s.source] || 'hash', { size: 12 })
                 )
               );
             })
@@ -9485,7 +9492,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
   };
   const catCls = CAT_CLS[trend.category] || 'cat-other';
   const catIco = CAT_ICONS[trend.category] || '📌';
-  const srcIco = SOURCE_ICONS[trend.source] || '📡';
+  const srcIco = SOURCE_ICONS[trend.source] || 'hash';
   const srcLbl = SOURCE_LABELS[trend.source] || trend.source;
   const srcLinkCls = trend.source === 'reddit' ? ' trend-link-reddit'
     : (trend.source === 'twitter' || trend.source === 'x_trends') ? ' trend-link-twitter'
@@ -9593,7 +9600,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
         h('span', { className: 'badge ' + catCls }, catIco + ' ' + (trend.category || 'other')),
         trend.manualSubmitted ? h('span', { className: 'badge badge-manual', title: t('feed.manual_tip') }, '🧪 MANUAL') : null,
         trend.narrativePhase ? h(PhaseBadge, { phase: trend.narrativePhase }) : null,
-        h('div', { className: 'source-chip' }, srcIco, ' ', srcLbl),
+        h('div', { className: 'source-chip' }, icon(srcIco, { size: 12 }), ' ', srcLbl),
         h('span', { className: 'time-cell', style: { fontSize: 11 } }, fmtTime(trend.lastSeen || trend.firstSeen)),
         h('button', { className: 'modal-close', onClick: onClose }, t('app.esc_close'))
       ),
@@ -10496,7 +10503,7 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
         tr.imageUrl
           ? h('img', { src: tr.imageUrl, alt: '', loading: 'lazy', className: 'analyze-thumb' })
           : h('div', { className: 'analyze-thumb-fb' },
-              SOURCE_ICONS[tr.source] || '🌐'
+              icon(SOURCE_ICONS[tr.source] || 'hash', { size: 36 })
             ),
         h('div', { className: 'analyze-hero-body' },
           h('div', { className: 'analyze-hero-title' }, tr.title),
@@ -10575,7 +10582,7 @@ function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
           allSources.map(row =>
             h('div', { key: row.source, className: 'stats-list-row' },
               h('div', { className: 'stats-list-main' },
-                h('span', null, SOURCE_ICONS[row.source] || '📡'),
+                h('span', null, icon(SOURCE_ICONS[row.source] || 'hash', { size: 12 })),
                 h('span', { className: 'stats-list-name' }, SOURCE_LABELS[row.source] || row.source)
               ),
               h('span', { className: 'stats-list-value' }, String(row.count))
@@ -10622,7 +10629,7 @@ function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
                 },
                   h('div', { className: 'stats-top-title' }, trend.title),
                   h('div', { className: 'stats-top-meta' },
-                    h('span', null, SOURCE_ICONS[trend.source] || '📡'),
+                    h('span', null, icon(SOURCE_ICONS[trend.source] || 'hash', { size: 12 })),
                     h('span', null, SOURCE_LABELS[trend.source] || trend.source),
                     h('span', null, (trend.adoptionScore || trend.memePotential || 0) + '/100')
                   )
@@ -11054,7 +11061,7 @@ function ArchiveCard() {
                 h('span', {
                   className: 'archive-row-icon',
                   style: { color: 'var(--text)' }
-                }, SOURCE_ICONS[it.source] || '📡'),
+                }, icon(SOURCE_ICONS[it.source] || 'hash', { size: 14 })),
                 h('div', { className: 'archive-row-body' },
                   h('div', { className: 'archive-row-title', title: it.title }, it.title),
                   h('div', { className: 'archive-row-meta' },
@@ -12535,7 +12542,7 @@ function App() {
           title: 'Follow @Catalystparser on X',
           'aria-label': 'Follow on X',
         },
-          h('span', { className: 'nav-icon-btn-ico' }, '𝕏')
+          h('span', { className: 'nav-icon-btn-ico' }, icon('twitter', { size: 14 }))
         ),
         h('button', {
           type: 'button',
