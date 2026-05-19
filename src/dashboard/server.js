@@ -2968,7 +2968,7 @@ class DashboardServer {
     .sidebar-section:first-child { margin-top: 0; padding-top: 2px; }
     .sidebar-section-link {
       font-size: 10px; font-weight: 600; letter-spacing: .4px;
-      color: var(--dim); cursor: pointer; padding: 2px 6px; border-radius: 4px;
+      color: var(--dim); cursor: pointer; padding: 2px 6px; border-radius: var(--r1);
       text-transform: none;
       transition: all .15s;
     }
@@ -2987,7 +2987,7 @@ class DashboardServer {
       color: var(--muted);
       background: rgba(255,255,255,.02);
       border: 1px solid var(--border);
-      border-radius: 7px;
+      border-radius: var(--r1);
       cursor: pointer;
       font-family: inherit;
       text-transform: uppercase;
@@ -3023,7 +3023,7 @@ class DashboardServer {
     /* ── Source items (brand-colored, feed-like rows) ── */
     .source-item {
       display: flex; align-items: center; gap: 10px;
-      padding: 9px 10px; border-radius: var(--radius-sm);
+      padding: 9px 10px; border-radius: var(--r1);
       border: 1px solid transparent;
       cursor: pointer; transition: all .18s ease;
       font-size: 12.5px; font-weight: 600;
@@ -3062,12 +3062,12 @@ class DashboardServer {
       padding: 3px 7px;
       background: rgba(239,243,244,0.04);
       border: 1px solid var(--border);
-      border-radius: 999px;
+      border-radius: var(--r1);
       flex-shrink: 0;
     }
     .source-item.locked:hover { opacity: .75; background: rgba(239,243,244,0.04); }
     .source-icon {
-      width: 26px; height: 26px; border-radius: 7px;
+      width: 26px; height: 26px; border-radius: var(--r1);
       display: inline-flex; align-items: center; justify-content: center;
       font-size: 13.5px; font-weight: 800; flex-shrink: 0;
       font-family: 'Inter', sans-serif; line-height: 1;
@@ -3107,7 +3107,7 @@ class DashboardServer {
     .source-count {
       font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 600;
       color: var(--text2); background: rgba(255,255,255,.04);
-      padding: 2px 7px; border-radius: 5px; min-width: 26px; text-align: center;
+      padding: 2px 7px; border-radius: var(--r1); min-width: 26px; text-align: center;
       border: 1px solid var(--border);
     }
     .source-count.hot { color: var(--accent2); background: rgba(var(--accent-rgb), .1); border-color: rgba(var(--accent-rgb), .22); }
@@ -3133,11 +3133,11 @@ class DashboardServer {
     /* ── Segmented control ── */
     .seg-group {
       display: flex; background: rgba(255,255,255,.025);
-      border: 1px solid var(--border); border-radius: 8px;
+      border: 1px solid var(--border); border-radius: var(--r1);
       padding: 2px; gap: 2px;
     }
     .seg-btn {
-      flex: 1; padding: 5px 4px; border-radius: 6px;
+      flex: 1; padding: 5px 4px; border-radius: var(--r1);
       font-size: 10.5px; font-weight: 600; color: var(--muted);
       background: transparent; border: none; cursor: pointer;
       transition: all .15s; font-family: inherit;
@@ -3156,7 +3156,7 @@ class DashboardServer {
       display: flex; align-items: center; justify-content: center; gap: 6px;
       padding: 6px 10px; margin-top: 4px;
       background: transparent; border: 1px dashed var(--border2);
-      border-radius: 6px; color: var(--muted);
+      border-radius: var(--r1); color: var(--muted);
       font-size: 10.5px; font-weight: 600; cursor: pointer;
       transition: all .15s; font-family: inherit;
     }
@@ -3171,14 +3171,14 @@ class DashboardServer {
     }
     .sb-foot-nav {
       display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px;
-      padding: 4px; border-radius: 10px;
+      padding: 4px; border-radius: var(--r1);
       background: rgba(0,0,0,.18);
       border: 1px solid var(--border);
     }
     .sb-foot-btn {
       position: relative;
       display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
-      padding: 9px 4px 8px; border-radius: 7px;
+      padding: 9px 4px 8px; border-radius: var(--r1);
       background: transparent; border: 1px solid transparent;
       cursor: pointer; transition: all .15s;
       color: var(--muted); font-size: 10px; font-weight: 600;
@@ -3395,7 +3395,7 @@ class DashboardServer {
       width: 100%; padding: 8px 11px;
       background: rgba(255,255,255,.025);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: var(--r1);
       color: var(--text2);
       font-size: 11.5px; font-weight: 600;
       font-family: inherit; cursor: pointer;
@@ -3440,7 +3440,7 @@ class DashboardServer {
       z-index: 50;
       background: var(--surface);
       border: 1px solid var(--border2);
-      border-radius: 10px;
+      border-radius: var(--r1);
       padding: 4px;
       box-shadow:
         0 -12px 40px rgba(0,0,0,.55),
@@ -3456,7 +3456,7 @@ class DashboardServer {
     .cat-dd-opt {
       display: flex; align-items: center; gap: 10px;
       width: 100%; padding: 7px 10px;
-      background: transparent; border: none; border-radius: 6px;
+      background: transparent; border: none; border-radius: var(--r1);
       color: var(--text2); font-size: 11.5px; font-weight: 500;
       font-family: inherit; cursor: pointer; text-align: left;
       transition: background .12s, color .12s;
@@ -4318,7 +4318,7 @@ class DashboardServer {
     /* ── Sidebar settings link ── */
     .sidebar-settings-btn {
       display: flex; align-items: center; gap: 9px;
-      padding: 8px 10px; border-radius: var(--radius-sm);
+      padding: 8px 10px; border-radius: var(--r1);
       cursor: pointer; color: var(--muted);
       font-size: 12px; font-weight: 500;
       transition: all .15s ease; border: 1px solid transparent;
