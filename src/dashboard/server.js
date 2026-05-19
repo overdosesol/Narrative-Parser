@@ -4147,6 +4147,9 @@ class DashboardServer {
     }
     /* Theme swatch previews — match the actual theme palettes above. Each
        row shows bg / accent / card so the user can preview at a glance. */
+    .theme-swatch[data-theme-preview="pulse"] .theme-swatch-dot-bg     { background: #000000; }
+    .theme-swatch[data-theme-preview="pulse"] .theme-swatch-dot-accent { background: #4ade80; }
+    .theme-swatch[data-theme-preview="pulse"] .theme-swatch-dot-card   { background: #16181c; }
     .theme-swatch[data-theme-preview="ink"]   .theme-swatch-dot-bg     { background: #000000; }
     .theme-swatch[data-theme-preview="ink"]   .theme-swatch-dot-accent { background: #1d9bf0; }
     .theme-swatch[data-theme-preview="ink"]   .theme-swatch-dot-card   { background: #16181c; }
@@ -6626,23 +6629,24 @@ try { document.documentElement.setAttribute('lang', CURRENT_LANG); } catch (e) {
 // detectTheme()'s validity check and reset to the new default — no
 // migration needed.
 const THEME_KEY = 'ts_theme';
-const SUPPORTED_THEMES = ['ink', 'tide'];
+const SUPPORTED_THEMES = ['pulse', 'ink', 'tide'];
 const THEME_META = {
-  ink:  { icon: '⬛', labelEn: 'Ink',  labelRu: 'Чернила' },
-  tide: { icon: '🌊', labelEn: 'Tide', labelRu: 'Прилив' },
+  pulse: { icon: '⚡', labelEn: 'Pulse', labelRu: 'Импульс' },
+  ink:   { icon: '⬛', labelEn: 'Ink',   labelRu: 'Чернила' },
+  tide:  { icon: '🌊', labelEn: 'Tide',  labelRu: 'Прилив' },
 };
 function detectTheme() {
   try {
     const saved = localStorage.getItem(THEME_KEY);
     if (saved && SUPPORTED_THEMES.indexOf(saved) >= 0) return saved;
   } catch (e) {}
-  return 'ink';
+  return 'pulse';
 }
 let CURRENT_THEME = detectTheme();
 const themeListeners = new Set();
 function applyThemeAttr(theme) {
   try {
-    if (theme && theme !== 'ink') document.body.setAttribute('data-theme', theme);
+    if (theme && theme !== 'pulse') document.body.setAttribute('data-theme', theme);
     else document.body.removeAttribute('data-theme');
   } catch (e) {}
 }
