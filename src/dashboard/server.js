@@ -3015,7 +3015,7 @@ class DashboardServer {
     /* Phase chip colour schema (spec 4.2):
        EARLY=muted, FORMING=white, STRONG=accent, SATURATED=warn.
        Only strong/saturated get colour emphasis; early/forming stay neutral. */
-    .phase-chip-early.active    { background: rgba(255,255,255,.04);    border-color: var(--border2);                  color: var(--muted); }
+    .phase-chip-early.active    { background: rgba(255,255,255,.06);    border-color: var(--border3);                  color: var(--text2); }
     .phase-chip-forming.active  { background: rgba(255,255,255,.06);    border-color: rgba(255,255,255,.20);           color: var(--text); }
     .phase-chip-strong.active   { background: rgba(var(--accent-rgb),.10); border-color: rgba(var(--accent-rgb),.30);  color: var(--accent); }
     .phase-chip-saturated.active{ background: rgba(var(--warn-rgb),.10);   border-color: rgba(var(--warn-rgb),.30);    color: var(--warn); }
@@ -7680,10 +7680,10 @@ const SOURCE_LINK_LABELS = { reddit: '🟠 Reddit', twitter: '𝕏 Twitter', tik
 // ── Phase constants ──────────────────────────────────────────────────────────
 // hint resolves via t() — call phaseHint(phase) when you need the localized text.
 const PHASE_META = {
-  early:     { label: 'EARLY',     color: '#3B82F6', bg: 'rgba(59,130,246,0.12)', hintKey: 'phase.early.hint' },
-  forming:   { label: 'FORMING',   color: '#EAB308', bg: 'rgba(234,179,8,0.12)',  hintKey: 'phase.forming.hint' },
-  strong:    { label: 'STRONG',    color: '#22C55E', bg: 'rgba(34,197,94,0.12)',  hintKey: 'phase.strong.hint' },
-  saturated: { label: 'SATURATED', color: '#EF4444', bg: 'rgba(239,68,68,0.12)',  hintKey: 'phase.saturated.hint' },
+  early:     { label: 'EARLY',     color: '#71767b', bg: 'rgba(255,255,255,0.04)', hintKey: 'phase.early.hint' },
+  forming:   { label: 'FORMING',   color: '#e7e9ea', bg: 'rgba(255,255,255,0.06)', hintKey: 'phase.forming.hint' },
+  strong:    { label: 'STRONG',    color: '#4ade80', bg: 'rgba(74,222,128,0.10)',  hintKey: 'phase.strong.hint' },
+  saturated: { label: 'SATURATED', color: '#f59e0b', bg: 'rgba(245,158,11,0.10)',  hintKey: 'phase.saturated.hint' },
 };
 function phaseHint(p) { const m = PHASE_META[p]; return m ? t(m.hintKey) : ''; }
 const PHASE_DOT = { early: '🔵', forming: '🟡', strong: '🟢', saturated: '🔴' };
