@@ -2859,8 +2859,8 @@ class DashboardServer {
     }
     .nav-icon-btn:hover {
       color: var(--text);
-      border-color: rgba(var(--accent-rgb), .35);
-      background: rgba(var(--accent-rgb), .06);
+      border-color: var(--border2);
+      background: transparent;
     }
     .nav-icon-btn.active {
       color: var(--accent2);
@@ -2998,7 +2998,7 @@ class DashboardServer {
       white-space: nowrap;
       overflow: hidden;
     }
-    .phase-chip:hover { color: var(--text2); background: rgba(255,255,255,.04); border-color: var(--border2); }
+    .phase-chip:hover { color: var(--text2); background: transparent; border-color: var(--border2); }
     .phase-chip-dot { font-size: 8px; line-height: 1; flex-shrink: 0; }
     .phase-chip-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
     .phase-chip-count {
@@ -3030,7 +3030,7 @@ class DashboardServer {
       user-select: none; position: relative;
     }
     .source-item:hover {
-      background: rgba(255,255,255,.04); border-color: var(--border2);
+      background: transparent; border-color: var(--border2);
       transform: translateX(1px);
     }
     .source-item.on {
@@ -3143,7 +3143,7 @@ class DashboardServer {
       transition: all .15s; font-family: inherit;
       white-space: nowrap; text-align: center;
     }
-    .seg-btn:hover { color: var(--text2); background: rgba(255,255,255,.03); }
+    .seg-btn:hover { color: var(--text2); background: transparent; border-color: var(--border2); }
     .seg-btn.active {
       background: var(--accent-glow);
       color: var(--accent2);
@@ -3187,7 +3187,7 @@ class DashboardServer {
       overflow: hidden;
     }
     .sb-foot-btn .sb-foot-ico { font-size: 15px; filter: saturate(.75); transition: filter .15s, transform .15s; }
-    .sb-foot-btn:hover { color: var(--text); background: rgba(255,255,255,.04); }
+    .sb-foot-btn:hover { color: var(--text); background: transparent; border-color: var(--border2); }
     .sb-foot-btn:hover .sb-foot-ico { filter: saturate(1.1); transform: scale(1.05); }
     .sb-foot-btn.active {
       color: var(--accent2);
@@ -3404,7 +3404,7 @@ class DashboardServer {
     }
     .cat-dd-trigger:hover {
       border-color: var(--border2); color: var(--text);
-      background: rgba(255,255,255,.045);
+      background: transparent;
     }
     .cat-dd.open .cat-dd-trigger {
       border-color: rgba(var(--accent-rgb), .4);
@@ -3463,7 +3463,7 @@ class DashboardServer {
       position: relative;
     }
     .cat-dd-opt:hover {
-      background: rgba(255,255,255,.045); color: var(--text);
+      background: transparent; color: var(--text); border-color: var(--border2);
     }
     .cat-dd-opt.active {
       background: var(--accent-glow);
@@ -4263,7 +4263,7 @@ class DashboardServer {
       min-width: 0;        /* lets flex children inside actually shrink */
       width: 100%;
     }
-    .atype-toggle:hover { border-color: var(--accent); background: rgba(255,255,255,.04); }
+    .atype-toggle:hover { border-color: var(--accent); background: transparent; }
     .atype-toggle.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
     .atype-toggle:disabled { opacity: 0.6; cursor: wait; }
     .atype-toggle-icon { font-size: 14px; line-height: 1; flex-shrink: 0; }
@@ -6324,8 +6324,8 @@ class DashboardServer {
       border: 1px solid transparent;
     }
     .top-item:hover {
-      background: rgba(255,255,255,.03);
-      border-color: var(--border);
+      background: transparent;
+      border-color: var(--border2);
       transform: translateX(1px);
     }
     .top-item-rank {
