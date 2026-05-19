@@ -4397,8 +4397,8 @@ class DashboardServer {
     .toast.success .toast-icon { color: var(--accent); }
     .toast.warn    { border-left-color: var(--warn); }
     .toast.warn    .toast-icon { color: var(--warn); }
-    .toast.error   { border-left-color: #ef4444; }
-    .toast.error   .toast-icon { color: #ef4444; }
+    .toast.error   { border-left-color: var(--red2, #ef4444); }
+    .toast.error   .toast-icon { color: var(--red2, #ef4444); }
     .toast-icon {
       flex-shrink: 0;
       width: 14px; height: 14px;
