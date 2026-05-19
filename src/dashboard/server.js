@@ -1054,6 +1054,9 @@ class DashboardServer {
 
     // Sort modes (no per-user personalization — removed 2026-04-27 along with
     // the per-category boost. Rank is now the same global ordering for everyone.)
+    // 2026-05-20 R5: dropped the 'virality' UI option (duplicated rank). The
+    // branch below is kept as legacy-tolerance so old shared URLs still resolve
+    // to a sensible ordering instead of falling through to default.
     let orderBy;
     if      (sortParam === 'time')      orderBy = 'first_seen_at DESC';
     else if (sortParam === 'virality')  orderBy = 'score DESC';
@@ -6950,7 +6953,6 @@ const I18N = {
     'sort.meme': 'Top adoption',
     'sort.emergence': 'Top emergence',
     'sort.time': 'Newest',
-    'sort.virality': 'Virality',
     'tooltip.hide_source': 'Hide from feed (visual only)',
     'tooltip.show_source': 'Show in feed',
     'tooltip.show_all': 'Show all',
@@ -7380,7 +7382,6 @@ const I18N = {
     'sort.meme': 'Топ adoption',
     'sort.emergence': 'Топ emergence',
     'sort.time': 'Свежие',
-    'sort.virality': 'Виральность',
     'tooltip.hide_source': 'Скрыть из фида (визуально)',
     'tooltip.show_source': 'Показать в фиде',
     'tooltip.show_all': 'Показать все',
