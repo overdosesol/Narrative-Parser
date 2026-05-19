@@ -5,9 +5,111 @@
 
 Append на верх — новейшие сверху, старейшие снизу. Порог в 10 — мягкий:
 если несколько entries относятся к одному PR/дню, можно временно держать
-до 12 без архивации. Полная история — в git.
+до 12 безархивации. Полная история — в git.
 
 Если задача мелкая, например передвинуть кнопку в дашборде или изменить немного текст в промпте для llm, можно сразу не записывать в WORKLOG, а подождать пока накопится около 5 мелких правок или 1 большая и записать всё вместе.
+
+---
+
+## 2026-05-20 · sonnet · Dashboard redesign Round 4 — iconography sweep
+
+**Триггер**: после Round 3 (градиенты + abyss-black) дашборд читался плоско, но ~90 эмодзи (категории, фазы, кнопки, settings rows, source glyphs) тянули его обратно в "AI-made". Round 4 закрывает редизайн: SVG icons (Lucide + Phosphor 2 exceptions + 5 brand glyphs), color-dot + uppercase text для phase/market state, plain text + color для sentiment.
+
+### Что покрыто
+
+8 коммитов в `src/dashboard/server.js`:
+
+1. **`2764a6f` Icon helper foundation** — `makeIcon()` factory + `ICONS` registry + `icon(name, opts)` shim near JS-helpers section. Smoke icons: search, x.
+2. **`7b1a69c` Brand SVGs (sources)** — 5 brand glyphs (reddit/twitter/google/tiktok/hash). `SOURCE_ICONS` → icon-key strings, обновил sidebar source rows + feed-card avatar + tw-prev-x + nav X button. Удалил `SOURCE_LOGOS` + `dangerouslySetInnerHTML` path. `SourceMark` теперь использует `icon()`.
+3. **`cbd138b` Bottom-nav + sidebar phase chips + filters** — `flame/star/search` для Feed/Saved/Analyze. `PHASE_DOT` emoji glyphs (🔵🟡🟢🔴) → `phaseDot()` helper с CSS-coloured `<span>`. CSS `.phase-dot` + `.phase-dot.glow`. `CAT_ICONS` → Lucide-key strings. Type chips EVENT/TREND/POST → newspaper/trend/circle-dot. Включает `lock` icon для locked tabs.
+4. **`df03dfc` Feed card chips/metrics/actions** — heart/message-circle/repeat-2/eye/arrow-up/award metrics, external-link/send/star/x actions, flask-conical для MANUAL badge.
+5. **`cddf10a` Settings + Account icons** — 21 settings-area icons (settings (Phosphor) / palette/globe/user/refresh-ccw/archive/radio-tower/bell/sparkles/rows/log-out/activity/gem/bot/clock/bar-chart-3/zap/calendar*/brain/target/droplet/waves). `Row` component accepts icon-NAME strings (legacy emoji fallback оставлен). `Sheet` тоже. Language flags 🇺🇸/🇷🇺 → "EN"/"RU".
+6. **`9a8f26c` Analyze panel + TrendModal** — alert-triangle/ban/x-circle/line-chart/thumbs-*/clipboard-check/inbox/search-x/book-open. Market stage: emoji → CSS dot/pulse/spinner (kind field). Sentiment text-only: i18n strings → POSITIVE/NEGATIVE/NEUTRAL без emoji. FeedbackBar thumbs SVG.
+7. **R4 Task 7: Empty states + warnings + misc** — empty-feed inbox / search-x, error-bar alert-triangle, lock icons на locked sources + source-lock chip + stats banner, feed-search-icon, sort segments (rank/meme/emergence/time/virality → icon-name keys).
+8. **R4 Task 8: i18n sweep + WORKLOG (this commit)** — strip leading emoji from ~50 translation strings (EN + RU). Update remaining JSX render sites to add icon() separately (modal-engagement metrics row, xtrends top tweets, archive snapshot banner, analyze action buttons, source-pulse render, account-hero gem chip, LoginScreen feature list). Nav-account avatar fallback 👤 → icon('user'). Nav logo onError 🐱 → "C" monogram inline. Window-pill locked emoji → icon('lock'). Manual filter chip emoji → icon('flask-conical').
+
+### Архитектура
+
+- `ICONS` registry — ~80 inline-SVG factories (Lucide stroke 2px + 2 Phosphor fill exceptions + 5 brand glyphs).
+- `makeIcon(viewBox, stroke, ...children)` returns render function captured with viewBox + stroke/fill style.
+- `icon(name, opts)` — use-site shim. `opts.size` default 14; `opts.color` cascades through inline style; `aria-hidden=true` unless `aria-label` set.
+- `currentColor` everywhere — theming работает автоматически.
+- `phaseDot(p)` helper для PHASE_META — color-circle через `<span>`.
+- `MARKET_STAGE_UI.kind` field — `'dot'|'pulse'|'spinner'` — picks indicator type. CSS: `.market-dot` + `.market-spinner` + `@keyframes`.
+- Sentiment: i18n POSITIVE/NEGATIVE/NEUTRAL + `.sentiment-chip` CSS (mono uppercase, currentColor border).
+
+### Файлы
+
+- `src/dashboard/server.js` — основной (~295k → 319k chars, +24k = inline SVG paths).
+- `ai-context/WORKLOG.md` — этот entry.
+
+### Деплой
+
+Не деплоил — оператор сам через `deploy.ps1`. SPA check зелёный после каждого коммита.
+
+### Риски / regression
+
+- SPA-trap (backticks в comments) поймана 3 раза за работу — каждый раз сразу пофиксил, no commit on red.
+- `Row` + `Sheet` components сохранили legacy-emoji-fallback ветку на случай если где-то остался не-мигрированный caller. Чисто defensive — после R4 не должно срабатывать.
+- `SOURCE_LINK_LABELS` теперь plain text (`'Reddit'`, `'Twitter'`, etc) — на feed-action-btn открытия источника теперь нет эмодзи префикса. Brand recognition — через `icon(external-link)` slot уже добавлен.
+- `MarketStageBadge` поменял shape — `kind` field вместо `icon`. Если где-то ещё читался `MARKET_STAGE_UI[stage].icon` (grep clean — нет), сломается. Final grep подтверждает.
+
+### Оставшиеся эмодзи в файле
+
+Все в comments (документация). Whitelist: `\u{1F300}-\u{1F9FF}` grep возвращает ~20 матчей, все из них — `//`-комментарии описывающие старые трапы или JSX (например `// 🔥 Trigger — concrete past-event`). Render path чистый.
+
+---
+
+## 2026-05-20 · sonnet · Dashboard redesign Round 3 — gradient removal (flat pass)
+
+**Триггер**: после деплоя Round 2 (radius + density) оператор сказал "Может уберем все градиенты?". Цель — убрать оставшиеся декоративные `linear-gradient`/`radial-gradient`, оставив только functional (брендовые avatars, медальные TOP-1/2/3, shimmer-анимации, select-arrow icon-hack).
+
+### Что покрыто
+
+Один файл — `src/dashboard/server.js`. Точечный sweep по 48 gradient-правилам:
+
+- **Heavy (видимые)**: CATALYST badge `.nav-logo-icon` + текст `.nav-logo-text`, `.nav-account-avatar`, `.meme-hero` modal hero, `.analyze-verdict.high/.low`. → solid альфы / `var(--surface2)`.
+- **LoginScreen**: убраны 2 ambient `<div>` целиком — radial-blue-blob и grid-overlay (с radial-маской). Monogram h1 → solid `var(--text)`. Verify-кнопка градиент `accent→#146da8` → solid `var(--accent)`.
+- **Decoration**: `.nav` bg `surface→bg` → solid `var(--surface)`. `.nav::after` accent-полоска → solid alpha. `.sidebar` bg, `.sidebar-footer` bg, `.sb-foot-btn.active::before`, `.stat-card::after` hover-полоска, `.feed-panel.is-refreshing::before` прогресс-бар — все плоско.
+- **Subtle bg overlays**: `.status-pill`, `.analyze-loader`, `.analyze-result`, `.analyze-hero`, `.settings-info`, `.sheet`, `.sheet-head`, `.story-hook`, `.alert-math-panel`, `.feed-panel-head`, `.feed-desc.pump`, `.feed-score::before` divider, `.feed-card:hover` (pillowy hover) — gradient → среднее значение solid.
+- **Button/bar fills**: `.range-slider` tracks (webkit + moz), `.feed-action-btn.primary` + `:hover`, `.cat-bar`, `.feed-image-placeholder` — все `accent→accent2` → solid `var(--accent)` / `var(--card2)`.
+- **Confidence bars**: `.conf-low/.conf-mid/.conf-high` градиент `.7→1` alpha → solid full-opacity (semantic red/yellow/green сохранен).
+- **Dead code**: `memeColor(v)` global function (shadowed внутри TrendCard `const memeColor = barColor(meme)`) — gradients заменены на возврат `var(--accent)`, добавлен комментарий что dead в дашборде.
+
+### Что осталось (functional, не трогали)
+
+- `select` arrow CSS-hack (45deg + 135deg triangles).
+- `.meme-hero-fill::after` shimmer animation (loading indicator).
+- `.skeleton` shimmer animation.
+- `.feed-avatar.reddit/twitter/tiktok/google_trends/x_trends` — брендовые градиенты Reddit оранжевый / TikTok бирюза+малина / Google Material / X-чёрный → semantic.
+- `.top-item-rank.top-1/.top-2/.top-3` — gold/silver/bronze медали (рейтинговая семантика).
+
+### Follow-up: surface/card scale "abyss black"
+
+После градиентного pass оператор сказал что cards читаются как "тёмно-серые" на чёрном bg. Crunched surface/card ladder в обеих темах (pulse + ink, tide-navy не трогал):
+
+- `--surface`  `#0a0a0a` → `#050505`
+- `--surface2` `#16181c` → `#0a0b0e`
+- `--card`     `#16181c` → `#0a0b0e`
+- `--card2`    `#1c1f24` → `#101114`
+- `--card3`    `#232730` → `#16181c`
+
+Depth-ordering сохранен (bg < surface < surface2/card < card2 < card3), но шкала смещена к `#000`. Borders (rgba) и текст не трогал — контраст с новым background чуть-чуть вырос, читается ОК. theme-swatch preview в settings (там hardcoded `#16181c` для card-чипа) показывает "старое" card-значение, но это превью-плашка размером 14px — переделаю если бросится в глаза.
+
+### Деплой
+
+Не деплоил — оператор сам через `deploy.ps1`. SPA check зелёный после каждой партии (4 партии: heavy → nav/sidebar/stripes → subtle overlays → confidence+hover+dead). Размер inner SPA: 295380 → 295419 chars (~+40 — комментарии добавлены, сами правила короче).
+
+### Риски / regression
+
+- LoginScreen теперь полностью пустой фон — Axiom-style ambient blobs и grid сняты. Может казаться "слишком пусто" — оператор это и просил.
+- `.feed-card:hover` теперь solid `rgba(255,255,255,.025)` вместо gradient'а 4%→1.5% — оставил тот же tone, лифт от translateY+shadow остался.
+- `memeColor()` function больше не возвращает gradient — все вызовы внутри TrendCard используют локальный const, поэтому изменение виртуальное. На случай если функция в проекте импортируется снаружи — теперь возвращает `var(--accent)` (consistent с barColor).
+
+### Файлы
+
+- `src/dashboard/server.js` — основной файл (одна серия Edit'ов).
+- `ai-context/WORKLOG.md` — этот entry.
 
 ---
 

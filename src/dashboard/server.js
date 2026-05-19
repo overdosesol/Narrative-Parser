@@ -6756,9 +6756,9 @@ const I18N = {
     'analyze.locked': 'Manual analysis is a Test/Pro feature.',
     'analyze.locked_tooltip': 'Available on Test/Pro plan',
     'analyze.locked_toast': 'Manual analysis is available on Test/Pro',
-    'analyze.verdict_high':     '🔥 Strong viral potential',
-    'analyze.verdict_mid':      '📈 Some traction',
-    'analyze.verdict_low':      '💤 Unlikely to take off',
+    'analyze.verdict_high':     'Strong viral potential',
+    'analyze.verdict_mid':      'Some traction',
+    'analyze.verdict_low':      'Unlikely to take off',
     'analyze.verdict_sub_high': 'This post matches the patterns we see in narratives that explode.',
     'analyze.verdict_sub_mid':  'There is a signal here, but the post has not broken out yet.',
     'analyze.verdict_sub_low':  'Weak narrative signal and low engagement — probably not going viral.',
@@ -6807,10 +6807,10 @@ const I18N = {
     'time.days_ago': '{d}d ago',
 
     // Lifespan
-    'lifespan.flash': '⚡ Hours',
-    'lifespan.short': '📅 1-2 days',
-    'lifespan.medium': '🗓 3-7 days',
-    'lifespan.long': '📆 Weeks+',
+    'lifespan.flash': 'Hours',
+    'lifespan.short': '1-2 days',
+    'lifespan.medium': '3-7 days',
+    'lifespan.long': 'Weeks+',
     'lifespan.unknown': '—',
 
     // Phase hints
@@ -6825,12 +6825,12 @@ const I18N = {
     'sentiment.neutral': 'NEUTRAL',
 
     // Bars / scores
-    'bar.emergence': '🌊 Emergence',
-    'bar.adoption': '💊 Adoption',
-    'bar.story': '📖 Story',
+    'bar.emergence': 'Emergence',
+    'bar.adoption': 'Adoption',
+    'bar.story': 'Story',
 
     // Feed card
-    'feed.details': '📖 Details',
+    'feed.details': 'Details',
     'feed.open_source': 'Open',
     'feed.copy_title': 'Copy title',
     'feed.category_tip': 'Category',
@@ -6838,7 +6838,7 @@ const I18N = {
     'feed.fresh_tip':  'First seen within the last hour',
     'feed.catalyst_tip': 'Catalyst forecast available — open the card to read it',
     'badge.fresh':     'NEW',
-    'badge.catalyst':  '🔮 Catalyst',
+    'badge.catalyst':  'Catalyst',
     'feedback.like': 'Smash that like',
     'feedback.unlike': 'Undo like',
     'feedback.dislike': 'Dislike',
@@ -6884,25 +6884,25 @@ const I18N = {
     'feed.atype.trend': 'Trend',
     'feed.atype.post':  'Post',
     'feed.atype_chip': (label) => label, // for badge in feed cards
-    'badge.alert_type.event': '📰 EVENT',
-    'badge.alert_type.trend': '📈 TREND',
-    'badge.alert_type.post':  '🚀 POST',
+    'badge.alert_type.event': 'EVENT',
+    'badge.alert_type.trend': 'TREND',
+    'badge.alert_type.post':  'POST',
     'account.alert_types':       'Alert types',
     'account.alert_types_desc':  'Choose which kinds of alerts to receive (subscription, applies to Telegram + this dashboard).',
     // Shortened 2026-05-01 — long forms overflowed the toggle container in
     // AlertTypesRow. Hover/title attribute keeps the longer description.
-    'account.alert_types_event': '📰 Events — concrete trigger',
-    'account.alert_types_trend': '📈 Trends — multi-platform narrative',
-    'account.alert_types_post':  '🚀 Posts — single viral post',
+    'account.alert_types_event': 'Events — concrete trigger',
+    'account.alert_types_trend': 'Trends — multi-platform narrative',
+    'account.alert_types_post':  'Posts — single viral post',
     'account.alert_types_save':  'Save',
-    'account.alert_types_saved': '✓ Saved',
+    'account.alert_types_saved': 'Saved',
     'account.alert_types_all_off_hint': 'All off = receive all (we never silently mute you).',
     'sidebar.show_all': 'Show all',
     'sidebar.reset': 'Reset',
     'sidebar.window': '⏱ Window',
-    'sidebar.category': '🏷️ Category',
+    'sidebar.category': 'Category',
     'sidebar.all_categories': 'All categories',
-    'sidebar.sort': '🔀 Sort',
+    'sidebar.sort': 'Sort',
     'sort.rank': 'Rank',
     'sort.meme': 'Top adoption',
     'sort.emergence': 'Top emergence',
@@ -6919,17 +6919,17 @@ const I18N = {
     'hero.window': 'Window',
     'hero.signals': 'Signals',
     'hero.alerts': 'Alerts',
-    'hero.stats': '📊 Stats',
-    'hero.scan_now': '⚡ Scan now',
+    'hero.stats': 'Stats',
+    'hero.scan_now': 'Scan now',
     'hero.scanning': '⏳ Scanning…',
 
     // Right panel
-    'right.top_narratives': '🏆 Top Narratives',
+    'right.top_narratives': 'Top Narratives',
     'right.top_suffix': '{h}h · top {n}',
     'right.no_signals': 'No signals yet',
-    'right.source_pulse': '📡 Source Pulse',
+    'right.source_pulse': 'Source Pulse',
     'right.live_count': '{a}/{t} live',
-    'right.activity': '🟢 Live',
+    'right.activity': 'Live',
     'right.activity_hours': '{h}h',
     'right.sources_label': 'Sources',
     'right.sources_active': 'Active sources',
@@ -6940,43 +6940,43 @@ const I18N = {
     'right.score.vrl': 'vrl',
 
     // Trend modal
-    'modal.why_now': '🔥 Trigger',
+    'modal.why_now': 'Trigger',
     'modal.why_now_empty': 'No clear trigger — organic slow-burn',
-    'modal.trigger': '🔥 Trigger',
-    'modal.ai_explanation': '🤖 AI alpha',
+    'modal.trigger': 'Trigger',
+    'modal.ai_explanation': 'AI alpha',
     // Trigger search (on-demand Grok reasoning)
-    'trigger.label':         '🔮 Catalyst',
-    'trigger.btn':           '🔮 Forecast Catalyst',
-    'trigger.btn_pro_only':  '🔒 Catalyst forecast — Test/Pro',
-    'trigger.daily_limit':   '⛔ Daily Catalyst limit reached ({cap}/24h)',
+    'trigger.label':         'Catalyst',
+    'trigger.btn':           'Forecast Catalyst',
+    'trigger.btn_pro_only':  'Catalyst forecast — Test/Pro',
+    'trigger.daily_limit':   'Daily Catalyst limit reached ({cap}/24h)',
     'window.locked_tooltip': 'Available on Test/Pro plan',
     'window.locked_toast':   'Wider time window is available on Test/Pro',
     'source.locked_tooltip': 'Available on Test/Pro plan',
     'source.locked_toast':   'This source is available on Test/Pro',
-    'usage.test_left':       '📊 {used}/{cap} used today ({left} left)',
+    'usage.test_left':       '{used}/{cap} used today ({left} left)',
     'trigger.locked_title':  'Catalyst forecast',
     'trigger.locked_desc':   'Available on Test and Pro plans',
-    'trigger.btn_loading':   '🔮 Forecasting… (~30-60s)',
+    'trigger.btn_loading':   'Forecasting… (~30-60s)',
     'trigger.confidence':    'Confidence: {pct}%',
     'trigger.confidence_label': 'Confidence',
-    'trigger.sources':       '📡 Sources:',
+    'trigger.sources':       'Sources:',
     'trigger.sources_head':  '𝕏 Sources',
-    'trigger.in_flight':     '🔮 Another user is already forecasting this catalyst. Try again in ~30s.',
+    'trigger.in_flight':     'Another user is already forecasting this catalyst. Try again in ~30s.',
     'trigger.cooldown':      '⏳ You can run another catalyst forecast in {min} min',
-    'trigger.error':         '❌ Catalyst forecast failed: {err}',
-    'trigger.disabled':      '❌ Catalyst forecast is currently unavailable.',
+    'trigger.error':         'Catalyst forecast failed: {err}',
+    'trigger.disabled':      'Catalyst forecast is currently unavailable.',
     'trigger.phase_label':   'Phase',
     'trigger.window_label':  'Window',
-    'trigger.drivers_label': '📈 Growth drivers',
-    'trigger.risks_label':   '⚠️ Risks',
+    'trigger.drivers_label': 'Growth drivers',
+    'trigger.risks_label':   'Risks',
     'trigger.cta_hint':      'Where this narrative is heading - phase, catalysts, risks.',
     'trigger.phase.early':       'Early',
     'trigger.phase.building':    'Building',
     'trigger.phase.peaking':     'Peaking',
     'trigger.phase.saturated':   'Saturated',
     'trigger.phase.fading':      'Fading',
-    'modal.market_stage': '💹 Market Stage',
-    'modal.metrics': '📊 Stats',
+    'modal.market_stage': 'Market Stage',
+    'modal.metrics': 'Stats',
     'modal.meme_score': 'Meme Score',
     'modal.lifespan': 'Lifespan',
     'modal.virality': 'Virality',
@@ -6985,10 +6985,10 @@ const I18N = {
     'modal.alert_score': 'Alert',
     'modal.alert_pass': 'would alert',
     'modal.alert_fail': "won't alert",
-    'modal.alert_breakdown': '🔔 Alert verdict',
+    'modal.alert_breakdown': 'Alert verdict',
     'modal.alert_floor': 'floor',
-    'modal.alert_type_in_filter': '✓ in your filter',
-    'modal.alert_type_muted': '✕ muted in your filter',
+    'modal.alert_type_in_filter': 'in your filter',
+    'modal.alert_type_muted': 'muted in your filter',
     'modal.alert_breakdown_meme': 'meme',
     'modal.alert_breakdown_viral': 'viral',
     'modal.alert_breakdown_emerge': 'emerge',
@@ -7014,18 +7014,18 @@ const I18N = {
     'term.alert_score': 'Composite 0-100 verdict. Combines meme, virality, emergence, X signal and feedback votes minus junk and stale-decay penalties. Decides if a Telegram alert fires.',
     'term.lifespan':    'AI prediction of how long this trend stays interesting — short / medium / long.',
     'term.emergence':   'Cluster velocity: how fast this narrative spreads vs background noise. High = picking up steam right now.',
-    'term.feedback':    'Bias from user 👍/👎 votes (50 = neutral). Likes push the score up; mass dislikes pull it down. Below 5 votes the effect is dampened.',
+    'term.feedback':    'Bias from user up/down votes (50 = neutral). Likes push the score up; mass dislikes pull it down. Below 5 votes the effect is dampened.',
     'term.junk':        'Junk-filter penalty (0-100) — politics, k-pop drama, celeb noise, no meme-shape, text-only. Subtracted from positive score.',
     'term.stale':       'Age penalty. After 24h grace each hour subtracts ~2 points (max −30). Punishes alerts about old news.',
-    'modal.feedback': '💬 Your take',
-    'modal.links': '🔗 Links',
+    'modal.feedback': 'Your take',
+    'modal.links': 'Links',
     'modal.source_link': '{ico} Source →',
-    'modal.tg_link': '📨 Telegram',
-    'modal.ask_grok': '🧠 Ask Grok',
-    'modal.xtrends_top_tweets': '🔥 Top tweets ({n})',
+    'modal.tg_link': 'Telegram',
+    'modal.ask_grok': 'Ask Grok',
+    'modal.xtrends_top_tweets': 'Top tweets ({n})',
 
     // Control panel
-    'control.title': '⚙️ Controls',
+    'control.title': 'Controls',
     'control.scan': 'Scan',
     'control.health': 'Health',
     'control.reload': 'Reload',
@@ -7036,7 +7036,7 @@ const I18N = {
     'control.disable_source': 'Disable source',
 
     // Stats view
-    'stats.overview': '📊 Stats overview',
+    'stats.overview': 'Stats overview',
     'stats.sources': 'Sources',
     'stats.window': '{h}h window',
     'stats.categories': 'Categories',
@@ -7049,10 +7049,10 @@ const I18N = {
 
     // Settings
     'settings.title': 'Dashboard settings',
-    'settings.flash_reset': '✓ Settings reset',
-    'settings.flash_sources_shown': '✓ All sources visible',
+    'settings.flash_reset': 'Settings reset',
+    'settings.flash_sources_shown': 'All sources visible',
 
-    'settings.appearance': '🎨 Appearance',
+    'settings.appearance': 'Appearance',
     'settings.appearance_desc': 'Visual preferences — applied instantly, stored in this browser.',
     'settings.density': 'Feed density',
     'settings.density_desc': 'Compact shrinks padding and card size for dense scrolling.',
@@ -7070,7 +7070,7 @@ const I18N = {
     'settings.col_right_desc': 'Insights / stats panel width. Currently {px}px.',
 
 
-    'settings.behavior': '🔄 Behavior',
+    'settings.behavior': 'Behavior',
     'settings.behavior_desc': 'Source visibility in the feed. New data arrives live — no auto-refresh timer needed.',
     'settings.hidden': 'Hidden sources',
     'settings.hidden_count': '{n} hidden. Visual filter in this browser only.',
@@ -7081,7 +7081,7 @@ const I18N = {
     'feed.hide_btn_tip': 'Hide this alert',
     'toast.alert_hidden': 'Hidden',
     'toast.undo': 'Undo',
-    'archive.title': '📦 Archive',
+    'archive.title': 'Archive',
     'archive.desc': 'Alerts you hid. Kept for 7 days, then auto-removed.',
     'archive.empty': 'Nothing here yet — click ✕ on a card to hide it.',
     'archive.restore': '↺ Restore',
@@ -7090,17 +7090,17 @@ const I18N = {
     'archive.count': '{n} hidden',
     'archive.loading': 'Loading…',
 
-    'settings.language': '🌐 Language',
+    'settings.language': 'Language',
     'settings.language_desc': 'Dashboard language and Ask-Grok prompt language. Bot stays in your Telegram language.',
     'settings.language_dashboard': 'Dashboard',
     'settings.language_dashboard_hint': 'UI language',
     'settings.grok_language': 'Ask Grok',
     'settings.grok_language_hint': 'Prompt language for the "Ask Grok" button',
 
-    'settings.theme': '🎨 Theme',
+    'settings.theme': 'Theme',
     'settings.theme_desc': 'Pick your vibe. All dark — no white allowed.',
 
-    'settings.account': '👤 Account',
+    'settings.account': 'Account',
     'settings.account_desc': 'Login goes through our Telegram bot. Your plan and settings are tied to this account.',
     'settings.tg': 'Telegram',
     'settings.tg_chatid': 'chat id: {id}',
@@ -7143,7 +7143,7 @@ const I18N = {
 
     // Toasts
     'toast.refreshing': 'Refreshed',
-    'toast.copied': '📋 Copied!',
+    'toast.copied': 'Copied!',
     'toast.copy_failed': 'Copy failed',
     'toast.all_sources_visible': 'All sources visible',
     'toast.hidden_from_feed': 'Hidden from feed: {name}',
@@ -7188,9 +7188,9 @@ const I18N = {
     'analyze.locked': 'Ручной анализ — на Test/Pro плане.',
     'analyze.locked_tooltip': 'Доступно на Test/Pro',
     'analyze.locked_toast': 'Ручной анализ — на Test/Pro',
-    'analyze.verdict_high':     '🔥 Высокий вирусный потенциал',
-    'analyze.verdict_mid':      '📈 Есть потенциал',
-    'analyze.verdict_low':      '💤 Вряд ли разлетится',
+    'analyze.verdict_high':     'Высокий вирусный потенциал',
+    'analyze.verdict_mid':      'Есть потенциал',
+    'analyze.verdict_low':      'Вряд ли разлетится',
     'analyze.verdict_sub_high': 'Пост попадает в паттерны нарративов, которые взрываются.',
     'analyze.verdict_sub_mid':  'Сигнал есть, но пост пока не пробил.',
     'analyze.verdict_sub_low':  'Слабый нарратив и низкая вовлечённость — вирусности ждать не стоит.',
@@ -7239,10 +7239,10 @@ const I18N = {
     'time.days_ago': '{d}д назад',
 
     // Lifespan
-    'lifespan.flash': '⚡ Часы',
-    'lifespan.short': '📅 1-2 дня',
-    'lifespan.medium': '🗓 3-7 дней',
-    'lifespan.long': '📆 Недели+',
+    'lifespan.flash': 'Часы',
+    'lifespan.short': '1-2 дня',
+    'lifespan.medium': '3-7 дней',
+    'lifespan.long': 'Недели+',
     'lifespan.unknown': '—',
 
     // Phase hints
@@ -7257,12 +7257,12 @@ const I18N = {
     'sentiment.neutral': 'NEUTRAL',
 
     // Bars / scores
-    'bar.emergence': '🌊 Emergence',
-    'bar.adoption': '💊 Adoption',
-    'bar.story': '📖 Story',
+    'bar.emergence': 'Emergence',
+    'bar.adoption': 'Adoption',
+    'bar.story': 'Story',
 
     // Feed card
-    'feed.details': '📖 Подробнее',
+    'feed.details': 'Подробнее',
     'feed.open_source': 'Открыть',
     'feed.copy_title': 'Скопировать заголовок',
     'feed.category_tip': 'Категория',
@@ -7270,7 +7270,7 @@ const I18N = {
     'feed.fresh_tip':  'Появился в последний час',
     'feed.catalyst_tip': 'Каталист найден — открой карточку чтобы прочитать прогноз',
     'badge.fresh':     'NEW',
-    'badge.catalyst':  '🔮 Каталист',
+    'badge.catalyst':  'Каталист',
     'feedback.like': 'Лайк',
     'feedback.unlike': 'Убрать лайк',
     'feedback.dislike': 'Дизлайк',
@@ -7314,25 +7314,25 @@ const I18N = {
     'feed.atype.trend': 'Тренд',
     'feed.atype.post':  'Пост',
     'feed.atype_chip': (label) => label,
-    'badge.alert_type.event': '📰 СОБЫТИЕ',
-    'badge.alert_type.trend': '📈 ТРЕНД',
-    'badge.alert_type.post':  '🚀 ПОСТ',
+    'badge.alert_type.event': 'СОБЫТИЕ',
+    'badge.alert_type.trend': 'ТРЕНД',
+    'badge.alert_type.post':  'ПОСТ',
     'account.alert_types':       'Типы алертов',
     'account.alert_types_desc':  'Выберите, какие алерты получать (подписка, применяется к Telegram и дашборду).',
     // Сокращено 2026-05-01 — длинные формулировки вылезали за границы тогглов
     // в AlertTypesRow.
-    'account.alert_types_event': '📰 События — конкретный триггер',
-    'account.alert_types_trend': '📈 Тренды — на нескольких платформах',
-    'account.alert_types_post':  '🚀 Посты — один вирусный пост',
+    'account.alert_types_event': 'События — конкретный триггер',
+    'account.alert_types_trend': 'Тренды — на нескольких платформах',
+    'account.alert_types_post':  'Посты — один вирусный пост',
     'account.alert_types_save':  'Сохранить',
-    'account.alert_types_saved': '✓ Сохранено',
+    'account.alert_types_saved': 'Сохранено',
     'account.alert_types_all_off_hint': 'Если выключить все — приходят все (мы никогда не мутим вас молча).',
     'sidebar.show_all': 'Показать все',
     'sidebar.reset': 'Сбросить',
     'sidebar.window': '⏱ Окно',
-    'sidebar.category': '🏷️ Категория',
+    'sidebar.category': 'Категория',
     'sidebar.all_categories': 'Все категории',
-    'sidebar.sort': '🔀 Сортировка',
+    'sidebar.sort': 'Сортировка',
     'sort.rank': 'Рейтинг',
     'sort.meme': 'Топ adoption',
     'sort.emergence': 'Топ emergence',
@@ -7349,17 +7349,17 @@ const I18N = {
     'hero.window': 'Окно',
     'hero.signals': 'Сигналы',
     'hero.alerts': 'Алерты',
-    'hero.stats': '📊 Статистика',
-    'hero.scan_now': '⚡ Сканировать',
+    'hero.stats': 'Статистика',
+    'hero.scan_now': 'Сканировать',
     'hero.scanning': '⏳ Сканирую…',
 
     // Right panel
-    'right.top_narratives': '🏆 Топ нарративов',
+    'right.top_narratives': 'Топ нарративов',
     'right.top_suffix': '{h}ч · топ {n}',
     'right.no_signals': 'Пока нет сигналов',
-    'right.source_pulse': '📡 Пульс источников',
+    'right.source_pulse': 'Пульс источников',
     'right.live_count': '{a}/{t} активных',
-    'right.activity': '🟢 Live',
+    'right.activity': 'Live',
     'right.activity_hours': '{h}ч',
     'right.sources_label': 'Источники',
     'right.sources_active': 'Активных источников',
@@ -7370,34 +7370,34 @@ const I18N = {
     'right.score.vrl': 'vrl',
 
     // Trend modal
-    'modal.why_now': '🔥 Триггер',
+    'modal.why_now': 'Триггер',
     'modal.why_now_empty': 'Нет явного триггера — органический рост',
-    'modal.trigger': '🔥 Триггер',
-    'modal.ai_explanation': '🤖 AI-объяснение',
+    'modal.trigger': 'Триггер',
+    'modal.ai_explanation': 'AI-объяснение',
     // Trigger search (on-demand Grok reasoning)
-    'trigger.label':         '🔮 Каталист',
-    'trigger.btn':           '🔮 Найти Каталиста',
-    'trigger.btn_pro_only':  '🔒 Каталист — Test/Pro',
+    'trigger.label':         'Каталист',
+    'trigger.btn':           'Найти Каталиста',
+    'trigger.btn_pro_only':  'Каталист — Test/Pro',
     'trigger.daily_limit':   '⛔ Дневной лимит Каталиста ({cap}/24ч)',
     'window.locked_tooltip': 'Доступно на Test/Pro',
     'window.locked_toast':   'Большее окно времени — на Test/Pro',
     'source.locked_tooltip': 'Доступно на Test/Pro',
     'source.locked_toast':   'Этот источник — на Test/Pro',
-    'usage.test_left':       '📊 {used}/{cap} сегодня (осталось {left})',
+    'usage.test_left':       '{used}/{cap} сегодня (осталось {left})',
     'trigger.locked_title':  'Катализатор',
     'trigger.locked_desc':   'Доступно на Test и Pro',
-    'trigger.btn_loading':   '🔮 Ищу Каталиста… (~30-60с)',
+    'trigger.btn_loading':   'Ищу Каталиста… (~30-60с)',
     'trigger.confidence':    'Уверенность: {pct}%',
     'trigger.confidence_label': 'Уверенность',
-    'trigger.sources':       '📡 Источники:',
+    'trigger.sources':       'Источники:',
     'trigger.sources_head':  '𝕏 Источники',
-    'trigger.in_flight':     '🔮 Другой юзер уже ищет Каталиста. Попробуй через ~30с.',
+    'trigger.in_flight':     'Другой юзер уже ищет Каталиста. Попробуй через ~30с.',
     'trigger.cooldown':      '⏳ Следующий поиск Каталиста через {min} мин',
     'trigger.error':         '❌ Ошибка поиска Каталиста: {err}',
     'trigger.disabled':      '❌ Поиск Каталиста недоступен.',
     'trigger.phase_label':   'Фаза',
     'trigger.window_label':  'Окно',
-    'trigger.drivers_label': '📈 Факторы роста',
+    'trigger.drivers_label': 'Факторы роста',
     'trigger.risks_label':   '⚠️ Риски',
     'trigger.cta_hint':      'Куда движется этот нарратив - фаза, каталисты, риски.',
     'trigger.phase.early':       'Зарождается',
@@ -7405,8 +7405,8 @@ const I18N = {
     'trigger.phase.peaking':     'На пике',
     'trigger.phase.saturated':   'Насыщен',
     'trigger.phase.fading':      'Угасает',
-    'modal.market_stage': '💹 Стадия рынка',
-    'modal.metrics': '📊 Метрики',
+    'modal.market_stage': 'Стадия рынка',
+    'modal.metrics': 'Метрики',
     'modal.meme_score': 'Meme Score',
     'modal.lifespan': 'Срок жизни',
     'modal.virality': 'Виральность',
@@ -7415,7 +7415,7 @@ const I18N = {
     'modal.alert_score': 'Alert',
     'modal.alert_pass': 'алерт пройдёт',
     'modal.alert_fail': 'не алертится',
-    'modal.alert_breakdown': '🔔 Решение алерта',
+    'modal.alert_breakdown': 'Решение алерта',
     'modal.alert_floor': 'порог',
     'modal.alert_type_in_filter': '✓ в вашем фильтре',
     'modal.alert_type_muted': '✕ выключен в фильтре',
@@ -7444,15 +7444,15 @@ const I18N = {
     'term.alert_score': 'Итоговый 0-100 verdict. Складывает meme, virality, emergence, X-сигнал и feedback votes минус penalties (junk, stale-decay). Решает: отправится ли Telegram-алерт.',
     'term.lifespan':    'Предсказание AI: как долго тренд останется интересным — короткий / средний / длинный.',
     'term.emergence':   'Cluster velocity: насколько быстро нарратив распространяется относительно фонового шума. Высокий = сейчас набирает обороты.',
-    'term.feedback':    'Bias от 👍/👎 юзеров (50 = нейтрал). Лайки толкают score вверх, дизы — вниз. Меньше 5 голосов — эффект ослаблен.',
+    'term.feedback':    'Bias от лайков/дизлайков юзеров (50 = нейтрал). Лайки толкают score вверх, дизы — вниз. Меньше 5 голосов — эффект ослаблен.',
     'term.junk':        'Штраф junk-фильтра (0-100) — политика, k-pop, celeb-шум, нет meme-shape, text-only. Вычитается из positive score.',
     'term.stale':       'Штраф за возраст. После 24h grace каждый час -2 очка (max -30). Бьёт по алертам о вчерашних новостях.',
-    'modal.feedback': '💬 Ваша оценка',
-    'modal.links': '🔗 Ссылки',
+    'modal.feedback': 'Ваша оценка',
+    'modal.links': 'Ссылки',
     'modal.source_link': '{ico} Источник →',
-    'modal.tg_link': '📨 Telegram',
-    'modal.ask_grok': '🧠 Спросить Grok',
-    'modal.xtrends_top_tweets': '🔥 Топовые твиты ({n})',
+    'modal.tg_link': 'Telegram',
+    'modal.ask_grok': 'Спросить Grok',
+    'modal.xtrends_top_tweets': 'Топовые твиты ({n})',
 
     // Control panel
     'control.title': '⚙️ Управление',
@@ -7466,7 +7466,7 @@ const I18N = {
     'control.disable_source': 'Отключить источник',
 
     // Stats view
-    'stats.overview': '📊 Обзор статистики',
+    'stats.overview': 'Обзор статистики',
     'stats.sources': 'Источники',
     'stats.window': 'окно {h}ч',
     'stats.categories': 'Категории',
@@ -7482,7 +7482,7 @@ const I18N = {
     'settings.flash_reset': '✓ Настройки сброшены',
     'settings.flash_sources_shown': '✓ Все источники показаны',
 
-    'settings.appearance': '🎨 Внешний вид',
+    'settings.appearance': 'Внешний вид',
     'settings.appearance_desc': 'Только визуальные предпочтения — применяются мгновенно и хранятся в этом браузере.',
     'settings.density': 'Плотность фида',
     'settings.density_desc': 'Compact уменьшает отступы и размер карточек для плотного просмотра.',
@@ -7500,7 +7500,7 @@ const I18N = {
     'settings.col_right_desc': 'Панель инсайтов и статистики. Сейчас {px}px.',
 
 
-    'settings.behavior': '🔄 Поведение',
+    'settings.behavior': 'Поведение',
     'settings.behavior_desc': 'Видимость источников в фиде. Новые данные приходят в реальном времени — таймер автообновления не нужен.',
     'settings.hidden': 'Скрытые источники',
     'settings.hidden_count': 'Сейчас скрыто: {n}. Это только визуальная фильтрация в твоём браузере.',
@@ -7511,7 +7511,7 @@ const I18N = {
     'feed.hide_btn_tip': 'Скрыть алерт',
     'toast.alert_hidden': 'Скрыто',
     'toast.undo': 'Отменить',
-    'archive.title': '📦 Архив',
+    'archive.title': 'Архив',
     'archive.desc': 'Алерты, которые ты скрыл. Хранятся 7 дней, потом удаляются.',
     'archive.empty': 'Пусто — клик по ✕ на карточке скроет её.',
     'archive.restore': '↺ Вернуть',
@@ -7520,17 +7520,17 @@ const I18N = {
     'archive.count': 'Скрыто: {n}',
     'archive.loading': 'Загрузка…',
 
-    'settings.language': '🌐 Язык',
+    'settings.language': 'Язык',
     'settings.language_desc': 'Язык дашборда и промта для Ask Grok. Бот остаётся на языке вашего Telegram.',
     'settings.language_dashboard': 'Дашборд',
     'settings.language_dashboard_hint': 'Язык интерфейса',
     'settings.grok_language': 'Ask Grok',
     'settings.grok_language_hint': 'Язык промта для кнопки "Ask Grok"',
 
-    'settings.theme': '🎨 Тема',
+    'settings.theme': 'Тема',
     'settings.theme_desc': 'Выбери настроение. Все тёмные — никакого белого.',
 
-    'settings.account': '👤 Аккаунт',
+    'settings.account': 'Аккаунт',
     'settings.account_desc': 'Вход выполняется через Telegram-бота. Твой план и настройки привязаны к этому аккаунту.',
     'settings.tg': 'Telegram',
     'settings.tg_chatid': 'chat id: {id}',
@@ -7572,7 +7572,7 @@ const I18N = {
 
     // Toasts
     'toast.refreshing': 'Обновлено',
-    'toast.copied': '📋 Скопировано!',
+    'toast.copied': 'Скопировано!',
     'toast.copy_failed': 'Не удалось скопировать',
     'toast.all_sources_visible': 'Все источники видимы',
     'toast.hidden_from_feed': 'Скрыт в фиде: {name}',
@@ -7720,7 +7720,9 @@ function lifespanLabel(k) {
 }
 
 // Source link labels
-const SOURCE_LINK_LABELS = { reddit: '🟠 Reddit', twitter: '𝕏 Twitter', tiktok: '🎵 TikTok', google_trends: '🔍 Google', x_trends: '📈 X Trends' };
+// 2026-05-20 R4 — emoji prefixes removed; labels are plain text. Brand
+// recognition handled by feed-action-btn icon() rendering elsewhere.
+const SOURCE_LINK_LABELS = { reddit: 'Reddit', twitter: 'Twitter', tiktok: 'TikTok', google_trends: 'Google', x_trends: 'X Trends' };
 
 // ── Phase constants ──────────────────────────────────────────────────────────
 // hint resolves via t() — call phaseHint(phase) when you need the localized text.
@@ -8560,7 +8562,7 @@ function TweetHoverPreview({ state, onMouseEnter, onMouseLeave }) {
               }, 'u/' + a.name)
             : h('div', { className: 'tw-prev-handle' }, 'u/' + (a.name || 'unknown'))
         ),
-        h('div', { className: 'tw-prev-x tw-prev-x-reddit' }, '🅡')
+        h('div', { className: 'tw-prev-x tw-prev-x-reddit' }, icon('reddit', { size: 12 }))
       ),
       data.title && h('div', { className: 'tw-prev-title', key: 'title' }, data.title),
       data.text && h('div', { className: 'tw-prev-text', key: 'text' }, data.text),
@@ -10010,7 +10012,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
       // favorite snapshot (live row was deleted from the trends table).
       // Tells the user "you're looking at the saved copy".
       trend.favoriteSnapshotted ? h('div', { className: 'modal-body', style: { paddingTop: 0, paddingBottom: 0 } },
-        h('span', { className: 'fav-snapshot-banner' }, '🗄 ' + t('fav.snapshot_hint'))
+        h('span', { className: 'fav-snapshot-banner' }, icon('archive', { size: 12 }), ' ', t('fav.snapshot_hint'))
       ) : null,
 
       // Body
@@ -10248,10 +10250,10 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                     return String(n);
                   };
                   const chips = [
-                    { ico: '\u{1F441}',   v: fmt(tw.views) },
-                    { ico: '❤️', v: fmt(tw.likes) },
-                    { ico: '\u{1F501}',   v: fmt(tw.retweets) },
-                    { ico: '\u{1F4AC}',   v: fmt(tw.replies) },
+                    { ico: 'eye',             v: fmt(tw.views) },
+                    { ico: 'heart',           v: fmt(tw.likes) },
+                    { ico: 'repeat-2',        v: fmt(tw.retweets) },
+                    { ico: 'message-circle',  v: fmt(tw.replies) },
                   ].filter(c => c.v !== null);
                   return h('a', {
                     key: i,
@@ -10266,7 +10268,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                     ),
                     tw.text ? h('div', { className: 'xtrends-toptweet-text' }, tw.text) : null,
                     chips.length ? h('div', { className: 'xtrends-toptweet-engage' },
-                      chips.map((c, j) => h('span', { key: j }, c.ico, ' ', c.v))
+                      chips.map((c, j) => h('span', { key: j }, icon(c.ico, { size: 10 }), ' ', c.v))
                     ) : null
                   );
                 })
@@ -10335,12 +10337,12 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
               };
               // Reddit puts upvotes into the views slot — use ⬆️ for clarity.
               const isReddit = trend.source === 'reddit';
-              const viewIco = isReddit ? '⬆️' : '👁';
+              const viewIco = isReddit ? 'arrow-up' : 'eye';
               const items = [
-                { ico: viewIco, n: e.views },
-                { ico: '❤️', n: e.likes },
-                { ico: '💬', n: e.comments },
-                { ico: '🔁', n: e.reposts },
+                { ico: viewIco,           n: e.views },
+                { ico: 'heart',           n: e.likes },
+                { ico: 'message-circle',  n: e.comments },
+                { ico: 'repeat-2',        n: e.reposts },
               ].filter(it => fmtCount(it.n) !== null);
 
               return h('div', { className: 'modal-stat' },
@@ -10351,7 +10353,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                 items.length
                   ? h('div', { className: 'modal-engagement' },
                       items.map((it, i) => h('span', { key: i, className: 'modal-engagement-item' },
-                        h('span', { className: 'modal-engagement-ico' }, it.ico),
+                        h('span', { className: 'modal-engagement-ico' }, icon(it.ico, { size: 11 })),
                         h('span', { className: 'modal-engagement-num' }, fmtCount(it.n))
                       ))
                     )
@@ -10723,7 +10725,7 @@ function ControlPanel({ scanning, onScan, sources, onCollectorToggle, addToast }
                 onClick: () => onCollectorToggle(src.source),
                 title: src.enabled ? t('control.disable_source') : t('control.enable_source'),
               },
-                h('span', null, '📡 ' + (SOURCE_LABELS[src.source] || src.source.charAt(0).toUpperCase() + src.source.slice(1))),
+                h('span', null, icon('radio-tower', { size: 12 }), ' ', (SOURCE_LABELS[src.source] || src.source.charAt(0).toUpperCase() + src.source.slice(1))),
                 h('div', { className: 'source-control-toggle' })
               )
             )
@@ -10862,7 +10864,9 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
       }),
       h('div', { className: 'analyze-row' },
         h('button', { className: 'btn btn-primary', onClick: run, disabled: loading || !url.trim() },
-          loading ? t('analyze.running') : ('🚀 ' + t('analyze.run_btn'))
+          loading
+            ? t('analyze.running')
+            : [icon('search', { size: 13 }), ' ', t('analyze.run_btn')]
         ),
         error ? h('span', { className: 'analyze-error' }, '⚠ ' + error) : null
       )
@@ -10920,8 +10924,8 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
             (tr.category ? ' · ' + tr.category : '')
           ),
           h('div', { className: 'analyze-hero-actions' },
-            tr.url ? h('a', { href: tr.url, target: '_blank', rel: 'noopener', className: 'btn btn-ghost btn-sm' }, '🔗 ' + t('analyze.open_link')) : null,
-            h('button', { className: 'btn btn-primary btn-sm', onClick: () => onOpenTrend(tr) }, '👁 ' + t('analyze.open_full'))
+            tr.url ? h('a', { href: tr.url, target: '_blank', rel: 'noopener', className: 'btn btn-ghost btn-sm' }, icon('external-link', { size: 12 }), ' ', t('analyze.open_link')) : null,
+            h('button', { className: 'btn btn-primary btn-sm', onClick: () => onOpenTrend(tr) }, icon('eye', { size: 12 }), ' ', t('analyze.open_full'))
           )
         )
       ),
@@ -10943,7 +10947,7 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
       // AI explanation — relabelled from "AI" to "Why this score" so the
       // section's job is obvious to a non-engineer reading the panel.
       tr.aiExplanation ? h('div', { className: 'analyze-explain' },
-        h('div', { className: 'analyze-explain-label' }, '🤖 ' + t('analyze.why_label')),
+        h('div', { className: 'analyze-explain-label' }, icon('bot', { size: 12 }), ' ', t('analyze.why_label')),
         h('div', { className: 'analyze-explain-body' }, tr.aiExplanation)
       ) : null,
       // Deep-analysis footer removed 2026-05-17 — even the trimmed one-liner
@@ -11636,9 +11640,12 @@ function AccountPanel({ onBack, user, onLogout }) {
     if (onLogout) onLogout();
   };
 
+  // 2026-05-20 R4 — fallback "?" instead of 👤 emoji. The big avatar tile
+  // is a 64x64 rounded square; a "?" reads clearly when no name is set
+  // and matches the monogram fallback used on the LoginScreen logo tile.
   const avatarLetter = (user && user.username)
     ? user.username.charAt(0).toUpperCase()
-    : '👤';
+    : '?';
   const avatarSrc = user?.hasAvatar
     ? '/api/auth/avatar?token=' + encodeURIComponent(AUTH_TOKEN) + '&k=' + encodeURIComponent(user.avatarKey || '')
     : null;
@@ -11670,7 +11677,7 @@ function AccountPanel({ onBack, user, onLogout }) {
             h('span', { className: 'account-hero-chip-v' }, user?.chatId || '—')
           ),
           h('span', { className: 'account-hero-chip' },
-            h('span', { className: 'account-hero-chip-k' }, '💎'),
+            h('span', { className: 'account-hero-chip-k' }, icon('gem', { size: 11 })),
             h('span', { className: 'account-hero-chip-v' }, planLabels[user?.plan] || user?.plan || '—')
           ),
           user?.status
@@ -11867,20 +11874,20 @@ function LoginScreen({ onLoggedIn }) {
           }
         },
           [
-            { i: '📡', t: 'Multi-source feed', s: 'Reddit · X · TikTok · Google · X Trends' },
-            { i: '🎯', t: 'Trend scoring',     s: 'Memetic potential, virality, emergence' },
-            { i: '🔔', t: 'Real-time alerts',  s: 'Direct to your Telegram, instantly' },
+            { i: 'radio-tower', t: 'Multi-source feed', s: 'Reddit · X · TikTok · Google · X Trends' },
+            { i: 'target',      t: 'Trend scoring',     s: 'Memetic potential, virality, emergence' },
+            { i: 'bell',        t: 'Real-time alerts',  s: 'Direct to your Telegram, instantly' },
           ].map((row, i) =>
             h('div', { key: i, style: { display: 'flex', alignItems: 'center', gap: 12 } },
               h('div', {
                 style: {
-                  flex: '0 0 32px', height: 32, borderRadius: 8,
+                  flex: '0 0 32px', height: 32, borderRadius: 4,
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 16,
+                  color: 'var(--muted, #71767b)',
                   background: 'rgba(239,243,244,0.04)',
                   border: '1px solid var(--border, rgba(239,243,244,0.08))',
                 }
-              }, row.i),
+              }, icon(row.i, { size: 16 })),
               h('div', { style: { flex: 1, minWidth: 0 } },
                 h('div', { style: { fontSize: 13, fontWeight: 600, color: 'var(--text, #e7e9ea)' } }, row.t),
                 h('div', { style: { fontSize: 11, color: 'var(--muted, #71767b)', marginTop: 2 } }, row.s)
@@ -12917,10 +12924,18 @@ function App() {
             alt: 'Catalyst',
             className: 'nav-logo-img',
             onError: (e) => {
+              // 2026-05-20 R4 — fall back to "C" monogram (JetBrains Mono).
+              // Was 🐱 emoji glyph; replaced for consistency with LoginScreen
+              // monogram fallback. Inline DOM hack because this is an <img>
+              // onError handler outside React render flow.
               const span = e.target.parentNode;
               if (span) {
                 span.removeChild(e.target);
-                span.textContent = '\u{1F431}'; // 🐱
+                span.style.fontFamily = 'JetBrains Mono, monospace';
+                span.style.fontWeight = '700';
+                span.style.fontSize = '18px';
+                span.style.color = 'var(--accent)';
+                span.textContent = 'C';
               }
             },
           })
@@ -12983,7 +12998,7 @@ function App() {
                 })
               : (me && me !== true && me.username)
                 ? me.username.charAt(0).toUpperCase()
-                : '👤'
+                : icon('user', { size: 14 })
           ),
           h('span', { className: 'nav-account-name' },
             (me && me !== true && me.username)
@@ -13199,7 +13214,7 @@ function App() {
                 },
                 title: manualOnly ? t('tooltip.manual_off') : t('tooltip.manual_on')
               },
-                h('span', { className: 'phase-chip-dot' }, '🧪'),
+                h('span', { className: 'phase-chip-dot' }, icon('flask-conical', { size: 10 })),
                 h('span', { className: 'phase-chip-label' }, t('sidebar.manual_only'))
               )
               // Saved-only chip removed from sidebar 2026-05-06 — moved into
@@ -13235,7 +13250,7 @@ function App() {
                         if (locked) { addToast(t('window.locked_toast'), 'info'); return; }
                         setHours(o.v); setOffset(0);
                       },
-                    }, locked ? '🔒 ' + o.l : o.l);
+                    }, locked ? [icon('lock', { size: 10 }), ' ', o.l] : o.l);
                   })
                 )
               ),
