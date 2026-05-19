@@ -3734,8 +3734,11 @@ class DashboardServer {
     .trend-link-twitter:hover { background: rgba(29,161,242,.1); border-color: rgba(29,161,242,.4); color: #fff; }
     .trend-link-tiktok { color: #ee1d52; border-color: rgba(238,29,82,.2); }
     .trend-link-tiktok:hover { background: rgba(238,29,82,.1); border-color: rgba(238,29,82,.4); color: #fff; }
-    .trend-link-grok { color: #b48cff; border-color: rgba(180,140,255,.25); }
-    .trend-link-grok:hover { background: rgba(180,140,255,.1); border-color: rgba(180,140,255,.5); color: #fff; }
+    /* Ask Grok — external (off-platform) secondary action. Uses --secondary
+       token so it visually distinguishes from primary catalyst actions while
+       still living in the disciplined palette. Task 7 (2026-05-19 redesign). */
+    .trend-link-grok { color: var(--secondary); border-color: rgba(var(--secondary-rgb),.30); background: rgba(var(--secondary-rgb),.06); }
+    .trend-link-grok:hover { background: rgba(var(--secondary-rgb),.10); border-color: rgba(var(--secondary-rgb),.50); color: var(--text); }
 
     /* ── Table wrap & header ── */
     .table-wrap { background: transparent; border: none; border-radius: var(--radius); overflow: hidden; }
@@ -3927,16 +3930,19 @@ class DashboardServer {
       display: flex; flex-direction: column; gap: 3px;
     }
     .analyze-verdict.high {
-      background: linear-gradient(135deg, color-mix(in srgb, var(--green) 16%, transparent), color-mix(in srgb, var(--green) 3%, transparent));
-      border-left: 4px solid var(--green);
+      background: linear-gradient(135deg, rgba(var(--accent-rgb), .10), rgba(var(--accent-rgb), .02));
+      border-left: 4px solid var(--accent);
+      box-shadow: 0 0 16px rgba(var(--accent-rgb), .18);
     }
     .analyze-verdict.mid {
-      background: linear-gradient(135deg, color-mix(in srgb, var(--yellow) 16%, transparent), color-mix(in srgb, var(--yellow) 3%, transparent));
-      border-left: 4px solid var(--yellow);
+      background: rgba(255,255,255,.03);
+      border-left: 4px solid rgba(255,255,255,.35);
+      box-shadow: 0 0 12px rgba(255,255,255,.04);
     }
     .analyze-verdict.low {
-      background: linear-gradient(135deg, rgba(255,120,73,.12), rgba(255,120,73,.02));
-      border-left: 4px solid #ff7849;
+      background: linear-gradient(135deg, rgba(var(--warn-rgb), .06), rgba(var(--warn-rgb), .01));
+      border-left: 4px solid var(--warn);
+      box-shadow: 0 0 12px rgba(var(--warn-rgb), .10);
     }
     .analyze-verdict-title { font-size: 15px; font-weight: 800; color: var(--text); }
     .analyze-verdict-sub   { font-size: 12px; color: var(--dim); line-height: 1.5; }
@@ -3968,12 +3974,14 @@ class DashboardServer {
     }
     .analyze-score-bar-fill {
       height: 100%;
-      background: var(--blue);
+      background: var(--accent);
       transition: width .35s ease;
     }
-    .analyze-score.high .analyze-score-bar-fill { background: var(--green); }
-    .analyze-score.mid  .analyze-score-bar-fill { background: var(--yellow); }
-    .analyze-score.low  .analyze-score-bar-fill { background: #ff7849; }
+    /* Bars unified on accent — bar LENGTH (width %) communicates level, not colour.
+       Task 7 (2026-05-19 dashboard redesign). */
+    .analyze-score.high .analyze-score-bar-fill,
+    .analyze-score.mid  .analyze-score-bar-fill,
+    .analyze-score.low  .analyze-score-bar-fill { background: var(--accent); }
     /* Qualitative tag (Low/Medium/High) — gives the bare number a verbal anchor
        for users who don't know what 20/100 means at a glance. */
     .analyze-score-tag {
