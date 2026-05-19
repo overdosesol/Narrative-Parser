@@ -3715,6 +3715,42 @@ class DashboardServer {
       border: 1px solid var(--border);
     }
 
+    /* ── Sort list (sidebar) — 2026-05-20 R5 ──
+       Replaced the 5-icon seg-control. Each option is a chip styled like
+       .phase-badge / .badge-atype-* (neutral surface2 + 1px border). Active
+       chip uses the .badge-catalyst accent-fill pattern. All colors flow
+       through theme tokens (--accent / --accent-rgb), so theme switch works. */
+    .sort-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .sort-chip {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 10px;
+      font-size: 13px; font-weight: 500;
+      cursor: pointer;
+      border-radius: var(--r1);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text2);
+      user-select: none;
+      transition: background .12s ease, color .12s ease, border-color .12s ease;
+    }
+    .sort-chip:hover {
+      background: var(--card);
+      color: var(--text);
+    }
+    .sort-chip.active {
+      background: rgba(var(--accent-rgb), .14);
+      border-color: rgba(var(--accent-rgb), .38);
+      color: var(--accent);
+    }
+    .sort-chip:focus-visible {
+      outline: 2px solid rgba(var(--accent-rgb), .5);
+      outline-offset: 1px;
+    }
+
     /* ── Badges ── */
     .badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: var(--r1); font-size: 10px; font-weight: 600; white-space: nowrap; letter-spacing: .2px; }
     .cat-meme          { background: rgba(162,155,254,.1); color: #a29bfe; border: 1px solid rgba(162,155,254,.18); }
