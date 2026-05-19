@@ -11376,15 +11376,15 @@ function LoginScreen({ onLoggedIn }) {
               objectFit: 'contain', display: 'block',
             },
             onError: (e) => {
-              // Mirror nav logo: drop the broken <img>, fall back to 🐱
+              // Fallback: monogram "C" in JetBrains Mono, accent color.
               const tile = e.target.parentNode;
-              if (tile) {
-                tile.removeChild(e.target);
-                tile.style.fontSize = '38px';
-                tile.style.lineHeight = '1';
-                tile.style.padding = '0';
-                tile.textContent = '\u{1F431}'; // 🐱
-              }
+              if (!tile) return;
+              tile.removeChild(e.target);
+              tile.style.padding = '0';
+              const monogram = document.createElement('span');
+              monogram.textContent = 'C';
+              monogram.style.cssText = 'font-family: JetBrains Mono, monospace; font-weight: 700; font-size: 28px; color: var(--accent); line-height: 1;';
+              tile.appendChild(monogram);
             },
           })
         ),
@@ -11443,36 +11443,34 @@ function LoginScreen({ onLoggedIn }) {
           )
         ),
 
-        // ── Primary CTA — X-blue glossy ───────────────────────────────
+        // ── Primary CTA — Telegram cyan (hardcoded brand) ─────────────
+        // Background is hardcoded #1d9bf0 (not var(--secondary)) because
+        // in ink theme --secondary swaps to green — but Telegram-button
+        // must stay blue across all themes by brand semantics.
         h('button', {
           onClick: startLogin,
           disabled: loading,
           style: {
-            width: '100%', padding: '14px 18px',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-            fontSize: 15, fontWeight: 700, letterSpacing: '0.01em',
-            color: '#fff',
-            background: 'linear-gradient(180deg, var(--accent, #1d9bf0) 0%, #146da8 100%)',
-            border: '1px solid rgba(var(--accent-rgb), 0.40)',
-            borderRadius: 12,
-            cursor: loading ? 'wait' : 'pointer',
-            // Flat — outer glow only, no inset highlight/shadow that read as
-            // a stripe on the button surface.
-            boxShadow: '0 8px 24px rgba(var(--accent-rgb), 0.26)',
+            width: '100%', padding: '11px',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+            fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
+            color: '#000',
+            background: '#1d9bf0',
+            border: '1px solid #1d9bf0',
+            borderRadius: 2,
+            cursor: loading ? 'not-allowed' : 'pointer',
             opacity: loading ? 0.7 : 1,
-            transition: 'transform 120ms ease, box-shadow 120ms ease',
+            transition: 'all .12s',
           },
-          onMouseEnter: (e) => { if (!loading) e.currentTarget.style.transform = 'translateY(-1px)'; },
-          onMouseLeave: (e) => { e.currentTarget.style.transform = 'translateY(0)'; },
         },
-          // Paper-plane glyph — Material "send" silhouette rotated -25 deg
-          // so the tip points up-right (Telegram's logo orientation),
-          // instead of straight right (which read as a directional arrow).
+          // Feather-style paper-plane (14×14)
           h('svg', {
-            width: 16, height: 16, viewBox: '0 0 24 24', fill: 'currentColor',
-            style: { display: 'block', transform: 'rotate(-25deg)' }
+            viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+            strokeWidth: 2.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+            style: { width: 14, height: 14, flexShrink: 0 },
           },
-            h('path', { d: 'M2.01 21l20.99-9L2.01 3 2 10l15 2-15 2z' })
+            h('line', { x1: 22, y1: 2, x2: 11, y2: 13 }),
+            h('polygon', { points: '22 2 15 22 11 13 2 9 22 2' })
           ),
           loading ? 'Please wait…' : 'Sign in with Telegram'
         ),
