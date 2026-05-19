@@ -3671,7 +3671,7 @@ class DashboardServer {
     }
 
     /* ── Badges ── */
-    .badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 5px; font-size: 10px; font-weight: 600; white-space: nowrap; letter-spacing: .2px; }
+    .badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: var(--r1); font-size: 10px; font-weight: 600; white-space: nowrap; letter-spacing: .2px; }
     .cat-meme          { background: rgba(162,155,254,.1); color: #a29bfe; border: 1px solid rgba(162,155,254,.18); }
     .cat-celebrity     { background: rgba(253,203,110,.1); color: #fdcb6e; border: 1px solid rgba(253,203,110,.18); }
     .cat-animals       { background: rgba(85,239,196,.1);  color: #55efc4; border: 1px solid rgba(85,239,196,.18); }
@@ -5668,7 +5668,7 @@ class DashboardServer {
          them. The gloss-top inset keeps a subtle "glassy" highlight. */
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: var(--r3);
       padding: 11px 13px 9px;
       transition: border-color .15s, background .15s, transform .15s, box-shadow .15s;
       cursor: pointer;
@@ -5687,7 +5687,7 @@ class DashboardServer {
       display: flex; align-items: flex-start; gap: 10px; margin-bottom: 6px;
     }
     .feed-avatar {
-      width: 38px; height: 38px; border-radius: 10px;
+      width: 38px; height: 38px; border-radius: var(--r3);
       display: flex; align-items: center; justify-content: center;
       font-size: 18px; flex-shrink: 0; font-weight: 800;
       border: 1px solid var(--border2);
@@ -5715,7 +5715,7 @@ class DashboardServer {
     .feed-meta-hint {
       color: var(--dim); font-size: 10.5px;
       font-family: 'JetBrains Mono', monospace;
-      padding: 1px 6px; border-radius: 4px;
+      padding: 1px 6px; border-radius: var(--r1);
       background: rgba(255,255,255,.025);
       border: 1px solid var(--border);
     }
@@ -5752,7 +5752,7 @@ class DashboardServer {
        circular floating action. */
     .feed-hide-btn {
       position: absolute; top: 9px; right: 9px;
-      width: 22px; height: 22px; border-radius: 5px;
+      width: 22px; height: 22px; border-radius: var(--r1);
       background: rgba(0,0,0,.5);
       border: 1px solid var(--border2);
       color: var(--muted);
@@ -5780,7 +5780,7 @@ class DashboardServer {
        row's font size; hidden until card hover unless the trend is saved.
        Pro/Admin only — for free/test the button is omitted entirely. */
     .feed-fav-btn {
-      width: 18px; height: 18px; border-radius: 4px;
+      width: 18px; height: 18px; border-radius: var(--r1);
       background: transparent;
       border: 1px solid var(--border2);
       color: var(--muted);
@@ -6069,7 +6069,7 @@ class DashboardServer {
        with a subtle dark backdrop filling the letterbox area. Never stretched. */
     .feed-image-wrap {
       position: relative;
-      border-radius: 14px; overflow: hidden;
+      border-radius: var(--r3); overflow: hidden;
       margin: 8px 0 10px;
       background: #0a0a12;
       border: 1px solid var(--border);
@@ -6127,7 +6127,7 @@ class DashboardServer {
        display:flex here. */
     .img-carousel {
       position: relative; width: 100%;
-      border-radius: 14px; overflow: hidden;
+      border-radius: var(--r3); overflow: hidden;
       margin: 8px 0 10px;
       background: #0a0a12;
       border: 1px solid var(--border);
@@ -6179,7 +6179,7 @@ class DashboardServer {
       position: absolute; top: 10px; right: 10px;
       background: rgba(0,0,0,.6);
       color: #fff; font-size: 11px; font-weight: 700;
-      padding: 4px 10px; border-radius: 12px;
+      padding: 4px 10px; border-radius: var(--r3);
       z-index: 2;
       font-family: 'JetBrains Mono', monospace;
       letter-spacing: .3px;
@@ -6211,7 +6211,7 @@ class DashboardServer {
     .feed-scores {
       display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0;
       padding: 8px 6px; margin: 6px 0 10px;
-      background: rgba(0,0,0,.18); border-radius: 8px;
+      background: rgba(0,0,0,.18); border-radius: var(--r2);
       border: 1px solid var(--border);
     }
     .feed-score {
@@ -6247,7 +6247,7 @@ class DashboardServer {
     }
     .feed-action-btn {
       display: inline-flex; align-items: center; gap: 5px;
-      padding: 5px 10px; border-radius: 7px;
+      padding: 5px 10px; border-radius: var(--r2);
       background: rgba(255,255,255,.03); border: 1px solid var(--border2);
       color: var(--muted); font-size: 11px; font-weight: 600;
       cursor: pointer; text-decoration: none;
