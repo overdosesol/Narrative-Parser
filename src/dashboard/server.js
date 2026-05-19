@@ -6727,7 +6727,7 @@ const I18N = {
     'analyze.subtitle': 'Usually takes 10-30 seconds',
     'analyze.locked': 'Manual analysis is a Test/Pro feature.',
     'analyze.locked_tooltip': 'Available on Test/Pro plan',
-    'analyze.locked_toast': '🔒 Manual analysis is available on Test/Pro',
+    'analyze.locked_toast': 'Manual analysis is available on Test/Pro',
     'analyze.verdict_high':     '🔥 Strong viral potential',
     'analyze.verdict_mid':      '📈 Some traction',
     'analyze.verdict_low':      '💤 Unlikely to take off',
@@ -6747,9 +6747,9 @@ const I18N = {
     'fav.add_tooltip': 'Save to favorites',
     'fav.remove_tooltip': 'Remove from favorites',
     'fav.locked_tooltip': 'Favorites is a Pro feature',
-    'fav.locked_toast': '🔒 Favorites is a Pro feature',
-    'fav.added_toast': '⭐ Saved to favorites',
-    'fav.removed_toast': '☆ Removed from favorites',
+    'fav.locked_toast': 'Favorites is a Pro feature',
+    'fav.added_toast': 'Saved to favorites',
+    'fav.removed_toast': 'Removed from favorites',
     'fav.note_placeholder': 'Add a note (private, optional)',
     'fav.note_save': 'Save note',
     'fav.note_cancel': 'Cancel',
@@ -6922,9 +6922,9 @@ const I18N = {
     'trigger.btn_pro_only':  '🔒 Catalyst forecast — Test/Pro',
     'trigger.daily_limit':   '⛔ Daily Catalyst limit reached ({cap}/24h)',
     'window.locked_tooltip': 'Available on Test/Pro plan',
-    'window.locked_toast':   '🔒 Wider time window is available on Test/Pro',
+    'window.locked_toast':   'Wider time window is available on Test/Pro',
     'source.locked_tooltip': 'Available on Test/Pro plan',
-    'source.locked_toast':   '🔒 This source is available on Test/Pro',
+    'source.locked_toast':   'This source is available on Test/Pro',
     'usage.test_left':       '📊 {used}/{cap} used today ({left} left)',
     'trigger.locked_title':  'Catalyst forecast',
     'trigger.locked_desc':   'Available on Test and Pro plans',
@@ -7002,8 +7002,8 @@ const I18N = {
     'control.health': 'Health',
     'control.reload': 'Reload',
     'control.stats': 'Stats',
-    'control.health_ok': '✅ Server alive · uptime {m}m',
-    'control.error': '❌ Error: {e}',
+    'control.health_ok': 'Server alive · uptime {m}m',
+    'control.error': 'Error: {e}',
     'control.enable_source': 'Enable source',
     'control.disable_source': 'Disable source',
 
@@ -7118,12 +7118,12 @@ const I18N = {
     'toast.refreshing': 'Refreshed',
     'toast.copied': '📋 Copied!',
     'toast.copy_failed': 'Copy failed',
-    'toast.all_sources_visible': '👁 All sources visible',
-    'toast.hidden_from_feed': '🙈 Hidden from feed: {name}',
-    'toast.shown_in_feed': '👁 Shown: {name}',
-    'toast.filters_reset': '♻️ Filters reset',
-    'toast.manual_only_on': '🧪 Showing manual submissions only',
-    'toast.manual_only_off': '🧪 Showing all trends',
+    'toast.all_sources_visible': 'All sources visible',
+    'toast.hidden_from_feed': 'Hidden from feed: {name}',
+    'toast.shown_in_feed': 'Shown: {name}',
+    'toast.filters_reset': 'Filters reset',
+    'toast.manual_only_on': 'Showing manual submissions only',
+    'toast.manual_only_off': 'Showing all trends',
     'toast.error_prefix': 'Error: {e}',
   },
 
@@ -7160,7 +7160,7 @@ const I18N = {
     'analyze.subtitle': 'Обычно 10-30 секунд',
     'analyze.locked': 'Ручной анализ — на Test/Pro плане.',
     'analyze.locked_tooltip': 'Доступно на Test/Pro',
-    'analyze.locked_toast': '🔒 Ручной анализ — на Test/Pro',
+    'analyze.locked_toast': 'Ручной анализ — на Test/Pro',
     'analyze.verdict_high':     '🔥 Высокий вирусный потенциал',
     'analyze.verdict_mid':      '📈 Есть потенциал',
     'analyze.verdict_low':      '💤 Вряд ли разлетится',
@@ -7180,9 +7180,9 @@ const I18N = {
     'fav.add_tooltip': 'В избранное',
     'fav.remove_tooltip': 'Убрать из избранного',
     'fav.locked_tooltip': 'Избранное — только на Pro',
-    'fav.locked_toast': '🔒 Избранное доступно только на Pro',
-    'fav.added_toast': '⭐ Добавлено в избранное',
-    'fav.removed_toast': '☆ Убрано из избранного',
+    'fav.locked_toast': 'Избранное доступно только на Pro',
+    'fav.added_toast': 'Добавлено в избранное',
+    'fav.removed_toast': 'Убрано из избранного',
     'fav.note_placeholder': 'Заметка (приватная, опционально)',
     'fav.note_save': 'Сохранить',
     'fav.note_cancel': 'Отмена',
@@ -7353,9 +7353,9 @@ const I18N = {
     'trigger.btn_pro_only':  '🔒 Каталист — Test/Pro',
     'trigger.daily_limit':   '⛔ Дневной лимит Каталиста ({cap}/24ч)',
     'window.locked_tooltip': 'Доступно на Test/Pro',
-    'window.locked_toast':   '🔒 Большее окно времени — на Test/Pro',
+    'window.locked_toast':   'Большее окно времени — на Test/Pro',
     'source.locked_tooltip': 'Доступно на Test/Pro',
-    'source.locked_toast':   '🔒 Этот источник — на Test/Pro',
+    'source.locked_toast':   'Этот источник — на Test/Pro',
     'usage.test_left':       '📊 {used}/{cap} сегодня (осталось {left})',
     'trigger.locked_title':  'Катализатор',
     'trigger.locked_desc':   'Доступно на Test и Pro',
@@ -7433,8 +7433,8 @@ const I18N = {
     'control.health': 'Здоровье',
     'control.reload': 'Перезагрузить',
     'control.stats': 'Статистика',
-    'control.health_ok': '✅ Сервер живёт · uptime {m}м',
-    'control.error': '❌ Ошибка: {e}',
+    'control.health_ok': 'Сервер живёт · uptime {m}м',
+    'control.error': 'Ошибка: {e}',
     'control.enable_source': 'Включить источник',
     'control.disable_source': 'Отключить источник',
 
@@ -7548,12 +7548,12 @@ const I18N = {
     'toast.refreshing': 'Обновлено',
     'toast.copied': '📋 Скопировано!',
     'toast.copy_failed': 'Не удалось скопировать',
-    'toast.all_sources_visible': '👁 Все источники видимы',
-    'toast.hidden_from_feed': '🙈 Скрыт в фиде: {name}',
-    'toast.shown_in_feed': '👁 Показан: {name}',
-    'toast.filters_reset': '♻️ Фильтры сброшены',
-    'toast.manual_only_on': '🧪 Только ручные сабмиты',
-    'toast.manual_only_off': '🧪 Показываю все тренды',
+    'toast.all_sources_visible': 'Все источники видимы',
+    'toast.hidden_from_feed': 'Скрыт в фиде: {name}',
+    'toast.shown_in_feed': 'Показан: {name}',
+    'toast.filters_reset': 'Фильтры сброшены',
+    'toast.manual_only_on': 'Только ручные сабмиты',
+    'toast.manual_only_off': 'Показываю все тренды',
     'toast.error_prefix': 'Ошибка: {e}',
   },
 };
@@ -11953,7 +11953,7 @@ function App() {
       // Server reject → roll back local hide and show error toast. Don't
       // touch pendingUndo — the user already pressed ✕ and got feedback.
       setLocalHidden(prev => { const n = new Set(prev); n.delete(trend.id); return n; });
-      addToast('⚠ ' + (e.message || 'hide failed'), 'error');
+      addToast('Hide failed: ' + (e.message || 'unknown error'), 'error');
     }
   }, [addToast]);
 
@@ -11965,7 +11965,7 @@ function App() {
     try {
       await api('/trends/' + trend.id + '/unhide', { method: 'POST' });
     } catch (e) {
-      addToast('⚠ ' + (e.message || 'undo failed'), 'error');
+      addToast('Undo failed: ' + (e.message || 'unknown error'), 'error');
     }
   }, [addToast]);
 
@@ -12000,7 +12000,7 @@ function App() {
       setModalTrend(prev => (prev && prev.id === trend.id) ? { ...prev, isFavorite: wasFav } : prev);
       setFavoriteCount(prev => Math.max(0, prev + (willFav ? -1 : 1)));
       if (e.status === 403) addToast(t('fav.locked_toast'), 'info');
-      else addToast('⚠ ' + (e.message || 'favorite failed'), 'error');
+      else addToast('Favorite failed: ' + (e.message || 'unknown error'), 'error');
     }
   }, [addToast]);
 
@@ -12021,7 +12021,7 @@ function App() {
     } catch (e) {
       setModalTrend(p => (p && p.id === trend.id) ? { ...p, favoriteNote: prev } : p);
       setTrends(prevList => prevList.map(t => (t && t.id === trend.id) ? { ...t, favoriteNote: prev } : t));
-      addToast('⚠ ' + (e.message || 'note save failed'), 'error');
+      addToast('Note save failed: ' + (e.message || 'unknown error'), 'error');
     }
   }, [addToast]);
 
