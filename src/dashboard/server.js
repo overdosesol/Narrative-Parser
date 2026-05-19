@@ -5783,6 +5783,11 @@ class DashboardServer {
       border-color: rgba(var(--accent-rgb), .45);
       color: var(--accent);
     }
+    .feed-fav-btn.saved:hover {
+      background: rgba(var(--accent-rgb), .14);
+      color: var(--accent);
+      border-color: rgba(var(--accent-rgb), .45);
+    }
     .feed-fav-btn:hover {
       background: rgba(255,255,255,.06);
       color: var(--text);
@@ -9900,7 +9905,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                 h('span', {
                   style: {
                     fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700,
-                    color: vel ? 'var(--accent)' : 'var(--muted)',
+                    color: vel ? 'var(--accent2)' : 'var(--dim)',
                   }
                 }, vel || '—')
               );
