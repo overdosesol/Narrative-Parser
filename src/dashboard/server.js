@@ -3000,6 +3000,15 @@ class DashboardServer {
     }
     .phase-chip:hover { color: var(--text2); background: transparent; border-color: var(--border2); }
     .phase-chip-dot { font-size: 8px; line-height: 1; flex-shrink: 0; }
+    /* 2026-05-20 R4 — colored circle dot replacing emoji (🔵🟡🟢🔴). Color
+       comes from inline style set to PHASE_META[p].color. STRONG gets a soft
+       glow so the eye picks the "active" phase. */
+    .phase-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      display: inline-block; flex-shrink: 0;
+      background: currentColor;
+    }
+    .phase-dot.glow { box-shadow: 0 0 5px currentColor; }
     .phase-chip-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
     .phase-chip-count {
       margin-left: auto; font-family: 'JetBrains Mono', monospace;
@@ -7610,7 +7619,10 @@ const api = (path, opts = {}) => {
 // the literal "reddit"/"twitter" word.
 const SOURCE_ICONS  = { reddit: 'reddit', google_trends: 'google', twitter: 'twitter', tiktok: 'tiktok', x_trends: 'hash' };
 const SOURCE_LABELS = { reddit: 'Reddit', google_trends: 'Google', twitter: 'Twitter/X', tiktok: 'TikTok', x_trends: 'X Trends' };
-const CAT_ICONS     = { meme:'😂', celebrity:'⭐', animals:'🐾', tech:'💻', gambling:'🎰', sports:'🏆', politics:'🏛️', entertainment:'🎬', gaming:'🎮', boring:'😴', other:'📌' };
+// 2026-05-20 R4 — emoji glyphs → Lucide icon-name keys. Render via
+// icon(CAT_ICONS[cat], { size }). Spec: gambling=coins, meme=image,
+// boring=moon, other=more-horizontal.
+const CAT_ICONS     = { meme:'image', celebrity:'star', animals:'paw-print', tech:'cpu', gambling:'coins', sports:'trophy', politics:'landmark', entertainment:'clapperboard', gaming:'gamepad-2', boring:'moon', other:'more-horizontal' };
 const CAT_CLS       = { meme:'cat-meme', celebrity:'cat-celebrity', animals:'cat-animals', tech:'cat-tech', gambling:'cat-gambling', sports:'cat-sports', politics:'cat-politics', entertainment:'cat-entertainment', gaming:'cat-gaming', boring:'cat-boring', other:'cat-other' };
 
 // Subject-name highlight helper. trend.subjectAliases is a sorted list
@@ -7688,7 +7700,17 @@ const PHASE_META = {
   saturated: { label: 'SATURATED', color: '#f59e0b', bg: 'rgba(245,158,11,0.10)',  hintKey: 'phase.saturated.hint' },
 };
 function phaseHint(p) { const m = PHASE_META[p]; return m ? t(m.hintKey) : ''; }
-const PHASE_DOT = { early: '🔵', forming: '🟡', strong: '🟢', saturated: '🔴' };
+// 2026-05-20 R4 — phaseDot() returns a CSS-coloured circle <span> replacing
+// the legacy emoji glyphs 🔵🟡🟢🔴. Color is inlined from PHASE_META.color;
+// STRONG gets a soft glow (.phase-dot.glow) so the active phase reads first.
+function phaseDot(p) {
+  const m = PHASE_META[p];
+  if (!m) return null;
+  return h('span', {
+    className: 'phase-dot' + (p === 'strong' ? ' glow' : ''),
+    style: { color: m.color }
+  });
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function memeClass(v) {
@@ -7776,6 +7798,114 @@ const ICONS = {
     h('line', { x1: 4, y1: 15, x2: 20, y2: 15 }),
     h('line', { x1: 10, y1: 3, x2: 8, y2: 21 }),
     h('line', { x1: 16, y1: 3, x2: 14, y2: 21 })
+  ),
+  // — Bottom-nav (R4 Task 3) —
+  flame: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z' })
+  ),
+  star: makeIcon('0 0 24 24', true,
+    h('polygon', { points: '12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2' })
+  ),
+  // — Alert-type chips (R4 Task 3) —
+  newspaper: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2Zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2' }),
+    h('path', { d: 'M18 14h-8' }),
+    h('path', { d: 'M15 18h-5' }),
+    h('path', { d: 'M10 6h8v4h-8V6Z' })
+  ),
+  'circle-dot': makeIcon('0 0 24 24', true,
+    h('circle', { cx: 12, cy: 12, r: 10 }),
+    h('circle', { cx: 12, cy: 12, r: 1 })
+  ),
+  check: makeIcon('0 0 24 24', true,
+    h('polyline', { points: '20 6 9 17 4 12' })
+  ),
+  // — Phosphor exception: trend (line chart with peak) —
+  trend: makeIcon('0 0 256 256', false,
+    h('path', { d: 'M232 208a8 8 0 0 1-8 8H32a8 8 0 0 1-8-8V48a8 8 0 0 1 16 0v94.37l50.34-50.35a8 8 0 0 1 11.32 0L128 116.69l50.34-50.35a8 8 0 0 1 11.32 11.32l-56 56a8 8 0 0 1-11.32 0L96 107.31l-56 56V200h184a8 8 0 0 1 8 8Z' })
+  ),
+  // — Category content tags (CAT_ICONS) (R4 Task 3) —
+  image: makeIcon('0 0 24 24', true,
+    h('rect', { x: 3, y: 3, width: 18, height: 18, rx: 2, ry: 2 }),
+    h('circle', { cx: 8.5, cy: 8.5, r: 1.5 }),
+    h('polyline', { points: '21 15 16 10 5 21' })
+  ),
+  'paw-print': makeIcon('0 0 24 24', true,
+    h('circle', { cx: 11, cy: 4, r: 2 }),
+    h('circle', { cx: 18, cy: 8, r: 2 }),
+    h('circle', { cx: 20, cy: 16, r: 2 }),
+    h('path', { d: 'M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z' })
+  ),
+  cpu: makeIcon('0 0 24 24', true,
+    h('rect', { x: 4, y: 4, width: 16, height: 16, rx: 2 }),
+    h('rect', { x: 9, y: 9, width: 6, height: 6 }),
+    h('line', { x1: 9, y1: 2, x2: 9, y2: 4 }),
+    h('line', { x1: 15, y1: 2, x2: 15, y2: 4 }),
+    h('line', { x1: 9, y1: 20, x2: 9, y2: 22 }),
+    h('line', { x1: 15, y1: 20, x2: 15, y2: 22 }),
+    h('line', { x1: 20, y1: 9, x2: 22, y2: 9 }),
+    h('line', { x1: 20, y1: 14, x2: 22, y2: 14 }),
+    h('line', { x1: 2, y1: 9, x2: 4, y2: 9 }),
+    h('line', { x1: 2, y1: 14, x2: 4, y2: 14 })
+  ),
+  coins: makeIcon('0 0 24 24', true,
+    h('circle', { cx: 8, cy: 8, r: 6 }),
+    h('path', { d: 'M18.09 10.37A6 6 0 1 1 10.34 18' }),
+    h('path', { d: 'M7 6h1v4' }),
+    h('path', { d: 'm16.71 13.88.7.71-2.82 2.82' })
+  ),
+  landmark: makeIcon('0 0 24 24', true,
+    h('line', { x1: 3, y1: 22, x2: 21, y2: 22 }),
+    h('line', { x1: 6, y1: 18, x2: 6, y2: 11 }),
+    h('line', { x1: 10, y1: 18, x2: 10, y2: 11 }),
+    h('line', { x1: 14, y1: 18, x2: 14, y2: 11 }),
+    h('line', { x1: 18, y1: 18, x2: 18, y2: 11 }),
+    h('polygon', { points: '12 2 20 7 4 7' })
+  ),
+  clapperboard: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M20.2 6 3 11l-.9-2.4c-.3-1.1.3-2.2 1.3-2.5l13.5-4c1.1-.3 2.2.3 2.5 1.3Z' }),
+    h('path', { d: 'm6.2 5.3 3.1 3.9' }),
+    h('path', { d: 'm12.4 3.4 3.1 4' }),
+    h('path', { d: 'M3 11h18v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z' })
+  ),
+  'gamepad-2': makeIcon('0 0 24 24', true,
+    h('line', { x1: 6, y1: 11, x2: 10, y2: 11 }),
+    h('line', { x1: 8, y1: 9, x2: 8, y2: 13 }),
+    h('line', { x1: 15, y1: 12, x2: 15.01, y2: 12 }),
+    h('line', { x1: 18, y1: 10, x2: 18.01, y2: 10 }),
+    h('path', { d: 'M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258A4 4 0 0 0 17.32 5z' })
+  ),
+  trophy: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M6 9H4.5a2.5 2.5 0 0 1 0-5H6' }),
+    h('path', { d: 'M18 9h1.5a2.5 2.5 0 0 0 0-5H18' }),
+    h('path', { d: 'M4 22h16' }),
+    h('path', { d: 'M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22' }),
+    h('path', { d: 'M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22' }),
+    h('path', { d: 'M18 2H6v7a6 6 0 0 0 12 0V2Z' })
+  ),
+  moon: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z' })
+  ),
+  'more-horizontal': makeIcon('0 0 24 24', true,
+    h('circle', { cx: 12, cy: 12, r: 1 }),
+    h('circle', { cx: 19, cy: 12, r: 1 }),
+    h('circle', { cx: 5, cy: 12, r: 1 })
+  ),
+  // — Locked state (R4 Task 3, used by bottom-nav + sidebar source rows) —
+  lock: makeIcon('0 0 24 24', true,
+    h('rect', { x: 3, y: 11, width: 18, height: 11, rx: 2 }),
+    h('path', { d: 'M7 11V7a5 5 0 0 1 10 0v4' })
+  ),
+  // — Sort + filter UI (R4 Task 3) —
+  tag: makeIcon('0 0 24 24', true,
+    h('path', { d: 'M20.59 13.41 13.42 20.58a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z' }),
+    h('line', { x1: 7, y1: 7, x2: 7.01, y2: 7 })
+  ),
+  'arrow-up-down': makeIcon('0 0 24 24', true,
+    h('path', { d: 'm21 16-4 4-4-4' }),
+    h('path', { d: 'M17 20V4' }),
+    h('path', { d: 'm3 8 4-4 4 4' }),
+    h('path', { d: 'M7 4v16' })
   ),
 };
 
@@ -7883,7 +8013,7 @@ function CategoryDropdown({ value, onChange, categories }) {
   }, [open]);
 
   const cur = value || '';
-  const curIcon = cur ? (CAT_ICONS[cur] || '🏷️') : '◆';
+  const curIcon = cur ? (CAT_ICONS[cur] || 'tag') : null;
   const curLabel = cur ? cur : t('sidebar.all_categories');
   const isPlaceholder = !cur;
 
@@ -7895,7 +8025,7 @@ function CategoryDropdown({ value, onChange, categories }) {
       'aria-expanded': open ? 'true' : 'false',
       'aria-haspopup': 'listbox'
     },
-      h('span', { className: 'cat-dd-trigger-ico' }, curIcon),
+      h('span', { className: 'cat-dd-trigger-ico' }, curIcon ? icon(curIcon, { size: 12 }) : '◆'),
       h('span', {
         className: 'cat-dd-trigger-label' + (isPlaceholder ? ' is-placeholder' : '')
       }, curLabel),
@@ -7921,9 +8051,9 @@ function CategoryDropdown({ value, onChange, categories }) {
         className: 'cat-dd-opt cat-dd-opt-' + c + (cur === c ? ' active' : ''),
         onClick: () => { onChange(c); setOpen(false); }
       },
-        h('span', { className: 'cat-dd-opt-ico' }, CAT_ICONS[c] || '🏷️'),
+        h('span', { className: 'cat-dd-opt-ico' }, icon(CAT_ICONS[c] || 'tag', { size: 12 })),
         h('span', { className: 'cat-dd-opt-label' }, c),
-        cur === c ? h('span', { className: 'cat-dd-opt-check' }, '✓') : null
+        cur === c ? h('span', { className: 'cat-dd-opt-check' }, icon('check', { size: 12 })) : null
       ))
     ) : null
   );
@@ -7938,7 +8068,7 @@ function PhaseBadge({ phase }) {
     className: 'phase-badge',
     style: { background: m.bg, color: m.color, border: '1px solid ' + m.color },
     title: phaseHint(phase)
-  }, PHASE_DOT[phase] + ' ' + m.label);
+  }, phaseDot(phase), ' ', m.label);
 }
 
 // [MARKET_STAGE] badge — remove component + call in TrendCard to disable UI
@@ -8724,7 +8854,7 @@ function FeedbackBar({ trend, variant }) {
 function FeedCard({ trend, onOpen, onHide, onFavToggle, canFavorite }) {
   useLang();
   const catCls = CAT_CLS[trend.category] || 'cat-other';
-  const catIco = CAT_ICONS[trend.category] || '📌';
+  const catIco = CAT_ICONS[trend.category] || 'more-horizontal';
   const srcIco = SOURCE_ICONS[trend.source] || 'hash';
   const srcLbl = SOURCE_LABELS[trend.source] || trend.source;
   const linkLabel = SOURCE_LINK_LABELS[trend.source] || t('feed.open_source');
@@ -8854,7 +8984,7 @@ function FeedCard({ trend, onOpen, onHide, onFavToggle, canFavorite }) {
             hasCatalyst
               ? h('span', { className: 'badge badge-catalyst', title: t('feed.catalyst_tip') }, t('badge.catalyst'))
               : null,
-            h('span', { className: 'badge ' + catCls, title: t('feed.category_tip') }, catIco + ' ' + (trend.category || 'other'))
+            h('span', { className: 'badge ' + catCls, title: t('feed.category_tip') }, icon(catIco, { size: 11 }), ' ', (trend.category || 'other'))
           )
         ),
         h('div', { className: 'feed-title' }, withSubjectHighlight(trend.title, trend.subjectAliases))
@@ -8974,7 +9104,7 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
                   h('div', { className: 'top-item-title', title: tr.title }, tr.title),
                   h('div', { className: 'top-item-meta' },
                     h('span', null, icon(SOURCE_ICONS[tr.source] || 'hash', { size: 11 })),
-                    tr.narrativePhase ? h('span', null, PHASE_DOT[tr.narrativePhase] + ' ' + (PHASE_META[tr.narrativePhase] || {}).label) : null,
+                    tr.narrativePhase ? h('span', null, phaseDot(tr.narrativePhase), ' ', (PHASE_META[tr.narrativePhase] || {}).label) : null,
                     h('span', null, (tr.score || tr.virality || 0) + ' ' + t('right.score.vrl'))
                   )
                 ),
@@ -9491,7 +9621,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
     }, '?');
   };
   const catCls = CAT_CLS[trend.category] || 'cat-other';
-  const catIco = CAT_ICONS[trend.category] || '📌';
+  const catIco = CAT_ICONS[trend.category] || 'more-horizontal';
   const srcIco = SOURCE_ICONS[trend.source] || 'hash';
   const srcLbl = SOURCE_LABELS[trend.source] || trend.source;
   const srcLinkCls = trend.source === 'reddit' ? ' trend-link-reddit'
@@ -9597,7 +9727,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
         trend.alertType
           ? h('span', { className: 'badge badge-atype badge-atype-' + trend.alertType }, t('badge.alert_type.' + trend.alertType))
           : null,
-        h('span', { className: 'badge ' + catCls }, catIco + ' ' + (trend.category || 'other')),
+        h('span', { className: 'badge ' + catCls }, icon(catIco, { size: 11 }), ' ', (trend.category || 'other')),
         trend.manualSubmitted ? h('span', { className: 'badge badge-manual', title: t('feed.manual_tip') }, '🧪 MANUAL') : null,
         trend.narrativePhase ? h(PhaseBadge, { phase: trend.narrativePhase }) : null,
         h('div', { className: 'source-chip' }, icon(srcIco, { size: 12 }), ' ', srcLbl),
@@ -10600,7 +10730,7 @@ function StatsPanel({ stats, hours, onBack, onOpenTrend }) {
             ? topCategories.map(row =>
                 h('div', { key: row.category || 'other', className: 'stats-list-row' },
                   h('div', { className: 'stats-list-main' },
-                    h('span', null, CAT_ICONS[row.category] || '📌'),
+                    h('span', null, icon(CAT_ICONS[row.category] || 'more-horizontal', { size: 12 })),
                     h('div', null,
                       h('div', { className: 'stats-list-name' }, row.category || 'other'),
                       h('div', { className: 'stats-list-meta' }, t('stats.cluster_count'))
@@ -11720,10 +11850,13 @@ function BottomNav({ view, setView, me, favoritesOnly, setFavoritesOnly, favorit
     (view === 'trends' && favoritesOnly && canFav) ? 'saved' :
     'trends';
 
+  // 2026-05-20 R4 — icon field holds icon-name keys resolved via icon().
+  // Analyze = search (per user review of icon preview); Saved = star (lock
+  // when plan-gated); Feed = flame. NO backticks in this comment (SPA trap).
   const tabs = [
-    { id: 'trends',  icon: '🔥',                              label: t('nav.feed'),    locked: false        },
-    { id: 'saved',   icon: savedLocked ? '🔒' : '⭐',          label: t('nav.saved'),   locked: savedLocked  },
-    { id: 'analyze', icon: analyzeLocked ? '🔒' : '🧪',       label: t('nav.analyze'), locked: analyzeLocked },
+    { id: 'trends',  icon: 'flame',                              label: t('nav.feed'),    locked: false        },
+    { id: 'saved',   icon: savedLocked   ? 'lock' : 'star',      label: t('nav.saved'),   locked: savedLocked  },
+    { id: 'analyze', icon: analyzeLocked ? 'lock' : 'search',    label: t('nav.analyze'), locked: analyzeLocked },
   ];
 
   const persistFav = (next) => {
@@ -11775,7 +11908,7 @@ function BottomNav({ view, setView, me, favoritesOnly, setFavoritesOnly, favorit
           ? (tab.id === 'saved' ? t('fav.locked_tooltip') : t('analyze.locked_tooltip'))
           : tab.label,
       },
-        h('span', { className: 'sb-foot-ico' }, tab.icon),
+        h('span', { className: 'sb-foot-ico' }, icon(tab.icon, { size: 16 })),
         h('span', null,
           tab.label,
           // Counter on Saved tab — shown only for Pro/Admin with at least
@@ -12685,7 +12818,7 @@ function App() {
                       className: 'phase-chip phase-chip-' + p + (phaseArr.includes(p) ? ' active' : ''),
                       onClick: () => togglePhase(p)
                     },
-                      h('span', { className: 'phase-chip-dot' }, PHASE_DOT[p]),
+                      phaseDot(p),
                       h('span', { className: 'phase-chip-label' }, PHASE_META[p].label)
                     )
                   )
@@ -12747,15 +12880,16 @@ function App() {
                      h('span', { className: 'phase-chip-label' }, t('feed.filter.all'))
                   )
                 ];
-                [['event','📰','feed.atype.event'],['trend','📈','feed.atype.trend'],['post','🚀','feed.atype.post']].forEach(spec => {
-                  const key = spec[0], emoji = spec[1], i18nKey = spec[2];
+                // 2026-05-20 R4 — emoji icons → Lucide names. Render via icon().
+                [['event','newspaper','feed.atype.event'],['trend','trend','feed.atype.trend'],['post','circle-dot','feed.atype.post']].forEach(spec => {
+                  const key = spec[0], iconName = spec[1], i18nKey = spec[2];
                   items.push(h('button', {
                     key: key,
                     type: 'button',
                     className: 'phase-chip atype-chip-' + key + (atypeArr.includes(key) ? ' active' : ''),
                     onClick: () => toggleAtype(key)
                   },
-                    h('span', { className: 'phase-chip-dot' }, emoji),
+                    h('span', { className: 'phase-chip-dot' }, icon(iconName, { size: 10 })),
                     h('span', { className: 'phase-chip-label' }, t(i18nKey))
                   ));
                 });
