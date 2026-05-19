@@ -7104,12 +7104,11 @@ const I18N = {
     'market.overheated.hint': 'Trading active — late/rug signals present',
 
     // Login
-    'login.subtitle': 'Sign in via Telegram',
-    'login.idle_desc': "No passwords here. Auth goes through our Telegram bot — you'll get a one-time code and paste it below.",
-    'login.idle_btn': '💬 Sign in with Telegram',
-    'login.code_desc': "Open the bot and hit Start — it'll send a 6-digit code. Paste it below:",
+    'login.idle_desc': "Sign in via our Telegram bot. You'll get a 6-digit code to paste below.",
+    'login.idle_btn': 'Sign in with Telegram',
+    'login.code_desc': "Open the bot and tap Start. It'll send a 6-digit code. Paste it below:",
     'login.bot_unavailable': 'Bot is temporarily unavailable. Try again later.',
-    'login.reopen_bot': '↗ Reopen the bot',
+    'login.reopen_bot': 'Reopen the bot',
     'login.verify_btn': 'Sign in',
     'login.verifying': 'Verifying…',
     'login.err_need_6': 'Enter the 6 digits from the bot message',
@@ -7534,12 +7533,11 @@ const I18N = {
     'market.overheated.hint': 'Торги идут — поздно / признаки rug',
 
     // Login
-    'login.subtitle': 'Вход через Telegram',
-    'login.idle_desc': 'Мы не храним пароли. Авторизация — через нашего Telegram-бота: ты получишь одноразовый код и введёшь его здесь.',
-    'login.idle_btn': '💬 Войти через Telegram',
-    'login.code_desc': 'Открой чат с ботом и нажми Start — он пришлёт шестизначный код. Введи его ниже:',
+    'login.idle_desc': 'Войди через нашего Telegram-бота. Получишь 6-значный код, чтобы ввести его здесь.',
+    'login.idle_btn': 'Войти через Telegram',
+    'login.code_desc': 'Открой чат с ботом и нажми Start. Он пришлёт шестизначный код. Введи его ниже:',
     'login.bot_unavailable': 'Бот временно недоступен. Попробуйте позже.',
-    'login.reopen_bot': '↗ Открыть бота снова',
+    'login.reopen_bot': 'Открыть бота снова',
     'login.verify_btn': 'Войти',
     'login.verifying': 'Проверяем…',
     'login.err_need_6': 'Введите 6 цифр из сообщения бота',
@@ -11276,7 +11274,7 @@ function LoginScreen({ onLoggedIn }) {
       const r = await fetch('/api/auth/initiate', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || 'HTTP ' + r.status);
-      if (!data.botUrl) throw new Error('Bot is temporarily unavailable. Try again later.');
+      if (!data.botUrl) throw new Error(t('login.bot_unavailable'));
       setSession(data);
       setPhase('code');
       try { window.open(data.botUrl, '_blank', 'noopener'); } catch (e) {}
@@ -11286,7 +11284,7 @@ function LoginScreen({ onLoggedIn }) {
 
   const submitCode = async () => {
     const clean = String(code || '').replace(/\D/g, '').slice(0, 6);
-    if (clean.length !== 6) { setError('Enter the 6 digits from the bot message'); return; }
+    if (clean.length !== 6) { setError(t('login.err_need_6')); return; }
     setLoading(true); setError('');
     try {
       const r = await fetch('/api/auth/verify', {
@@ -11472,7 +11470,7 @@ function LoginScreen({ onLoggedIn }) {
             h('line', { x1: 22, y1: 2, x2: 11, y2: 13 }),
             h('polygon', { points: '22 2 15 22 11 13 2 9 22 2' })
           ),
-          loading ? 'Please wait…' : 'Sign in with Telegram'
+          loading ? t('login.verifying') : t('login.idle_btn')
         ),
 
         h('div', {
@@ -11480,7 +11478,7 @@ function LoginScreen({ onLoggedIn }) {
             marginTop: 16, fontSize: 11, lineHeight: 1.5,
             color: 'var(--dim, #4d5258)', textAlign: 'center',
           }
-        }, "No password needed. We'll send a one-time code to your Telegram.")
+        }, t('login.idle_desc'))
       ),
 
       // ── Code phase (after click "Sign in") ────────────────────────────
@@ -11491,7 +11489,7 @@ function LoginScreen({ onLoggedIn }) {
             color: 'var(--text2, #c4c8cc)',
             margin: '0 0 14px',
           }
-        }, "Open the bot and tap Start — it'll send a 6-digit code. Paste it below:"),
+        }, t('login.code_desc')),
         session?.botUrl && h('a', {
           href: session.botUrl, target: '_blank', rel: 'noopener',
           style: {
@@ -11504,7 +11502,7 @@ function LoginScreen({ onLoggedIn }) {
             borderRadius: 10,
             textDecoration: 'none',
           }
-        }, '↗ Reopen the bot'),
+        }, t('login.reopen_bot')),
         h('input', {
           type: 'text', inputMode: 'numeric', pattern: '[0-9]*', autoFocus: true,
           maxLength: 6, value: code,
@@ -11547,7 +11545,7 @@ function LoginScreen({ onLoggedIn }) {
             opacity: loading ? 0.7 : 1,
             transition: 'background 120ms ease, box-shadow 120ms ease',
           },
-        }, loading ? 'Verifying…' : 'Sign in'),
+        }, loading ? t('login.verifying') : t('login.verify_btn')),
         h('button', {
           onClick: () => { setPhase('idle'); setSession(null); setCode(''); setError(''); },
           style: {
