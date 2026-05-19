@@ -3719,35 +3719,39 @@ class DashboardServer {
     }
 
     /* ── Sort list (sidebar) — 2026-05-20 R5 ──
-       Replaced the 5-icon seg-control. Each option is a chip styled like
-       .phase-badge / .badge-atype-* (neutral surface2 + 1px border). Active
-       chip uses the .badge-catalyst accent-fill pattern. All colors flow
-       through theme tokens (--accent / --accent-rgb), so theme switch works. */
+       Each option is a chip styled like .phase-chip (transparent fill, 10.5px
+       700-weight uppercase, gap 6, .4 letter-spacing). Active chip uses the
+       phase-chip-strong accent pattern (rgba accent .12 + .35 border + accent
+       text + inset box-shadow). All colors flow through theme tokens so
+       pulse/ink/tide switch works automatically. */
     .sort-list {
       display: flex;
       flex-direction: column;
       gap: 4px;
     }
     .sort-chip {
-      display: flex; align-items: center; gap: 8px;
-      padding: 7px 10px;
-      font-size: 13px; font-weight: 500;
+      display: flex; align-items: center; gap: 6px;
+      padding: 7px 9px;
+      font-size: 10.5px; font-weight: 700; letter-spacing: .4px;
+      text-transform: uppercase;
       cursor: pointer;
       border-radius: var(--r1);
-      background: var(--surface2);
+      background: rgba(255,255,255,.02);
       border: 1px solid var(--border);
-      color: var(--text2);
+      color: var(--muted);
       user-select: none;
       transition: background .12s ease, color .12s ease, border-color .12s ease;
     }
     .sort-chip:hover {
-      background: var(--card);
-      color: var(--text);
+      background: transparent;
+      color: var(--text2);
+      border-color: var(--border2);
     }
     .sort-chip.active {
-      background: rgba(var(--accent-rgb), .14);
-      border-color: rgba(var(--accent-rgb), .38);
+      background: rgba(var(--accent-rgb), .12);
+      border-color: rgba(var(--accent-rgb), .35);
       color: var(--accent);
+      box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), .1);
     }
     .sort-chip:focus-visible {
       outline: 2px solid rgba(var(--accent-rgb), .5);
@@ -5747,18 +5751,32 @@ class DashboardServer {
       border: 1px solid var(--border);
       border-radius: var(--r3);
       padding: 10px 12px 8px;
-      transition: border-color .15s, background .15s, transform .15s, box-shadow .15s;
+      /* 2026-05-20 R5 perf: box-shadow removed from transition. When wheel-
+         scrolling over the feed the cursor crossed 5-10 cards in quick
+         succession, each triggering a 150ms transition that animated a 14px
+         blur shadow — paint-expensive, ran for all cards at once, ate the
+         frame budget. transform-only lift keeps the same intent cheap. */
+      transition: border-color .15s, background .15s, transform .15s;
       cursor: pointer;
       position: relative;
       box-shadow: var(--gloss-top);
+      /* 2026-05-20 R5 perf: content-visibility:auto lets the browser skip
+         layout + style + paint for offscreen cards. contain-intrinsic-size
+         auto-N reserves a placeholder height (N = fallback before first
+         render, then browser uses last-measured size) so the scrollbar
+         stays stable. contain isolates each card from its neighbors —
+         changes in one no longer invalidate others. Result: per-frame work
+         scales with viewport, not feed length. */
+      content-visibility: auto;
+      contain-intrinsic-size: auto 280px;
+      contain: layout style paint;
     }
     .feed-card:hover {
       border-color: var(--border3);
-      /* Hover = soft white-alpha overlay (same trick X uses) — gives a lift
-         without shifting hue. */
+      /* Hover = soft white-alpha overlay + transform lift. box-shadow
+         was removed 2026-05-20 R5 — paint-expensive on wheel-scroll. */
       background: rgba(255,255,255,.025);
       transform: translateY(-1px);
-      box-shadow: 0 4px 14px rgba(0,0,0,.35), var(--gloss-top);
     }
     .feed-card-head {
       display: flex; align-items: flex-start; gap: 8px; margin-bottom: 5px;
@@ -7064,7 +7082,7 @@ const I18N = {
     'term.stale':       'Age penalty. After 24h grace each hour subtracts ~2 points (max −30). Punishes alerts about old news.',
     'modal.feedback': 'Your take',
     'modal.links': 'Links',
-    'modal.source_link': '{ico} Source →',
+    'modal.source_link': 'Source →',
     'modal.tg_link': 'Telegram',
     'modal.ask_grok': 'Ask Grok',
     'modal.xtrends_top_tweets': 'Top tweets ({n})',
@@ -7493,7 +7511,7 @@ const I18N = {
     'term.stale':       'Штраф за возраст. После 24h grace каждый час -2 очка (max -30). Бьёт по алертам о вчерашних новостях.',
     'modal.feedback': 'Ваша оценка',
     'modal.links': 'Ссылки',
-    'modal.source_link': '{ico} Источник →',
+    'modal.source_link': 'Источник →',
     'modal.tg_link': 'Telegram',
     'modal.ask_grok': 'Спросить Grok',
     'modal.xtrends_top_tweets': 'Топовые твиты ({n})',
@@ -9683,8 +9701,11 @@ function TriggerSection({ trend, lang, me }) {
             className: 'btn btn-primary',
             disabled: loading,
             onClick: onSearch,
-            style: { padding: '8px 14px', borderRadius: 8, cursor: loading ? 'wait' : 'pointer' },
-          }, loading ? t('trigger.btn_loading') : t('trigger.btn'))
+            style: { padding: '8px 14px', cursor: loading ? 'wait' : 'pointer' },
+          },
+            loading ? null : icon('sparkles', { size: 12 }),
+            loading ? t('trigger.btn_loading') : t('trigger.btn')
+          )
         // Locked card for Free — small icon-tile + two-line text. Reads like
         // a content row, not a dimmed-out button. Still inert on click; the
         // upgrade-flow already lives in /menu / Account.
@@ -10219,7 +10240,11 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
               // skip both).
               'data-tweet-id':  _twModalPreviewId,
               'data-reddit-id': _redditModalPreviewId,
-            }, t('modal.source_link', { ico: srcIco })) : null,
+            },
+              icon(srcIco, { size: 12 }),
+              ' ',
+              t('modal.source_link')
+            ) : null,
             trend.tgMessageUrl ? h('a', { className: 'trend-link trend-link-tg', href: trend.tgMessageUrl, target: '_blank', rel: 'noopener' }, t('modal.tg_link')) : null,
             (() => {
               const title = trend.titleEn || trend.original_title || trend.originalTitle || trend.title || '';
@@ -13339,7 +13364,7 @@ function App() {
                       className: 'sort-chip' + (sort === o.v ? ' active' : ''),
                       onClick: () => { setSort(o.v); setOffset(0); }
                     },
-                      icon(o.i, { size: 14 }),
+                      icon(o.i, { size: 12 }),
                       h('span', null, o.label)
                     )
                   )
