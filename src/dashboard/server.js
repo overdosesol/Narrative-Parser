@@ -11322,9 +11322,8 @@ function LoginScreen({ onLoggedIn }) {
       style: {
         position: 'absolute', inset: 0, pointerEvents: 'none',
         background:
-          'radial-gradient(60% 50% at 18% 22%, rgba(var(--accent-rgb), 0.18) 0%, transparent 60%),' +
-          'radial-gradient(50% 40% at 82% 18%, rgba(var(--accent-rgb), 0.10) 0%, transparent 60%),' +
-          'radial-gradient(70% 55% at 50% 95%, rgba(var(--accent-rgb), 0.07) 0%, transparent 60%)',
+          'radial-gradient(40% 35% at 20% 18%, rgba(var(--accent-rgb), 0.10) 0%, transparent 70%),' +
+          'radial-gradient(35% 30% at 80% 85%, rgba(var(--accent-rgb), 0.05) 0%, transparent 70%)',
         filter: 'blur(40px)',
       }
     }),
@@ -11347,16 +11346,11 @@ function LoginScreen({ onLoggedIn }) {
       style: {
         position: 'relative', zIndex: 1,
         width: '100%', maxWidth: '440px',
-        background: 'linear-gradient(180deg, rgba(22,24,28,0.92) 0%, rgba(10,10,10,0.94) 100%)',
-        border: '1px solid var(--border, rgba(239,243,244,0.08))',
-        borderRadius: '20px',
-        padding: '40px 32px 28px',
-        boxShadow:
-          '0 30px 80px rgba(0,0,0,0.65),' +
-          '0 0 0 1px rgba(239,243,244,0.02) inset,' +
-          'inset 0 1px 0 rgba(239,243,244,0.04)',
-        backdropFilter: 'blur(12px)',
-        WebkitBackdropFilter: 'blur(12px)',
+        background: '#000',
+        border: '1px solid var(--border2, rgba(239,243,244,0.14))',
+        borderRadius: '4px',
+        padding: '40px 32px 32px',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.6)',
       }
     },
       // ── Brand mark ────────────────────────────────────────────────────
@@ -11367,11 +11361,11 @@ function LoginScreen({ onLoggedIn }) {
         h('div', {
           style: {
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-            width: 80, height: 80, borderRadius: 20,
-            background: 'radial-gradient(120% 100% at 50% 0%, rgba(var(--accent-rgb), 0.22) 0%, rgba(var(--accent-rgb), 0.05) 60%, transparent 100%)',
-            border: '1px solid rgba(var(--accent-rgb), 0.20)',
-            boxShadow: '0 0 40px rgba(var(--accent-rgb), 0.18), inset 0 1px 0 rgba(239,243,244,0.05)',
-            padding: 10, boxSizing: 'border-box',
+            width: 64, height: 64, borderRadius: 3,
+            background: 'rgba(var(--accent-rgb), 0.06)',
+            border: '1px solid rgba(var(--accent-rgb), 0.30)',
+            boxShadow: '0 0 20px rgba(var(--accent-rgb), 0.18)',
+            padding: 8, boxSizing: 'border-box',
           }
         },
           h('img', {
