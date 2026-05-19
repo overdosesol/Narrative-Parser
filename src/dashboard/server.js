@@ -3583,11 +3583,14 @@ class DashboardServer {
 
     /* ── Score / meme bars ── */
     .meme-score { display: flex; align-items: center; gap: 7px; }
-    .meme-num { font-size: 17px; font-weight: 800; font-family: 'JetBrains Mono', monospace; line-height: 1; }
-    .meme-num.hot  { color: var(--red2); text-shadow: 0 0 10px rgba(var(--red-rgb), .35); }
-    .meme-num.warm { color: var(--orange); }
-    .meme-num.ok   { color: var(--yellow); }
-    .meme-num.cold { color: var(--dim); }
+    .meme-num { font-size: 17px; font-weight: 800; font-family: 'JetBrains Mono', monospace; line-height: 1; color: var(--accent); }
+    /* Score level communicated via bar-fill length, not number color — keep
+       all tier classes (hot/warm/ok/cold) on the same accent for visual
+       calmness ("светофор" removed 2026-05-19). */
+    .meme-num.hot,
+    .meme-num.warm,
+    .meme-num.ok,
+    .meme-num.cold { color: var(--accent); }
     .meme-bar-wrap { display: flex; flex-direction: column; gap: 2px; min-width: 70px; }
     .meme-bar { height: 3px; border-radius: 3px; background: rgba(255,255,255,.06); overflow: hidden; width: 70px; }
     .meme-fill { height: 100%; border-radius: 3px; transition: width .35s ease; }
@@ -3625,10 +3628,11 @@ class DashboardServer {
       font-size: 16px; font-weight: 800; line-height: 1;
       letter-spacing: -0.3px;
     }
-    .meme-hero-num.hot  { color: var(--red2);  text-shadow: 0 0 8px rgba(var(--red-rgb), .4); }
-    .meme-hero-num.warm { color: var(--orange); }
-    .meme-hero-num.ok   { color: var(--yellow); }
-    .meme-hero-num.cold { color: var(--dim); }
+    /* All tiers on --accent — level via bar-fill length, not color */
+    .meme-hero-num.hot,
+    .meme-hero-num.warm,
+    .meme-hero-num.ok,
+    .meme-hero-num.cold { color: var(--accent); }
     .meme-hero-num-sub { font-size: 9px; color: var(--dim); font-weight: 600; }
     .meme-hero-bar {
       flex: 1; height: 4px;
@@ -5735,7 +5739,7 @@ class DashboardServer {
       width: 22px; height: 22px; border-radius: 5px;
       background: rgba(0,0,0,.5);
       border: 1px solid var(--border2);
-      color: var(--text2);
+      color: var(--muted);
       font-size: 11px; line-height: 1;
       display: flex; align-items: center; justify-content: center;
       cursor: pointer;
@@ -5745,9 +5749,9 @@ class DashboardServer {
     }
     .feed-card:hover .feed-hide-btn { opacity: 1; }
     .feed-hide-btn:hover {
-      background: rgba(248,113,113,.18);
-      color: #fca5a5;
-      border-color: rgba(248,113,113,.45);
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      border-color: var(--border3);
     }
     /* Touch devices have no hover — show the button always but at lower
        contrast so it's discoverable without dominating the card. */
@@ -5763,7 +5767,7 @@ class DashboardServer {
       width: 18px; height: 18px; border-radius: 4px;
       background: transparent;
       border: 1px solid var(--border2);
-      color: var(--text2);
+      color: var(--muted);
       font-size: 11px; line-height: 1;
       display: inline-flex; align-items: center; justify-content: center;
       cursor: pointer;
@@ -5777,12 +5781,12 @@ class DashboardServer {
       opacity: 1;                    /* always-visible when saved */
       background: rgba(var(--accent-rgb), .18);
       border-color: rgba(var(--accent-rgb), .45);
-      color: var(--accent2);
+      color: var(--accent);
     }
     .feed-fav-btn:hover {
-      background: rgba(var(--accent-rgb), .14);
-      color: var(--accent2);
-      border-color: rgba(var(--accent-rgb), .45);
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      border-color: var(--border3);
     }
     .feed-fav-btn.just-saved { animation: favPulse .4s cubic-bezier(.21,.62,.32,1.06); }
     @keyframes favPulse {
@@ -7702,12 +7706,11 @@ function memeColor(v) {
   if (v >= 40) return 'linear-gradient(90deg, #fdcb6e, #ffeaa7)';
   return '#333348';
 }
-// Bar color for emergence/adoption scores
-function barColor(v) {
-  if (v >= 80) return '#22C55E';
-  if (v >= 60) return '#4ADE80';
-  if (v >= 30) return '#EAB308';
-  return '#4B5563';
+// Bar color for emergence/adoption/meme scores. Unified on --accent —
+// score LEVEL is communicated via bar-fill LENGTH, not color (no more
+// red/yellow/green "светофор"). Single token; theme-aware.
+function barColor(_v) {
+  return 'var(--accent)';
 }
 function fmtVelocity(v) {
   if (!v || v === 0) return null;
@@ -9573,7 +9576,9 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                   className: 'meme-hero-fill',
                   style: {
                     width: Math.min(v, 100) + '%',
-                    background: 'linear-gradient(90deg, ' + fillColor + ', ' + fillColor + 'cc)',
+                    // Solid accent fill — no more tier gradient. Level via
+                    // width, not color (see barColor() comment).
+                    background: fillColor,
                   }
                 })
               )
@@ -9883,6 +9888,8 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
             })(),
             // Velocity — growth rate per hour. fmtVelocity returns null when
             // velocity ≤ 0; we render an em-dash so the cell stays balanced.
+            // Positive → accent (green), zero → muted. Negative case was
+            // removed from the scanner pipeline a week ago.
             (() => {
               const vel = fmtVelocity(trend.velocity || 0);
               return h('div', { className: 'modal-stat' },
@@ -9893,7 +9900,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
                 h('span', {
                   style: {
                     fontFamily: 'JetBrains Mono', fontSize: 13, fontWeight: 700,
-                    color: vel ? 'var(--accent2)' : 'var(--dim)',
+                    color: vel ? 'var(--accent)' : 'var(--muted)',
                   }
                 }, vel || '—')
               );
