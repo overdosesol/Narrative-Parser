@@ -2759,7 +2759,7 @@ class DashboardServer {
       background: rgba(var(--accent-rgb), .35);
       border: 3px solid transparent;
       background-clip: padding-box;
-      border-radius: 10px;
+      border-radius: var(--r1);
       min-height: 40px;
     }
     .main-feed::-webkit-scrollbar-thumb:hover {
@@ -3260,7 +3260,7 @@ class DashboardServer {
     .hero-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green2); box-shadow: 0 0 6px rgba(var(--green-rgb), .5); }
     .hero-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .hero-side-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    .hero-mini-card { border-radius: 8px; border: 1px solid var(--border); background: rgba(255,255,255,.025); padding: 10px; }
+    .hero-mini-card { border-radius: var(--r1); border: 1px solid var(--border); background: rgba(255,255,255,.025); padding: 10px; }
     .hero-mini-label { font-size: 9px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; color: var(--dim); margin-bottom: 5px; }
     .hero-mini-value { font-size: 15px; font-weight: 800; color: var(--text); letter-spacing: -.4px; margin-bottom: 2px; font-family: 'JetBrains Mono', monospace; }
     .hero-mini-sub { font-size: 10px; color: var(--muted); }
@@ -3326,7 +3326,7 @@ class DashboardServer {
       display: flex; flex-direction: column; align-items: center; gap: 5px;
       padding: 11px 8px;
       background: rgba(255,255,255,.025); border: 1px solid var(--border2);
-      border-radius: 8px; cursor: pointer; transition: all .15s ease;
+      border-radius: var(--r1); cursor: pointer; transition: all .15s ease;
       font-size: 11px; font-weight: 600; color: var(--muted);
       white-space: nowrap; position: relative; overflow: hidden;
     }
@@ -3354,7 +3354,7 @@ class DashboardServer {
     .source-control-btn:hover { border-color: rgba(var(--accent-rgb), .22); background: rgba(var(--accent-rgb), .05); }
     .source-control-btn.disabled { border-color: var(--border); background: transparent; color: var(--dim); }
     .source-control-toggle {
-      width: 26px; height: 14px; border-radius: 7px; background: var(--green);
+      width: 26px; height: 14px; border-radius: var(--r1); background: var(--green);
       position: relative; transition: background .2s; flex-shrink: 0;
     }
     .source-control-toggle::after {
@@ -3368,7 +3368,7 @@ class DashboardServer {
     .toolbar-sep { width: 1px; height: 16px; background: var(--border); margin: 0 2px; }
     select {
       background: rgba(255,255,255,.025); border: 1px solid var(--border);
-      color: var(--text2); padding: 7px 10px; border-radius: 8px;
+      color: var(--text2); padding: 7px 10px; border-radius: var(--r1);
       font-size: 11px; font-weight: 600; outline: none; cursor: pointer;
       font-family: 'Inter', sans-serif; transition: all .15s;
       appearance: none; -webkit-appearance: none;
@@ -3497,7 +3497,7 @@ class DashboardServer {
     }
 
     .btn {
-      padding: 7px 12px; border-radius: 8px; border: 1px solid transparent;
+      padding: 7px 12px; border-radius: var(--r1); border: 1px solid transparent;
       cursor: pointer; font-size: 11px; font-weight: 700;
       transition: all .15s ease; white-space: nowrap;
       font-family: 'Inter', sans-serif; letter-spacing: .1px;
@@ -3535,7 +3535,7 @@ class DashboardServer {
     .trend-card {
       background: rgba(255,255,255,.01);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: var(--r1);
       padding: 0;
       transition: border-color .15s, background .15s;
       animation: fadeIn .25s ease backwards;
@@ -3612,7 +3612,7 @@ class DashboardServer {
     .meme-hero {
       display: flex; align-items: center; gap: 10px;
       padding: 6px 9px;
-      border-radius: 8px;
+      border-radius: var(--r1);
       background: linear-gradient(135deg, rgba(255,107,107,0.08), rgba(255,184,0,0.05));
       border: 1px solid rgba(255,107,107,0.18);
       box-shadow: 0 0 12px -8px rgba(255,107,107,0.25);
@@ -3721,7 +3721,7 @@ class DashboardServer {
       display: inline-flex; align-items: center; gap: 5px;
       font-size: 11px; font-weight: 600; color: var(--muted);
       text-decoration: none; padding: 5px 11px;
-      border: 1px solid var(--border); border-radius: 6px;
+      border: 1px solid var(--border); border-radius: var(--r1);
       background: rgba(255,255,255,.025); transition: all .13s;
       white-space: nowrap;
     }
@@ -3781,7 +3781,7 @@ class DashboardServer {
     /* ── Error ── */
     .error-bar {
       background: rgba(var(--red-rgb), .07); border: 1px solid rgba(var(--red-rgb), .2);
-      color: var(--red2); padding: 10px 14px; border-radius: 8px;
+      color: var(--red2); padding: 10px 14px; border-radius: var(--r1);
       margin-bottom: 12px; font-size: 12px; font-weight: 500;
       display: flex; align-items: center; gap: 8px;
       animation: fadeIn .25s ease;
@@ -3797,7 +3797,7 @@ class DashboardServer {
     .analyze-form {
       background: rgba(var(--accent-rgb), .04);
       border: 1px solid rgba(var(--accent-rgb), .18);
-      border-radius: 12px;
+      border-radius: var(--r3);
       padding: 14px 16px;
       margin-bottom: 16px;
       display: flex; flex-direction: column; gap: 10px;
@@ -3807,7 +3807,7 @@ class DashboardServer {
       width: 100%;
       background: var(--bg2);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: var(--r1);
       padding: 10px 12px;
       color: var(--text);
       font-size: 13px;
@@ -3822,7 +3822,7 @@ class DashboardServer {
       text-align: center; padding: 28px 20px;
       color: var(--dim); font-size: 13px;
       border: 1px dashed var(--border);
-      border-radius: 12px;
+      border-radius: var(--r3);
     }
     /* Stage loader — shown during /api/manual-analysis fetch. The pipeline
        runs PreStage → Stage 1 → Stage 2 → finalize; backend doesn't stream
@@ -3832,7 +3832,7 @@ class DashboardServer {
       display: flex; flex-direction: column; align-items: center;
       gap: 14px; padding: 36px 20px;
       border: 1px solid var(--border);
-      border-radius: 14px;
+      border-radius: var(--r3);
       background: linear-gradient(180deg, rgba(var(--accent-rgb), .05), rgba(var(--accent-rgb), .01));
     }
     .analyze-loader-spinner {
@@ -3892,7 +3892,7 @@ class DashboardServer {
     .analyze-result {
       background: linear-gradient(180deg, rgba(255,255,255,.025), rgba(255,255,255,.005));
       border: 1px solid var(--border);
-      border-radius: 14px;
+      border-radius: var(--r3);
       padding: 0;
       overflow: hidden;
     }
@@ -3904,13 +3904,13 @@ class DashboardServer {
     }
     .analyze-thumb {
       width: 84px; height: 84px;
-      object-fit: cover; border-radius: 12px;
+      object-fit: cover; border-radius: var(--r3);
       border: 1px solid var(--border);
       flex-shrink: 0; background: var(--bg2);
     }
     .analyze-thumb-fb {
       width: 84px; height: 84px;
-      border-radius: 12px;
+      border-radius: var(--r3);
       border: 1px solid var(--border);
       background: var(--bg2);
       display: flex; align-items: center; justify-content: center;
@@ -3956,7 +3956,7 @@ class DashboardServer {
     .analyze-score {
       background: var(--bg2);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: var(--r1);
       padding: 10px 12px;
     }
     .analyze-score-label { font-size: 10px; font-weight: 700; letter-spacing: .4px; color: var(--dim); text-transform: uppercase; margin-bottom: 4px; }
@@ -4133,7 +4133,7 @@ class DashboardServer {
       position: relative;
       display: flex; flex-direction: column; gap: 6px;
       padding: 12px;
-      border-radius: 12px;
+      border-radius: var(--r3);
       border: 1px solid var(--border2);
       background: var(--card2);
       cursor: pointer;
@@ -4158,7 +4158,7 @@ class DashboardServer {
     }
     .theme-swatch-dot {
       display: inline-block;
-      width: 100%; height: 14px; border-radius: 6px;
+      width: 100%; height: 14px; border-radius: var(--r1);
       border: 1px solid rgba(255,255,255,.06);
     }
     /* Theme swatch previews — match the actual theme palettes above. Each
@@ -4181,7 +4181,7 @@ class DashboardServer {
     .stats-list { display: flex; flex-direction: column; gap: 5px; }
     .stats-list-row {
       display: flex; align-items: center; justify-content: space-between; gap: 8px;
-      padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
+      padding: 9px 11px; border-radius: var(--r1); border: 1px solid var(--border);
       background: rgba(255,255,255,.018);
     }
     .stats-list-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -4189,7 +4189,7 @@ class DashboardServer {
     .stats-list-meta { font-size: 10px; color: var(--dim); }
     .stats-list-value { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: var(--accent2); font-size: 11px; white-space: nowrap; }
     .stats-top-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    .stats-top-card { padding: 11px; border-radius: 8px; border: 1px solid var(--border); background: rgba(255,255,255,.018); cursor: pointer; transition: border-color .15s, background .15s; }
+    .stats-top-card { padding: 11px; border-radius: var(--r1); border: 1px solid var(--border); background: rgba(255,255,255,.018); cursor: pointer; transition: border-color .15s, background .15s; }
     .stats-top-card:hover { border-color: rgba(var(--accent-rgb), .25); background: rgba(var(--accent-rgb), .05); }
     .stats-top-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
     .stats-top-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--muted); font-size: 10px; }
@@ -4256,7 +4256,7 @@ class DashboardServer {
     }
     .atype-toggle {
       display: flex; align-items: center; gap: 10px;
-      padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--r1);
       background: var(--card2); color: var(--text); cursor: pointer;
       font-size: 12px; text-align: left; line-height: 1.3;
       transition: background .12s, border-color .12s;
@@ -4328,7 +4328,7 @@ class DashboardServer {
     .sidebar-settings-btn.active { background: rgba(var(--accent-rgb), .1); color: var(--accent2); border-color: rgba(var(--accent-rgb), .2); }
 
     /* ── Card image thumbnail ── */
-    .card-image-wrap { flex-shrink: 0; border-radius: 7px; overflow: hidden; background: var(--card3); border: 1px solid var(--border); position: relative; }
+    .card-image-wrap { flex-shrink: 0; border-radius: var(--r1); overflow: hidden; background: var(--card3); border: 1px solid var(--border); position: relative; }
     .card-image-wrap img { width: 100%; height: 100%; object-fit: cover; transition: transform .25s ease; }
     .trend-card:hover .card-image-wrap img { transform: scale(1.04); }
     .card-image-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 24px; opacity: .18; }
@@ -4430,7 +4430,7 @@ class DashboardServer {
     .refresh-badge {
       font-family: 'JetBrains Mono', monospace; font-size: 10px;
       color: var(--dim); background: rgba(255,255,255,.03);
-      border: 1px solid var(--border); border-radius: 6px;
+      border: 1px solid var(--border); border-radius: var(--r1);
       padding: 3px 8px; white-space: nowrap;
     }
     .kbd { display: inline-block; background: rgba(255,255,255,.05); border: 1px solid var(--border2); border-radius: 4px; padding: 1px 5px; font-size: 9px; font-family: 'JetBrains Mono', monospace; color: var(--dim); }
@@ -4458,7 +4458,7 @@ class DashboardServer {
       max-height: calc(100vh - 56px);
       background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
       border: 1px solid var(--border2);
-      border-radius: 16px;
+      border-radius: var(--r3);
       box-shadow: 0 24px 80px rgba(0,0,0,.7), 0 0 0 1px rgba(var(--accent-rgb), .08);
       animation: sheetPop .28s cubic-bezier(.2,.8,.2,1);
       display: flex; flex-direction: column;
@@ -4485,7 +4485,7 @@ class DashboardServer {
       width: 30px; height: 30px;
       display: inline-flex; align-items: center; justify-content: center;
       background: rgba(255,255,255,.04); border: 1px solid var(--border2);
-      color: var(--muted); border-radius: 8px;
+      color: var(--muted); border-radius: var(--r1);
       cursor: pointer; font-size: 14px;
       transition: all .12s;
     }
@@ -4504,7 +4504,7 @@ class DashboardServer {
     .sheet-body .settings-panel  { padding-bottom: 0; }
     @media (max-width: 700px) {
       .sheet-overlay { padding: 10px; }
-      .sheet { border-radius: 12px; max-height: calc(100vh - 20px); }
+      .sheet { border-radius: var(--r3); max-height: calc(100vh - 20px); }
     }
 
     /* ── Modal overlay (kept for TrendModal) ── */
@@ -4529,7 +4529,7 @@ class DashboardServer {
     }
     .modal-close {
       margin-left: auto; background: rgba(255,255,255,.04); border: 1px solid var(--border2);
-      color: var(--muted); border-radius: 6px; padding: 5px 9px;
+      color: var(--muted); border-radius: var(--r1); padding: 5px 9px;
       cursor: pointer; font-size: 12px; transition: all .12s; flex-shrink: 0;
     }
     .modal-close:hover { background: rgba(var(--red-rgb), .12); color: var(--red2); border-color: rgba(var(--red-rgb), .25); }
@@ -4541,7 +4541,7 @@ class DashboardServer {
     .modal-image-wrap {
       position: relative;
       width: 100%;
-      border-radius: 8px;
+      border-radius: var(--r1);
       overflow: hidden;
       background: #0a0a12;
       border: 1px solid var(--border);
@@ -4574,7 +4574,7 @@ class DashboardServer {
          multiple images, the layout doesn't jump by 220px. Single-image
          render also uses min-height 260px on .modal-image-wrap, so 440px
          here is a slight upper bound — fine for shimmer. */
-      height: 440px; border-radius: 8px;
+      height: 440px; border-radius: var(--r1);
       background: linear-gradient(90deg, var(--card2) 25%, var(--card3) 50%, var(--card2) 75%);
       background-size: 200% 100%; animation: shimmer 1.5s linear infinite; border: 1px solid var(--border);
     }
@@ -4610,7 +4610,7 @@ class DashboardServer {
       max-width: 92vw;
       max-height: 92vh;
       object-fit: contain;
-      border-radius: 6px;
+      border-radius: var(--r1);
       box-shadow: 0 20px 60px rgba(0,0,0,.6);
       display: block;
     }
@@ -4645,7 +4645,7 @@ class DashboardServer {
       z-index: 8500;
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: var(--r3);
       padding: 12px;
       box-shadow: 0 12px 36px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.02);
       font-size: 13px;
@@ -4769,7 +4769,7 @@ class DashboardServer {
     }
     .tw-prev-media {
       position: relative;
-      border-radius: 8px;
+      border-radius: var(--r1);
       overflow: hidden;
       background: #0a0a12;
       border: 1px solid var(--border);
@@ -4804,7 +4804,7 @@ class DashboardServer {
     .modal-title { font-size: 15px; font-weight: 800; color: var(--text); line-height: 1.35; letter-spacing: -.25px; }
     .modal-section { display: flex; flex-direction: column; gap: 7px; }
     .modal-section-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); font-weight: 700; }
-    .modal-section-content { font-size: 12px; color: var(--text2); line-height: 1.55; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 11px 13px; }
+    .modal-section-content { font-size: 12px; color: var(--text2); line-height: 1.55; background: var(--card); border: 1px solid var(--border); border-radius: var(--r1); padding: 11px 13px; }
     .modal-section-content.pump { color: var(--orange); border-color: rgba(var(--orange-rgb), .15); background: rgba(var(--orange-rgb), .05); }
     .modal-section-content.why-now { color: #ff6b6b; border-color: rgba(255, 107, 107, .18); background: rgba(255, 107, 107, .06); font-weight: 500; }
     /* Subject-name highlight — the names extracted by Gemini / Stage 2 / nano
@@ -4816,7 +4816,7 @@ class DashboardServer {
     .feed-title .subject-hl { color: #fdcb6e; }
     /* .pref-chip* CSS removed 2026-04-27 with PersonalizationCard. */
     .modal-stats-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }
-    .modal-stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; }
+    .modal-stat { background: var(--card); border: 1px solid var(--border); border-radius: var(--r1); padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; }
     .modal-stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: .7px; color: var(--dim); font-weight: 600; }
     .modal-actions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 2px; }
 
@@ -4847,7 +4847,7 @@ class DashboardServer {
       display: block;
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: var(--r1);
       padding: 9px 11px;
       text-decoration: none;
       color: var(--text);
@@ -4892,7 +4892,7 @@ class DashboardServer {
       padding: 10px 14px 10px 12px;
       border-left: 3px solid var(--accent);
       background: linear-gradient(90deg, rgba(var(--accent-rgb), .06), rgba(255,255,255,.01) 60%);
-      border-radius: 6px;
+      border-radius: var(--r1);
       display: flex; align-items: flex-start; gap: 6px;
       font-size: 13px; line-height: 1.5;
       color: var(--text);
@@ -4921,7 +4921,7 @@ class DashboardServer {
       font-size: 12px;
     }
     .alert-verdict-pill {
-      padding: 4px 12px; border-radius: 6px;
+      padding: 4px 12px; border-radius: var(--r1);
       font-family: 'JetBrains Mono', ui-monospace, monospace;
       font-weight: 700;
     }
@@ -4932,7 +4932,7 @@ class DashboardServer {
       background: rgba(var(--red-rgb), .15); color: #ff6b6b;
     }
     .alert-type-chip {
-      padding: 4px 10px; border-radius: 6px;
+      padding: 4px 10px; border-radius: var(--r1);
       background: rgba(140,140,140,.10); color: var(--dim);
     }
     .alert-type-chip.muted {
@@ -4942,7 +4942,7 @@ class DashboardServer {
       margin-left: auto; padding: 4px 12px;
       background: rgba(255,255,255,.04);
       border: 1px solid var(--border);
-      color: var(--text2); font-size: 11px; border-radius: 6px;
+      color: var(--text2); font-size: 11px; border-radius: var(--r1);
       font-family: inherit; cursor: pointer;
       transition: background 120ms, border-color 120ms, color 120ms;
       white-space: nowrap;
@@ -4960,7 +4960,7 @@ class DashboardServer {
       margin-top: 10px; padding: 12px;
       background: linear-gradient(180deg, rgba(var(--accent-rgb), .04), rgba(255,255,255,.01));
       border: 1px solid rgba(var(--accent-rgb), .18);
-      border-radius: 8px;
+      border-radius: var(--r1);
     }
     .alert-math-panel.empty {
       text-align: center; color: var(--muted); font-size: 12px;
@@ -4973,7 +4973,7 @@ class DashboardServer {
       .alert-math-grid { grid-template-columns: 1fr; }
     }
     .alert-math-section {
-      background: rgba(0,0,0,.20); border-radius: 6px;
+      background: rgba(0,0,0,.20); border-radius: var(--r1);
       padding: 9px 11px; border: 1px solid rgba(255,255,255,.04);
     }
     .alert-math-h {
@@ -5037,7 +5037,7 @@ class DashboardServer {
     }
     .alert-math-eq {
       margin-top: 10px; padding: 9px 12px;
-      background: rgba(0,0,0,.30); border-radius: 6px;
+      background: rgba(0,0,0,.30); border-radius: var(--r1);
       font-family: 'JetBrains Mono', ui-monospace, monospace;
       font-size: 13px; text-align: center;
       color: var(--text2); line-height: 1.7;
@@ -5100,7 +5100,7 @@ class DashboardServer {
       padding: 9px 11px;
       background: #16181c;
       border: 1px solid rgba(255,255,255,.10);
-      border-radius: 6px;
+      border-radius: var(--r1);
       font-size: 11px; font-weight: 400;
       color: var(--text2);
       letter-spacing: 0; text-transform: none;
@@ -5142,7 +5142,7 @@ class DashboardServer {
       margin-top: 12px; padding: 10px 12px;
       background: rgba(0,0,0,.20);
       border: 1px solid rgba(255,255,255,.04);
-      border-radius: 6px;
+      border-radius: var(--r1);
     }
     .alert-spark-header {
       display: flex; align-items: center; justify-content: space-between;
@@ -5252,7 +5252,7 @@ class DashboardServer {
     .catalyst-sources {
       margin-top: 14px;
       padding: 10px 12px 11px;
-      border-radius: 8px;
+      border-radius: var(--r1);
       background: rgba(255,255,255,.02);
       border: 1px solid rgba(255,255,255,.06);
     }
@@ -5427,7 +5427,7 @@ class DashboardServer {
     .feed-panel {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: var(--r3);
       overflow: hidden;
       display: flex; flex-direction: column;
       position: relative;
@@ -5499,7 +5499,7 @@ class DashboardServer {
     .feed-search input {
       width: 100%; padding: 7px 10px 7px 30px;
       background: rgba(255,255,255,.025); border: 1px solid var(--border);
-      border-radius: 8px; color: var(--text); font-size: 12px;
+      border-radius: var(--r1); color: var(--text); font-size: 12px;
       font-weight: 500;
       font-family: 'Inter', sans-serif;
       transition: all .15s;
@@ -5520,11 +5520,11 @@ class DashboardServer {
     .feed-filters-bar {
       display: flex; gap: 5px; flex-wrap: wrap; align-items: center;
       background: rgba(255,255,255,.02); border: 1px solid var(--border);
-      border-radius: 9px; padding: 3px;
+      border-radius: var(--r1); padding: 3px;
     }
     .feed-chip {
       display: inline-flex; align-items: center; gap: 5px;
-      padding: 5px 10px; border-radius: 6px;
+      padding: 5px 10px; border-radius: var(--r1);
       background: transparent; border: none;
       color: var(--muted); font-size: 11px; font-weight: 600;
       cursor: pointer; transition: all .15s;
@@ -5546,13 +5546,13 @@ class DashboardServer {
     .fb-bar {
       display: inline-flex; gap: 3px;
       background: rgba(255,255,255,.025); border: 1px solid var(--border);
-      border-radius: 8px; padding: 2px;
+      border-radius: var(--r1); padding: 2px;
       align-items: center;
     }
     .fb-btn {
       display: inline-flex; align-items: center; gap: 5px;
       background: transparent; border: none; cursor: pointer;
-      padding: 4px 9px; border-radius: 6px;
+      padding: 4px 9px; border-radius: var(--r1);
       font-family: inherit; font-size: 11px; font-weight: 700;
       color: var(--muted); transition: all .15s;
       line-height: 1;
@@ -5589,7 +5589,7 @@ class DashboardServer {
     /* Modal variant — larger, full-width */
     .fb-bar-modal {
       display: flex; gap: 4px; padding: 3px;
-      border-radius: 9px;
+      border-radius: var(--r1);
     }
     .fb-bar-modal .fb-btn {
       flex: 1; padding: 7px 12px; font-size: 12px; gap: 7px;
@@ -5614,7 +5614,7 @@ class DashboardServer {
       width: 100%; min-height: 56px; max-height: 140px;
       padding: 8px 10px; box-sizing: border-box;
       background: rgba(255,255,255,.025); color: var(--text);
-      border: 1px solid var(--border); border-radius: 8px;
+      border: 1px solid var(--border); border-radius: var(--r1);
       font-family: inherit; font-size: 12.5px; line-height: 1.4;
       resize: vertical; outline: none;
       transition: border-color .15s, background .15s;
@@ -5632,7 +5632,7 @@ class DashboardServer {
     .fb-reason-count.over { color: var(--red2); }
     .fb-reason-actions { display: flex; gap: 6px; }
     .fb-reason-btn {
-      padding: 5px 11px; border-radius: 6px;
+      padding: 5px 11px; border-radius: var(--r1);
       font-family: inherit; font-size: 11px; font-weight: 600;
       cursor: pointer; transition: all .15s;
       border: 1px solid var(--border);
@@ -5822,7 +5822,7 @@ class DashboardServer {
 
     /* Modal star button — same styling, but inline in the modal head row */
     .modal-fav-btn {
-      width: 26px; height: 26px; border-radius: 6px;
+      width: 26px; height: 26px; border-radius: var(--r1);
       background: rgba(0,0,0,.4);
       border: 1px solid var(--border2);
       color: var(--text2);
@@ -5849,7 +5849,7 @@ class DashboardServer {
       padding: 10px 12px;
       background: rgba(var(--accent-rgb), .04);
       border: 1px solid rgba(var(--accent-rgb), .14);
-      border-radius: 8px;
+      border-radius: var(--r1);
       font-size: 12.5px; color: var(--text2);
     }
     .fav-note-row { display: flex; align-items: flex-start; gap: 8px; }
@@ -5865,7 +5865,7 @@ class DashboardServer {
       width: 100%; min-height: 60px; max-height: 160px;
       padding: 8px 10px;
       background: rgba(0,0,0,.3); color: var(--text);
-      border: 1px solid var(--border2); border-radius: 6px;
+      border: 1px solid var(--border2); border-radius: var(--r1);
       font-size: 12.5px; line-height: 1.45;
       font-family: inherit; resize: vertical;
       box-sizing: border-box; outline: none;
@@ -5929,7 +5929,7 @@ class DashboardServer {
       background: var(--surface);
       border: 1px solid var(--border3);
       padding: 10px 14px;
-      border-radius: 10px;
+      border-radius: var(--r1);
       display: flex; align-items: center; gap: 12px;
       box-shadow: 0 6px 20px rgba(0,0,0,.5), var(--gloss-top);
       z-index: 1000;
@@ -6006,13 +6006,13 @@ class DashboardServer {
       gap: 10px; align-items: center;
       padding: 8px 10px;
       border: 1px solid var(--border2);
-      border-radius: 8px;
+      border-radius: var(--r1);
       background: rgba(255,255,255,.015);
       transition: border-color .12s, background .12s;
     }
     .archive-row:hover { border-color: var(--border3); background: rgba(255,255,255,.03); }
     .archive-row-icon {
-      width: 28px; height: 28px; border-radius: 6px;
+      width: 28px; height: 28px; border-radius: var(--r1);
       display: flex; align-items: center; justify-content: center;
       font-weight: 800; font-size: 13px;
       border: 1px solid var(--border2);
@@ -6027,7 +6027,7 @@ class DashboardServer {
       background: transparent;
       border: 1px solid var(--border2);
       color: var(--text2);
-      border-radius: 6px;
+      border-radius: var(--r1);
       padding: 4px 9px;
       font-size: 12px;
       cursor: pointer;
@@ -6038,7 +6038,7 @@ class DashboardServer {
       color: var(--text3); font-size: 13px;
       padding: 16px; text-align: center;
       border: 1px dashed var(--border2);
-      border-radius: 8px;
+      border-radius: var(--r1);
     }
     .archive-actions {
       display: flex; gap: 8px; justify-content: flex-end;
@@ -6153,7 +6153,7 @@ class DashboardServer {
        — without the body-prefix the prefs-compact rule wins and the modal
        carousel collapses to 280px even on desktop. */
     .img-carousel.in-modal,
-    body.prefs-compact .img-carousel.in-modal { height: 260px; border-radius: 8px; }
+    body.prefs-compact .img-carousel.in-modal { height: 260px; border-radius: var(--r1); }
     .img-carousel-nav {
       position: absolute; top: 50%; transform: translateY(-50%);
       width: 38px; height: 38px; border-radius: 50%;
