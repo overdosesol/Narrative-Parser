@@ -205,6 +205,164 @@ For off-host backups, push the dump to S3/Backblaze/your-NAS via rsync or
 `aws s3 cp`. Avoid copying the file directly while the bot is running —
 SQLite WAL mode tolerates it but `sqlite3 ".backup"` is safer.
 
+### 6.5. Restore from backup
+
+Когда нужно: БД на проде сломалась / удалилась / прод-VPS погиб и восстанавливаем на новом.
+
+**Step 1 — Choose backup source**
+
+Локальный (если VPS жив):
+```bash
+ls -lh /var/backups/catalyst/
+# Выбери последний catalyst_*.db.gz
+```
+
+Off-site (если VPS погиб):
+```bash
+# На новом VPS — установи rclone (apt install rclone) + настрой B2 remote
+# через `rclone config` (выбери New remote → Backblaze B2 → введи applicationKeyId
+# и applicationKey из Backblaze console). Config ляжет в /root/.config/rclone/rclone.conf.
+# Если есть backup rclone.conf со старого VPS — просто скопируй его сюда. Контракт
+# названия remote: "b2" (см. SESSION_CONTEXT §Production posture).
+rclone ls b2:catalyst-prod-backups/
+rclone copy b2:catalyst-prod-backups/catalyst_YYYY-MM-DD_HH-MM.db.gz /tmp/
+```
+
+**Step 2 — Verify archive integrity**
+
+```bash
+gzip -t /tmp/catalyst_YYYY-MM-DD_HH-MM.db.gz
+# Exit 0 = OK. Иначе — пробуй предыдущий бэкап.
+```
+
+**Step 3 — Extract**
+
+```bash
+gunzip -k /tmp/catalyst_YYYY-MM-DD_HH-MM.db.gz
+mv /tmp/catalyst_YYYY-MM-DD_HH-MM.db /tmp/restore.db
+```
+
+**Step 4 — Verify DB integrity**
+
+```bash
+sqlite3 /tmp/restore.db "PRAGMA integrity_check;"
+# Должно быть "ok"
+```
+
+**Step 5 — Stop container**
+
+```bash
+cd /opt/catalyst
+docker compose stop app
+```
+
+**Step 6 — Replace DB file (safe variant — сохраняем старый)**
+
+```bash
+# Discover volume mount path (same logic as backup script)
+VOLUME_NAME=$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/data" }}{{ .Name }}{{ end }}{{ end }}' catalyst-app)
+VOLUME_PATH=$(docker volume inspect -f '{{ .Mountpoint }}' "$VOLUME_NAME")
+
+# Save current ownership so we can restore it
+ORIG_OWNER=$(stat -c '%u:%g' "$VOLUME_PATH/catalyst.db")
+
+# Move broken files aside (don't delete them yet)
+TS=$(date +%s)
+mv "$VOLUME_PATH/catalyst.db"     "$VOLUME_PATH/catalyst.db.broken-$TS"
+mv "$VOLUME_PATH/catalyst.db-wal" "$VOLUME_PATH/catalyst.db-wal.broken-$TS" 2>/dev/null || true
+mv "$VOLUME_PATH/catalyst.db-shm" "$VOLUME_PATH/catalyst.db-shm.broken-$TS" 2>/dev/null || true
+
+# Put restored DB into place, restore ownership
+cp /tmp/restore.db "$VOLUME_PATH/catalyst.db"
+chown "$ORIG_OWNER" "$VOLUME_PATH/catalyst.db"
+```
+
+**Step 7 — Start container**
+
+```bash
+docker compose start app
+docker compose logs -f app  # check startup is clean
+```
+
+**Step 8 — Smoke check**
+
+- `curl https://catalyst.example.com/api/health` → 200
+- Открой дашборд в браузере → видны trends/users из бэкапа
+- Telegram бот → `/start` → отвечает
+
+**Step 9 — Cleanup after confirmed success**
+
+```bash
+rm "$VOLUME_PATH"/catalyst.db.broken-*
+rm "$VOLUME_PATH"/catalyst.db-wal.broken-* 2>/dev/null || true
+rm "$VOLUME_PATH"/catalyst.db-shm.broken-* 2>/dev/null || true
+rm /tmp/restore.db /tmp/catalyst_*.db.gz
+```
+
+Запиши в `ai-context/WORKLOG.md`: дата, причина, какой бэкап восстанавливали, smoke check result.
+
+### 6.6. Quarterly restore drill
+
+Цель: убедиться что бэкапы реально восстанавливаемы **до** того как реальная беда. Раз в квартал, ~20 минут.
+
+**Step 1 — Pull the latest backup from B2** (имитируем «VPS умер, есть только B2»)
+
+```bash
+mkdir -p /tmp/drill
+LATEST=$(rclone lsf b2:catalyst-prod-backups/ | sort | tail -1)
+rclone copy "b2:catalyst-prod-backups/$LATEST" /tmp/drill/
+echo "Drill file: /tmp/drill/$LATEST"
+```
+
+**Step 2 — Verify gzip integrity**
+
+```bash
+gzip -t /tmp/drill/*.db.gz
+```
+
+Expected: exit 0, no output.
+
+**Step 3 — Extract**
+
+```bash
+gunzip /tmp/drill/*.db.gz
+```
+
+**Step 4 — Run PRAGMA integrity_check**
+
+```bash
+sqlite3 /tmp/drill/*.db "PRAGMA integrity_check;"
+```
+
+Expected: `ok`. Anything else — паника, проверь предыдущие бэкапы.
+
+**Step 5 — Row counts across core tables**
+
+```bash
+sqlite3 /tmp/drill/*.db "
+SELECT 'users',         COUNT(*) FROM users
+UNION ALL SELECT 'trends',        COUNT(*) FROM trends
+UNION ALL SELECT 'notifications', COUNT(*) FROM notifications
+UNION ALL SELECT 'payments',      COUNT(*) FROM payments;
+"
+```
+
+Глазами сверь — цифры разумные? Растут с прошлого drill?
+
+**Step 6 — Cleanup**
+
+```bash
+rm -rf /tmp/drill/
+```
+
+**Step 7 — Record result in WORKLOG**
+
+```markdown
+## YYYY-MM-DD · drill · OK · users=NNN trends=NNN notifications=NNN payments=NNN
+```
+
+Если на любом шаге что-то не сошлось — паника: проверь предыдущий бэкап, разбирайся почему БД гниёт.
+
 ---
 
 ## 7. Updates / rolling deploys
@@ -215,6 +373,12 @@ git pull
 npm ci --production
 sudo systemctl restart catalyst
 ```
+
+**Pre-deploy validation gate** (Bundle #16, 2026-06-04): Deploy скрипт автоматически вызывает `npm run check:spa` ДО архивации. Если в inline React SPA (`src/dashboard/server.js` или `src/admin/server.js`) есть syntax error — backtick в комментарии внутри template literal, `\n` в строке, double-escape в regex — validator ловит это и abort'ит deploy. Сломанный SPA до прода не доходит.
+
+Manual local check (быстрая проверка перед commit): `npm run check:spa` или `npm run check`.
+
+---
 
 The systemd-level restart sends `SIGTERM` to the process. The graceful
 shutdown handler (`src/index.js`):

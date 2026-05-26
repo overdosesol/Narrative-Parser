@@ -10,27 +10,41 @@ echo "🚀 Catalyst Docker Deploy → $SERVER"
 echo "📁 Источник: $LOCAL_DIR"
 echo ""
 
-echo "[1/4] Архивация проекта..."
+echo "[1/5] Validating SPA syntax..."
+npm run check:spa
+echo "   SPA OK"
+echo ""
+
+echo "[2/5] Архивация проекта..."
 rm -f "$TMP_ARCHIVE"
 cd "$LOCAL_DIR"
 zip -qr "$TMP_ARCHIVE" . \
-  -x "node_modules/*" "data/*" "logs/*" ".git/*" ".env"
+  -x "node_modules/*" "data/*" "logs/*" ".git/*" ".env" \
+     ".claude/*" "posts/*" "ai-context/*" "EvilCatPack/*"
 echo "✅ Архив готов: $TMP_ARCHIVE"
 
 echo ""
-echo "[2/4] Загрузка архива на сервер..."
-scp -o StrictHostKeyChecking=no "$TMP_ARCHIVE" "$SERVER:/tmp/catalyst.zip"
+echo "[3/5] Загрузка архива на сервер..."
+scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$TMP_ARCHIVE" "$SERVER:/tmp/catalyst.zip"
 
 if [ -f "$LOCAL_DIR/.env" ]; then
-  echo "[3/4] Загрузка .env..."
-  scp -o StrictHostKeyChecking=no "$LOCAL_DIR/.env" "$SERVER:/tmp/catalyst.env"
+  echo "[4/5] Загрузка .env..."
+  scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$LOCAL_DIR/.env" "$SERVER:/tmp/catalyst.env"
 else
-  echo "[3/4] .env локально не найден, оставляю серверный .env"
+  echo "[4/5] .env локально не найден, оставляю серверный .env"
 fi
 
 echo ""
-echo "[4/4] Запуск remote setup..."
-scp -o StrictHostKeyChecking=no "$LOCAL_DIR/setup_remote.sh" "$SERVER:/tmp/catalyst_setup.sh"
+echo "[5/5] Запуск remote setup..."
+scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$LOCAL_DIR/setup_remote.sh" "$SERVER:/tmp/catalyst_setup.sh"
+# === Sync production backup script (single source of truth: scripts/catalyst-backup.sh) ===
+echo "Syncing catalyst-backup.sh to VPS..."
+BACKUP_SCRIPT="$LOCAL_DIR/scripts/catalyst-backup.sh"
+scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "$BACKUP_SCRIPT" "$SERVER:/usr/local/bin/catalyst-backup.sh"
+ssh -o StrictHostKeyChecking=no "$SERVER" "chmod +x /usr/local/bin/catalyst-backup.sh"
+echo "Backup script synced."
+# === End backup sync ===
+
 ssh -o StrictHostKeyChecking=no "$SERVER" "REMOTE_DIR='$REMOTE_DIR' bash /tmp/catalyst_setup.sh"
 
 rm -f "$TMP_ARCHIVE"

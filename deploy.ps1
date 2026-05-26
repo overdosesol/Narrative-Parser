@@ -18,7 +18,15 @@ if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-Write-Host "[1/4] Building archive..." -ForegroundColor Yellow
+Write-Host "[1/5] Validating SPA syntax..." -ForegroundColor Yellow
+npm run check:spa
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: SPA validation failed. Fix syntax issues before deploying." -ForegroundColor Red
+    exit 1
+}
+Write-Host "   SPA OK" -ForegroundColor Green
+Write-Host ""
+Write-Host "[2/5] Building archive..." -ForegroundColor Yellow
 
 if (Test-Path $TEMP_DIR) { Remove-Item $TEMP_DIR -Recurse -Force }
 New-Item -ItemType Directory -Path $TEMP_DIR | Out-Null
@@ -45,7 +53,7 @@ Remove-Item $TEMP_DIR -Recurse -Force
 Write-Host "   Archive OK" -ForegroundColor Green
 
 Write-Host ""
-Write-Host "[2/4] Uploading archive..." -ForegroundColor Yellow
+Write-Host "[3/5] Uploading archive..." -ForegroundColor Yellow
 # ServerAliveInterval/CountMax keep the SSH channel breathing during the upload
 # so a slow link or NAT idle-timeout doesn't drop us mid-transfer.
 scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 $TEMP_ZIP "${Server}:/tmp/catalyst.zip"
@@ -58,7 +66,7 @@ Write-Host "   Upload OK" -ForegroundColor Green
 $ENV_FILE = Join-Path $LOCAL_DIR ".env"
 if (Test-Path $ENV_FILE) {
     Write-Host ""
-    Write-Host "[3/4] Uploading .env..." -ForegroundColor Yellow
+    Write-Host "[4/5] Uploading .env..." -ForegroundColor Yellow
     scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 $ENV_FILE "${Server}:/tmp/catalyst.env"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: .env upload failed." -ForegroundColor Red
@@ -66,17 +74,27 @@ if (Test-Path $ENV_FILE) {
     }
     Write-Host "   .env OK" -ForegroundColor Green
 } else {
-    Write-Host "[3/4] .env not found locally, keeping server .env" -ForegroundColor Yellow
+    Write-Host "[4/5] .env not found locally, keeping server .env" -ForegroundColor Yellow
 }
 
 $SETUP_FILE = Join-Path $LOCAL_DIR "setup_remote.sh"
 Write-Host ""
-Write-Host "[4/4] Running remote Docker setup..." -ForegroundColor Yellow
+Write-Host "[5/5] Running remote Docker setup..." -ForegroundColor Yellow
 scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 $SETUP_FILE "${Server}:/tmp/catalyst_setup.sh"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: setup script upload failed." -ForegroundColor Red
     exit 1
 }
+
+# === Sync production backup script (single source of truth: scripts/catalyst-backup.sh) ===
+Write-Host "Syncing catalyst-backup.sh to VPS..."
+$BACKUP_SCRIPT = Join-Path $LOCAL_DIR "scripts\catalyst-backup.sh"
+scp -o StrictHostKeyChecking=no $BACKUP_SCRIPT "${Server}:/usr/local/bin/catalyst-backup.sh"
+if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: failed to scp catalyst-backup.sh" -ForegroundColor Red; exit 1 }
+ssh -o StrictHostKeyChecking=no $Server "chmod +x /usr/local/bin/catalyst-backup.sh"
+if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: failed to chmod catalyst-backup.sh" -ForegroundColor Red; exit 1 }
+Write-Host "Backup script synced." -ForegroundColor Green
+# === End backup sync ===
 
 # Single SSH session for mkdir + setup — avoids hitting SSH MaxSessions/
 # MaxStartups when the previous deploy left lingering connections, and keeps
