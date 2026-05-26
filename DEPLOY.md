@@ -112,8 +112,8 @@ sudo journalctl -u catalyst -f
 
 Two ports to proxy:
 
-- **`:7357`** — public dashboard (web UI + REST API + SSE)
-- **`:8080`** — admin panel — **MUST be firewalled / never exposed publicly**
+- **`:8080`** — public dashboard (web UI + REST API + SSE)
+- **`:8081`** — admin panel — **MUST be firewalled / never exposed publicly**
 
 Example `/etc/nginx/sites-available/catalyst`:
 
@@ -130,7 +130,7 @@ server {
     client_max_body_size 64k;
 
     location / {
-        proxy_pass http://127.0.0.1:7357;
+        proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
 
         # SSE support — see /api/stream endpoint
@@ -163,8 +163,71 @@ Reload: `sudo nginx -t && sudo systemctl reload nginx`.
 Default `ADMIN_HOST=127.0.0.1` in `.env.example` keeps admin bound to
 loopback. If you want remote access:
 
-- **Option A (recommended):** SSH tunnel — `ssh -L 8080:127.0.0.1:8080 catalyst-host`
+- **Option A (recommended):** SSH tunnel — `ssh -L 8081:127.0.0.1:8081 catalyst-host`
 - **Option B:** Separate auth-walled subdomain — `admin.catalyst.example.com` with **basic auth** in nginx in front of the `X-Admin-Key` header. Don't rely on the admin key alone if you expose the port to the internet.
+
+### 4.2. TLS certificate renewal verification
+
+Certbot auto-renews HTTPS cert every ~60 days (cert valid 90 days, renews at 30 days remaining). **Renewal can fail silently** if port 80 is blocked, DNS misconfigured, or certbot.timer is disabled. Bundle #17 (2026-06-05) adds monitoring + SOP.
+
+#### Daily auto-check
+
+`scripts/check-cert-expiry.sh` runs daily via cron, logs to `/var/log/catalyst-cert.log`, exit 1 (warn) if cert expires in less than 14 days. Install on VPS (one-time setup):
+
+```bash
+scp scripts/check-cert-expiry.sh root@catalystparser.io:/usr/local/bin/
+ssh root@catalystparser.io "chmod +x /usr/local/bin/check-cert-expiry.sh"
+ssh root@catalystparser.io "echo '#!/bin/bash' > /etc/cron.daily/catalyst-cert-check"
+ssh root@catalystparser.io "echo '/usr/local/bin/check-cert-expiry.sh catalystparser.io' >> /etc/cron.daily/catalyst-cert-check"
+ssh root@catalystparser.io "chmod +x /etc/cron.daily/catalyst-cert-check"
+```
+
+If cron MAILTO is configured, operator gets email on warning. Otherwise check log weekly:
+
+```bash
+ssh root@catalystparser.io "tail -10 /var/log/catalyst-cert.log"
+```
+
+#### Manual verification
+
+```bash
+# 1. Certbot timer status (should be active, enabled)
+sudo systemctl status certbot.timer
+
+# 2. Last 20 renewal attempts (look for errors)
+sudo journalctl -u certbot.timer -n 20
+
+# 3. List all certs + expiry dates
+sudo certbot certificates
+
+# 4. External check (from any machine, no SSH needed)
+echo | openssl s_client -connect catalystparser.io:443 2>/dev/null \
+  | openssl x509 -noout -dates
+# Expected: notAfter=<date 30-90d in future>
+
+# 5. Manual renewal dry-run (safe — doesn't actually renew)
+sudo certbot renew --dry-run
+```
+
+#### If renewal failed
+
+1. Check `journalctl -u certbot.timer` for the error message
+2. Verify port 80 accessible: `ufw status`, `curl -I http://catalystparser.io`
+3. Manual renewal: `sudo certbot renew`
+4. Reload nginx: `sudo nginx -t && sudo systemctl reload nginx`
+5. Re-test cert: `echo | openssl s_client -connect catalystparser.io:443 | openssl x509 -noout -dates`
+6. Log result in `ai-context/WORKLOG.md`: date, reason, fix applied
+
+#### nginx config in repo
+
+The production nginx config is versioned at `scripts/nginx-catalyst.conf`. On change in repo:
+
+```bash
+scp scripts/nginx-catalyst.conf root@catalystparser.io:/etc/nginx/sites-available/catalyst
+ssh root@catalystparser.io "sudo nginx -t && sudo systemctl reload nginx"
+```
+
+**Do not edit `/etc/nginx/sites-available/catalyst` directly on VPS** — drift unrecoverable.
 
 ---
 
@@ -176,7 +239,7 @@ sudo ufw default allow outgoing
 sudo ufw allow 22/tcp     # SSH
 sudo ufw allow 443/tcp    # HTTPS
 sudo ufw allow 80/tcp     # HTTP (for cert renewal + redirect)
-# DO NOT open 7357, 8080 — they're loopback-bound or proxied via nginx
+# DO NOT open 8080, 8081 — they're loopback-bound or proxied via nginx
 sudo ufw enable
 ```
 
@@ -447,6 +510,47 @@ users without issue.
 | Hot refresh on demand | Admin panel → "Hot trends refresh" → "Run now" |
 | Rotate ADMIN_API_KEY | Edit `.env`, `systemctl restart catalyst`, update operator's key store |
 | Backup right now | `sudo /etc/cron.daily/catalyst-backup` |
+
+### 10.1. Secret rotation
+
+Each secret has a lifetime. Bundle #17 (2026-06-05) documents the recommended rotation schedule + per-key procedure + incident response if a key leaks.
+
+#### Rotation schedule
+
+| Key | Cadence | Where to rotate | Verification after |
+|---|---|---|---|
+| `XAI_API_KEY` | 90 days | https://x.ai/api/keys | Manual trend rescore → check log `stage1 ok` |
+| `OPENAI_API_KEY` | 90 days | https://platform.openai.com/api-keys | Manual trend rescore → check stage1 batch logs |
+| `GEMINI_API_KEY` | 90 days | https://aistudio.google.com | Manual trend with image → check stage0b log |
+| `OPENROUTER_API_KEY` | 90 days | https://openrouter.ai/keys | Same as Gemini (Vision fallback) |
+| `TELEGRAM_BOT_TOKEN` | only if leaked | @BotFather → `/revoke` (regenerates) | `/start` → bot responds |
+| `SUPPORT_BOT_TOKEN` | 180 days | @BotFather | Same |
+| `ADMIN_API_KEY` | 90 days or after operator change | local `openssl rand -base64 32` | `curl -H "X-Admin-Key: ..." /admin/api/health` |
+| `DASHBOARD_API_KEY` | 180 days | local `openssl rand -base64 32` | Browser login still works |
+| `HELIUS_API_KEY` | 180 days | https://helius.dev | Solana payment confirmation test |
+| `APIFY_TWEET_SCRAPER_TOKEN` | 180 days | https://console.apify.com/account/integrations | Manual X collection → check log |
+| `APIFY_TRENDS_SCRAPER_TOKEN` | 180 days | same | Manual trends collection |
+| `TIKTOK_*` keys | 180 days | https://console.apify.com | Manual TikTok collection |
+
+#### Per-key procedure
+
+1. **Generate** new key on the provider side (keep old key active for now)
+2. **Edit `.env`** on VPS: `ssh root@catalystparser.io "nano /opt/catalyst/.env"` — replace old value with new
+3. **Restart**: `ssh root@catalystparser.io "cd /opt/catalyst && docker compose restart app"`
+4. **Verify** using the test from the schedule table above
+5. **Revoke old key** on the provider side (only AFTER verification — otherwise risk downtime if new key doesn't work)
+6. **Log** in `ai-context/WORKLOG.md`:
+   ```
+   ## YYYY-MM-DD · rotation · <KEY_NAME> · OK · verified <method>
+   ```
+
+#### If leak suspected (incident response)
+
+1. **Immediately**: revoke old key on the provider side (even before preparing the new one — better downtime than abuse)
+2. Generate new key
+3. Edit `.env`, restart container, verify
+4. WORKLOG entry: date, key, reason (leak/suspected), source of leak if known
+5. Audit: check provider usage logs for anomalies during leak window
 
 ---
 
