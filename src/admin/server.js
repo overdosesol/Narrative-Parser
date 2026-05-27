@@ -2228,6 +2228,13 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:#fff}
 .sp-trigger-sources a{color:var(--blue);margin-right:8px;text-decoration:none}
 .sp-trigger-sources a:hover{text-decoration:underline}
 .sp-trigger-conf{margin-top:4px;font-size:11px;color:var(--text2);font-style:italic}
+.error-banner{display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:8px;font-size:13px;margin:8px 0}
+.error-banner-error{background:rgba(244,33,46,.08);border:1px solid rgba(244,33,46,.3);color:#ff6b6b}
+.error-banner-warn{background:rgba(255,167,38,.08);border:1px solid rgba(255,167,38,.3);color:#ffcc80}
+.error-banner-icon{font-size:16px}
+.error-banner-msg{flex:1}
+.error-banner-retry{padding:4px 10px;border-radius:6px;background:transparent;border:1px solid currentColor;color:inherit;cursor:pointer;font-size:12px}
+.error-banner-retry:hover{background:rgba(255,255,255,.05)}
 @media (max-width:780px){
   .sp-hero{flex-direction:column;align-items:flex-start;gap:12px}
   .sp-hero-thumb,.sp-hero-thumb-fallback{width:64px;height:64px;font-size:28px}
@@ -2268,6 +2275,19 @@ async function api(path, method='GET', body=null) {
     throw Object.assign(new Error(msg), { status: r.status, body: data });
   }
   return data;
+}
+
+// ── Error banner component (Bundle #13, 2026-05-28) ──────────────────────
+// Shared inline error UI. Use as: React.createElement(ErrorBanner, { message, onRetry, variant })
+// Mirror of dashboard SPA's ErrorBanner — keep in sync.
+function ErrorBanner({ message, onRetry, variant }) {
+  const h = React.createElement;
+  const v = variant || 'error';
+  return h('div', { className: 'error-banner error-banner-' + v },
+    h('span', { className: 'error-banner-icon' }, v === 'error' ? '⚠' : 'ⓘ'),
+    h('span', { className: 'error-banner-msg' }, String(message || 'Something went wrong')),
+    onRetry ? h('button', { className: 'error-banner-retry', onClick: onRetry }, 'Retry') : null
+  );
 }
 
 // ── Section primitive ───────────────────────────────────────────────────────
@@ -4013,6 +4033,7 @@ function DecisionsPage() {
   const [reason, setReason] = useState('');
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   // Per-card expand state for the detailed math panel. Keyed by ts+trendId.
   // Survives polling refresh because we update by key, not array index.
   const [expanded, setExpanded] = useState(() => new Set());
@@ -4026,8 +4047,8 @@ function DecisionsPage() {
     setLoading(true);
     const qs = 'filter=' + filter + (reason ? '&reason=' + encodeURIComponent(reason) : '') + '&limit=200';
     api('/api/alert-decisions?' + qs)
-      .then(d => { setData(d); setLoading(false); })
-      .catch(() => setLoading(false));
+      .then(d => { setData(d); setError(null); setLoading(false); })
+      .catch(e => { setError(e.message || 'Failed to load decisions'); setLoading(false); });
   };
   useEffect(load, [filter, reason]);
   useEffect(() => {
@@ -4036,6 +4057,9 @@ function DecisionsPage() {
   }, [filter, reason]);
 
   if (loading && !data) return h('div', { className: 'loading' }, 'Загрузка решений...');
+  if (error && !data) return h('div', null,
+    h(ErrorBanner, { message: error, onRetry: load, variant: 'error' })
+  );
   if (!data) return h('div', { className: 'empty' }, 'Нет данных');
 
   const allItems = data.items || [];
@@ -4288,6 +4312,7 @@ function DecisionsPage() {
   };
 
   return h('div', null,
+    error ? h(ErrorBanner, { message: error, onRetry: load, variant: 'error' }) : null,
     h('div', { className: 'dec-page-head' },
       h('h2', null, '🔔 Решения алерт-гейта'),
       h('p', null,
@@ -4679,10 +4704,17 @@ function StatsPage() {
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
   const [maintMsg, setMaintMsg] = useState('');
+  const [error, setError] = useState(null);
 
-  useEffect(()=>{
-    api('/api/stats').then(s=>{ setStats(s); setLoading(false); }).catch(()=>setLoading(false));
-  },[]);
+  const loadStats = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    api('/api/stats')
+      .then(s => { setStats(s); setLoading(false); })
+      .catch(e => { setError(e.message || 'Failed to load stats'); setLoading(false); });
+  }, []);
+
+  useEffect(()=>{ loadStats(); }, [loadStats]);
 
   // Cleanup old alerts/notifications. Moved here from PaymentsPage where it
   // didn't really belong (payments != alerts) — Stats is the natural home for
@@ -4699,6 +4731,9 @@ function StatsPage() {
   };
 
   if (loading) return React.createElement('div',{className:'loading'},'Загрузка статистики...');
+  if (error && !stats) return React.createElement('div', null,
+    React.createElement(ErrorBanner, { message: error, onRetry: loadStats, variant: 'error' })
+  );
   if (!stats) return React.createElement('div',{className:'empty'},'Нет данных');
 
   const COLORS=['#7c3aed','#3b82f6','#10b981','#f59e0b','#ef4444'];
@@ -4721,6 +4756,7 @@ function StatsPage() {
   const activeShare = stats.users.total ? Math.round((stats.users.active / stats.users.total) * 100) : 0;
 
   return React.createElement('div',null,
+    error ? React.createElement(ErrorBanner, { message: error, onRetry: loadStats, variant: 'error' }) : null,
     React.createElement('div',{className:'page-header'},
       React.createElement('h2',null,'📊 Статистика'),
       React.createElement('p',null,'Главный срез по пользователям, оплатам и состоянию базы. Это экран для быстрого sanity-check проекта: рост, монетизация, состав аудитории и нагрузка на хранилище.')
@@ -7210,18 +7246,25 @@ function SumMeter({ preset, paths, h, getEffective }) {
 function StatusBar({ onNavigate }) {
   const h = React.createElement;
   const [state, setState] = useState(null);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     let alive = true;
     const tick = () => {
-      api('/api/pipeline').then(s => { if (alive) setState(s); }).catch(() => {});
+      api('/api/pipeline')
+        .then(s => { if (alive) { setState(s); setError(null); } })
+        .catch(e => { if (alive) setError(e.message || 'unknown error'); });
     };
     tick();
     const id = setInterval(tick, 2500);
     return () => { alive = false; clearInterval(id); };
   }, []);
 
-  if (!state) return null;
+  // No data yet — if we already errored, show compact warn banner; otherwise stay invisible.
+  if (!state) {
+    if (error) return h(ErrorBanner, { message: 'Pipeline status unavailable: ' + error, variant: 'warn' });
+    return null;
+  }
 
   // Same routing logic as the old PipelineFlow component
   const live     = state.running && state.cycleInProgress;
@@ -7292,17 +7335,20 @@ function StatusBar({ onNavigate }) {
     }
   });
 
-  return h('div', { className: 'main-topbar sb-topbar' + (state.paused ? ' is-paused' : '') },
-    h('div', {
-      className: 'sb-head',
-      onClick: () => onNavigate && onNavigate('scanners'),
-      style: { cursor: onNavigate ? 'pointer' : 'default' },
-      title: 'Открыть Сканеры',
-    },
-      h('h2', null, '🔄 Пайплайн'),
-      h('p', null, subtitle)
-    ),
-    h('div', { className: 'sb-pipeline' }, nodes)
+  return h('div', null,
+    error ? h(ErrorBanner, { message: 'Pipeline status unavailable: ' + error, variant: 'warn' }) : null,
+    h('div', { className: 'main-topbar sb-topbar' + (state.paused ? ' is-paused' : '') },
+      h('div', {
+        className: 'sb-head',
+        onClick: () => onNavigate && onNavigate('scanners'),
+        style: { cursor: onNavigate ? 'pointer' : 'default' },
+        title: 'Открыть Сканеры',
+      },
+        h('h2', null, '🔄 Пайплайн'),
+        h('p', null, subtitle)
+      ),
+      h('div', { className: 'sb-pipeline' }, nodes)
+    )
   );
 }
 

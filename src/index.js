@@ -20,6 +20,7 @@ import TelegramNotifier from './notifications/telegram.js';
 import { recomputeAlertScores, dispatchAlerts } from './notifications/alert-dispatcher.js';
 import { AlertScheduler } from './notifications/alert-scheduler.js';
 import SupportBot from './support/bot.js';
+import { initAdminAlerts, notifyAdminCrash } from './notifications/admin-alert.js';
 import HotMetricsRefresher from './refresh/hot-metrics.js';
 import TagRefresher from './refresh/tag-refresher.js';
 import SolanaPayMonitor from './billing/solana-pay.js';
@@ -159,6 +160,10 @@ telegram.solanaMonitor = solanaMonitor;
 // back to the user. Disabled gracefully when env vars are missing.
 const supportBot = new SupportBot(config, logger, db);
 supportBot.start();
+
+// Bundle #13 (2026-05-28): wire admin crash alerts to support bot instance.
+// supportBot.bot is the underlying node-telegram-bot-api instance.
+initAdminAlerts(supportBot?.bot, config, logger);
 
 // Periodic refresh + re-score of "hot" trends (≤24h, memePotential≥50). Re-fetches
 // live metrics from source (free: fxtwitter / reddit json) every 2h, runs them
@@ -757,8 +762,17 @@ async function shutdown(signal) {
 }
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('uncaughtException',  err => logger.error(`Uncaught exception: ${err.message}`, { stack: err.stack }));
-process.on('unhandledRejection', reason => logger.error(`Unhandled rejection: ${reason}`));
+// Bundle #13 (PROD-006): log + admin TG notification. 5-min dedupe via notifyAdminCrash.
+// Note: handlers still don't process.exit — Docker healthcheck handles fatal-state restart.
+process.on('uncaughtException', err => {
+  logger.error(`Uncaught exception: ${err.message}`, { stack: err.stack });
+  notifyAdminCrash(err, { kind: 'uncaughtException' });
+});
+process.on('unhandledRejection', reason => {
+  logger.error(`Unhandled rejection: ${reason}`);
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  notifyAdminCrash(err, { kind: 'unhandledRejection' });
+});
 
 // ── Start! ──────────────────────────────────────────────────────────────────
 startScheduler();

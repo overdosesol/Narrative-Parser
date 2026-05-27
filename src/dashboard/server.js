@@ -4937,6 +4937,56 @@ class DashboardServer {
       .toast-msg { white-space: normal; }
     }
 
+    /* ── Error banner (Bundle #13, 2026-05-28) ── */
+    .error-banner {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin: 8px 0;
+    }
+    .error-banner-error {
+      background: rgba(var(--red-rgb), .08);
+      border: 1px solid rgba(var(--red-rgb), .3);
+      color: var(--red2);
+    }
+    .error-banner-warn {
+      background: rgba(var(--orange-rgb), .08);
+      border: 1px solid rgba(var(--orange-rgb), .3);
+      color: var(--orange2);
+    }
+    .error-banner-icon { font-size: 16px; }
+    .error-banner-msg { flex: 1; }
+    .error-banner-retry {
+      padding: 4px 10px; border-radius: 6px;
+      background: transparent;
+      border: 1px solid currentColor;
+      color: inherit; cursor: pointer; font-size: 12px;
+    }
+    .error-banner-retry:hover { background: rgba(255,255,255,.05); }
+
+    /* ── Skip-link (a11y: keyboard users skip nav, jump to main content) ── */
+    .skip-link {
+      position: absolute;
+      left: -9999px;
+      top: 0;
+      z-index: 99999;
+      padding: 8px 14px;
+      background: var(--card);
+      color: var(--text);
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 13px;
+      text-decoration: none;
+    }
+    .skip-link:focus {
+      left: 8px;
+      top: 8px;
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
     /* ── Refresh badge + keyboard hints ── */
     .refresh-badge {
       font-family: 'JetBrains Mono', monospace; font-size: 10px;
@@ -5964,6 +6014,9 @@ class DashboardServer {
     @media (prefers-reduced-motion: reduce) {
       .feed-panel.is-refreshing::before { animation: none; transform: scaleX(1); opacity: .5; }
       .feed-list.is-refreshing { opacity: 1; }
+      /* CAT-008 (Bundle #11): disable CatMascot FSM animations for motion-sensitive users. */
+      .cat-mascot,
+      .cat-mascot * { animation: none !important; transition: none !important; }
     }
     .feed-panel-head {
       padding: 12px 14px 10px;
@@ -7123,6 +7176,59 @@ function safeUrl(url) {
 function safeHref(url) {
   const safe = safeUrl(url);
   return safe ? escHtmlAttr(safe) : '#';
+}
+
+// ── Error banner component (Bundle #13, 2026-05-28) ──────────────────────
+// Shared inline error UI. Use as: h(ErrorBanner, { message, onRetry, variant })
+// variant: 'error' (red, default) | 'warn' (orange)
+function ErrorBanner({ message, onRetry, variant }) {
+  const v = variant || 'error';
+  return h('div', { className: 'error-banner error-banner-' + v },
+    h('span', { className: 'error-banner-icon' }, v === 'error' ? '⚠' : 'ⓘ'),
+    h('span', { className: 'error-banner-msg' }, String(message || 'Something went wrong')),
+    onRetry ? h('button', { className: 'error-banner-retry', onClick: onRetry }, 'Retry') : null
+  );
+}
+
+// ── Focus trap hook (Bundle #11, 2026-05-28) ────────────────────────────
+// useFocusTrap(containerRef, isOpen) — trap Tab cycle inside container
+// while isOpen=true. On unmount or isOpen=false, restore focus to the
+// element that was focused when the trap was first activated.
+//
+// Usage: const ref = useRef(null);
+//        useFocusTrap(ref, true);
+//        ... h('div', { ref, ... }, ...) ...
+function useFocusTrap(containerRef, isOpen) {
+  const returnRef = useRef(null);
+  useEffect(() => {
+    if (!isOpen) return;
+    returnRef.current = document.activeElement;
+    const container = containerRef.current;
+    if (!container) return;
+    const sel = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const getFocusable = () => Array.from(container.querySelectorAll(sel)).filter(el => el.offsetParent !== null);
+    const initial = getFocusable();
+    if (initial.length > 0) initial[0].focus();
+    const handler = (e) => {
+      if (e.key !== 'Tab') return;
+      const focusable = getFocusable();
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+      } else {
+        if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    };
+    container.addEventListener('keydown', handler);
+    return () => {
+      container.removeEventListener('keydown', handler);
+      if (returnRef.current && typeof returnRef.current.focus === 'function') {
+        try { returnRef.current.focus(); } catch (e) { /* element gone */ }
+      }
+    };
+  }, [isOpen]);
 }
 
 // ── Auth token ────────────────────────────────────────────────────────────
@@ -8916,6 +9022,9 @@ function videoVolumeRef(el) {
 // Mounted into document.body via a portal so its z-index sits above the trend
 // modal. Closes on click anywhere (overlay or image), the close button, or Esc.
 function Lightbox({ src, onClose }) {
+  const modalRef = useRef(null);
+  useFocusTrap(modalRef, true);
+
   useEffect(() => {
     const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
     // Capture phase so we beat the modal's own Escape handler.
@@ -8931,7 +9040,7 @@ function Lightbox({ src, onClose }) {
   if (!src) return null;
   const handleClick = (e) => { e.stopPropagation(); onClose(); };
   return ReactDOM.createPortal(
-    h('div', { className: 'img-lightbox-overlay', onClick: handleClick },
+    h('div', { className: 'img-lightbox-overlay', onClick: handleClick, ref: modalRef },
       h('button', {
         className: 'img-lightbox-close',
         onClick: handleClick,
@@ -9856,21 +9965,28 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
   const totalSrc  = srcList.length;
   const srcOk     = totalSrc > 0 && activeSrc === totalSrc;
 
-  return h('div', { className: 'right-panel-sticky' },
+  return h('aside', { className: 'right-panel-sticky', 'aria-label': 'Top narratives' },
    h('div', { className: 'right-panel' },  // inner scroll container via right-panel-inner wrapper below
     h('div', { className: 'right-panel-inner' },
 
     // ── Top Narratives ──
     h('div', { className: 'right-section' },
       h('div', { className: 'right-section-head' },
-        h('span', { className: 'right-section-title' }, t('right.top_narratives')),
+        h('h2', { className: 'right-section-title' }, t('right.top_narratives')),
         h('span', { className: 'right-section-count' }, t('right.top_suffix', { h: hours, n: topTrends.length }))
       ),
       h('div', { className: 'right-section-body' },
         topTrends.length
           ? topTrends.map((tr, i) => {
               const adoptionVal = tr.adoptionScore || tr.memePotential || 0;
-              return h('div', { key: tr.id, className: 'top-item', onClick: () => onOpenTrend && onOpenTrend(tr) },
+              return h('div', {
+                key: tr.id,
+                className: 'top-item',
+                role: 'button',
+                tabIndex: 0,
+                onClick: () => onOpenTrend && onOpenTrend(tr),
+                onKeyDown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpenTrend && onOpenTrend(tr); } },
+              },
                 h('div', { className: 'top-item-rank' + (i < 3 ? ' top-' + (i + 1) : '') }, i + 1),
                 h('div', { className: 'top-item-info' },
                   h('div', { className: 'top-item-title', title: tr.title }, tr.title),
@@ -9898,7 +10014,7 @@ function RightPanel({ stats, hours, sources, scanning, onOpenTrend }) {
     // shows enabled state via a colored dot, total count in the head.
     h('div', { className: 'right-section' },
       h('div', { className: 'right-section-head' },
-        h('span', { className: 'right-section-title' },
+        h('h2', { className: 'right-section-title' },
           h('span', { className: 'right-live-dot' + (paused ? ' paused' : '') }),
           paused ? t('status.offline') : t('status.live')
         ),
@@ -10069,7 +10185,7 @@ function TriggerSection({ trend, lang, me }) {
     // consumers, just hidden from the UI.
     const hasConfidence = typeof data.confidence === 'number' && data.confidence > 0;
     return h('div', { className: 'modal-section' },
-      h('div', { className: 'modal-section-label' }, t('trigger.label')),
+      h('h3', { className: 'modal-section-label' }, t('trigger.label')),
       h('div', { className: 'modal-section-content catalyst-forecast' }, data.text),
       hasChips
         ? h('div', { className: 'catalyst-chips' },
@@ -10130,7 +10246,7 @@ function TriggerSection({ trend, lang, me }) {
   // whyNow is NOT rendered here — it has its own "🔥 Trigger" section
   // above in the modal. Semantics: 🔥 = past, 🔮 = future.
   return h('div', { className: 'modal-section' },
-    h('div', { className: 'modal-section-label' }, t('trigger.label')),
+    h('h3', { className: 'modal-section-label' }, t('trigger.label')),
 
     h('div', { style: { marginTop: 10 } },
       isPro
@@ -10359,6 +10475,9 @@ function fmtSparkTs(ts) {
 
 // ── TrendModal (side drawer) ───────────────────────────────────────────────────
 function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote = null }) {
+  const modalRef = useRef(null);
+  useFocusTrap(modalRef, true);
+
   const lang = useLang();
   const [imgUrl, setImgUrl] = useState(trend.imageUrl || null);
   const [imgLoading, setImgLoading] = useState(!trend.imageUrl && !!trend.url);
@@ -10488,7 +10607,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
   return h(React.Fragment, null,
    lightboxSrc ? h(Lightbox, { src: lightboxSrc, onClose: () => setLightboxSrc(null) }) : null,
    h('div', { className: 'modal-overlay', onClick: e => { if (e.target === e.currentTarget) onClose(); } },
-    h('div', { className: 'modal-drawer' },
+    h('div', { className: 'modal-drawer', ref: modalRef },
 
       // Head — alertType / category / manual / phase / source / time / close
       // Phase moved here (used to live in its own labelled section). Without
@@ -10656,7 +10775,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
         // was a vague rationale text. Rendered first so the user reads "what
         // happened" before the forward-looking Catalyst forecast below.
         trend.whyNow ? h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.trigger')),
+          h('h3', { className: 'modal-section-label' }, t('modal.trigger')),
           h('div', { className: 'modal-section-content why-now' }, withSubjectHighlight(trend.whyNow, trend.subjectAliases))
         ) : null,
 
@@ -10667,7 +10786,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
 
         // Actions — moved up for quick access to source/TG/Grok
         h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.links')),
+          h('h3', { className: 'modal-section-label' }, t('modal.links')),
           h('div', { className: 'modal-actions' },
             trend.url ? h('a', {
               className: 'trend-link' + srcLinkCls,
@@ -10747,7 +10866,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
         // hover-preview (data-tweet-id wires into the global useTweetHover).
         (trend.source === 'x_trends' && Array.isArray(trend.topTweets) && trend.topTweets.length > 0)
           ? h('div', { className: 'modal-section' },
-              h('div', { className: 'modal-section-label' },
+              h('h3', { className: 'modal-section-label' },
                 t('modal.xtrends_top_tweets', { n: trend.topTweets.length })
               ),
               h('div', { className: 'xtrends-toptweets' },
@@ -10787,13 +10906,13 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
 
         // Feedback
         h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.feedback')),
+          h('h3', { className: 'modal-section-label' }, t('modal.feedback')),
           h(FeedbackBar, { trend, variant: 'modal' })
         ),
 
         // [MARKET_STAGE] market stage line in modal — remove block to disable
         trend.marketStage && trend.marketStage !== 'none' ? h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.market_stage')),
+          h('h3', { className: 'modal-section-label' }, t('modal.market_stage')),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
             h(MarketStageBadge, { stage: trend.marketStage }),
             h('span', { style: { fontSize: 12, color: 'var(--dim)' } },
@@ -10829,7 +10948,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
         // Cross-platform "Platforms" tile was already removed earlier with
         // the cross-source aggregation rip-out.
         h('div', { className: 'modal-section' },
-          h('div', { className: 'modal-section-label' }, t('modal.metrics')),
+          h('h3', { className: 'modal-section-label' }, t('modal.metrics')),
           h('div', { className: 'modal-stats-grid' },
             // Virality cell — per-source engagement metrics
             // (👁 views · ❤️ likes · 💬 comments · 🔁 reposts). Pulls
@@ -10984,7 +11103,7 @@ function TrendModal({ trend, onClose, me = null, onFavToggle = null, onFavNote =
           const junkContrib = junkVal * (Number(w && w.weightJunk) || 0);
 
           return h('div', { className: 'modal-section' },
-            h('div', { className: 'modal-section-label' }, t('modal.alert_breakdown')),
+            h('h3', { className: 'modal-section-label' }, t('modal.alert_breakdown')),
             // Compact verdict header — always visible
             h('div', { className: 'alert-verdict-header' },
               h('span', {
@@ -11260,7 +11379,14 @@ function HeroPanel({ stats, hours, refreshIn, scanning, onScan, onOpenStats }) {
       h('div', { className: 'session-chip' },
         t('hero.alerts') + ' ', h('span', { className: 'chip-val' }, String(stats ? stats.alerts || 0 : 0))
       ),
-      h('div', { className: 'session-chip', style: { cursor: 'pointer' }, onClick: onOpenStats },
+      h('div', {
+        className: 'session-chip',
+        role: 'button',
+        tabIndex: 0,
+        style: { cursor: 'pointer' },
+        onClick: onOpenStats,
+        onKeyDown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpenStats && onOpenStats(); } },
+      },
         t('hero.stats')
       ),
       h('button', {
@@ -11280,6 +11406,9 @@ function HeroPanel({ stats, hours, refreshIn, scanning, onScan, onOpenStats }) {
 // server-side — this UI is only rendered when me.plan ∈ {pro, admin}, but
 // the endpoint will 403 if the user changes plan mid-session.
 function AnalyzePanel({ onBack, onOpenTrend }) {
+  const modalRef = useRef(null);
+  useFocusTrap(modalRef, true);
+
   useLang();
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
@@ -11353,7 +11482,7 @@ function AnalyzePanel({ onBack, onOpenTrend }) {
     { k: 'story',  v: tr.storyScore     || 0, icon: 'book-open' },
   ] : [];
 
-  return h('div', { className: 'analyze-panel' },
+  return h('div', { className: 'analyze-panel', ref: modalRef },
     h('div', { className: 'settings-header' },
       h('button', { className: 'btn btn-ghost', onClick: onBack }, t('app.back')),
       h('span', { className: 'settings-title' }, icon('flask-conical', { size: 14 }), ' ', t('analyze.title'))
@@ -11700,6 +11829,9 @@ const Row = ({ icon: iconName, title, desc, control, stacked = false }) =>
 // (SQLite does not support cheap DROP COLUMN; it has no consumers anymore).
 
 function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
+  const modalRef = useRef(null);
+  useFocusTrap(modalRef, true);
+
   const lang = useLang();
   const grokLang = useGrokLang();
   const theme = useTheme();
@@ -11723,7 +11855,7 @@ function SettingsPanel({ onBack, onResetHiddenSources, hiddenSourcesCount }) {
   };
 
 
-  return h('div', { className: 'settings-panel' },
+  return h('div', { className: 'settings-panel', ref: modalRef },
     h('div', { className: 'settings-header' },
       h('button', { className: 'btn btn-ghost', onClick: onBack }, t('app.back')),
       h('span', { className: 'settings-title' }, t('settings.title')),
@@ -12141,6 +12273,9 @@ function AlertTypesRow({ initial }) {
 
 // ── AccountPanel — profile / plan / logout (extracted from SettingsPanel) ─────
 function AccountPanel({ onBack, user, onLogout }) {
+  const modalRef = useRef(null);
+  useFocusTrap(modalRef, true);
+
   useLang();
   const planLabels = { free: t('plan.free'), test: t('plan.test'), pro: t('plan.pro'), admin: t('plan.admin') };
   const doLogout = async () => {
@@ -12163,7 +12298,7 @@ function AccountPanel({ onBack, user, onLogout }) {
     ? new Date(user.subscriptionExpiresAt).toLocaleDateString(localeTag(), { day: '2-digit', month: 'short', year: 'numeric' })
     : null;
 
-  return h('div', { className: 'settings-panel' },
+  return h('div', { className: 'settings-panel', ref: modalRef },
     h('div', { className: 'settings-header' },
       h('button', { className: 'btn btn-ghost', onClick: onBack }, t('app.back')),
       h('span', { className: 'settings-title' }, t('nav.account'))
@@ -13150,6 +13285,7 @@ function CatMascot(props) {
   return h('div', {
     ref: catRef,
     className: 'cat-mascot',
+    'aria-hidden': 'true',
     'data-state': stateName,
     'data-route': route,
     onClick: onCatClick
@@ -14003,8 +14139,10 @@ function App() {
     //   open as centered modal sheets with blurred backdrop (see below). ──
     h('div', { className: 'dashboard-grid' },
 
+          h('a', { href: '#main-content', className: 'skip-link' }, 'Skip to content'),
+
           // ── Sidebar ──
-          h('aside', { className: 'sidebar' },
+          h('aside', { className: 'sidebar', 'aria-label': 'Navigation' },
             h('div', { className: 'sidebar-section' },
               h('span', null, t('sidebar.sources')),
               hiddenSources.size
@@ -14291,8 +14429,8 @@ function App() {
           h(ColumnResizer, { side: 'left' }),
 
           // ── Main feed ──
-          h('main', { className: 'main-feed', ref: mainFeedRef },
-            error ? h('div', { className: 'error-bar', style: { marginBottom: 12 } }, icon('alert-triangle', { size: 13 }), ' ', error) : null,
+          h('main', { className: 'main-feed', id: 'main-content', ref: mainFeedRef },
+            error ? h(ErrorBanner, { message: error, onRetry: refreshAll, variant: 'error' }) : null,
 
             h('div', { className: 'feed-panel' + (refreshPulse && trends.length > 0 ? ' is-refreshing' : '') },
 

@@ -17,6 +17,7 @@ function maskId(id) {
   return s ? '***' + s.slice(-4) : '<empty>';
 }
 import { runManualAnalysis, peekManualAnalysisCache } from '../analysis/manual-analysis.js';
+import { notifyAdminCrash } from './admin-alert.js';
 
 /**
  * Build a deep-link to grok.com with a pre-filled prompt asking Grok to
@@ -1230,6 +1231,36 @@ class TelegramNotifier {
 
   // ── Send alert to a specific user ─────────────────────────────────────────
 
+  /**
+   * Send a plain-text TG message, truncating at 4090 chars to avoid the
+   * 4096 silent-drop (BOT-003). On truncation, sends full payload to admin
+   * support group via notifyAdminCrash for post-mortem.
+   *
+   * @param {number|string} chatId
+   * @param {string} message
+   * @param {Object} [opts] - passthrough to bot.sendMessage
+   * @param {Object} [ctx] - audit context (userId, telegram_chat_id, trendId)
+   */
+  async _sendPlainTextChunked(chatId, message, opts = {}, ctx = {}) {
+    const TG_PLAIN_LIMIT = 4096;
+    const TRUNCATE_AT    = 4090;
+    const TRUNCATE_SUFFIX = '\n\n…[truncated, see admin log]';
+    let outgoing = message;
+    if (typeof message === 'string' && message.length > TG_PLAIN_LIMIT) {
+      outgoing = message.slice(0, TRUNCATE_AT) + TRUNCATE_SUFFIX;
+      notifyAdminCrash(new Error('alert_truncated'), {
+        kind: 'tg_truncate',
+        chatId,
+        userId: ctx.userId ?? null,
+        telegram_chat_id: ctx.telegram_chat_id ?? chatId,
+        trendId: ctx.trendId ?? null,
+        fullMessageLength: message.length,
+        fullMessage: message.slice(0, 8000),
+      });
+    }
+    return this.bot.sendMessage(chatId, outgoing, opts);
+  }
+
   async sendAlertToUser(trend, user, opts = {}) {
     if (!this.enabled || !this.bot) return false;
 
@@ -1293,11 +1324,11 @@ class TelegramNotifier {
             supports_streaming: true,
           });
           if (!fitsInCaption) {
-            await this.bot.sendMessage(chatId, message, {
+            await this._sendPlainTextChunked(chatId, message, {
               parse_mode: 'HTML',
               disable_web_page_preview: true,
               reply_to_message_id: sentMsg?.message_id,
-            });
+            }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
           }
         } catch (err) {
           // Common causes: >50MB, bad codec, Telegram can't fetch URL. Fall
@@ -1311,23 +1342,23 @@ class TelegramNotifier {
                 parse_mode: 'HTML',
               });
               if (!fitsInCaption) {
-                await this.bot.sendMessage(chatId, message, {
+                await this._sendPlainTextChunked(chatId, message, {
                   parse_mode: 'HTML',
                   disable_web_page_preview: true,
                   reply_to_message_id: sentMsg?.message_id,
-                });
+                }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
               }
             } catch {
-              sentMsg = await this.bot.sendMessage(chatId, message, {
+              sentMsg = await this._sendPlainTextChunked(chatId, message, {
                 parse_mode: 'HTML',
                 disable_web_page_preview: false,
-              });
+              }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
             }
           } else {
-            sentMsg = await this.bot.sendMessage(chatId, message, {
+            sentMsg = await this._sendPlainTextChunked(chatId, message, {
               parse_mode: 'HTML',
               disable_web_page_preview: false,
-            });
+            }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
           }
         }
       } else if (imageUrls.length >= 2) {
@@ -1343,11 +1374,11 @@ class TelegramNotifier {
           // triggers the single notification ping (with buttons attached).
           const group = await this.bot.sendMediaGroup(chatId, media, { disable_notification: true });
           const albumAnchor = Array.isArray(group) ? group[0] : group;
-          sentMsg = await this.bot.sendMessage(chatId, message, {
+          sentMsg = await this._sendPlainTextChunked(chatId, message, {
             parse_mode: 'HTML',
             disable_web_page_preview: true,
             reply_to_message_id: albumAnchor?.message_id,
-          });
+          }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
         } catch (err) {
           this.logger.warn(`sendMediaGroup failed (${err.message}) - falling back to sendPhoto`);
           try {
@@ -1356,17 +1387,17 @@ class TelegramNotifier {
               parse_mode: 'HTML',
             });
             if (!fitsInCaption) {
-              await this.bot.sendMessage(chatId, message, {
+              await this._sendPlainTextChunked(chatId, message, {
                 parse_mode: 'HTML',
                 disable_web_page_preview: true,
                 reply_to_message_id: sentMsg?.message_id,
-              });
+              }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
             }
           } catch {
-            sentMsg = await this.bot.sendMessage(chatId, message, {
+            sentMsg = await this._sendPlainTextChunked(chatId, message, {
               parse_mode: 'HTML',
               disable_web_page_preview: false,
-            });
+            }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
           }
         }
       } else if (imageUrls.length === 1) {
@@ -1376,23 +1407,23 @@ class TelegramNotifier {
             parse_mode: 'HTML',
           });
           if (!fitsInCaption) {
-            await this.bot.sendMessage(chatId, message, {
+            await this._sendPlainTextChunked(chatId, message, {
               parse_mode: 'HTML',
               disable_web_page_preview: true,
               reply_to_message_id: sentMsg?.message_id,
-            });
+            }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
           }
         } catch {
-          sentMsg = await this.bot.sendMessage(chatId, message, {
+          sentMsg = await this._sendPlainTextChunked(chatId, message, {
             parse_mode: 'HTML',
             disable_web_page_preview: false,
-          });
+          }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
         }
       } else {
-        sentMsg = await this.bot.sendMessage(chatId, message, {
+        sentMsg = await this._sendPlainTextChunked(chatId, message, {
           parse_mode: 'HTML',
           disable_web_page_preview: false,
-        });
+        }, { userId: user?.id, telegram_chat_id: chatId, trendId: trend?.id });
       }
 
       const msgId = sentMsg.message_id;
