@@ -21,6 +21,7 @@ import { getPlanEntitlements, shouldShowUsageCounter } from '../billing/entitlem
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { timingSafeEqual, createHash } from 'crypto';
+import { UserRateLimiter } from '../utils/rate-limiter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -411,6 +412,15 @@ function html(res, content) {
 }
 
 // ─── Dashboard class ──────────────────────────────────────────────────────────
+
+// Bundle #8 — COST-004: per-user rate-limit for hover-preview endpoints.
+// 30 requests / 5 minutes per user. Normal hover-skim (~5-10 previews per
+// minute) unaffected; automated scraping that could trigger Reddit IP-ban
+// gets blocked at 30 / 5min = 1 per 10s sustained.
+const PREVIEW_RATE_WINDOW_MS  = 5 * 60 * 1000;
+const PREVIEW_RATE_MAX        = 30;
+const tweetPreviewLimiter  = new UserRateLimiter({ windowMs: PREVIEW_RATE_WINDOW_MS, maxRequests: PREVIEW_RATE_MAX });
+const redditPreviewLimiter = new UserRateLimiter({ windowMs: PREVIEW_RATE_WINDOW_MS, maxRequests: PREVIEW_RATE_MAX });
 
 class DashboardServer {
   constructor(config, logger, db, appState, scanFn, telegram = null, triggerFinder = null, extras = {}) {
@@ -1335,6 +1345,13 @@ class DashboardServer {
       return json(res, 403, { error: 'Twitter preview requires a paid plan', reason: 'plan' });
     }
 
+    // COST-004 (Bundle #8): per-user rate-limit. Defense against automated
+    // scraping that could trigger upstream IP-ban.
+    const userKey = req.user?.id || req.user?.chat_id || 'anon';
+    if (!tweetPreviewLimiter.allow(userKey)) {
+      return json(res, 429, { error: 'Too many preview requests. Please slow down.', reason: 'rate_limit' });
+    }
+
     const idParam  = url.searchParams.get('id') || '';
     const urlParam = url.searchParams.get('url') || '';
     const id = /^\d{5,25}$/.test(idParam) ? idParam : extractTweetId(urlParam);
@@ -1398,6 +1415,13 @@ class DashboardServer {
     const planSources = getPlanEntitlements(req.user?.plan_name).sources;
     if (!planSources || !planSources.includes('reddit')) {
       return json(res, 403, { error: 'Reddit preview requires a paid plan', reason: 'plan' });
+    }
+
+    // COST-004 (Bundle #8): per-user rate-limit. Defense against automated
+    // scraping that could trigger Reddit IP-ban on our server's IP.
+    const userKey = req.user?.id || req.user?.chat_id || 'anon';
+    if (!redditPreviewLimiter.allow(userKey)) {
+      return json(res, 429, { error: 'Too many preview requests. Please slow down.', reason: 'rate_limit' });
     }
 
     const idParam  = url.searchParams.get('id') || '';
@@ -2127,6 +2151,11 @@ class DashboardServer {
   }
 
   async _handleScan(req, res) {
+    // Bundle #7 — SEC-001 + BILL-003: admin-only operation. Free/test/pro
+    // users could burn LLM credits triggering full collect+score cycles.
+    if (req.user?.plan_name !== 'admin') {
+      return json(res, 403, { error: 'Manual scan is admin-only', reason: 'plan' });
+    }
     if (this.appState?.paused) {
       return json(res, 409, { error: 'Scanner is paused. Resume it first.' });
     }
@@ -2134,6 +2163,11 @@ class DashboardServer {
       return json(res, 409, { error: 'Scan is already running. Try again in a moment.' });
     }
     if (typeof this.scanFn === 'function') {
+      // Bundle #7 — PIPE-004: record trigger timestamp immediately so admin UI
+      // shows "scan in progress" without waiting for the cycle to complete (which
+      // can take 30-60s). Existing finally block in runScanCycle still writes
+      // lastScanCompletedAt — admin UI compares the two to detect in-flight scans.
+      try { this.db.setSetting('lastScanStartedAt', String(Date.now())); } catch {}
       // Run in background, don't await
       this.scanFn().catch(e => this.logger.error(`Manual scan error: ${e.message}`));
       return json(res, 202, { message: 'Scan triggered — check logs for progress' });

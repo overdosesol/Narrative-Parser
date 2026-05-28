@@ -1574,12 +1574,18 @@ class AdminServer {
 
       if (path === '/api/scanners/pause' && method === 'POST') {
         this.appState.paused = true;
+        // Bundle #7 — ADM-018 + SD-16: persist so pause survives deploy/restart.
+        try { this.db.setSetting('scanner_paused', '1'); }
+        catch (e) { this.logger.warn(`[Admin] Failed to persist pause: ${e.message}`); }
         this.logger.info('[Admin] Scanner paused');
         return json(res, 200, { paused: true });
       }
 
       if (path === '/api/scanners/resume' && method === 'POST') {
         this.appState.paused = false;
+        // Bundle #7 — ADM-018 + SD-16: persist so resume survives deploy/restart.
+        try { this.db.setSetting('scanner_paused', '0'); }
+        catch (e) { this.logger.warn(`[Admin] Failed to persist resume: ${e.message}`); }
         this.logger.info('[Admin] Scanner resumed');
         return json(res, 200, { paused: false });
       }
