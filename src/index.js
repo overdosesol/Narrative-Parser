@@ -341,6 +341,14 @@ const appState = {
   alertDecisionsCap: 500,
 };
 
+// Bundle #7 — ADM-018 + SD-16: restore scanner pause state across restart.
+try {
+  if (db.getSetting('scanner_paused') === '1') {
+    appState.paused = true;
+    logger.warn('[Boot] Scanner is PAUSED (persisted from previous session). Resume via admin panel.');
+  }
+} catch (e) { logger.warn(`[Boot] Failed to read scanner_paused setting: ${e.message}`); }
+
 function setPipelineStage(stage) {
   appState.currentStage = stage;
   appState.stageStartedAt = Date.now();
