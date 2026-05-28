@@ -8,6 +8,8 @@
 // at boot AFTER supportBot is constructed. Until init is called,
 // notifyAdminCrash() is a no-op (logs the gap once at init time).
 
+import { withTelegramRetry } from './telegram-retry.js';
+
 let _bot = null;
 let _groupId = null;
 let _logger = console;
@@ -88,11 +90,14 @@ export async function notifyAdminCrash(error, context = {}) {
   }
 
   try {
-    await _bot.sendMessage(_groupId, msg, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      disable_notification: false,
-    });
+    await withTelegramRetry(
+      () => _bot.sendMessage(_groupId, msg, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        disable_notification: false,
+      }),
+      { logger: _logger, label: 'admin-crash' }
+    );
   } catch (e) {
     // Admin TG send failed — log and swallow. Don't cascade into another crash.
     _logger.warn(`[admin-alert] sendMessage to admin group failed: ${e.message}`);

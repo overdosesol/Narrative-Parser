@@ -75,8 +75,6 @@ const telegram = new TelegramNotifier(config, logger, db, null, triggerFinder, s
 const alertScheduler = new AlertScheduler({ logger, db });
 alertScheduler.start();
 telegram.scheduler = alertScheduler;  // for pause-toggle dropQueue hook
-// Prune muxed video cache on startup (files older than 7 days)
-try { telegram.cleanupVideoCache(5); } catch {}
 
 // Hidden trends archive — sweep entries older than 7 days. Run once on
 // startup, then daily. Per-user dashboard archive feature; rows accumulate
@@ -125,6 +123,83 @@ setInterval(() => {
 setInterval(() => {
   try { db.pruneFeatureUsageLog(FEATURE_USAGE_RETENTION_DAYS); }
   catch (e) { logger.warn(`[Maintenance] feature_usage_log sweep failed: ${e.message}`); }
+}, 24 * 60 * 60 * 1000);
+
+// Bundle #10 (2026-05-28): retention for notifications + 3 audit-style tables.
+// notifications        — 30d  (DB-008)
+// feedback_votes       — 90d  (DB-009 — votes lose forecasting value after 3mo)
+// x_analysis_history   — 90d  (DB-009 — X virality snapshots, debugging window)
+// tag_refresh_history  — 365d (DB-009 — audit log of preset reloads, low write rate)
+const NOTIFICATIONS_RETENTION_DAYS   =  30;
+const FEEDBACK_VOTES_RETENTION_DAYS  =  90;
+const X_ANALYSIS_RETENTION_DAYS      =  90;
+const TAG_REFRESH_RETENTION_DAYS     = 365;
+
+try {
+  const n = db.pruneNotifications(NOTIFICATIONS_RETENTION_DAYS);
+  if (n > 0) logger.info(`[Maintenance] notifications: pruned ${n} rows older than ${NOTIFICATIONS_RETENTION_DAYS}d`);
+} catch (e) { logger.warn(`[Maintenance] notifications sweep failed: ${e.message}`); }
+try {
+  const n = db.pruneFeedbackVotes(FEEDBACK_VOTES_RETENTION_DAYS);
+  if (n > 0) logger.info(`[Maintenance] feedback_votes: pruned ${n} rows older than ${FEEDBACK_VOTES_RETENTION_DAYS}d`);
+} catch (e) { logger.warn(`[Maintenance] feedback_votes sweep failed: ${e.message}`); }
+try {
+  const n = db.pruneXAnalysisHistory(X_ANALYSIS_RETENTION_DAYS);
+  if (n > 0) logger.info(`[Maintenance] x_analysis_history: pruned ${n} rows older than ${X_ANALYSIS_RETENTION_DAYS}d`);
+} catch (e) { logger.warn(`[Maintenance] x_analysis_history sweep failed: ${e.message}`); }
+try {
+  const n = db.pruneTagRefreshHistory(TAG_REFRESH_RETENTION_DAYS);
+  if (n > 0) logger.info(`[Maintenance] tag_refresh_history: pruned ${n} rows older than ${TAG_REFRESH_RETENTION_DAYS}d`);
+} catch (e) { logger.warn(`[Maintenance] tag_refresh_history sweep failed: ${e.message}`); }
+
+setInterval(() => {
+  try { db.pruneNotifications(NOTIFICATIONS_RETENTION_DAYS); }
+  catch (e) { logger.warn(`[Maintenance] notifications sweep failed: ${e.message}`); }
+}, 24 * 60 * 60 * 1000);
+setInterval(() => {
+  try { db.pruneFeedbackVotes(FEEDBACK_VOTES_RETENTION_DAYS); }
+  catch (e) { logger.warn(`[Maintenance] feedback_votes sweep failed: ${e.message}`); }
+}, 24 * 60 * 60 * 1000);
+setInterval(() => {
+  try { db.pruneXAnalysisHistory(X_ANALYSIS_RETENTION_DAYS); }
+  catch (e) { logger.warn(`[Maintenance] x_analysis_history sweep failed: ${e.message}`); }
+}, 24 * 60 * 60 * 1000);
+setInterval(() => {
+  try { db.pruneTagRefreshHistory(TAG_REFRESH_RETENTION_DAYS); }
+  catch (e) { logger.warn(`[Maintenance] tag_refresh_history sweep failed: ${e.message}`); }
+}, 24 * 60 * 60 * 1000);
+
+// Bundle #6 (2026-05-28): housekeeping daily loops.
+// video-cache       — 3d  (DB-010 + DB-023 — tightened from 7d default for disk safety)
+// auth_sessions     — 24h (DB-011 — moved from boot-only)
+// logs              — 14d (DB-014 — application-level rotation)
+const VIDEO_CACHE_RETENTION_DAYS    =  3;
+const AUTH_SESSIONS_RETENTION_HOURS = 24;
+const LOG_RETENTION_DAYS            = 14;
+
+try {
+  telegram.cleanupVideoCache(VIDEO_CACHE_RETENTION_DAYS);
+} catch (e) { logger.warn(`[Maintenance] video-cache sweep failed: ${e.message}`); }
+try {
+  const n = db.pruneAuthSessions(AUTH_SESSIONS_RETENTION_HOURS);
+  if (n > 0) logger.info(`[Maintenance] auth_sessions: pruned ${n} rows older than ${AUTH_SESSIONS_RETENTION_HOURS}h`);
+} catch (e) { logger.warn(`[Maintenance] auth_sessions sweep failed: ${e.message}`); }
+try {
+  const n = logger.cleanupOldLogs(LOG_RETENTION_DAYS);
+  if (n > 0) logger.info(`[Maintenance] logs: pruned ${n} files older than ${LOG_RETENTION_DAYS}d`);
+} catch (e) { logger.warn(`[Maintenance] log rotation failed: ${e.message}`); }
+
+setInterval(() => {
+  try { telegram.cleanupVideoCache(VIDEO_CACHE_RETENTION_DAYS); }
+  catch (e) { logger.warn(`[Maintenance] video-cache sweep failed: ${e.message}`); }
+}, 24 * 60 * 60 * 1000);
+setInterval(() => {
+  try { db.pruneAuthSessions(AUTH_SESSIONS_RETENTION_HOURS); }
+  catch (e) { logger.warn(`[Maintenance] auth_sessions sweep failed: ${e.message}`); }
+}, 24 * 60 * 60 * 1000);
+setInterval(() => {
+  try { logger.cleanupOldLogs(LOG_RETENTION_DAYS); }
+  catch (e) { logger.warn(`[Maintenance] log rotation failed: ${e.message}`); }
 }, 24 * 60 * 60 * 1000);
 
 // ── Initialize Solana Pay Monitor ───────────────────────────────────────────

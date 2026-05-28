@@ -21,6 +21,8 @@ class TrendDatabase {
 
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
+    this.db.pragma('foreign_keys = ON');    // Bundle #10 — DB-005: enforce FK declarations
+    this.db.pragma('busy_timeout = 5000');  // Bundle #10 — 5s lock-wait on concurrent writes
     this._migrate();
     this.logger.info('Database initialized', { path: dbPath });
   }
@@ -448,14 +450,10 @@ class TrendDatabase {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_auth_token   ON auth_sessions(token)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_auth_chat    ON auth_sessions(chat_id)`);
 
-    // Housekeeping — prune anything that's fully expired and has no token
-    try {
-      this.db.prepare(
-        `DELETE FROM auth_sessions
-         WHERE token IS NULL
-           AND created_at < datetime('now', '-1 day')`
-      ).run();
-    } catch (e) { /* best-effort */ }
+    // Housekeeping — prune anything that's fully expired and has no token.
+    // Daily setInterval in src/index.js (Bundle #6) covers ongoing prunes.
+    try { this.pruneAuthSessions(24); }
+    catch { /* best-effort at boot */ }
 
     // Plan normalization (v4 pricing/policy 2026-05-06):
     //   - alert_limit kept at -1 (unlimited) for all plans — alerts are
@@ -1499,7 +1497,7 @@ class TrendDatabase {
   }
 
   recordNotification(trendId, channel, userId = null) {
-    this.db.prepare(`INSERT INTO notifications (trend_id, channel, user_id) VALUES (?, ?, ?)`).run(trendId, channel, userId);
+    this.db.prepare(`INSERT OR IGNORE INTO notifications (trend_id, channel, user_id) VALUES (?, ?, ?)`).run(trendId, channel, userId);
   }
 
   wasNotificationSentToUser(trendId, userId) {
@@ -2567,6 +2565,41 @@ class TrendDatabase {
       this.logger.warn(`[Maintenance] pruneFeatureUsageLog failed: ${e.message}`);
       return 0;
     }
+  }
+
+  pruneNotifications(retentionDays = 30) {
+    const res = this.db.prepare(
+      `DELETE FROM notifications WHERE sent_at < datetime('now', ?)`
+    ).run(`-${retentionDays} days`);
+    return res.changes | 0;
+  }
+
+  pruneFeedbackVotes(retentionDays = 90) {
+    const res = this.db.prepare(
+      `DELETE FROM feedback_votes WHERE created_at < datetime('now', ?)`
+    ).run(`-${retentionDays} days`);
+    return res.changes | 0;
+  }
+
+  pruneXAnalysisHistory(retentionDays = 90) {
+    const res = this.db.prepare(
+      `DELETE FROM x_analysis_history WHERE at < datetime('now', ?)`
+    ).run(`-${retentionDays} days`);
+    return res.changes | 0;
+  }
+
+  pruneTagRefreshHistory(retentionDays = 365) {
+    const res = this.db.prepare(
+      `DELETE FROM tag_refresh_history WHERE ts < datetime('now', ?)`
+    ).run(`-${retentionDays} days`);
+    return res.changes | 0;
+  }
+
+  pruneAuthSessions(maxAgeHours = 24) {
+    const res = this.db.prepare(
+      `DELETE FROM auth_sessions WHERE token IS NULL AND created_at < datetime('now', ?)`
+    ).run(`-${maxAgeHours} hours`);
+    return res.changes | 0;
   }
 }
 

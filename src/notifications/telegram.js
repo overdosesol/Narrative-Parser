@@ -18,6 +18,7 @@ function maskId(id) {
 }
 import { runManualAnalysis, peekManualAnalysisCache } from '../analysis/manual-analysis.js';
 import { notifyAdminCrash } from './admin-alert.js';
+import { withTelegramRetry } from './telegram-retry.js';
 
 /**
  * Build a deep-link to grok.com with a pre-filled prompt asking Grok to
@@ -1258,7 +1259,10 @@ class TelegramNotifier {
         fullMessage: message.slice(0, 8000),
       });
     }
-    return this.bot.sendMessage(chatId, outgoing, opts);
+    return withTelegramRetry(
+      () => this.bot.sendMessage(chatId, outgoing, opts),
+      { logger: this.logger, label: 'alert-text' }
+    );
   }
 
   async sendAlertToUser(trend, user, opts = {}) {
@@ -1318,11 +1322,14 @@ class TelegramNotifier {
           }
         }
         try {
-          sentMsg = await this.bot.sendVideo(chatId, videoSource, {
-            caption: fitsInCaption ? message : undefined,
-            parse_mode: 'HTML',
-            supports_streaming: true,
-          });
+          sentMsg = await withTelegramRetry(
+            () => this.bot.sendVideo(chatId, videoSource, {
+              caption: fitsInCaption ? message : undefined,
+              parse_mode: 'HTML',
+              supports_streaming: true,
+            }),
+            { logger: this.logger, label: 'alert-video' }
+          );
           if (!fitsInCaption) {
             await this._sendPlainTextChunked(chatId, message, {
               parse_mode: 'HTML',
@@ -1337,10 +1344,13 @@ class TelegramNotifier {
           const fallbackImg = imageUrls[0] || trend.metrics?.thumbnailUrl || null;
           if (fallbackImg) {
             try {
-              sentMsg = await this.bot.sendPhoto(chatId, fallbackImg, {
-                caption: fitsInCaption ? message : undefined,
-                parse_mode: 'HTML',
-              });
+              sentMsg = await withTelegramRetry(
+                () => this.bot.sendPhoto(chatId, fallbackImg, {
+                  caption: fitsInCaption ? message : undefined,
+                  parse_mode: 'HTML',
+                }),
+                { logger: this.logger, label: 'alert-photo-fallback' }
+              );
               if (!fitsInCaption) {
                 await this._sendPlainTextChunked(chatId, message, {
                   parse_mode: 'HTML',
@@ -1372,7 +1382,10 @@ class TelegramNotifier {
           const media = imageUrls.map((u) => ({ type: 'photo', media: u }));
           // Send the album silently - the follow-up text message is what
           // triggers the single notification ping (with buttons attached).
-          const group = await this.bot.sendMediaGroup(chatId, media, { disable_notification: true });
+          const group = await withTelegramRetry(
+            () => this.bot.sendMediaGroup(chatId, media, { disable_notification: true }),
+            { logger: this.logger, label: 'alert-album' }
+          );
           const albumAnchor = Array.isArray(group) ? group[0] : group;
           sentMsg = await this._sendPlainTextChunked(chatId, message, {
             parse_mode: 'HTML',
@@ -1382,10 +1395,13 @@ class TelegramNotifier {
         } catch (err) {
           this.logger.warn(`sendMediaGroup failed (${err.message}) - falling back to sendPhoto`);
           try {
-            sentMsg = await this.bot.sendPhoto(chatId, imageUrls[0], {
-              caption: fitsInCaption ? message : undefined,
-              parse_mode: 'HTML',
-            });
+            sentMsg = await withTelegramRetry(
+              () => this.bot.sendPhoto(chatId, imageUrls[0], {
+                caption: fitsInCaption ? message : undefined,
+                parse_mode: 'HTML',
+              }),
+              { logger: this.logger, label: 'alert-photo-album-fallback' }
+            );
             if (!fitsInCaption) {
               await this._sendPlainTextChunked(chatId, message, {
                 parse_mode: 'HTML',
@@ -1402,10 +1418,13 @@ class TelegramNotifier {
         }
       } else if (imageUrls.length === 1) {
         try {
-          sentMsg = await this.bot.sendPhoto(chatId, imageUrls[0], {
-            caption: fitsInCaption ? message : undefined,
-            parse_mode: 'HTML',
-          });
+          sentMsg = await withTelegramRetry(
+            () => this.bot.sendPhoto(chatId, imageUrls[0], {
+              caption: fitsInCaption ? message : undefined,
+              parse_mode: 'HTML',
+            }),
+            { logger: this.logger, label: 'alert-photo' }
+          );
           if (!fitsInCaption) {
             await this._sendPlainTextChunked(chatId, message, {
               parse_mode: 'HTML',

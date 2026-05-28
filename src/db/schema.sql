@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 CREATE INDEX IF NOT EXISTS idx_notifications_trend ON notifications(trend_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user  ON notifications(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedup ON notifications(trend_id, channel, user_id);
 
 -- -- Payments (Solana Pay tracking) -----------------------
 CREATE TABLE IF NOT EXISTS payments (

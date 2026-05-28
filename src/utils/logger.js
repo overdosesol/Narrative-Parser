@@ -40,6 +40,25 @@ class Logger {
   info(msg, data) { this._write('info', msg, data); }
   warn(msg, data) { this._write('warn', msg, data); }
   error(msg, data) { this._write('error', msg, data); }
+
+  cleanupOldLogs(maxAgeDays = 14) {
+    if (!fs.existsSync(this.logDir)) return 0;
+    const cutoffMs = Date.now() - maxAgeDays * 86_400_000;
+    let removed = 0;
+    try {
+      for (const name of fs.readdirSync(this.logDir)) {
+        if (!name.endsWith('.log')) continue;
+        const p = path.join(this.logDir, name);
+        try {
+          if (fs.statSync(p).mtimeMs < cutoffMs) {
+            fs.unlinkSync(p);
+            removed++;
+          }
+        } catch { /* skip unreadable file */ }
+      }
+    } catch { /* skip unreadable directory */ }
+    return removed;
+  }
 }
 
 export default Logger;

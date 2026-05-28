@@ -6,6 +6,25 @@
 
 set -euo pipefail
 
+# Bundle #6 — TG alert on backup failure. Load env (best-effort; secrets at
+# /etc/catalyst.env or wherever deploy.sh writes them).
+[ -f /etc/catalyst.env ] && set -o allexport && . /etc/catalyst.env && set +o allexport
+
+notify_failure() {
+  local exit_code=$?
+  # Don't alert on successful exit.
+  if [ "$exit_code" -eq 0 ]; then exit 0; fi
+  if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${SUPPORT_GROUP_ID:-}" ]; then
+    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${SUPPORT_GROUP_ID}" \
+      --data-urlencode "text=🚨 Catalyst backup FAILED (exit ${exit_code}) on $(hostname) at $(date -Is)" \
+      > /dev/null 2>&1 || true
+  fi
+  exit "$exit_code"
+}
+
+trap notify_failure EXIT
+
 BACKUP_DIR=/var/backups/catalyst
 DATE=$(date +%Y-%m-%d_%H-%M)
 mkdir -p "$BACKUP_DIR"

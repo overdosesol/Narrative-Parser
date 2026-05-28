@@ -4,6 +4,8 @@
  */
 
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import { timingSafeEqual } from 'crypto';
 import {
   PRESET_KEYS as PRESET_CONFIG_KEYS,
@@ -18,6 +20,7 @@ import {
   mergeOverrideBlobs,
 } from '../analysis/preset-config.js';
 import { runManualAnalysis } from '../analysis/manual-analysis.js';
+import { withTelegramRetry } from '../notifications/telegram-retry.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -203,7 +206,7 @@ class AdminServer {
 
     const storage = this.db.getStorageStats();
 
-    return {
+    const stats = {
       users: { total: totalUsers, active: activeUsers, paid: paidUsers, newToday, newWeek, newMonth },
       revenue: {
         total: revenueTotal,
@@ -217,6 +220,26 @@ class AdminServer {
       dailyRevenue,
       storage,
     };
+
+    // Bundle #6 — backup status info for admin UI Backup card.
+    const BACKUP_DIR = '/var/backups/catalyst';
+    let backup = { lastBackupAt: null, lastBackupBytes: 0, dirExists: false };
+    try {
+      if (fs.existsSync(BACKUP_DIR)) {
+        backup.dirExists = true;
+        const files = fs.readdirSync(BACKUP_DIR)
+          .filter(n => n.endsWith('.db.gz'))
+          .map(n => ({ n, stat: fs.statSync(path.join(BACKUP_DIR, n)) }))
+          .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+        if (files.length > 0) {
+          backup.lastBackupAt = files[0].stat.mtimeMs;
+          backup.lastBackupBytes = files[0].stat.size;
+        }
+      }
+    } catch { /* best-effort */ }
+    stats.backup = backup;
+
+    return stats;
   }
 
   _getPlans() {
@@ -769,7 +792,10 @@ class AdminServer {
     let sent = 0, failed = 0;
     for (const u of users) {
       try {
-        const sentMsg = await this.bot.sendMessage(u.telegram_chat_id, message, { parse_mode: 'HTML' });
+        const sentMsg = await withTelegramRetry(
+          () => this.bot.sendMessage(u.telegram_chat_id, message, { parse_mode: 'HTML' }),
+          { logger: this.logger, label: 'broadcast' }
+        );
 
         if (u.pinned_broadcast_message_id) {
           try {
@@ -802,7 +828,17 @@ class AdminServer {
 
         sent++;
         await new Promise(r => setTimeout(r, 50)); // rate limit
-      } catch { failed++; }
+      } catch (err) {
+        if (err?.response?.statusCode === 403) {
+          this.logger.warn(`Broadcast: user ${u.id} blocked the bot - suspending`);
+          try {
+            this.db.db.prepare('UPDATE users SET status = ? WHERE id = ?').run('suspended', u.id);
+          } catch (e) {
+            this.logger.warn(`Broadcast: failed to mark user ${u.id} as suspended: ${e.message}`);
+          }
+        }
+        failed++;
+      }
     }
     this.db.finalizeBroadcast(broadcastId, sent, failed);
     return { sent, failed, total: users.length, broadcastId };
@@ -1015,6 +1051,49 @@ class AdminServer {
         const days = Math.max(1, Math.min(365, Number(body.days || 30)));
         const result = this.db.cleanupAlerts(days);
         return json(res, 200, { ok: true, ...result });
+      }
+
+      if (path === '/api/admin/maintenance/vacuum' && method === 'POST') {
+        const t0 = Date.now();
+        try {
+          this.db.db.exec('VACUUM');
+          return json(res, 200, { ok: true, elapsedMs: Date.now() - t0 });
+        } catch (e) {
+          this.logger.error(`[Maintenance] VACUUM failed: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+      }
+
+      if (path === '/api/admin/maintenance/cleanup-video' && method === 'POST') {
+        try {
+          if (this.telegram?.cleanupVideoCache) {
+            this.telegram.cleanupVideoCache(3);
+          }
+          return json(res, 200, { ok: true });
+        } catch (e) {
+          this.logger.error(`[Maintenance] cleanup-video failed: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+      }
+
+      if (path === '/api/admin/maintenance/cleanup-auth' && method === 'POST') {
+        try {
+          const removed = this.db.pruneAuthSessions(24);
+          return json(res, 200, { ok: true, removed });
+        } catch (e) {
+          this.logger.error(`[Maintenance] cleanup-auth failed: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
+      }
+
+      if (path === '/api/admin/maintenance/rotate-logs' && method === 'POST') {
+        try {
+          const removed = this.logger.cleanupOldLogs(14);
+          return json(res, 200, { ok: true, removed });
+        } catch (e) {
+          this.logger.error(`[Maintenance] rotate-logs failed: ${e.message}`);
+          return json(res, 500, { error: e.message });
+        }
       }
 
       // ── Stats ──
@@ -4730,6 +4809,37 @@ function StatsPage() {
     } catch(e){ setMaintMsg('Ошибка: ' + e.message); setTimeout(()=>setMaintMsg(''), 4000); }
   };
 
+  const runVacuum = async () => {
+    if (!window.confirm('VACUUM блокирует БД на время выполнения. Продолжить?')) return;
+    try {
+      const r = await api('/api/admin/maintenance/vacuum', 'POST');
+      setMaintMsg('VACUUM завершён за ' + r.elapsedMs + 'ms');
+      setTimeout(()=>setMaintMsg(''), 4000);
+      loadStats();
+    } catch(e) { setMaintMsg('VACUUM ошибка: ' + e.message); setTimeout(()=>setMaintMsg(''), 4000); }
+  };
+  const cleanupVideoCache = async () => {
+    try {
+      await api('/api/admin/maintenance/cleanup-video', 'POST');
+      setMaintMsg('Video cache очищен');
+      setTimeout(()=>setMaintMsg(''), 3000);
+    } catch(e) { setMaintMsg('Ошибка: ' + e.message); setTimeout(()=>setMaintMsg(''), 3000); }
+  };
+  const cleanupAuthSessions = async () => {
+    try {
+      const r = await api('/api/admin/maintenance/cleanup-auth', 'POST');
+      setMaintMsg('Auth sessions: удалено ' + r.removed);
+      setTimeout(()=>setMaintMsg(''), 3000);
+    } catch(e) { setMaintMsg('Ошибка: ' + e.message); setTimeout(()=>setMaintMsg(''), 3000); }
+  };
+  const rotateLogs = async () => {
+    try {
+      const r = await api('/api/admin/maintenance/rotate-logs', 'POST');
+      setMaintMsg('Logs: удалено ' + r.removed + ' файлов');
+      setTimeout(()=>setMaintMsg(''), 3000);
+    } catch(e) { setMaintMsg('Ошибка: ' + e.message); setTimeout(()=>setMaintMsg(''), 3000); }
+  };
+
   if (loading) return React.createElement('div',{className:'loading'},'Загрузка статистики...');
   if (error && !stats) return React.createElement('div', null,
     React.createElement(ErrorBanner, { message: error, onRetry: loadStats, variant: 'error' })
@@ -4754,6 +4864,29 @@ function StatsPage() {
   };
   const paidShare = stats.users.total ? Math.round((stats.users.paid / stats.users.total) * 100) : 0;
   const activeShare = stats.users.total ? Math.round((stats.users.active / stats.users.total) * 100) : 0;
+  const backup = stats.backup || {};
+    let backupLabel = '⚠ Нет';
+    let backupSub = 'Папка ' + (backup.dirExists ? 'пуста' : 'отсутствует');
+    let backupCardColor = 'yellow';
+    if (backup.lastBackupAt) {
+      const ageMs = Date.now() - backup.lastBackupAt;
+      const ageHours = Math.floor(ageMs / 3_600_000);
+      const ageDays = Math.floor(ageHours / 24);
+      if (ageHours < 36) {
+        backupLabel = ageHours + 'ч назад';
+        backupCardColor = 'green';
+      } else if (ageDays < 7) {
+        backupLabel = '⚠ ' + ageDays + 'д назад';
+        backupCardColor = 'yellow';
+      } else {
+        backupLabel = '🚨 ' + ageDays + 'д назад';
+        backupCardColor = 'yellow';
+      }
+      backupSub = fmtBytes(backup.lastBackupBytes);
+    } else if (!backup.dirExists) {
+      backupLabel = '🚨 Нет папки';
+      backupCardColor = 'yellow';
+    }
 
   return React.createElement('div',null,
     error ? React.createElement(ErrorBanner, { message: error, onRetry: loadStats, variant: 'error' }) : null,
@@ -4767,7 +4900,8 @@ function StatsPage() {
       React.createElement('div',{className:'card blue'},React.createElement('div',{className:'card-label'},'Платных'),React.createElement('div',{className:'card-value'},stats.users.paid),React.createElement('div',{className:'card-sub'},paidShare+'% от всей базы')),
       React.createElement('div',{className:'card yellow'},React.createElement('div',{className:'card-label'},'Доход 30д'),React.createElement('div',{className:'card-value'},fmtRevenueByCurrency(stats.revenue.byCurrency30days)),React.createElement('div',{className:'card-sub'},'Текущий месячный срез')),
       React.createElement('div',{className:'card'},React.createElement('div',{className:'card-label'},'Новые сегодня'),React.createElement('div',{className:'card-value'},stats.users.newToday),React.createElement('div',{className:'card-sub'},'+'+stats.users.newWeek+' за неделю · +'+stats.users.newMonth+' за месяц')),
-      React.createElement('div',{className:'card'},React.createElement('div',{className:'card-label'},'Размер БД'),React.createElement('div',{className:'card-value'},fmtBytes(stats.storage.dbBytes)),React.createElement('div',{className:'card-sub'},stats.storage.trendsCount+' trends · '+stats.storage.notificationsCount+' notifications'))
+      React.createElement('div',{className:'card'},React.createElement('div',{className:'card-label'},'Размер БД'),React.createElement('div',{className:'card-value'},fmtBytes(stats.storage.dbBytes)),React.createElement('div',{className:'card-sub'},stats.storage.trendsCount+' trends · '+stats.storage.notificationsCount+' notifications')),
+      React.createElement('div',{className:'card ' + backupCardColor},React.createElement('div',{className:'card-label'},'Бэкап'),React.createElement('div',{className:'card-value'},backupLabel),React.createElement('div',{className:'card-sub'},backupSub))
     ),
     React.createElement('div',{className:'stats-grid'},
       React.createElement('div',{className:'chart-wrap'},
@@ -4812,6 +4946,10 @@ function StatsPage() {
       ),
       React.createElement('div',{className:'maintenance-actions'},
         React.createElement('button',{className:'btn btn-danger btn-sm',onClick:cleanupAlerts},'🧹 Очистить старые алерты'),
+        React.createElement('button',{className:'btn btn-warning btn-sm',onClick:runVacuum, title:'Сжать БД (VACUUM). Блокирует на ~1с.'},'💾 VACUUM'),
+        React.createElement('button',{className:'btn btn-secondary btn-sm',onClick:cleanupVideoCache, title:'Удалить muxed видео старше 3 дней.'},'🎞 Video cache'),
+        React.createElement('button',{className:'btn btn-secondary btn-sm',onClick:cleanupAuthSessions, title:'Удалить незавершённые auth-сессии старше 24ч.'},'🔑 Auth sessions'),
+        React.createElement('button',{className:'btn btn-secondary btn-sm',onClick:rotateLogs, title:'Удалить лог-файлы старше 14 дней.'},'📜 Rotate logs'),
         React.createElement('span',{style:{fontSize:12,color:'var(--text2)'}},'удаляет тренды + notifications старше N дней'),
         maintMsg && React.createElement('span',{className:maintMsg.startsWith('Ошибка')?'error-msg':'success-msg'},maintMsg)
       )
