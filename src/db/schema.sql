@@ -84,7 +84,11 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 CREATE INDEX IF NOT EXISTS idx_notifications_trend ON notifications(trend_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user  ON notifications(user_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedup ON notifications(trend_id, channel, user_id);
+-- The UNIQUE (trend_id, channel, user_id) dedup index is intentionally NOT
+-- created here. A bare CREATE UNIQUE INDEX throws on an existing DB that still
+-- has duplicate rows and crashes the whole boot (caused prod 502 on 2026-05-29).
+-- It is created in database.js _migrate() AFTER a dedup pass — self-healing,
+-- no manual pre-deploy migration required. See Bundle #5 hardening.
 
 -- -- Payments (Solana Pay tracking) -----------------------
 CREATE TABLE IF NOT EXISTS payments (

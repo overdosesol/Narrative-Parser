@@ -61,6 +61,25 @@ class TrendDatabase {
     // Notifications user_id migration
     addIfMissing('notifications', 'user_id', 'INTEGER');
 
+    // ── Self-healing dedup index (Bundle #5 hardening) ──────────────────────
+    // The UNIQUE (trend_id, channel, user_id) index can't live in schema.sql:
+    // on an existing DB with duplicate rows a bare CREATE UNIQUE INDEX throws
+    // SQLITE_CONSTRAINT_UNIQUE and crashes the whole boot — this caused a prod
+    // 502 on 2026-05-29 when the manual pre-deploy dedup migration was skipped.
+    // So we dedup FIRST (keep the oldest row per group), THEN create the index,
+    // on every boot. Idempotent; no manual pre-deploy step needed. Wrapped so a
+    // failure degrades gracefully (boot continues) instead of crash-looping.
+    try {
+      this.db.exec(`
+        DELETE FROM notifications
+         WHERE id NOT IN (SELECT MIN(id) FROM notifications GROUP BY trend_id, channel, user_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedup
+          ON notifications(trend_id, channel, user_id);
+      `);
+    } catch (e) {
+      this.logger.warn(`DB migration: notifications dedup-index step skipped (${e.message})`);
+    }
+
     // Pipeline status — tracks how far a trend got through the analysis pipeline
     // 'save_only' = clusterer skipped AI scoring; 'scored' = went through stage 1 AI
     addIfMissing('trends', 'pipeline_status', "TEXT NOT NULL DEFAULT 'save_only'");
