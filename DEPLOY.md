@@ -247,26 +247,27 @@ sudo ufw enable
 
 ## 6. Backups
 
-The entire app state is in **one SQLite file** at `DB_PATH`. Daily backup
-via cron:
+The entire app state is in **one SQLite file** at `DB_PATH`. Backups are handled
+by `scripts/catalyst-backup.sh`, which the deploy scripts sync to
+`/usr/local/bin/catalyst-backup.sh` on the VPS. It runs daily via cron
+(`/etc/cron.d/catalyst-backup`, 03:30 UTC) and does:
 
-```bash
-# /etc/cron.daily/catalyst-backup
-#!/bin/bash
-set -e
-DEST=/var/backups/catalyst
-mkdir -p "$DEST"
-DATE=$(date +%Y%m%d-%H%M%S)
-sqlite3 /var/lib/catalyst/data/catalyst.db ".backup $DEST/catalyst-$DATE.db"
-# Keep 14 days
-find "$DEST" -name 'catalyst-*.db' -mtime +14 -delete
-```
+1. Locate the live DB inside the running container (`docker inspect catalyst-app`, `/data` volume).
+2. `PRAGMA integrity_check` on the source — aborts if the DB is already corrupt.
+3. Hot backup via `sqlite3 ".backup"` (lock-aware — safe while the app writes).
+4. `gzip` the snapshot → `/var/backups/catalyst/catalyst_YYYY-MM-DD_HH-MM.db.gz`, then `gzip -t` to verify the archive.
+5. Prune local snapshots older than 14 days.
+6. Copy the snapshot off-site to Backblaze B2 via `rclone` (`b2:catalystparser-prod-backups/`).
+7. On **any** non-zero exit, a Telegram alert is sent to `SUPPORT_GROUP_ID` (failure trap).
 
-`make executable`: `sudo chmod +x /etc/cron.daily/catalyst-backup`.
+Backblaze + Telegram credentials live in `/etc/catalyst.env` (sourced by the
+script, **not** committed). The B2 rclone remote must be named `b2`.
+`scripts/catalyst-backup.sh` is the authoritative source — read it before
+changing anything here.
 
-For off-host backups, push the dump to S3/Backblaze/your-NAS via rsync or
-`aws s3 cp`. Avoid copying the file directly while the bot is running —
-SQLite WAL mode tolerates it but `sqlite3 ".backup"` is safer.
+> The DB is the only stateful asset. **Secrets (`.env`) and code are NOT in
+> these snapshots** — back `.env` up to your password manager and restore code
+> via deploy (see §6.7 Disaster Recovery).
 
 ### 6.5. Restore from backup
 
@@ -426,6 +427,78 @@ rm -rf /tmp/drill/
 
 Если на любом шаге что-то не сошлось — паника: проверь предыдущий бэкап, разбирайся почему БД гниёт.
 
+### 6.7. Disaster Recovery — полный rebuild VPS с нуля
+
+Сценарий: прод-VPS погиб безвозвратно, поднимаем Catalyst на новом сервере.
+Бэкап БД лежит в B2; **секреты и код в бэкап НЕ входят** — восстанавливаем отдельно.
+
+**Что нужно под рукой:** доступ к Backblaze B2 (applicationKeyId + applicationKey), содержимое `/opt/catalyst/.env` (из password manager) и `/etc/catalyst.env`, доступ к DNS-зоне `catalystparser.io`.
+
+**Step 1 — Новый VPS + DNS**
+
+- Подними чистый VPS (Debian/Ubuntu, та же мажорная версия, что была).
+- Поменяй A-запись `catalystparser.io` (и `www`) на новый IP, дождись пропагейшна (`dig catalystparser.io +short`).
+- В `deploy.ps1` / `deploy.sh` обнови хост (старый IP → новый) — деплой ходит по нему.
+
+**Step 2 — Базовый софт**
+
+```bash
+apt update && apt install -y docker.io docker-compose-plugin rclone sqlite3 git ufw nginx certbot python3-certbot-nginx
+systemctl enable --now docker
+```
+
+Настрой ufw как в §5 (только 22/80/443).
+
+**Step 3 — Восстанови секреты**
+
+```bash
+mkdir -p /opt/catalyst
+nano /opt/catalyst/.env     # содержимое из password manager (минимум ключей — §2)
+chmod 600 /opt/catalyst/.env
+nano /etc/catalyst.env      # B2 + TG креды для backup-скрипта (§6)
+chmod 600 /etc/catalyst.env
+```
+
+**Step 4 — Разверни код**
+
+С рабочей машины запусти деплой на новый хост — зальёт код, соберёт контейнер, поднимет app (стартует с пустой БД, заменим на след. шаге):
+
+```bash
+./deploy.ps1   # или ./deploy.sh
+```
+
+**Step 5 — Восстанови БД из B2**
+
+Настрой rclone remote `b2` (`rclone config` → Backblaze B2 → ключи), затем выполни процедуру **§6.5 (Steps 1-9)** с off-site источника: pull последнего `.db.gz` из `b2:catalystparser-prod-backups/`, `gzip -t`, gunzip, `PRAGMA integrity_check`, stop container, подмена файла в volume, start, smoke.
+
+**Step 6 — TLS сертификат**
+
+DNS уже указывает на новый IP (Step 1):
+
+```bash
+scp scripts/nginx-catalyst.conf root@<new-ip>:/etc/nginx/sites-available/catalyst
+ssh root@<new-ip> "ln -sf /etc/nginx/sites-available/catalyst /etc/nginx/sites-enabled/ && nginx -t && systemctl reload nginx"
+ssh root@<new-ip> "certbot --nginx -d catalystparser.io -d www.catalystparser.io"
+```
+
+**Step 7 — Восстанови cron-задачи**
+
+- Backup: скрипт синкается деплоем в `/usr/local/bin/catalyst-backup.sh`; пересоздай `/etc/cron.d/catalyst-backup` (03:30 UTC) — см. §6.
+- Cert-check: переустанови `/usr/local/bin/check-cert-expiry.sh` + `/etc/cron.daily/catalyst-cert-check` — см. §4.2.
+
+**Step 8 — Финальная проверка**
+
+- `curl https://catalystparser.io/api/health` → 200
+- Дашборд в браузере → видны trends/users из бэкапа
+- Бот → `/start` → отвечает
+- `docker compose logs -f app` → чисто, без ошибок старта
+
+**Step 9 — WORKLOG**
+
+Запиши в `ai-context/WORKLOG.md`: дата, причина DR, какой бэкап восстановили, RTO (время до рабочего сервиса), что пошло не так.
+
+**Целевые метрики:** RTO ~30-60 мин при секретах под рукой. RPO ≤ 24ч (суточный бэкап) — тренды/события с момента последнего ночного бэкапа теряются.
+
 ---
 
 ## 7. Updates / rolling deploys
@@ -440,6 +513,13 @@ sudo systemctl restart catalyst
 **Pre-deploy validation gate** (Bundle #16, 2026-06-04): Deploy скрипт автоматически вызывает `npm run check:spa` ДО архивации. Если в inline React SPA (`src/dashboard/server.js` или `src/admin/server.js`) есть syntax error — backtick в комментарии внутри template literal, `\n` в строке, double-escape в regex — validator ловит это и abort'ит deploy. Сломанный SPA до прода не доходит.
 
 Manual local check (быстрая проверка перед commit): `npm run check:spa` или `npm run check`.
+
+**Database migrations** run automatically on every app/container boot —
+`_migrate()` in `src/db/database.js` applies `src/db/schema.sql` (idempotent
+`CREATE TABLE/INDEX IF NOT EXISTS`) plus any `ALTER TABLE ADD COLUMN` steps, and
+clears stale in-flight locks. **No manual migration step is needed** for a
+deploy — just restart and the schema catches up. Migration activity shows in the
+startup logs.
 
 ---
 
@@ -471,7 +551,7 @@ Returns `{ ok: true, uptime: <seconds>, paused: <bool> }`. Public, no auth.
 For the admin port (only reachable from localhost / SSH tunnel):
 
 ```
-GET http://127.0.0.1:8080/api/health
+GET http://127.0.0.1:8081/api/health
 ```
 
 ---
@@ -591,7 +671,63 @@ What to watch for the first week:
 
 ---
 
-## 13. Future hardening (not blocking for v1)
+## 13. Common troubleshooting
+
+Быстрый incident-response по частым проблемам. Команды предполагают Docker-деплой (`docker compose` из `/opt/catalyst`); для systemd-варианта замени `docker compose logs app` на `journalctl -u catalyst`.
+
+### Бот не отвечает на `/start`
+
+```bash
+docker compose logs --tail 100 app | grep -iE "polling|telegram|401|409"
+```
+
+- `401 Unauthorized` → протух/неверный `TELEGRAM_BOT_TOKEN` (ротация — §10.1).
+- `409 Conflict` → два инстанса с одним токеном (старый контейнер не умер, или локальный dev параллельно). `docker ps`, убей дубликат.
+- Тишина в логах → процесс умер: `docker compose ps`, затем `docker compose restart app`.
+
+### Dashboard отдаёт 502 / не открывается
+
+```bash
+curl -I http://127.0.0.1:8080/api/health   # на самом VPS
+docker compose ps
+```
+
+- `health` 200 локально, но снаружи 502 → проблема в nginx: `nginx -t`, `systemctl status nginx`, `tail /var/log/nginx/error.log`.
+- `health` не отвечает локально → app лежит: `docker compose logs --tail 50 app`, рестарт.
+- TLS-ошибка в браузере → серт протух, см. §4.2.
+
+### Apify quota exceeded (X/TikTok сбор встал)
+
+```bash
+docker compose logs app | grep -iE "apify|quota|429"
+```
+
+- Кончился лимит Apify → сбор X/TikTok тихо деградирует, **Reddit + Google Trends продолжают работать** (они без Apify). Проверь баланс на console.apify.com.
+
+### Один коллектор в краш-лупе
+
+```bash
+docker compose logs app | grep -iE "collector|crash|unhandled"
+```
+
+- Источник кидает ошибку каждый цикл → отключи его в дашборде (как admin-юзер) → страница `/sources`, разберись с ключом/лимитом, включи обратно. Остальные коллекторы изолированы и продолжают работать.
+
+### Высокое потребление памяти / контейнер рестартует (OOM)
+
+```bash
+docker stats --no-stream catalyst-app
+docker compose logs app | grep -iE "oom|heap"
+```
+
+- Норма — стабильно <300MB. Постоянный рост → подозревай Map-leak (см. §12). Временный фикс: `docker compose restart app`. Лимит памяти контейнера — 1GB (docker-compose).
+
+### `database is locked` / SQLITE_BUSY в логах
+
+- Редко, при тяжёлой конкуренции записи. `busy_timeout=5000` уже выставлен (Bundle #10). Если повторяется часто → проверь, не висит ли ручной `sqlite3`-коннект к боевой БД (закрой его), и не идёт ли backup в момент пиковой записи.
+
+---
+
+## 14. Future hardening (not blocking for v1)
 
 - **Telegram webhook** — drops alert latency from 3-5s polling to ~instant
 - **Redis** for `_authVerifyAttempts`, `_authInitiateAttempts`,

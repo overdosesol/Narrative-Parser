@@ -1496,6 +1496,45 @@ class TrendDatabase {
     return result.lastInsertRowid;
   }
 
+  /**
+   * Save many trend payloads in a SINGLE transaction (one fsync for the whole
+   * batch instead of one per row — see audit DB-013/TXN). Each payload is a
+   * fully-built trend object exactly as you'd pass to saveTrend(); this only
+   * changes HOW they're committed, not what gets written.
+   *
+   * @param {Array<object>} payloads - pre-built trend objects (caller sets
+   *        pipelineStatus / score / etc.).
+   * @param {object}   [opts]
+   * @param {boolean}  [opts.skipErrors=false] - when true a failed saveTrend is
+   *        caught (its id slot becomes null) instead of rolling back the whole
+   *        batch. Use for best-effort paths (e.g. hot-refresh) that previously
+   *        had a per-item try/catch.
+   * @param {function} [opts.onError] - called as onError(payload, err) for each
+   *        skipped failure (only when skipErrors=true).
+   * @returns {Array<number|null>} trend ids aligned to payloads order (null for
+   *          a skipped failure).
+   */
+  saveTrendsBatch(payloads, { skipErrors = false, onError = null } = {}) {
+    if (!Array.isArray(payloads) || payloads.length === 0) return [];
+    const run = this.db.transaction((items) => {
+      const ids = [];
+      for (const p of items) {
+        if (skipErrors) {
+          try {
+            ids.push(this.saveTrend(p));
+          } catch (e) {
+            ids.push(null);
+            if (onError) onError(p, e);
+          }
+        } else {
+          ids.push(this.saveTrend(p));
+        }
+      }
+      return ids;
+    });
+    return run(payloads);
+  }
+
   recordNotification(trendId, channel, userId = null) {
     this.db.prepare(`INSERT OR IGNORE INTO notifications (trend_id, channel, user_id) VALUES (?, ?, ?)`).run(trendId, channel, userId);
   }
@@ -2384,6 +2423,23 @@ class TrendDatabase {
         source ? String(source).slice(0, 32) : null,
       );
     } catch { /* non-fatal: history is decorative */ }
+  }
+
+  /**
+   * Record many alert-score-history rows in ONE transaction (audit DB-013/TXN).
+   * recordAlertScoreHistory swallows its own errors (decorative data), so this
+   * batch is resilient by construction — a bad row is skipped, the rest commit.
+   *
+   * @param {Array<{trendId, breakdown, floorAtTs, source}>} rows
+   * @returns {number} number of rows processed
+   */
+  recordAlertScoreHistoryBatch(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) return 0;
+    const run = this.db.transaction((items) => {
+      for (const r of items) this.recordAlertScoreHistory(r);
+      return items.length;
+    });
+    return run(rows);
   }
 
   // Read last N points for a trend (newest first). Limit caps the array

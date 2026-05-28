@@ -702,6 +702,12 @@ class Scorer {
       );
 
       for (const trend of stage2Candidates) {
+        // NB (audit COST-007 — false positive): the Stage-2 cap is enforced by
+        // `.slice(0, stage2MaxCalls)` on stage2Candidates above. This counter
+        // is telemetry only (cost log line + admin pipeline UI) — it does NOT
+        // gate the loop. Counting attempts here (including failures, which can
+        // still burn tokens) is the correct semantics for a "calls" metric; do
+        // not move it inside the try to count only successes.
         metrics.stage2Calls++;
         try {
           const { inputTokens, outputTokens } = await this._stage2DeepDive(trend, stage2Cfg);

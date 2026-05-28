@@ -88,6 +88,7 @@ export function recomputeAlertScores(trends, alertWeights, db, opts = {}) {
   const floorAtTs = Number.isFinite(opts.floor) ? Math.round(opts.floor) : null;
   const recordHistory = typeof db?.recordAlertScoreHistory === 'function';
 
+  const historyRows = [];
   for (const t of trends) {
     let feedbackBoost = 50;
     let feedbackStats = null;
@@ -110,15 +111,26 @@ export function recomputeAlertScores(trends, alertWeights, db, opts = {}) {
     t.alertBreakdown = probe.breakdown;
     t._alertHardJunk = probe.hardJunk;
 
-    // Append sparkline point. Skip when we have no DB id (pre-persist trends
-    // wouldn't have anything to FK to anyway).
+    // Collect sparkline point. Skip when we have no DB id (pre-persist trends
+    // wouldn't have anything to FK to anyway). Flushed below in one transaction
+    // (audit DB-013) instead of one fsync per trend.
     if (recordHistory && t._dbId) {
-      db.recordAlertScoreHistory({
+      historyRows.push({
         trendId: t._dbId,
         breakdown: { ...probe.breakdown, score: probe.alertScore },
         floorAtTs,
         source: historySource,
       });
+    }
+  }
+  // Persist all sparkline points in a single transaction. Falls back to
+  // per-row writes if the batch helper isn't present (defensive — mirrors the
+  // recordHistory capability check above).
+  if (recordHistory && historyRows.length) {
+    if (typeof db.recordAlertScoreHistoryBatch === 'function') {
+      db.recordAlertScoreHistoryBatch(historyRows);
+    } else {
+      for (const r of historyRows) db.recordAlertScoreHistory(r);
     }
   }
   return trends;

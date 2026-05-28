@@ -258,18 +258,22 @@ export default class HotMetricsRefresher {
       }
 
       // ── Phase 3: persist back ────────────────────────────────────────────
+      // Batched into one transaction (audit DB-013) — same UPSERTs (by
+      // externalId), one fsync. skipErrors keeps the old per-item resilience:
+      // a single bad row is logged + skipped, the rest still commit. We do NOT
+      // map ids back to _dbId here — the Phase-4 alert filter relies on _dbId
+      // from the Phase-1 load, and changing that would alter who gets alerted.
       let saved = 0;
       let stage2Hits = 0;
-      for (const t of scored) {
+      const refreshPayloads = scored.map(t => {
         if (t.xSearchData) stage2Hits++;
-        try {
-          // saveTrend UPSERTs by externalId — same row gets updated.
-          this.db.saveTrend({ ...t, pipelineStatus: 'scored' });
-          saved++;
-        } catch (e) {
-          this.logger.warn?.(`[HotRefresh] saveTrend failed for ${t.externalId}: ${e.message}`);
-        }
-      }
+        return { ...t, pipelineStatus: 'scored' };
+      });
+      const refreshIds = this.db.saveTrendsBatch(refreshPayloads, {
+        skipErrors: true,
+        onError: (p, e) => this.logger.warn?.(`[HotRefresh] saveTrend failed for ${p.externalId}: ${e.message}`),
+      });
+      saved = refreshIds.filter(id => id != null).length;
       result.saved = saved;
       result.stage2Hits = stage2Hits;
 

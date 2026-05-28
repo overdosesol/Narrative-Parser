@@ -6,6 +6,144 @@
 Append-only внутри файла — порядок: новейшие архивированные сверху, старейшие снизу.
 Полная история до агрегации — в git.
 
+---
+
+## 2026-06-06 · sonnet · Bundle #19 — Dead code cleanup (QUAL-005/006/007/011 + SD-23 + chained dead const)
+
+**Цель**: удалить мёртвый код в dashboard SPA (~24 LOC + chained 8 LOC bonus) + 1 stale CSS comment update + 1 doc annotation. Tier 2 #19 из `docs/audit/INDEX.md` — самый высокий ROI Tier 2 (7.0).
+
+**Контекст**: Stage 11 audit пометил функции и CSS классы от прошлых iterations (R4 redesign + ранние UX experiments). Haiku-grep валидация подтвердила 0 actual usages для всех dead items до старта. Pure polish после foundation Tier 1 (Bundle #1/#16/#17 closed).
+
+**Метод**: brainstorm (`docs/superpowers/specs/2026-06-06-dead-code-cleanup-design.md`) → 9-task plan (`docs/superpowers/plans/2026-06-06-dead-code-cleanup.md`), subagent-driven T1-T8, operator T9. Per-task `npm run check:spa` validation gate (Bundle #16 deploy gate) после каждого `src/dashboard/server.js` edit — раннее обнаружение SPA-trap. **6 server.js edits, все прошли SPA check без revert'ов.**
+
+**Файлы**:
+- `src/dashboard/server.js` (~-35 LOC + ~3 lines updated):
+  - **T1** Updated CSS theme comment: "2 dark themes" → "3 themes (pulse default + ink + tide)" — QUAL-005 + SD-23
+  - **T2** Deleted `.toolbar` CSS class (+ orphan section comment) — QUAL-007 part 1
+  - **T3** Deleted `.kbd` CSS class — QUAL-007 part 2 (kbd_hint i18n key preserved — 2 usages)
+  - **T4** Deleted `lifespanLabel()` function — QUAL-006 part 1
+  - **T4.5** Bonus: deleted chained dead const `LIFESPAN_KEYS` (used only by deleted `lifespanLabel`) + its introducing comment. `LIFESPAN_VALUES` preserved (still imported + injected в SPA template)
+  - **T5** Deleted `memeClass()` function — QUAL-006 part 2
+  - **T6** Deleted `memeColor()` function (NOT const at line ~9617 — explicit verify const stays) — QUAL-006 part 3 + closes QUAL-011 (shadow risk resolved, only const remains)
+- `ai-context/WORKLOG_ARCHIVE.md` (+1 bullet): annotation к R4 entry о partial coverage (~85% glyphs, 18 emoji остались per UX-003) — SD-14
+
+**T7 (SESSION_CONTEXT useEffect count) — no-op**: drift не было (Stage 12 sync-pass уже резолвил это, либо документ изначально не упоминал точное число). Bonus discovery: реальный count в CatMascot = **14 useEffects** (audit assumed 11, actual differs). Out of scope, не правил.
+
+**Verification**:
+- SPA check (`npm run check:spa`) после каждого из 6 server.js edits → exit 0, без revert'ов
+- Final cross-file review (sonnet): 7/7 checks pass — dead items count 0, live items count preserved, SPA OK, scope clean, diff sanity OK
+- Char count baseline: Dashboard SPA 342963 → 342072 chars (≈ -1KB после deletes), Admin SPA unchanged 266605 chars
+
+**Closed findings**:
+- QUAL-005 (CSS theme comment updated to 3 themes)
+- QUAL-006 (3 dead functions deleted: lifespanLabel, memeClass, memeColor)
+- QUAL-007 (2 dead CSS classes deleted: .toolbar, .kbd)
+- QUAL-011 (shadow risk resolved — function gone, only const memeColor remains)
+- SD-14 (WORKLOG_ARCHIVE R4 annotation о ~85% coverage)
+- SD-23 (resolved together с QUAL-005)
+- **Bonus**: chained dead const `LIFESPAN_KEYS` (8 LOC) — not in audit, found by T4 subagent
+
+**Не закрыто (deferred)**:
+- QUAL-013 (useEffect count drift) — no-op в SESSION_CONTEXT, drift не existed. Bonus discovery (audit 11 vs actual 14) — отдельный mini-bundle если operator захочет.
+- T9 operator smoke (final `npm run check:spa`, `npm run dev` startup, browser smoke) — ждёт operator.
+
+**Tier 2 progress**: Bundle #19 closed (first из 5 Tier 2 bundles). Tier 2 remaining: #2 audit log persistence (~4h), #3 URL safety (~2h), #11 A11y sprint (~4h), #13 error visibility (~4h). Tier 2 total ~14h ahead.
+
+**Риски/заметки**:
+- SPA validation gate (Bundle #16) отработал идеально — каждый edit прошёл check:spa без откатов. Это validates наш design choice (T6 deploy hardening) — validators реально ловят bugs до того как они уйдут в прод.
+- `const memeColor` at line ~9617 explicitly verified survived T6 delete. Usages on lines ~9747, ~9750 preserved.
+- Chained dead code pattern: subagent T4 предупредил о LIFESPAN_KEYS становящемся dead после `lifespanLabel` delete. T4.5 cleanup'ил same session. Pattern для будущих bundles: после function delete grep всё что только эта функция использовала.
+- `docs/superpowers/specs/2026-06-06-*.md` + `docs/superpowers/plans/2026-06-06-*.md` — planning artifacts, untracked. Operator может включить в commit Bundle #19 или оставить как pending.
+
+---
+
+## 2026-06-05 · sonnet · Bundle #17 — Cert + infra visibility (PROD-007/008/021 + DOC-003/004 + port drift)
+
+**Цель**: версионировать prod nginx config в репо, добавить cert expiry monitoring + cron, задокументировать cert renewal + secret rotation SOPs. Tier 1 #17 из `docs/audit/INDEX.md`.
+
+**Контекст**: prod nginx config жил только на VPS (`/etc/nginx/sites-available/catalyst`) → drift unrecoverable. HTTPS мог тихо умереть на 90д (нет alerting'а). Secret rotation был 1-liner stub в DEPLOY.md §10. Operator принёс prod nginx через `ssh cat` — bonus discovered drift в DEPLOY.md §4 (пример port 7357 vs real 8080, admin tunnel 8080 vs real 8081). Закрыли заодно.
+
+**Метод**: brainstorm (`docs/superpowers/specs/2026-06-05-cert-infra-visibility-design.md`) → 7-task plan (`docs/superpowers/plans/2026-06-05-cert-infra-visibility.md`), subagent-driven T1-T6, operator-driven T7. Operator выбрал «Минимум» scope per Bundle #16 pattern (TG bot pings + auto-deploy nginx + external uptime monitor + DR section deferred).
+
+**Файлы**:
+- `scripts/nginx-catalyst.conf` (new, 56 lines) — exact prod copy + source-of-truth header (Bundle #17, manual sync procedure). Содержание: `server_name catalystparser.io www.catalystparser.io`, `proxy_pass http://127.0.0.1:8080`, certbot-managed TLS, set_real_ip_from 127.0.0.1, 4 X-headers + Authorization passthrough, HTTP→HTTPS redirect
+- `scripts/check-cert-expiry.sh` (new, mode 100755) — bash + openssl s_client external check, exit 1 если < 14 дней (WARN_DAYS=14), exit 2 если fetch fails, log в `/var/log/catalyst-cert.log` через tee
+- `DEPLOY.md` — port drift fix 4 + 1 bonus места (dashboard 7357→8080, admin 8080→8081, nginx proxy_pass пример, ssh tunnel пример, firewall comment) + new §4.2 TLS certificate renewal verification (~70 lines: install snippet, daily auto-check, manual verification, if-renewal-failed, nginx config in repo note) + new §10.1 Secret rotation (~50 lines: 12-key schedule table + 6-step per-key procedure + 5-step incident response)
+- `ai-context/SESSION_CONTEXT.md` (+3 bullets, line 750) — Production posture: nginx config, Cert monitoring, Secret rotation — все ref на Bundle #17
+
+**Деплой/проверка (T7 operator-driven)**:
+- `scp scripts/check-cert-expiry.sh root@vps:/usr/local/bin/` + chmod +x → success
+- Cron entry `/etc/cron.daily/catalyst-cert-check` создан, chmod +x → success
+- Manual test: `ssh root@vps "/usr/local/bin/check-cert-expiry.sh catalystparser.io"` → `OK: catalystparser.io cert valid for 68 days (expires Aug 3 15:20:52 2026 GMT)`, exit 0. Comfortable margin (68 >> 14).
+- nginx diff `ssh ... cat /etc/nginx/sites-available/catalyst` vs `scripts/nginx-catalyst.conf` → only diffs: новый header comment (intended) + cosmetic whitespace cleanup. Content semantically identical.
+
+**Closed findings (audit series)**:
+- PROD-007 (nginx config теперь в репо как `scripts/nginx-catalyst.conf`, manual sync задокументирован в DEPLOY.md §4.2)
+- PROD-008 (daily cert expiry check via cron — warn если < 14д, верифицирован live: 68 days margin)
+- PROD-021 (secret rotation полностью задокументирован в DEPLOY.md §10.1: 12-key schedule + per-key procedure + incident response)
+- DOC-003 (DEPLOY.md §4.2 full cert renewal verification SOP)
+- DOC-004 (DEPLOY.md §10.1 full secret rotation SOP)
+
+**Bonus** (discovered during brainstorm, not in audit):
+- DEPLOY.md §4 port drift: dashboard 7357→8080, admin 8080→8081, proxy_pass example, ssh tunnel example. **+1 subagent-discovered**: firewall comment line ("# DO NOT open 7357, 8080" → "8080, 8081"). 5 fix'ов total.
+
+**Не закрыто (deferred)**:
+- TG bot pings при cert expiry — Bundle #15 (Bot resilience) territory
+- Auto-deploy nginx config через `deploy.{ps1,sh}` — требует `sudo nginx -t && systemctl reload nginx` логику; defer как риск сломать prod при broken config
+- External uptime monitor (UptimeRobot/BetterStack) — operator может настроить отдельно при желании
+- DR section в DEPLOY.md (VPS погиб целиком) — большой scope, отдельный bundle
+
+**Tier 1 progress**: **Tier 1 fully closed** — Bundle #1 + #16 + #17. Все 5 critical audit'а серии разрешены (DB-001/003 false-positive, DB-002+004 Bundle #1, QUAL-001 Bundle #16). Operational readiness восстановлен. Tier 2 next: 5 bundles общим ~15h — #2 audit log persistence, #3 URL safety, #11 A11y compliance, #13 error visibility, #19 dead code cleanup.
+
+**Риски/заметки**:
+- T1 subagent потерял ` # managed by Certbot` коммент на `return 404;` строке (likely markdown rendering quirk при копировании из prompt). Controller post-fix'нул через targeted Edit. Cosmetic only — certbot CLI might re-add марк при следующем renewal.
+- `scripts/nginx-catalyst.conf` теперь source of truth — если кто-то правит `/etc/nginx/sites-available/catalyst` на VPS вручную, drift молчит. Mitigation defer (можно добавить quarterly diff в drill procedure).
+- Cert check использует GNU `date -d` — на BSD упадёт. Catalyst prod = Debian/Ubuntu (GNU), OK.
+- В случае cron MAILTO not configured, operator проверяет `/var/log/catalyst-cert.log` руками. Pattern documented в §4.2.
+
+---
+
+## 2026-06-04 · sonnet · Bundle #16 — Deploy hardening (QUAL-001 + PROD-002/003)
+
+**Цель**: интегрировать существующие SPA validators в обязательный deploy gate + sync drift между deploy.ps1 и deploy.sh. Tier 1 #16 из `docs/audit/INDEX.md` master backlog.
+
+**Контекст**: validators (`scripts/check-dashboard-spa.cjs`, `scripts/check-admin-spa.cjs`) существовали с тех пор как backtick traps срабатывали 3 раза за неделю, но никогда не вызывались автоматически. Audit пометил это QUAL-001 (CRITICAL) — defensive infra без integration. PROD-003 — этот же gap с прод-стороны. PROD-002 — `.sh` отстал от `.ps1` (нет ServerAlive flags на scp, нет EvilCatPack/.claude/posts/ai-context в zip exclude).
+
+**Метод**: brainstorm (`docs/superpowers/specs/2026-06-04-deploy-hardening-design.md`) → 7-task plan (`docs/superpowers/plans/2026-06-04-deploy-hardening.md`), subagent-driven для T1-T5, operator-driven для T7. T6 (synthetic negative test) skip'нут оператором — positive test уже показал что validators реально импортируют SPA и валидируют (342963 chars dashboard, 266605 chars admin).
+
+**Файлы**:
+- `package.json` (+2 lines) — `"check:spa"` chain + `"check"` umbrella alias
+- `deploy.ps1` — новая `[1/5] Validating SPA syntax` phase + renumber [1/4]..[4/4] → [2/5]..[5/5]
+- `deploy.sh` — симметричная `[1/5]` phase + ServerAlive flags на 4 scp calls + zip exclude расширен 4 entries (`.claude/*`, `posts/*`, `ai-context/*`, `EvilCatPack/*`)
+- `DEPLOY.md` (+~6 lines в §7) — note о pre-deploy validation gate
+- `ai-context/SESSION_CONTEXT.md` (+1 bullet) — Deploy gate в Production posture
+
+**Verification**:
+- Positive: `npm run check:spa` локально → exit 0, оба validators OK
+- Cross-file review (sonnet): 8/8 checks pass — naming consistent, phases симметричны, ServerAlive 4/4, exclude list complete, docs cross-referenced
+- Real deploy: `./deploy.ps1` показал `[1/5] Validating SPA syntax... → Dashboard SPA inner OK → SPA inner OK → SPA OK` → продолжил архивацию → завершился успешно
+
+**Closed findings**:
+- QUAL-001 (validators integrated в deploy gate) — **CRITICAL → resolved**
+- PROD-002 (deploy.sh symmetric с deploy.ps1 — ServerAlive + exclude list)
+- PROD-003 (pre-deploy validation now mandatory)
+
+**Не закрыто (deferred)**:
+- PROD-004 (rollback feature) — отдельный mini-PR на ~3-4h. Включает image tagging + DB backup hook + `--rollback` flag. Out of scope текущего bundle (operator выбрал «Минимум»).
+
+**Series milestone**: после Bundle #16 **все 5 critical** из 12-stage audit разрешены. DB-001/003 = false-positive audit (prod уже OK), DB-002+DB-004 = Bundle #1, QUAL-001 = Bundle #16. Critical-free posture восстановлен.
+
+**Bonus**: subagent fix T3 (deploy.ps1) добавил `Join-Path $LOCAL_DIR` (CWD-independence) + colored Write-Host для consistency с соседними блоками — улучшение из code review, не было в исходном spec.
+
+**Риски/заметки**:
+- Если validator сам падает (bug в check-*-spa.cjs) — блокирует deploy. Fallback: оператор может разово закомментить `npm run check:spa` блок в deploy.{ps1,sh}.
+- `npm` теперь required на dev машине для deploy. Раньше можно было deploy без node (только scp/ssh).
+- Phase renumber [1/4] → [1/5] — внутренние UX labels, никто на них не парсится.
+- T6 (synthetic negative test) skip'нут оператором as nice-to-have, не блокер.
+
+**Tier 1 progress**: Bundle #1 + Bundle #16 closed. Остались: #18 QA infrastructure (~3h) + #17 cert visibility (~3h).
+
+---
 
 ## 2026-06-03 · sonnet · Bundle #1 — Backup integrity rewrite (T1-T7 implementation)
 

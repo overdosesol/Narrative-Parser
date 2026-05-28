@@ -766,12 +766,16 @@ Catalyst публично захощен на `https://catalystparser.io` (TLS, 
 - **Bundle #7 (/api/scan admin gate + pause persistence)** — `_handleScan` в `src/dashboard/server.js` теперь требует `plan_name === 'admin'` (403 `reason: 'plan'` иначе) + сразу пишет `lastScanStartedAt` в settings. `/api/scanners/{pause,resume}` в `src/admin/server.js` теперь persist'ят `scanner_paused` через `setSetting('1'|'0')`. На boot `src/index.js` восстанавливает `appState.paused` из DB. Закрывает SEC-001 + PIPE-004 + BILL-003 + ADM-018 + SD-16. No schema change — re-uses existing settings table.
 - **A11y compliance** (Bundle #11, 2026-05-28): focus trap для 5 modals (Lightbox, TrendModal, AnalyzePanel, SettingsPanel, AccountPanel) через inline `useFocusTrap(ref, isOpen)` hook в SPA template. Semantic landmarks: `<main id="main-content">` (main-feed), `<aside aria-label="Navigation">` (sidebar), `<aside aria-label="Top narratives">` (right-panel-sticky). Skip link `<a href="#main-content" className="skip-link">` first child of dashboard-grid с visible-on-focus CSS. Heading hierarchy: `right-section-title` теперь `<h2>` (2 sites), `modal-section-label` теперь `<h3>` (9 sites). 2 clickable divs (`.top-item` + interactive `.session-chip`) теперь `role="button"` + `tabIndex={0}` + `onKeyDown` (Enter/Space). CatMascot: `aria-hidden="true"` на root div + `prefers-reduced-motion` extended на cat animations. **Admin SPA not touched** (out of audit scope). Closes UX-002, UX-006, UX-012, UX-013, UX-017, CAT-001, CAT-008.
 
-**Tier 1+2 audit-fix status** (as of 2026-05-28):
+**Audit-fix backlog status** (as of 2026-05-29):
 - Tier 1: 3/4 closed (#1 Backup integrity, #16 Deploy hardening, #17 Cert/infra visibility). Outstanding: **#18 QA infra bootstrap** (~3h, Tier 1 last item).
 - Tier 2: 5/5 closed (#2 Observability persistence, #3 URL safety, #11 A11y compliance, #13 Error visibility, #19 Dead code cleanup). **Tier 2 fully done.**
-- Tier 3 (~12h, 4 bundles): #15 Bot resilience, #8 Rate-limits + cooldowns, #6 Housekeeping + admin UI, #10 DB constraints + retention.
-- Tier 4 (~11h, 7 bundles): polish items per `docs/audit/INDEX.md`.
-- ⚠ **5 bundles in working tree uncommitted** (#2, #3, #11, #13, #19) — see WORKLOG entries для details. Migration script `scripts/migrate-audit-log-2026-06-07.sql` (Bundle #2) needed on VPS before deploy.
+- Tier 3: **4/4 closed** (#15 Bot resilience, #10 DB constraints + retention, #6 Housekeeping + admin UI, #8 Rate-limit + cooldown). **Tier 3 fully done.**
+- Tier 4: 4/7 closed (#7 /api/scan admin gate + pause persistence, #20 README + DEPLOY runbooks, #4 db.transaction batch save loops, #9 hover-preview plan-check + rate-limit — verified pre-closed by #3/#8). Remaining 3: #5 sqliteCutoff consolidation, #12 theme contract sync, #14 i18n strict-mode sweep.
+- ⚠ **Working tree (uncommitted, pending operator commit):** Bundle #20 docs (`README.md` new, `DEPLOY.md`) + Bundle #4 code (`src/db/database.js`, `src/index.js`, `src/refresh/hot-metrics.js`, `src/notifications/alert-dispatcher.js`, `src/analysis/scorer.js`) + `ai-context/WORKLOG.md` + this marker. Earlier bundles #15/#10/#6/#8/#7 already committed.
+- ⚠ **Operator action items before/at deploy:**
+  - Bundle #10: run `scripts/migrate-db-constraints-2026-05-28.sql` on VPS (orphan sweep + notifications dedup + UNIQUE index) BEFORE deploying new `database.js` with `foreign_keys=ON`. Verify with `PRAGMA foreign_key_check;` (expect 0 rows).
+  - Bundle #6: ensure `/etc/catalyst.env` on VPS contains `TG_BOT_TOKEN` + `SUPPORT_GROUP_ID` so `catalyst-backup.sh` can fire TG alert on backup failure (silent skip if unset — not fatal).
+  - Bundle #1 (pre-existing): first manual restore drill (T9) still outstanding.
 
 **Prod paths cheat-sheet** (для quick SQL/diagnostics):
 - **Код**: `/opt/catalyst` (host) — туда деплоится через `deploy.ps1`/`deploy.sh`.

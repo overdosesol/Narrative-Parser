@@ -587,17 +587,16 @@ async function runScanCycle() {
     // Save "save_only" items directly (no AI cost, no alerts). They now
     // carry PreStage data into the DB even though they never went to Stage 1
     // — a future cycle that re-clusters this narrative will benefit.
-    for (const trend of toSave) {
-      db.saveTrend({
-        ...trend,
-        score:           0,
-        memePotential:   0,
-        aiExplanation:   null,
-        predictedLifespan: null,
-        category:        null,
-        sentiment:       null,
-      });
-    }
+    // Batched into one transaction (audit DB-013) — same rows, one fsync.
+    db.saveTrendsBatch(toSave.map(trend => ({
+      ...trend,
+      score:           0,
+      memePotential:   0,
+      aiExplanation:   null,
+      predictedLifespan: null,
+      category:        null,
+      sentiment:       null,
+    })));
     if (toSave.length > 0) {
       logger.info(`Saved ${toSave.length} low-signal trends (no AI scoring)`);
     }
@@ -638,20 +637,25 @@ async function runScanCycle() {
     const allToSave = validTrends.filter(t =>
       (t.score || 0) >= minScoreToSave || (t.memePotential || 0) >= minScoreToSave
     );
-    for (const trend of allToSave) {
-      // pipeline_status governs isTrendSeen behaviour on the NEXT scan:
-      //   'scored'     → blocked (within rescoreCooldownHours) — AI got a real verdict
-      //   'save_only'  → always pass through — needs another shot at AI
-      //
-      // _aiUnavailable flag is set by scorer._fallback when the LLM provider
-      // returned 5xx / timeout / parse-error and we had to use heuristic
-      // scoring. We mark such trends 'save_only' so next scan re-attempts
-      // the AI call (and the alert-dispatcher.ai_score gate suppresses
-      // the bogus heuristic-only alert in the meantime).
-      const status = trend._aiUnavailable ? 'save_only' : 'scored';
-      const trendId = db.saveTrend({ ...trend, pipelineStatus: status });
-      trend._dbId = trendId;
-    }
+    // pipeline_status governs isTrendSeen behaviour on the NEXT scan:
+    //   'scored'     → blocked (within rescoreCooldownHours) — AI got a real verdict
+    //   'save_only'  → always pass through — needs another shot at AI
+    //
+    // _aiUnavailable flag is set by scorer._fallback when the LLM provider
+    // returned 5xx / timeout / parse-error and we had to use heuristic
+    // scoring. We mark such trends 'save_only' so next scan re-attempts
+    // the AI call (and the alert-dispatcher.ai_score gate suppresses
+    // the bogus heuristic-only alert in the meantime).
+    //
+    // Batched into one transaction (audit DB-013) — same UPSERTs, one fsync.
+    // saveTrendsBatch returns ids in payload order; map them back to _dbId so
+    // the alert-dispatch step below can reference each trend's DB row.
+    const saveBatch = allToSave.map(trend => ({
+      ...trend,
+      pipelineStatus: trend._aiUnavailable ? 'save_only' : 'scored',
+    }));
+    const savedIds = db.saveTrendsBatch(saveBatch);
+    allToSave.forEach((trend, i) => { trend._dbId = savedIds[i]; });
     appState.cycleInProgress.save = allToSave.length;
 
     logger.info(`Scored ${scoredTrends.length} trends, saved ${allToSave.length}`);
