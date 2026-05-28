@@ -7,6 +7,7 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { timingSafeEqual } from 'crypto';
+import { sqliteCutoff } from '../utils/sqlite-time.js';
 import {
   PRESET_KEYS as PRESET_CONFIG_KEYS,
   PRESET_GROUPS,
@@ -160,8 +161,8 @@ class AdminServer {
   _getStats() {
     const db = this.db.db;
     const now = new Date();
-    const day7 = new Date(now - 7*86400000).toISOString();
-    const day30 = new Date(now - 30*86400000).toISOString();
+    const day7 = sqliteCutoff(7*86400000);
+    const day30 = sqliteCutoff(30*86400000);
 
     const totalUsers = db.prepare(`SELECT COUNT(*) as n FROM users`).get().n;
     const activeUsers = db.prepare(`SELECT COUNT(*) as n FROM users WHERE status='active'`).get().n;

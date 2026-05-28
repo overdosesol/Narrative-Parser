@@ -9,8 +9,8 @@
  *     to other similarity signals (image hash, entity overlap, Jaccard).
  *   - Batched: a single HTTP call per cycle, up to 2048 inputs (OpenAI cap).
  *   - In-memory LRU keyed by text hash so repeated trends across consecutive
- *     cycles don't pay twice. TTL configurable; default 5min matches the
- *     scan interval × 2.
+ *     cycles don't pay twice. TTL configurable via EMBEDDING_CACHE_TTL_MS
+ *     (default 5min) — long enough to dedupe re-scored trends within a cycle.
  *
  * Cosine similarity helper exported alongside — the clusterer uses dot
  * product (vectors are L2-normalised by OpenAI, so dot == cosine).

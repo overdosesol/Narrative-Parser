@@ -6,6 +6,7 @@ import { calculateJunkPenalty } from './junk-filter.js';
 
 // [PRESET_CONFIG] per-preset cluster + junk knobs (PR-2 of preset-configs)
 import { getActivePresetConfig } from './preset-config.js';
+import { sqliteCutoff } from '../utils/sqlite-time.js';
 
 // [MULTI_SIGNAL] semantic + perceptual similarity inputs. Both modules degrade
 // to null on any failure, so the clusterer keeps working even if OpenAI or
@@ -618,7 +619,7 @@ class NarrativeClusterer {
     if (words.length < 2) return [];
 
     const pattern = '%' + words.slice(0, 2).join('%').substring(0, 35) + '%';
-    const cutoff  = new Date(Date.now() - this.DB_WINDOW_HOURS * 3_600_000).toISOString();
+    const cutoff  = sqliteCutoff(this.DB_WINDOW_HOURS * 3_600_000);
 
     try {
       return this.db.db.prepare(`

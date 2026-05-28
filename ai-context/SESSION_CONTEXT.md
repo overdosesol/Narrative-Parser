@@ -552,12 +552,13 @@ Forward-looking прогноз: что подтолкнёт **дальнейши
 
 ## Theme system (dashboard)
 
-2 dark темы через `body[data-theme="..."]`. localStorage `ts_theme`.
+3 темы. `pulse` — дефолт, задаётся в `:root` (без `data-theme` атрибута); `ink`/`tide` — оверрайды через `body[data-theme="ink"|"tide"]`. localStorage `ts_theme`.
 
 | Theme | bg | accent | use case |
 |---|---|---|---|
-| `ink`  | `#000000` | `#1d9bf0` | **default**, X true-black |
-| `tide` | `#0a1622` | `#4dd4e0` | deep navy + cyan/aqua accent (crypto-terminal vibe) |
+| `pulse` | soft graphite | `#4ade80` (green) | **default**, `:root` baseline (без attribute) |
+| `ink`  | `#000000` | `#1d9bf0` | pure black + X-blue (`data-theme="ink"`) |
+| `tide` | `#0a1622` | `#4dd4e0` | deep navy + cyan/aqua accent (crypto-terminal vibe, `data-theme="tide"`) |
 
 **Дизайн-принципы**:
 - Один accent на тему (через `--accent-rgb` для `rgba(var(--accent-rgb), α)` — никаких hardcoded rgba).
@@ -566,7 +567,7 @@ Forward-looking прогноз: что подтолкнёт **дальнейши
 - Glossy: `--gloss-top: inset 0 1px 0 rgba(255,255,255,.04)`, `--gloss-edge: inset 0 0 0 1px rgba(255,255,255,.02)`.
 - Surfaces: везде `var(--surface)` — карточки матчат сайдбар, разделяются только 1px бордером.
 
-`detectTheme()` дефолтит на `ink`. Юзеры со старой темой автоматически переключаются на default через validity-check — миграция не нужна.
+`SUPPORTED_THEMES = ['pulse','ink','tide']`; `detectTheme()` дефолтит на `pulse`, `applyThemeAttr()` ставит `data-theme` только для не-pulse (pulse = baseline, атрибут снимается). Юзеры с невалидной сохранённой темой откатываются на дефолт через validity-check — миграция не нужна.
 
 ## Dashboard layout
 
@@ -767,11 +768,11 @@ Catalyst публично захощен на `https://catalystparser.io` (TLS, 
 - **A11y compliance** (Bundle #11, 2026-05-28): focus trap для 5 modals (Lightbox, TrendModal, AnalyzePanel, SettingsPanel, AccountPanel) через inline `useFocusTrap(ref, isOpen)` hook в SPA template. Semantic landmarks: `<main id="main-content">` (main-feed), `<aside aria-label="Navigation">` (sidebar), `<aside aria-label="Top narratives">` (right-panel-sticky). Skip link `<a href="#main-content" className="skip-link">` first child of dashboard-grid с visible-on-focus CSS. Heading hierarchy: `right-section-title` теперь `<h2>` (2 sites), `modal-section-label` теперь `<h3>` (9 sites). 2 clickable divs (`.top-item` + interactive `.session-chip`) теперь `role="button"` + `tabIndex={0}` + `onKeyDown` (Enter/Space). CatMascot: `aria-hidden="true"` на root div + `prefers-reduced-motion` extended на cat animations. **Admin SPA not touched** (out of audit scope). Closes UX-002, UX-006, UX-012, UX-013, UX-017, CAT-001, CAT-008.
 
 **Audit-fix backlog status** (as of 2026-05-29):
-- Tier 1: 3/4 closed (#1 Backup integrity, #16 Deploy hardening, #17 Cert/infra visibility). Outstanding: **#18 QA infra bootstrap** (~3h, Tier 1 last item).
+- Tier 1: 3/4 closed (#1 Backup integrity, #16 Deploy hardening, #17 Cert/infra visibility). **#18 QA infra bootstrap — deprioritized 2026-05-29** (operator: малоценно для соло, добавляет husky/CI-возню; revisit перед масштабированием на команду). **Единственный незакрытый пункт всего бэклога.**
 - Tier 2: 5/5 closed (#2 Observability persistence, #3 URL safety, #11 A11y compliance, #13 Error visibility, #19 Dead code cleanup). **Tier 2 fully done.**
 - Tier 3: **4/4 closed** (#15 Bot resilience, #10 DB constraints + retention, #6 Housekeeping + admin UI, #8 Rate-limit + cooldown). **Tier 3 fully done.**
-- Tier 4: 4/7 closed (#7 /api/scan admin gate + pause persistence, #20 README + DEPLOY runbooks, #4 db.transaction batch save loops, #9 hover-preview plan-check + rate-limit — verified pre-closed by #3/#8). Remaining 3: #5 sqliteCutoff consolidation, #12 theme contract sync, #14 i18n strict-mode sweep.
-- ⚠ **Working tree (uncommitted, pending operator commit):** Bundle #20 docs (`README.md` new, `DEPLOY.md`) + Bundle #4 code (`src/db/database.js`, `src/index.js`, `src/refresh/hot-metrics.js`, `src/notifications/alert-dispatcher.js`, `src/analysis/scorer.js`) + `ai-context/WORKLOG.md` + this marker. Earlier bundles #15/#10/#6/#8/#7 already committed.
+- Tier 4: **6/7 closed** (#7 /api/scan gate, #20 README+DEPLOY docs, #4 db.transaction batching, #9 hover-preview pre-closed by #3/#8, #12 theme sync doc-only, #5 sqliteCutoff — **починен реальный space/T баг**, тихо ломавший fuzzy-дедуп / кластеризацию / getRecentTrends / admin 7-30д статы). **#14 i18n — DROPPED** (operator YAGNI). **Tier 4 полностью разобран.**
+- ⚠ **Commits:** оператор коммитит инкрементально по ходу (throwaway-сообщения вроде `7548575`). ai-context (WORKLOG + этот маркер) — source of truth по сделанному; git history — детали.
 - ⚠ **Operator action items before/at deploy:**
   - Bundle #10: run `scripts/migrate-db-constraints-2026-05-28.sql` on VPS (orphan sweep + notifications dedup + UNIQUE index) BEFORE deploying new `database.js` with `foreign_keys=ON`. Verify with `PRAGMA foreign_key_check;` (expect 0 rows).
   - Bundle #6: ensure `/etc/catalyst.env` on VPS contains `TG_BOT_TOKEN` + `SUPPORT_GROUP_ID` so `catalyst-backup.sh` can fire TG alert on backup failure (silent skip if unset — not fatal).
