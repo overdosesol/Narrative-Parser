@@ -12,6 +12,7 @@
  */
 
 import http from 'http';
+import { sqliteCutoff } from '../utils/sqlite-time.js';
 import path from 'path';
 import { LIFESPAN_VALUES, normalizeLifespan } from '../analysis/lifespan.js';
 import { runManualAnalysis, peekManualAnalysisCache } from '../analysis/manual-analysis.js';
@@ -129,9 +130,8 @@ export function maskId(id) {
  *
  * Symptom that revealed this: dashboard 6h window returned an empty feed.
  */
-function sqliteCutoff(msAgo) {
-  return new Date(Date.now() - msAgo).toISOString().slice(0, 19).replace('T', ' ');
-}
+// sqliteCutoff() now lives in src/utils/sqlite-time.js (imported at top) so
+// every module shares one correct implementation — see the bug note above.
 
 // ─── Plan-based gating helpers ────────────────────────────────────────────────
 // getPlanEntitlements is imported from src/billing/entitlements.js — shared

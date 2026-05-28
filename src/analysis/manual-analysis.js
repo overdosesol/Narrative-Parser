@@ -13,6 +13,7 @@
 // the others.
 
 import { resolveUrlToTrend } from './url-resolver.js';
+import { sqliteCutoff } from '../utils/sqlite-time.js';
 
 // ── Cross-user URL cache ────────────────────────────────────────────────────
 // Stage 2 deep-dive costs ~5¢ per call. If user A analyses URL X and user B
@@ -35,13 +36,6 @@ const RESULT_CACHE = new Map();              // cacheKey → { trend, pipeline, 
 // throughout a working day without paying twice for the same URL.
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;     // 6 hours
 const CACHE_MAX_ENTRIES = 200;               // LRU-ish soft cap, expired entries swept on every miss
-
-// SQLite stores CURRENT_TIMESTAMP as 'YYYY-MM-DD HH:MM:SS' (space, no T).
-// Local helper avoids importing from dashboard/server.js. Keep in sync with
-// sqliteCutoff() in dashboard if the storage format ever changes.
-function sqliteCutoff(msAgo) {
-  return new Date(Date.now() - msAgo).toISOString().slice(0, 19).replace('T', ' ');
-}
 
 function cacheKeyFor(url) {
   // Lowercase trim — different cases / trailing whitespace are the same URL.

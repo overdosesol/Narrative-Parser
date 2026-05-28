@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { PRESET_KEYS, validatePresetOverrides } from '../analysis/preset-config.js';
+import { sqliteCutoff } from '../utils/sqlite-time.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1165,7 +1166,7 @@ class TrendDatabase {
    *  query to filter out rows the user has dismissed. */
   getHiddenTrendIdsByChat(chatId, retentionDays = 7) {
     if (!chatId) return [];
-    const cutoff = new Date(Date.now() - retentionDays * 86400_000).toISOString();
+    const cutoff = sqliteCutoff(retentionDays * 86400_000);
     return this.db.prepare(
       `SELECT trend_id FROM hidden_trends WHERE chat_id = ? AND hidden_at > ?`
     ).all(String(chatId), cutoff).map(r => r.trend_id);
@@ -1175,7 +1176,7 @@ class TrendDatabase {
    *  Caller is responsible for shaping into TrendCard payload. */
   getHiddenTrendsByChat(chatId, retentionDays = 7, limit = 200) {
     if (!chatId) return [];
-    const cutoff = new Date(Date.now() - retentionDays * 86400_000).toISOString();
+    const cutoff = sqliteCutoff(retentionDays * 86400_000);
     return this.db.prepare(`
       SELECT t.*, h.hidden_at as hidden_at
       FROM hidden_trends h
@@ -1194,7 +1195,7 @@ class TrendDatabase {
 
   /** Sweep entries past the retention window. Called from maintenance loop. */
   cleanupExpiredHiddenTrends(retentionDays = 7) {
-    const cutoff = new Date(Date.now() - retentionDays * 86400_000).toISOString();
+    const cutoff = sqliteCutoff(retentionDays * 86400_000);
     return this.db.prepare(`DELETE FROM hidden_trends WHERE hidden_at < ?`)
       .run(cutoff).changes;
   }
@@ -1398,7 +1399,7 @@ class TrendDatabase {
   }
 
   isTrendSeenFuzzy(title, hoursBack = 6) {
-    const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteCutoff(hoursBack * 60 * 60 * 1000);
     const words = title.toLowerCase().split(/\s+/).filter(w => w.length > 4);
     if (words.length === 0) return false;
 
@@ -1550,7 +1551,7 @@ class TrendDatabase {
   }
 
   getRecentTrends(hours = 24) {
-    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteCutoff(hours * 60 * 60 * 1000);
     return this.db.prepare(`SELECT * FROM trends WHERE first_seen_at > ? ORDER BY score DESC`).all(cutoff);
   }
 
@@ -2459,7 +2460,7 @@ class TrendDatabase {
   // than a week visually, but keeping a month means we can debug "why did
   // this trend's score drop yesterday" after the fact.
   pruneAlertScoreHistory(retentionDays = 30) {
-    const cutoff = new Date(Date.now() - retentionDays * 86400_000).toISOString();
+    const cutoff = sqliteCutoff(retentionDays * 86400_000);
     const r = this.db.prepare(`DELETE FROM alert_score_history WHERE ts < ?`).run(cutoff);
     return r.changes | 0;
   }
