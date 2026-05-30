@@ -5283,14 +5283,21 @@ function BotPage() {
           }),
           React.createElement('span',null, aiDraft.deepReasoningEnabled ? 'Reasoning ON' : 'Reasoning OFF')
         ),
-        React.createElement('input',{
+        React.createElement('select',{
           className:'filter',
-          type:'text',
           style:{minWidth:260,maxWidth:360},
-          placeholder:'grok reasoning model id (e.g. grok-3-mini)',
-          value:aiDraft.stage2ReasoningModel,
+          value:aiDraft.stage2ReasoningModel || '',
           onChange:e=>setAiDraft(prev=>({ ...prev, stage2ReasoningModel: e.target.value }))
-        }),
+        },
+          React.createElement('option',{value:''},'— не задано (reasoning off) —'),
+          (() => {
+            const list = (aiModels.xai || []).slice();
+            const cur = aiDraft.stage2ReasoningModel;
+            if (cur && !list.includes(cur)) list.unshift(cur);
+            return list.map(m => React.createElement('option',{key:m,value:m},m));
+          })()
+        ),
+        React.createElement('button',{className:'btn btn-ghost btn-sm',onClick:loadAiModels},'↻ Models'),
         React.createElement('label',{style:{display:'flex',alignItems:'center',gap:6,fontSize:13}},
           React.createElement('span',null,'Reserve slots:'),
           React.createElement('input',{
@@ -5305,7 +5312,7 @@ function BotPage() {
         )
       ),
       React.createElement('div',{style:{fontSize:11,color:'var(--text3)',marginTop:4,lineHeight:1.4}},
-        'Reasoning активен только когда тумблер ON и model id задан. Reserve = сколько Stage 2 слотов отдаётся под эскалированные тренды.'
+        'Reasoning активен только когда тумблер ON и модель выбрана (список — Grok-модели, ↻ Models обновляет). Reserve = сколько Stage 2 слотов отдаётся под эскалированные тренды.'
       ),
 
       aiModelsError && React.createElement('div',{className:'mt16',style:{fontSize:12,color:'var(--red)'}},'Models API: ' + aiModelsError),
