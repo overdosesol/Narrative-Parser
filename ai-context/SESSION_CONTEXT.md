@@ -870,3 +870,4 @@ Bundle #5 (2026-05-29) свёл сюда 2 дубля (были в `dashboard/se
 - `ai-context/SESSION_CONTEXT.md` — этот файл (state-spec)
 - `ai-context/WORKLOG.md` — последние ~10 entries, append на верх
 - `ai-context/WORKLOG_ARCHIVE.md` — старше 10, архив
+- `ai-context/IDEAS.md` — бэклог отложенных идей/направлений (не state, не журнал)
