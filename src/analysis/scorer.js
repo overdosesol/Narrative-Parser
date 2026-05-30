@@ -319,6 +319,36 @@ export function computeAlertScore(trend, w = DEFAULT_ALERT_WEIGHTS) {
   };
 }
 
+// ─── Deep-escalation detection (Stage 1 → Stage 2 second-chance) ───────────
+// Conservative seed thresholds. Runtime-overridable via settings in scoreTrends.
+export const DEFAULT_ESCALATION_THRESHOLDS = {
+  lowMemeCeil:   50,  // model meme >= this → already "interesting", not under-scored
+  highEmergence: 65,  // cluster emergenceScore (0-100)
+  highViral:     60,  // metrics.twitter.viralityScore (0-100)
+  bigCluster:    8,   // clusterMetrics.itemCount (post count in the narrative)
+  junkFloor:     40,  // junkPenalty >= this → low score is legitimately explained by junk
+};
+
+function _escalEmergence(t) { return Number(t.emergenceScore ?? t.clusterMetrics?.emergenceScore) || 0; }
+function _escalViral(t)     { return Number(t.metrics?.twitter?.viralityScore) || 0; }
+function _escalItemCount(t) { return Number(t.clusterMetrics?.itemCount ?? (Array.isArray(t.items) ? t.items.length : 0)) || 0; }
+function _escalJunk(t)      { return Number(t.junkPenalty ?? t.clusterMetrics?.junkPenalty) || 0; }
+
+// Strongest objective-activity axis, normalized to ~0-100 (itemCount * 10, capped).
+export function escalationSignalStrength(trend) {
+  return Math.max(_escalEmergence(trend), _escalViral(trend), Math.min(100, _escalItemCount(trend) * 10));
+}
+
+// "Confident under-scoring": objective activity high, model meme low, not junk.
+export function isUnderscored(trend, th = DEFAULT_ESCALATION_THRESHOLDS) {
+  const meme = Number(trend.memePotential) || 0;
+  if (meme >= th.lowMemeCeil) return false;
+  if (_escalJunk(trend) >= th.junkFloor) return false;
+  return _escalEmergence(trend) >= th.highEmergence ||
+         _escalViral(trend)     >= th.highViral     ||
+         _escalItemCount(trend) >= th.bigCluster;
+}
+
 /**
  * AI Scorer — uses xAI Responses API to analyze trend virality and meme potential.
  *
