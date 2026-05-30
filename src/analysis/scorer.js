@@ -717,6 +717,14 @@ class Scorer {
     };
     const stage2Threshold = readNum('stage2Threshold', this.stage2Threshold);
     const stage2MaxCalls  = readNum('stage2MaxCalls',  this.stage2MaxCalls);
+    const escalationReserve = readNum('escalationReserve', 2);
+    const escThresholds = {
+      lowMemeCeil:   readNum('escLowMemeCeil',   DEFAULT_ESCALATION_THRESHOLDS.lowMemeCeil),
+      highEmergence: readNum('escHighEmergence', DEFAULT_ESCALATION_THRESHOLDS.highEmergence),
+      highViral:     readNum('escHighViral',     DEFAULT_ESCALATION_THRESHOLDS.highViral),
+      bigCluster:    readNum('escBigCluster',    DEFAULT_ESCALATION_THRESHOLDS.bigCluster),
+      junkFloor:     readNum('escJunkFloor',     DEFAULT_ESCALATION_THRESHOLDS.junkFloor),
+    };
 
     // ── Stage 2: x_search deep-dive for high-potential trends ──
     // Gates: threshold (default 60), max (default 6), skip google_trends, novelty gate.
@@ -726,26 +734,28 @@ class Scorer {
     // article/post URL to x_search, gtrends entries are bare keywords and
     // Grok can't deep-dive them. stage2MaxCalls cap also still applies;
     // manual is single-trend so cap-vs-1 doesn't matter in practice.
-    const stage2Candidates = stage1Results
-      .filter(t =>
-        t.source?.toLowerCase() !== 'google_trends' &&
-        (forceStage2 || (
-          t.memePotential >= stage2Threshold &&
-          t.clusterMetrics?.isNovel !== false
-        ))
-      )
-      .slice(0, stage2MaxCalls);
+    const stage2Candidates = selectDeepDiveCandidates({
+      stage1Results,
+      stage2Threshold,
+      cap: stage2MaxCalls,
+      reserve: escalationReserve,
+      forceStage2,
+      thresholds: escThresholds,
+    });
 
     metrics.stage2Candidates = stage2Candidates.length;
 
     if (!stage2Enabled) {
       this.logger.info('Stage 2 disabled in admin settings — skipping x_search');
     } else if (stage2Candidates.length > 0) {
+      const reasoningOn    = String(this.db?.getSetting?.('deepReasoningEnabled', '0')) === '1';
+      const reasoningModel = (this.db?.getSetting?.('stage2ReasoningModel', '') || '').trim();
+      const deepModel      = (reasoningOn && reasoningModel) ? reasoningModel : this.stage2Model;
       const stage2Cfg = {
         provider: 'xai',
         apiKey: this.providers.xai.apiKey,
         baseUrl: this.providers.xai.baseUrl,
-        model: this.stage2Model,
+        model: deepModel,
         enabled: !!this.providers.xai.apiKey,
       };
 
@@ -755,12 +765,13 @@ class Scorer {
       }
 
       this.logger.info(
-        `Stage 2: ${stage2Candidates.length} trends scored >= ${stage2Threshold} (cap=${stage2MaxCalls}), running x_search with ${stage2Cfg.model}`
+        `Stage 2: ${stage2Candidates.length} trends scored >= ${stage2Threshold} (cap=${stage2MaxCalls}), running x_search with ${stage2Cfg.model} (reasoning=${reasoningOn ? 'on' : 'off'})`
       );
 
       for (const trend of stage2Candidates) {
-        // NB (audit COST-007 — false positive): the Stage-2 cap is enforced by
-        // `.slice(0, stage2MaxCalls)` on stage2Candidates above. This counter
+        // NB (audit COST-007 — false positive): the Stage-2 cap is enforced
+        // inside selectDeepDiveCandidates (cap = stage2MaxCalls) when building
+        // stage2Candidates above. This counter
         // is telemetry only (cost log line + admin pipeline UI) — it does NOT
         // gate the loop. Counting attempts here (including failures, which can
         // still burn tokens) is the correct semantics for a "calls" metric; do
@@ -791,7 +802,7 @@ class Scorer {
       `in=${metrics.stage1InputTokens} out=${metrics.stage1OutputTokens} | ` +
       `stage2_calls=${metrics.stage2Calls}/${metrics.stage2Candidates} ` +
       `in=${metrics.stage2InputTokens} out=${metrics.stage2OutputTokens} | ` +
-      `total_in=${totalIn} total_out=${totalOut} (real tokens from API)`
+      `total_in=${totalIn} total_out=${totalOut} escalated=${stage2Candidates.filter(t=>t._deepDiveReason==='escalation').length} (real tokens from API)`
     );
 
     // Expose latest metrics so the pipeline observability layer (admin UI's
@@ -806,6 +817,9 @@ class Scorer {
       stage1Model:     this.current?.model    || 'unknown',
       stage2Provider:  'xai',
       stage2Model:     this.stage2Model,
+      stage2HighMeme:    stage2Candidates.filter(t => t._deepDiveReason === 'high_meme').length,
+      stage2Escalated:   stage2Candidates.filter(t => t._deepDiveReason === 'escalation').length,
+      deepReasoning:     String(this.db?.getSetting?.('deepReasoningEnabled', '0')) === '1',
     };
 
     // ── Post-pass: text-only meme/viral multiplier ─────────────────────────
