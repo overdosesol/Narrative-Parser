@@ -605,6 +605,9 @@ class AdminServer {
     const geminiModel = this.db.getSetting('geminiModel', process.env.GEMINI_STAGE1_MODEL || 'gemini-3.1-flash-lite');
 
     const stage2Enabled = String(this.db.getSetting('aiStage2Enabled', '1')) !== '0';
+    const deepReasoningEnabled = String(this.db.getSetting('deepReasoningEnabled', '0')) !== '0';
+    const stage2ReasoningModel = this.db.getSetting('stage2ReasoningModel', '');
+    const escalationReserve = parseInt(this.db.getSetting('escalationReserve', '2'), 10) || 2;
     const currentModel =
       provider === 'openai' ? openaiModel :
       provider === 'gemini' ? geminiModel :
@@ -617,6 +620,9 @@ class AdminServer {
       openaiModel,
       geminiModel,
       stage2Enabled,
+      deepReasoningEnabled,
+      stage2ReasoningModel,
+      escalationReserve,
       hasXaiKey:    !!process.env.XAI_API_KEY,
       hasOpenaiKey: !!process.env.OPENAI_API_KEY,
       hasGeminiKey: !!process.env.GOOGLE_AI_API_KEY,
@@ -626,7 +632,7 @@ class AdminServer {
     };
   }
 
-  _setAiConfig({ provider, model, stage2Enabled }) {
+  _setAiConfig({ provider, model, stage2Enabled, deepReasoningEnabled, stage2ReasoningModel, escalationReserve }) {
     const safeProvider = String(provider || '').toLowerCase();
     if (!['xai', 'openai', 'gemini'].includes(safeProvider)) {
       throw new Error('Invalid AI provider');
@@ -646,6 +652,17 @@ class AdminServer {
       const raw = stage2Enabled;
       const enabled = raw === true || raw === 1 || raw === '1' || raw === 'true';
       this.db.setSetting('aiStage2Enabled', enabled ? '1' : '0');
+    }
+
+    if (deepReasoningEnabled !== undefined) {
+      const on = deepReasoningEnabled === true || deepReasoningEnabled === '1' || deepReasoningEnabled === 'true';
+      this.db.setSetting('deepReasoningEnabled', on ? '1' : '0');
+    }
+    if (typeof stage2ReasoningModel === 'string') {
+      this.db.setSetting('stage2ReasoningModel', stage2ReasoningModel.trim());
+    }
+    if (escalationReserve !== undefined && escalationReserve !== '') {
+      this.db.setSetting('escalationReserve', String(parseInt(escalationReserve, 10) || 2));
     }
   }
 
@@ -4996,7 +5013,7 @@ function BotPage() {
   const [plans, setPlans] = useState([]);
   const [broadcasts, setBroadcasts] = useState([]);
   const [aiCfg, setAiCfg] = useState(null);
-  const [aiDraft, setAiDraft] = useState({ provider: 'xai', model: 'grok-4-1-fast-non-reasoning', stage2Enabled: true });
+  const [aiDraft, setAiDraft] = useState({ provider: 'xai', model: 'grok-4-1-fast-non-reasoning', stage2Enabled: true, deepReasoningEnabled: false, stage2ReasoningModel: '', escalationReserve: 2 });
   const [aiModels, setAiModels] = useState({ xai: [], openai: [], gemini: [] });
   const [aiModelsError, setAiModelsError] = useState('');
   const [editedPlans, setEditedPlans] = useState({});
@@ -5030,7 +5047,7 @@ function BotPage() {
     try {
       const cfg = await api('/api/ai-config');
       setAiCfg(cfg);
-      setAiDraft({ provider: cfg.provider, model: cfg.model, stage2Enabled: !!cfg.stage2Enabled });
+      setAiDraft({ provider: cfg.provider, model: cfg.model, stage2Enabled: !!cfg.stage2Enabled, deepReasoningEnabled: !!cfg.deepReasoningEnabled, stage2ReasoningModel: cfg.stage2ReasoningModel || '', escalationReserve: cfg.escalationReserve ?? 2 });
     } catch (_) {}
   };
 
@@ -5158,6 +5175,9 @@ function BotPage() {
         provider: aiDraft.provider,
         model: aiDraft.model,
         stage2Enabled: !!aiDraft.stage2Enabled,
+        deepReasoningEnabled: !!aiDraft.deepReasoningEnabled,
+        stage2ReasoningModel: aiDraft.stage2ReasoningModel || '',
+        escalationReserve: aiDraft.escalationReserve ?? 2,
       });
       setAiCfg(cfg);
       setMsg('✓ AI конфигурация обновлена');
@@ -5251,6 +5271,41 @@ function BotPage() {
           React.createElement('span',null, aiDraft.stage2Enabled ? 'Включено' : 'Отключено')
         ),
         React.createElement('button',{className:'btn btn-primary',onClick:saveAiConfig,disabled:aiSaving||!aiDraft.model?.trim()},aiSaving?'Сохранение...':'💾 Сохранить')
+      ),
+
+      React.createElement('div',{style:{marginTop:14,marginBottom:8,fontSize:12,fontWeight:700,color:'var(--text2)'}},'Deep Escalation — reasoning model'),
+      React.createElement('div',{className:'broadcast-footer',style:{alignItems:'center',flexWrap:'wrap',gap:8}},
+        React.createElement('label',{style:{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:13}},
+          React.createElement('input',{
+            type:'checkbox',
+            checked:!!aiDraft.deepReasoningEnabled,
+            onChange:e=>setAiDraft(prev=>({ ...prev, deepReasoningEnabled: e.target.checked }))
+          }),
+          React.createElement('span',null, aiDraft.deepReasoningEnabled ? 'Reasoning ON' : 'Reasoning OFF')
+        ),
+        React.createElement('input',{
+          className:'filter',
+          type:'text',
+          style:{minWidth:260,maxWidth:360},
+          placeholder:'grok reasoning model id (e.g. grok-3-mini)',
+          value:aiDraft.stage2ReasoningModel,
+          onChange:e=>setAiDraft(prev=>({ ...prev, stage2ReasoningModel: e.target.value }))
+        }),
+        React.createElement('label',{style:{display:'flex',alignItems:'center',gap:6,fontSize:13}},
+          React.createElement('span',null,'Reserve slots:'),
+          React.createElement('input',{
+            className:'filter',
+            type:'number',
+            style:{width:60},
+            min:0,
+            max:20,
+            value:aiDraft.escalationReserve ?? 2,
+            onChange:e=>setAiDraft(prev=>({ ...prev, escalationReserve: parseInt(e.target.value,10)||0 }))
+          })
+        )
+      ),
+      React.createElement('div',{style:{fontSize:11,color:'var(--text3)',marginTop:4,lineHeight:1.4}},
+        'Reasoning активен только когда тумблер ON и model id задан. Reserve = сколько Stage 2 слотов отдаётся под эскалированные тренды.'
       ),
 
       aiModelsError && React.createElement('div',{className:'mt16',style:{fontSize:12,color:'var(--red)'}},'Models API: ' + aiModelsError),
