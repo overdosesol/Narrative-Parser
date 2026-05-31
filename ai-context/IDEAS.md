@@ -100,6 +100,10 @@ TODO:
 - Прикинуть стоимость/вызов reasoning vs non-reasoning на нашем профиле (x_search ~12K+ input токенов/вызов).
 - Проверить гипотезу удешевления; если не подтвердится — reasoning-слой остаётся выключенным (риск ноль, код за флагом).
 
+#### ✅ Stage 1 grokcli provider — SHIPPED (2026-06-01)
+
+Путь «CLI как Stage 1 провайдер» реализован и залит в main. Plan: `docs/superpowers/plans/2026-06-01-grokcli-stage1-provider.md`. Ships OFF (default provider не изменён); оператор включает через admin-селектор. Только 30/60-мин циклы. Подробности — в SESSION_CONTEXT §AI provider config.
+
 #### ❌ Grok Build CLI по подписке вместо API — ПРОВЕРЕНО, НЕ РАБОТАЕТ (2026-06-01)
 
 Гипотеза оператора: гонять скоринг через `grok` CLI (Grok Build) по подписке SuperGrok ($30/мес)
