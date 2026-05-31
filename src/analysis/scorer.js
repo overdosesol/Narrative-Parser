@@ -745,12 +745,12 @@ class Scorer {
       const batchResultArrays = await runBounded(
         batches,
         this.current.concurrency || 4,
-        (batch) => this._scoreBatchWithFallback(batch, metrics, systemPrompt)
+        (batch) => this._scoreBatchWithFallback(batch, metrics, systemPrompt, runtime)
       );
       for (const scored of batchResultArrays) stage1Results.push(...scored);
     } else {
       for (let bi = 0; bi < batches.length; bi++) {
-        const scored = await this._scoreBatchWithFallback(batches[bi], metrics, systemPrompt);
+        const scored = await this._scoreBatchWithFallback(batches[bi], metrics, systemPrompt, runtime);
         stage1Results.push(...scored);
         if (bi + 1 < batches.length) {
           await new Promise(r => setTimeout(r, 2000));
@@ -890,10 +890,9 @@ class Scorer {
   // ─── Stage 1 batch resilience helpers ───────────────────────────────────────
 
   // One batch with resilience: cli retry → http fallback → heuristic.
-  async _scoreBatchWithFallback(batch, metrics, systemPrompt) {
-    const rt = this.current;
+  async _scoreBatchWithFallback(batch, metrics, systemPrompt, rt) {
     if (rt.transport === 'cli') {
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      for (let attempt = 1; attempt <= 2; attempt++) { // 2 = 1 initial attempt + 1 retry
         try { return await this._analyzeBatchStage1(batch, metrics, systemPrompt, rt); }
         catch (e) { this.logger.warn(`[grokcli] batch attempt ${attempt} failed: ${e.message}`); }
       }
