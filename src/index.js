@@ -27,6 +27,7 @@ import SolanaPayMonitor from './billing/solana-pay.js';
 import DashboardServer from './dashboard/server.js';
 import AdminServer from './admin/server.js';
 import { getTranslations } from './i18n/index.js';
+import { probeGrokSession } from './analysis/grok-cli.js';
 
 const logger = new Logger(config.logLevel);
 
@@ -56,6 +57,23 @@ if (preStage.enabled) {
 }
 
 const scorer = new Scorer(config, logger, db, preStage);
+
+// grokcli session liveness — only meaningful when grokcli is the chosen
+// provider, but cheap enough to probe always so the admin panel can show
+// status and the scorer's fallback logic has accurate availability.
+async function refreshGrokSession() {
+  try {
+    const cfg = scorer.providers.grokcli;
+    scorer._grokSessionAlive = await probeGrokSession({ bin: cfg.bin, timeoutMs: 30000 });
+  } catch {
+    scorer._grokSessionAlive = false;
+  }
+  scorer.current = scorer._getRuntimeAiConfig();   // re-resolve in case availability flipped
+}
+refreshGrokSession().then(() => {
+  logger.info(`[grokcli] session alive: ${scorer._grokSessionAlive}`);
+});
+setInterval(refreshGrokSession, 5 * 60 * 1000);
 
 // On-demand trigger search (Pro-plan button in TG + dashboard).
 // Disabled gracefully when XAI_API_KEY is missing — `enabled` flag exposed
