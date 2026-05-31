@@ -33,7 +33,14 @@ RUN apk add --no-cache \
     curl \
     ca-certificates \
     ffmpeg \
-    tini
+    tini \
+    git
+
+# Установить Grok Build CLI (pinned version, binary в /root/.grok/bin/grok)
+ARG GROK_CLI_VERSION=0.2.14
+RUN curl -fsSL https://x.ai/cli/install.sh | bash -s "${GROK_CLI_VERSION}" \
+    && ln -sf /root/.grok/bin/grok /usr/local/bin/grok \
+    && /usr/local/bin/grok --version
 
 # node:18-alpine already has user 'node' (uid/gid 1000) - use it directly
 

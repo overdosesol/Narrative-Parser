@@ -17,6 +17,7 @@ services:
       ADMIN_PORT: 8081
       ADMIN_HOST: 0.0.0.0
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      GROK_CLI_CWD: /app
     
     ports:
       - "127.0.0.1:8080:8080"  # Main Dashboard (only via nginx with TLS)
@@ -27,6 +28,8 @@ services:
       - catalyst_data:/data
       # Логи
       - catalyst_logs:/logs
+      # Grok CLI сессия (operator runs `grok login --device-auth` once on host)
+      - /root/.grok:/home/node/.grok
     
     # Ограничение ресурсов
     deploy:
