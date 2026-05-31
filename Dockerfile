@@ -36,14 +36,19 @@ RUN apk add --no-cache \
     tini \
     git
 
-# Установить Grok Build CLI (pinned version, binary в /root/.grok/bin/grok)
+# Установить Grok Build CLI (pinned version, binary в /root/.grok/bin/grok).
+# BEST-EFFORT: если x.ai недоступен в момент сборки — образ всё равно собирается,
+# а grokcli-провайдер просто будет недоступен (скоринг падает на API-fallback,
+# фича ships OFF). Это сознательно: install НЕ должен ронять deploy-сборку и
+# гасить прод из-за внешней зависимости от x.ai (ср. инцидент 502 «деплой всё разом»).
 ARG GROK_CLI_VERSION=0.2.14
-RUN curl -fsSL https://x.ai/cli/install.sh | bash -s "${GROK_CLI_VERSION}" \
-    && cp -L /root/.grok/bin/grok /usr/local/bin/grok \
-    && chmod 755 /usr/local/bin/grok \
-    && /usr/local/bin/grok --version
+RUN (curl -fsSL https://x.ai/cli/install.sh | bash -s "${GROK_CLI_VERSION}" \
+      && cp -L /root/.grok/bin/grok /usr/local/bin/grok \
+      && chmod 755 /usr/local/bin/grok \
+      && /usr/local/bin/grok --version) \
+    || echo "WARN: Grok CLI install failed (x.ai unreachable?) — grokcli provider will be unavailable; scoring falls back to API."
 
-# node:18-alpine already has user 'node' (uid/gid 1000) - use it directly
+# node:20-alpine already has user 'node' (uid/gid 1000) - use it directly
 
 # Скопировать node_modules из builder
 COPY --from=builder /build/node_modules ./node_modules
