@@ -78,6 +78,20 @@ done
 # Stop current compose stack (handles catalyst-app and any other services)
 $DC down || true
 $DC build
+
+# ── Grok CLI session ownership ────────────────────────────────────────────────
+# The grokcli Stage-1 provider mounts the host's /root/.grok session into the
+# container at /home/node/.grok. The container runs as uid 1000 (node) and the
+# CLI needs READ+WRITE there (auth.json + locks/cache it rewrites). A fresh
+# `grok login` or token-refresh leaves files owned by root → container loses
+# access and grokcli silently falls back to the API. Re-assert uid 1000 on every
+# deploy so the session survives rebuilds and DR restores. No-op if absent (the
+# feature just stays unavailable, scoring uses an HTTP provider). An hourly cron
+# (/etc/cron.d/grok-auth-perms) covers refreshes between deploys.
+if [ -d /root/.grok ]; then
+  chown -R 1000:1000 /root/.grok && echo "grok session chowned to uid 1000"
+fi
+
 $DC up -d
 
 # ── Auto-cleanup: prune stale Docker build cache ──────────────────────────────
