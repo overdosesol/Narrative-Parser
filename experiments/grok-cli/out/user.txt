@@ -1,0 +1,51 @@
+Write alerts for the following 12 trends.
+
+For each trend, return a JSON object with these fields (definitions in the SYSTEM_PROMPT):
+- "title", "explanation", "whyNow"        — narrative text (English, terse, no speculation)
+- "alertType"                             — "event" | "trend" | "post"
+- "sentiment"                             — "positive" | "negative" | "neutral" | "mixed"
+- "predictedLifespan"                     — one of [flash, short, medium, long] or "unknown"   (flash=hours, short=1-2 days, medium=3-7 days, long=weeks+)
+- "isGenuinelyInteresting"                — false ONLY for spam/bots/gibberish/recycled-no-angle
+- "memePotential", "viralityScore", "category" — ECHO from "GeminiScore" line in input. Categories: [meme, celebrity, animals, tech, gambling, sports, politics, entertainment, gaming, boring, other]
+- "scoreOverride"                         — null in 95%+ of cases. Set ONLY if you can see crucial CONTEXT that Stage 0b missed (must include "value" 0-100 and a one-sentence "reason" ≥8 chars). Otherwise null.
+
+When a trend has GeminiScore present in its input, ECHO those values exactly (memePotential / viralityScore / category). Use Stage 0b's subjectNames in the title where they exist. Do NOT recompute scores — Stage 0b already did the calibrated rubric.
+
+Respond ONLY with { "trends": [ ... ] }. Same length as input. Same order. No markdown, no preamble.
+
+TRENDS:
+1. "Laura Freigang faces potential doping control issues" [Source: reddit]
+   Age: 2.8h | r/Bundesliga | Feed position: #41
+
+2. "Financial advice for wedding planning" [Source: reddit]
+   Age: 1h | r/Finanzen | Feed position: #26
+
+3. "Eier, wir brauchen Eier! meme revival" [Source: reddit]
+   Age: 4.3h | r/deutschememes | Feed position: #25
+
+4. "Six-pack product packaging deception" [Source: reddit]
+   Age: 3.5h | r/MogelPackung | Feed position: #21
+
+5. "Wall damage during 85-inch TV installation" [Source: reddit]
+   Age: 2.7h | r/mildlyinfuriating | Feed position: #20
+
+6. "Italy bans Kanye West and Travis Scott concerts" [Source: reddit]
+   Age: 4.8h | r/de | Feed position: #18
+
+7. "Debate on male-only spaces" [Source: reddit]
+   Age: 0.5h | r/Unbeliebtemeinung | Feed position: #16
+
+8. "ZDF commentator criticism sparks debate" [Source: reddit]
+   Age: 2.9h | r/fussball | Feed position: #11
+
+9. "Champions League Final discussion" [Source: reddit]
+   Age: 4.4h | r/Bundesliga | Feed position: #8
+
+10. "The original 4chan 'straight' boy greentext" [Source: reddit]
+   Age: 3.8h | r/TheMatpatEffect | Feed position: #46
+
+11. "Overwatch fan art by pugcrumbs" [Source: reddit]
+   Age: 3.4h | r/Overwatch | Feed position: #45
+
+12. "Backrooms movie box office satire" [Source: reddit]
+   Age: 2.1h | r/shittymoviedetails | Feed position: #43
