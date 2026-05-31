@@ -28,3 +28,17 @@ test('grokcli with DEAD session falls back to an http provider', () => {
   assert.strictEqual(rt.transport, 'http');
   assert.notStrictEqual(rt.provider, 'grokcli');
 });
+
+test('_callResponsesAPI routes cli transport to _callGrokCli', async () => {
+  const s = new Scorer({}, logger, fakeDb({ aiProvider: 'grokcli' }), null);
+  s._grokSessionAlive = true;
+  let calledWith = null;
+  s._callGrokCli = async (args) => { calledWith = args; return { text: '{"trends":[]}', inputTokens: 0, outputTokens: 0 }; };
+  const rt = s._getRuntimeAiConfig();
+  const out = await s._callResponsesAPI({
+    input: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'usr' }],
+    runtimeOverride: rt,
+  });
+  assert.ok(calledWith, '_callGrokCli was invoked');
+  assert.strictEqual(out.text, '{"trends":[]}');
+});

@@ -8,6 +8,7 @@ import {
 } from './prompts.js';
 import { normalizeLifespan } from './lifespan.js';
 import { getActivePresetConfig } from './preset-config.js';
+import { callGrokCli } from './grok-cli.js';
 
 /**
  * Deterministic alert-type derivation — used (a) when AI returns an invalid
@@ -1319,6 +1320,10 @@ class Scorer {
       });
     }
 
+    if (runtime.transport === 'cli') {
+      return this._callGrokCli({ input, runtime });
+    }
+
     const body = {
       model: runtime.model,
       input,
@@ -1406,6 +1411,21 @@ class Scorer {
     }
 
     return this._extractResponseData(data);
+  }
+
+  // Bridge: flatten the two-message input into one prompt and run it through
+  // the CLI. Mirrors the sandbox-validated form: system + separator + user.
+  async _callGrokCli({ input, runtime }) {
+    const sys = input.find(m => m.role === 'system')?.content || '';
+    const usr = input.find(m => m.role === 'user')?.content || '';
+    const prompt = `${sys}\n\n=== INPUT ===\n\n${usr}`;
+    return callGrokCli({
+      bin: runtime.bin,
+      prompt,
+      cwd: runtime.cwd,
+      timeoutMs: runtime.timeoutMs,
+      logger: this.logger,
+    });
   }
 
   /**
