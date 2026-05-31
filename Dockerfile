@@ -28,13 +28,16 @@ LABEL description="24/7 AI-powered trend monitoring for memecoin narratives"
 WORKDIR /app
 
 # Установить runtime зависимости
+# bash — нужен для установщика Grok CLI (`install.sh | bash`); alpine его не несёт.
+# git — grok-build (coding-агент) спавнит git на старте.
 RUN apk add --no-cache \
     sqlite-dev \
     curl \
     ca-certificates \
     ffmpeg \
     tini \
-    git
+    git \
+    bash
 
 # Установить Grok Build CLI (pinned version, binary в /root/.grok/bin/grok).
 # BEST-EFFORT: если x.ai недоступен в момент сборки — образ всё равно собирается,
