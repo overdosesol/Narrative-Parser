@@ -400,11 +400,13 @@ class Scorer {
 
     this.providers = {
       xai: {
+        transport: 'http',
         apiKey: process.env.XAI_API_KEY || '',
         baseUrl: process.env.XAI_BASE_URL || 'https://api.x.ai/v1',
         defaultModel: process.env.XAI_MODEL || 'grok-4-1-fast-non-reasoning',
       },
       openai: {
+        transport: 'http',
         apiKey: process.env.OPENAI_API_KEY || '',
         baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
         // Default bumped 2026-04-27: gpt-4.1-mini → gpt-5.4-mini.
@@ -423,11 +425,28 @@ class Scorer {
       // ships json_object mode and relies on the prompt to enforce shape.
       // Same GOOGLE_AI_API_KEY is reused across Stage 0b and Stage 1.
       gemini: {
+        transport: 'http',
         apiKey: process.env.GOOGLE_AI_API_KEY || '',
         baseUrl: process.env.GEMINI_OPENAI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai',
         defaultModel: process.env.GEMINI_STAGE1_MODEL || 'gemini-3.1-flash-lite',
       },
+      // Grok Build CLI — subscription-based, no API key. Availability is
+      // determined by session liveness (probed on boot and periodically).
+      grokcli: {
+        transport: 'cli',
+        bin: process.env.GROK_CLI_BIN || 'grok',
+        cwd: process.env.GROK_CLI_CWD || '/app',
+        defaultModel: process.env.GROKCLI_MODEL || 'grok-build',
+        concurrency: Number(process.env.GROKCLI_CONCURRENCY || 4),
+        timeoutMs: Number(process.env.GROKCLI_TIMEOUT_MS || 180000),
+        apiKey: '',
+        baseUrl: '',
+      },
     };
+
+    // CLI session liveness — refreshed by index.js on boot + periodically.
+    // false until proven alive (probed in index.js).
+    this._grokSessionAlive = false;
 
     this.current = this._getRuntimeAiConfig();
 
@@ -476,39 +495,49 @@ class Scorer {
   }
 
   _getRuntimeAiConfig() {
-    const VALID_PROVIDERS = ['xai', 'openai', 'gemini'];
+    const VALID_PROVIDERS = ['xai', 'openai', 'gemini', 'grokcli'];
     const rawProvider = this.db?.getSetting('aiProvider', 'xai') || 'xai';
     let provider = VALID_PROVIDERS.includes(String(rawProvider).toLowerCase())
       ? String(rawProvider).toLowerCase()
       : 'xai';
 
-    // Auto-fallback chain when the selected provider has no API key:
-    // try xai → openai → gemini (in that order) so an admin pick that
-    // happens to lack a key still produces a working scorer.
     let providerCfg = this.providers[provider] || this.providers.xai;
-    if (!providerCfg.apiKey) {
-      const fallbackOrder = ['xai', 'openai', 'gemini'].filter(p => p !== provider);
-      for (const candidate of fallbackOrder) {
-        const cand = this.providers[candidate];
-        if (cand?.apiKey) {
-          provider = candidate;
-          providerCfg = cand;
-          break;
-        }
+
+    // "available" differs by transport: cli = session alive; http = has apiKey.
+    const isAvailable = (name) => {
+      const cfg = this.providers[name];
+      if (!cfg) return false;
+      return cfg.transport === 'cli' ? !!this._grokSessionAlive : !!cfg.apiKey;
+    };
+
+    // Auto-fallback chain when the chosen provider isn't available. grokcli
+    // falls back to http providers (xai→openai→gemini); http providers keep
+    // the same xai→openai→gemini chain as before.
+    if (!isAvailable(provider)) {
+      const chain = ['xai', 'openai', 'gemini'].filter(p => p !== provider);
+      for (const candidate of chain) {
+        if (isAvailable(candidate)) { provider = candidate; providerCfg = this.providers[candidate]; break; }
       }
     }
+
     const modelSettingKey =
-      provider === 'openai' ? 'openaiModel' :
-      provider === 'gemini' ? 'geminiModel' :
+      provider === 'openai'  ? 'openaiModel' :
+      provider === 'gemini'  ? 'geminiModel' :
+      provider === 'grokcli' ? 'grokcliModel' :
       'xaiModel';
     const model = this.db?.getSetting(modelSettingKey, providerCfg.defaultModel) || providerCfg.defaultModel;
 
     return {
       provider,
+      transport: providerCfg.transport || 'http',
       model,
       apiKey: providerCfg.apiKey,
       baseUrl: providerCfg.baseUrl,
-      enabled: !!providerCfg.apiKey,
+      bin: providerCfg.bin,
+      cwd: providerCfg.cwd,
+      concurrency: providerCfg.concurrency || 1,
+      timeoutMs: providerCfg.timeoutMs,
+      enabled: isAvailable(provider),
     };
   }
 
