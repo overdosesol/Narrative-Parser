@@ -490,7 +490,7 @@ class Scorer {
     if (!this.current.enabled) {
       this.logger.warn('AI API key not set for selected provider — AI scoring disabled, using heuristics');
     } else {
-      this.logger.info(`AI scorer: ${this.current.provider}:${this.current.model} @ ${this.current.baseUrl} (Responses API, 2-stage)`);
+      this.logger.info(`AI scorer: ${this.current.provider}:${this.current.model} @ ${this.current.transport === 'cli' ? `cli:${this.current.bin || 'grok'}` : this.current.baseUrl} (Responses API, 2-stage)`);
     }
   }
 
@@ -667,7 +667,7 @@ class Scorer {
     this.current = runtime;
 
     if (changed) {
-      this.logger.info(`AI config updated: ${this.current.provider}:${this.current.model} @ ${this.current.baseUrl}`);
+      this.logger.info(`AI config updated: ${this.current.provider}:${this.current.model} @ ${this.current.transport === 'cli' ? `cli:${this.current.bin || 'grok'}` : this.current.baseUrl}`);
     }
 
     if (!this.current.enabled) {
