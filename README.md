@@ -136,5 +136,4 @@ the current policy and known notes.
 
 ## License
 
-License TBD. See [docs/open-source-readiness.md](docs/open-source-readiness.md)
-for the current pre-publication checklist.
+MIT. See [LICENSE](LICENSE).

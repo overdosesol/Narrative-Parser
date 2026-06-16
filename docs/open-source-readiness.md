@@ -99,25 +99,27 @@ Recommendation:
 Rotate any matching live keys before publication. If publishing with history,
 rewrite history and re-scan.
 
-### OSR-004: License and contributor metadata are incomplete
+### OSR-004: Open source metadata is mostly in place
 
 Severity: Medium
 
 Evidence:
 
-- `package.json` has empty `author` and `license: ISC`.
-- No `LICENSE` or `CONTRIBUTING.md` exists yet.
+- `package.json` has empty `author`.
+- `LICENSE` has been added with MIT.
+- `CONTRIBUTING.md` has been added.
 - `SECURITY.md` and `.github/dependabot.yml` have been added.
-- `README.md` now says license is TBD.
+- `README.md` now points to the MIT license.
 
 Impact:
 
-The project is legally and socially unclear for contributors.
+The project is now legally clear enough for a first public release, but owner
+metadata can still be improved.
 
 Recommendation:
 
-Choose a license, add `LICENSE`, update package metadata, and decide whether
-contribution docs are wanted for the first release.
+Fill in package `author` if desired, and expand contributor docs after the
+first public release.
 
 ### OSR-005: Dependency audit has production vulnerabilities
 
