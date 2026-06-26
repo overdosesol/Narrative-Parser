@@ -1,5 +1,6 @@
 import BaseCollector from './base-collector.js';
 import { getActivePresetConfig } from '../analysis/preset-config.js';
+import { parseRedditAtomFeed } from '../utils/reddit-preview.js';
 
 /**
  * Reddit collector — uses Reddit JSON API (no auth needed with proper User-Agent)
@@ -129,43 +130,34 @@ class RedditCollector extends BaseCollector {
   }
 
   _parseAtomFeed(xml) {
-    const items = [];
-    const entryRegex = /<entry>([\s\S]*?)<\/entry>/g;
-    let match;
-    let position = 0;
+    return parseRedditAtomFeed(xml).map((post, position) => {
+      const ageHours = post.createdAt
+        ? (Date.now() - post.createdAt) / 3_600_000
+        : 99;
+      const imageUrls = (post.media || [])
+        .filter(m => m?.type === 'photo' && m.url)
+        .map(m => m.url);
 
-    while ((match = entryRegex.exec(xml)) !== null) {
-      const entry = match[1];
-      const title     = this._extractTag(entry, 'title') || '';
-      const id        = this._extractTag(entry, 'id') || '';
-      const link      = this._extractAttr(entry, 'link', 'href') || '';
-      const published = this._extractTag(entry, 'published') || '';
-      const updated   = this._extractTag(entry, 'updated') || '';
-      const category  = this._extractAttr(entry, 'category', 'label') || '';
-
-      if (title.length < 5) continue;
-
-      const publishedDate = new Date(published || updated);
-      const ageHours = (Date.now() - publishedDate.getTime()) / 3_600_000;
-
-      items.push({
-        externalId: `reddit_${id.replace('t3_', '').replace(/.*\//, '')}`,
+      return {
+        externalId: `reddit_${post.id}`,
         source:     'reddit',
-        title:      this._decodeHtml(title),
+        title:      post.title,
         description:'',
-        url:        link,
+        url:        post.permalink,
         metrics: {
           upvotes:   0,           // unknown via RSS
           comments:  0,
           ageHours:  Math.round(ageHours * 10) / 10,
           velocity:  0,
           engagement:0,
-          subreddit: category.replace('r/', ''),
-          position:  position++,  // proxy: lower = more popular on page
+          subreddit: post.author?.subreddit || '',
+          author:    post.author?.name ? `u/${post.author.name}` : '',
+          imageUrl:  imageUrls[0] || null,
+          imageUrls,
+          position,               // proxy: lower = more popular on page
         },
-      });
-    }
-    return items;
+      };
+    });
   }
 
   _extractTag(xml, tag) {

@@ -24,6 +24,13 @@ import { fileURLToPath } from 'url';
 import { timingSafeEqual, createHash, randomBytes } from 'crypto';
 import net from 'net';
 import { UserRateLimiter } from '../utils/rate-limiter.js';
+import {
+  buildRedditPreviewFromTrendRow,
+  extractRedditPostId,
+  extractSubredditFromRedditUrl,
+  normalizeRedditPost,
+  parseRedditAtomFeed,
+} from '../utils/reddit-preview.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -268,65 +275,6 @@ function redditPreviewCacheSet(id, status, data) {
   redditPreviewCache.set(id, { status, data, ts: Date.now() });
 }
 
-function extractRedditPostId(url) {
-  if (!url) return null;
-  const m = String(url).match(/\/comments\/([a-z0-9]{4,12})(?:[/?#]|$)/i);
-  return m ? m[1] : null;
-}
-
-/**
- * Normalize Reddit JSON response into the same shape the hover-preview
- * frontend understands. Mirrors normalizeFxTweet — author/text/media/metrics
- * with platform-appropriate field names.
- */
-function normalizeRedditPost(post) {
-  if (!post || typeof post !== 'object') return null;
-  // Pick first preview image if available (Reddit serves multiple sizes;
-  // .source is full-res). Galleries we collapse to first item — hover card
-  // shouldn't have a carousel.
-  let imageUrl = null;
-  const direct = post.url_overridden_by_dest || post.url || '';
-  if (/\.(jpe?g|png|gif|webp)(\?|$)/i.test(direct)) imageUrl = direct;
-  else if (post.preview?.images?.[0]?.source?.url) imageUrl = post.preview.images[0].source.url;
-  else if (post.is_gallery && post.media_metadata && post.gallery_data?.items?.length) {
-    const firstId = post.gallery_data.items[0].media_id;
-    const item = firstId && post.media_metadata[firstId];
-    imageUrl = item?.s?.u || item?.s?.gif || null;
-  }
-
-  // Reddit awards: post.total_awards_received or post.all_awardings (length).
-  // We collapse into a single number for the hover card.
-  const awards = typeof post.total_awards_received === 'number'
-    ? post.total_awards_received
-    : (Array.isArray(post.all_awardings) ? post.all_awardings.length : 0);
-
-  return {
-    id: String(post.id || ''),
-    permalink: post.permalink ? ('https://reddit.com' + post.permalink) : '',
-    title: String(post.title || '').slice(0, 400),
-    text: String(post.selftext || '').slice(0, 1500),
-    createdAt: post.created_utc ? post.created_utc * 1000 : null,
-    author: {
-      name: post.author || '',
-      subreddit: post.subreddit || '',
-      // Reddit doesn't expose author avatar in the post JSON cheaply (would
-      // need a second fetch to /user/<u>/about.json). Skip for now — the
-      // hover card falls back to a letter avatar like Twitter does.
-      avatarUrl: null,
-    },
-    media: imageUrl ? [{ type: 'photo', url: imageUrl, width: null, height: null }] : [],
-    metrics: {
-      upvotes:   typeof post.score        === 'number' ? post.score        : (post.ups || null),
-      comments:  typeof post.num_comments === 'number' ? post.num_comments : null,
-      // Reddit doesn't expose per-post views in the public JSON. Leave null.
-      views:     null,
-      awards,
-      ratio:     typeof post.upvote_ratio === 'number' ? post.upvote_ratio : null,
-    },
-    nsfw: !!post.over_18,
-  };
-}
-
 /**
  * Fetch reddit post by id (base36) using the public .json endpoint. No auth
  * needed but a polite User-Agent is good citizenship — Reddit explicitly
@@ -382,6 +330,46 @@ async function fetchTweetPreview(id) {
   } catch (e) {
     return { ok: false, status: 599, error: String(e?.message || e) };
   }
+}
+
+const redditRssFeedCache = new Map();
+const REDDIT_RSS_FEED_TTL_MS = 60_000;
+
+async function fetchRedditRssPreviewByUrl(postUrl) {
+  const id = extractRedditPostId(postUrl);
+  const subreddit = extractSubredditFromRedditUrl(postUrl);
+  if (!id || !subreddit) return null;
+
+  let entries = null;
+  const cacheKey = subreddit.toLowerCase();
+  const cached = redditRssFeedCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < REDDIT_RSS_FEED_TTL_MS) {
+    entries = cached.entries;
+  }
+
+  if (!entries) {
+    const ctl = new AbortController();
+    const tm = setTimeout(() => ctl.abort(), 5000);
+    try {
+      const rssUrl = `https://www.reddit.com/r/${encodeURIComponent(subreddit)}/hot/.rss?limit=100`;
+      const r = await fetch(rssUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+          'Accept': 'application/atom+xml, text/xml, */*',
+        },
+        signal: ctl.signal,
+      });
+      clearTimeout(tm);
+      if (!r.ok) return null;
+      entries = parseRedditAtomFeed(await r.text());
+      redditRssFeedCache.set(cacheKey, { entries, ts: Date.now() });
+    } catch {
+      clearTimeout(tm);
+      return null;
+    }
+  }
+
+  return (entries || []).find(p => p.id && p.id.toLowerCase() === id.toLowerCase()) || null;
 }
 
 /** Constant-time string comparison to prevent timing attacks */
@@ -1480,6 +1468,23 @@ class DashboardServer {
     });
   }
 
+  _getStoredRedditPreview(postId) {
+    if (!postId || !/^[a-z0-9]{4,12}$/i.test(postId)) return null;
+    try {
+      const row = this.db.db.prepare(`
+        SELECT external_id, title, original_title, description, url, raw_metrics, first_seen_at, last_seen_at
+        FROM trends
+        WHERE url LIKE ?
+        ORDER BY last_seen_at DESC, id DESC
+        LIMIT 1
+      `).get('%/comments/' + postId + '%');
+      return buildRedditPreviewFromTrendRow(row);
+    } catch (e) {
+      this.logger.warn?.(`[RedditPreview] DB fallback failed for ${postId}: ${e.message}`);
+      return null;
+    }
+  }
+
   /**
    * GET /api/reddit-preview?id=<post_id>  OR  ?url=<full_reddit_url>
    *
@@ -1523,9 +1528,9 @@ class DashboardServer {
     }
 
     const r = await fetchRedditPreview(id);
-    redditPreviewCacheSet(id, r.status, r.ok ? r.data : null);
 
     if (r.ok) {
+      redditPreviewCacheSet(id, r.status, r.data);
       let derivedVelocity = null;
       try {
         const upd = this.db.updateRedditEngagement(id, r.data.metrics || {});
@@ -1537,6 +1542,21 @@ class DashboardServer {
         ok: true, cached: false, post: r.data, velocity: derivedVelocity,
       });
     }
+
+    const rssFallback = urlParam ? await fetchRedditRssPreviewByUrl(urlParam) : null;
+    const storedFallback = rssFallback || this._getStoredRedditPreview(id);
+    if (storedFallback) {
+      redditPreviewCacheSet(id, 200, storedFallback);
+      return json(res, 200, {
+        ok: true,
+        cached: false,
+        stale: true,
+        post: storedFallback,
+        velocity: null,
+      });
+    }
+
+    redditPreviewCacheSet(id, r.status, null);
     return json(res, r.status >= 400 && r.status < 600 ? r.status : 502, {
       ok: false, cached: false,
     });
@@ -2532,6 +2552,23 @@ class DashboardServer {
             }
           }
         } catch (e) { /* fall through to og:image */ }
+
+        const postId = extractRedditPostId(target);
+        const stored = postId ? this._getStoredRedditPreview(postId) : null;
+        const storedUrls = (stored?.media || [])
+          .filter(m => m?.type === 'photo' && m.url)
+          .map(m => m.url);
+        if (storedUrls.length) {
+          return json(res, 200, { imageUrl: storedUrls[0], imageUrls: storedUrls });
+        }
+
+        const rssPost = await fetchRedditRssPreviewByUrl(target);
+        const rssUrls = (rssPost?.media || [])
+          .filter(m => m?.type === 'photo' && m.url)
+          .map(m => m.url);
+        if (rssUrls.length) {
+          return json(res, 200, { imageUrl: rssUrls[0], imageUrls: rssUrls });
+        }
       }
 
       // ── TikTok: official oEmbed JSON endpoint ────────────────────────────
@@ -9463,7 +9500,10 @@ function useTweetHover() {
         setState({ anchor: rect, status: 'loading', data: null, kind });
         try {
           const endpoint = kind === 'reddit' ? '/reddit-preview' : '/tweet-preview';
-          const j = await api(endpoint + '?id=' + encodeURIComponent(id));
+          const sourceHref = kind === 'reddit' && hit.el.href ? hit.el.href : '';
+          const query = '?id=' + encodeURIComponent(id)
+            + (sourceHref ? '&url=' + encodeURIComponent(sourceHref) : '');
+          const j = await api(endpoint + query);
           // Twitter returns j.tweet, Reddit returns j.post — normalize.
           const payload = kind === 'reddit' ? j?.post : j?.tweet;
           if (j && j.ok && payload) {
