@@ -1,5 +1,5 @@
 /**
- * Catalyst Dashboard — Express REST API + embedded React SPA
+ * Catalyst Dashboard — Node HTTP REST API + embedded React SPA
  *
  * Endpoints:
  *   GET  /api/health          — health check (no auth)
@@ -184,7 +184,8 @@ export function maskId(id) {
 // Lightweight in-memory cache keyed by tweet ID. The dashboard's hover-preview
 // feature (added 2026-05-04) shows a card when the user hovers a tweet link.
 // Source of truth: api.fxtwitter.com — open, no auth, returns clean JSON with
-// text/author/media/metrics. Same backend Discord and Telegram use to render
+// text/author/media/metrics. Same backend Telegram alerts and dashboard source
+// previews use to render
 // tweet cards, so the format is well-tested.
 //
 // LRU is overkill for ≤500 entries; a Map + age check + simple eviction does

@@ -1,6 +1,8 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+const apifyApiKey = process.env.APIFY_API_KEY || process.env.APIFY_API || '';
+
 const config = {
   // Reddit - direct RSS scraping, no auth needed
   reddit: {
@@ -19,7 +21,7 @@ const config = {
     category: 'all',
   },
 
-  // Twitter/X - via Apify tweet-scraper (requires APIFY_API key)
+  // Twitter/X - via Apify tweet-scraper (requires APIFY_API_KEY)
   twitter: {
     enabled: process.env.TWITTER_ENABLED === 'true',
     maxItemsPerQuery: parseInt(process.env.TWITTER_MAX_ITEMS || '20', 10),
@@ -28,7 +30,7 @@ const config = {
       : undefined,
   },
 
-  // TikTok - via Apify tiktok-scraper (requires APIFY_API key)
+  // TikTok - via Apify tiktok-scraper (requires APIFY_API_KEY)
   tiktok: {
     enabled: process.env.TIKTOK_ENABLED === 'true',
     maxVideosPerTag: parseInt(process.env.TIKTOK_MAX_VIDEOS || '15', 10),
@@ -46,7 +48,7 @@ const config = {
 
   // Apify - on-demand X/Twitter analysis + collectors
   apify: {
-    apiKey:  process.env.APIFY_API  || '',
+    apiKey:  apifyApiKey,
     // Per-actor tokens. The active Twitter actor is a runtime admin setting
     // ('twitterActor' in DB, values: 'kaitoeasyapi' | 'xquik'), and we look
     // up the matching token here when instantiating the collector.
@@ -56,10 +58,10 @@ const config = {
     },
     // Same pattern for TikTok: per-actor tokens, runtime-switched via
     // 'tiktokActor' DB setting (values: 'clockworks' | 'apidojo').
-    // Default actor (clockworks) reuses the generic APIFY_API for back-compat
-    // with single-key deployments — no .env change required to keep working.
+    // Default actor (clockworks) reuses the generic APIFY_API_KEY. The legacy
+    // APIFY_API name is still accepted for older single-key deployments.
     tiktokKeys: {
-      clockworks: process.env.APIFY_API_CLOCKWORKS || process.env.APIFY_API || '',
+      clockworks: process.env.APIFY_API_CLOCKWORKS || apifyApiKey,
       apidojo:    process.env.APIFY_API_APIDOJO    || '',
     },
     twitterAuthToken: process.env.TWITTER_AUTH_TOKEN || '',
@@ -89,6 +91,7 @@ const config = {
     merchantWallet: process.env.SOLANA_MERCHANT_WALLET || '',
     rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
     heliusApiKey: process.env.HELIUS_API_KEY || '',
+    manualFallback: process.env.SOLANA_PAY_MANUAL_FALLBACK === '1',
     // USDC on Solana mainnet
     usdcMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
   },
@@ -96,7 +99,7 @@ const config = {
   // Dashboard - web UI & REST API
   dashboard: {
     enabled:  process.env.DASHBOARD_ENABLED !== 'false', // on by default
-    port:     parseInt(process.env.DASHBOARD_PORT || '3000', 10),
+    port:     parseInt(process.env.DASHBOARD_PORT || '8080', 10),
     apiKey:   process.env.DASHBOARD_API_KEY || '',       // protects the REST API
     host:     process.env.DASHBOARD_HOST    || '0.0.0.0',
   },
@@ -145,9 +148,9 @@ flag(isProduction && !config.publicBaseUrl, 'PUBLIC_BASE_URL not set in producti
 
 // Soft (warn only)
 flag(!config.solanaPay.merchantWallet, 'SOLANA_MERCHANT_WALLET is not set - crypto payments disabled');
-flag(config.twitter.enabled && !config.apify.apiKey, 'TWITTER_ENABLED=true but APIFY_API not set');
+flag(config.twitter.enabled && !config.apify.apiKey, 'TWITTER_ENABLED=true but APIFY_API_KEY not set');
 flag(config.tiktok.enabled && !Object.values(config.apify.tiktokKeys).some(Boolean),
-     'TIKTOK_ENABLED=true but no TikTok actor key (APIFY_API / APIFY_API_APIDOJO) set');
+     'TIKTOK_ENABLED=true but no TikTok actor key (APIFY_API_KEY / APIFY_API_APIDOJO) set');
 flag(config.dashboard.enabled && !config.dashboard.apiKey, 'DASHBOARD_API_KEY not set - legacy header check will fail');
 flag(config.support.botToken && !config.support.groupId, 'SUPPORT_BOT_TOKEN set but SUPPORT_GROUP_ID missing - support bot disabled');
 

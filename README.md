@@ -10,8 +10,7 @@ moving social narratives before they become obvious.**
 
 It continuously collects candidates from Reddit, Google Trends, X/Twitter and
 TikTok, deduplicates and clusters them, scores them with a multi-stage AI
-pipeline, and sends high-signal alerts through Telegram, Discord and a web
-dashboard.
+pipeline, and sends high-signal alerts through Telegram and the web dashboard.
 
 The project started as a single-operator production tool for memecoin and
 internet-culture monitoring. It is now being opened as a practical reference
@@ -34,8 +33,7 @@ implementation for:
 - **Clusters related narratives** with embeddings, entity matching, image hash
   signals and source-aware heuristics.
 - **Scores virality and meme potential** through configurable AI providers.
-- **Sends alerts** to Telegram and Discord when a narrative clears the alert
-  gate.
+- **Sends alerts** to Telegram when a narrative clears the alert gate.
 - **Provides a dashboard** for browsing, filtering, favorites, manual analysis
   and live updates.
 - **Provides an admin panel** for source settings, plans, AI provider selection,
@@ -103,7 +101,7 @@ src/
   analysis/         enrichment, clustering, URL/manual analysis, prompts
   scoring/          alert gate and scoring metadata helpers
   billing/          plans, entitlements, Solana Pay integration
-  notifications/    Telegram and Discord delivery
+  notifications/    Telegram delivery and alert dispatch
   dashboard/        public dashboard SPA, REST API and SSE
   admin/            loopback-only admin SPA and API
   db/               SQLite schema, migrations and data access
@@ -169,6 +167,7 @@ Never commit real `.env` files. The repository includes `.env.example` only.
 | `npm run dev` | Run with Node watch mode for local development. |
 | `npm run check:spa` | Validate embedded dashboard/admin React apps. |
 | `npm run check` | Current pre-deploy check alias. |
+| `npm test` | Run focused unit tests under `test/*.test.mjs`. |
 
 ## Deployment
 

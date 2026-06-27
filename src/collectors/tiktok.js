@@ -107,8 +107,8 @@ class TikTokCollector extends BaseCollector {
   constructor(config, logger, db) {
     super('TikTok', logger);
     this.enabled = config.tiktok?.enabled ?? false;
-    // Per-actor tokens — falls back to generic APIFY_API for clockworks
-    // (back-compat with old single-key deployments).
+    // Per-actor tokens — falls back to generic APIFY_API_KEY for clockworks.
+    // Legacy APIFY_API is still accepted in config.js for old deployments.
     this.tiktokKeys = config.apify?.tiktokKeys || {};
     this.customHashtags = config.tiktok?.hashtags || null;
     this.maxVideosPerTag = config.tiktok?.maxVideosPerTag || MAX_VIDEOS_PER_TAG;
@@ -116,7 +116,7 @@ class TikTokCollector extends BaseCollector {
 
     const configured = Object.entries(this.tiktokKeys).filter(([, v]) => v).map(([k]) => k);
     if (this.enabled && configured.length === 0) {
-      this.logger.warn('[TikTok] enabled=true but no actor keys (APIFY_API / APIFY_API_APIDOJO) set — disabling');
+      this.logger.warn('[TikTok] enabled=true but no actor keys (APIFY_API_KEY / APIFY_API_APIDOJO) set — disabling');
       this.enabled = false;
     }
 

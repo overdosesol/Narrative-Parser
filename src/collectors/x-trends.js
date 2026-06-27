@@ -118,6 +118,7 @@ class XTrendsCollector extends BaseCollector {
     this.apiKey = process.env.APIFY_X_TRENDS_KEY
                || config.apify?.apiKey
                || process.env.APIFY_API_KEY
+               || process.env.APIFY_API
                || '';
     this.actorId = process.env.APIFY_X_TRENDS_ACTOR_ID || ACTOR_ID;
     this.country = process.env.X_TRENDS_COUNTRY || 'United States';

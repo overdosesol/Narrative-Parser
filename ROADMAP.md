@@ -14,7 +14,9 @@ architecture.
 
 ## Security And Reliability
 
-- Revisit the Solana Pay manual-transfer fallback before promoting paid plans.
+- Keep Solana Pay reference-based verification as the default. The
+  manual-transfer amount/time fallback remains operator-only and disabled by
+  default; revisit whether it should be removed before promoting paid plans.
 - Continue reducing token exposure in browser flows.
 - Add more regression checks around URL fetching and SSRF protections.
 - Document safe production rotation for Telegram, AI provider and admin keys.

@@ -386,13 +386,17 @@ export async function resolveTiktokUrl(url) {
   // Tier 1: apidojo — full engagement + video URL.
   // Token fallback chain matches the collector (`tiktok.js _activeActor`):
   //   APIFY_API_APIDOJO  — preferred, dedicated per-actor key
-  //   APIFY_API          — generic single-account fallback (most users have this)
+  //   APIFY_API_KEY      — generic single-account fallback (most users have this)
+  //   APIFY_API          — legacy name, still accepted for old deployments
   // One Apify account / token can run any actor it's been granted permission
   // to. Some third-party actors (like apidojo) trigger a one-time
   // "approve permissions" prompt in Apify Console — until that's done, the
   // actor returns 403 `full-permission-actor-not-approved`. We treat that
   // as a soft-fail and keep the oEmbed fallback for manual analysis.
-  const apidojoKey = process.env.APIFY_API_APIDOJO || process.env.APIFY_API || '';
+  const apidojoKey = process.env.APIFY_API_APIDOJO
+                  || process.env.APIFY_API_KEY
+                  || process.env.APIFY_API
+                  || '';
   if (apidojoKey) {
     try {
       const fromActor = await _resolveTiktokViaApidojo(url, videoId, apidojoKey);

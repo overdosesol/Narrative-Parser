@@ -1,14 +1,14 @@
 /**
  * GeminiCaptioner — Stage 0b vision preprocessing.
  *
- * Two-provider failover (2026-04-28 architecture):
+ * Two-provider failover:
  *   - PRIMARY:  Direct Google AI Studio (`generativelanguage.googleapis.com`)
- *               — supports BOTH images AND native video (up to 30s) via
+ *               — supports BOTH images AND native video via
  *                 inlineData with base64-encoded bytes.
  *               — geo-restricted (Germany/US/most-EU = supported,
  *                 RU/BY/etc = blocked).
  *   - FALLBACK: OpenRouter (`openrouter.ai/api/v1`)
- *               — gemini-2.5-flash via OpenAI-compatible chat/completions.
+ *               — configured Gemini vision model via chat/completions.
  *               — IMAGES ONLY (OpenRouter can't reliably proxy video).
  *               — for video trends the fallback uses the poster image,
  *                 sacrificing temporal info but keeping vision available.

@@ -1,6 +1,6 @@
 # Open Source Readiness Notes
 
-Date: 2026-06-17
+Date: 2026-06-28
 
 This is the public readiness note for Catalyst's first open-source preview. It
 summarizes the repository cleanup that was done before publication and the
@@ -18,9 +18,9 @@ custom scan, `.env` is ignored, and `.env.example` uses explicit placeholders.
 Internal/private agent state, local source asset packs, generated logs and
 runtime databases are excluded from version control.
 
-Public-facing repository docs, GitHub contribution templates, package metadata,
-license, security policy and Dependabot configuration are in place for the
-first OSS release.
+Public-facing repository docs, GitHub contribution templates, a CI workflow,
+package metadata, license, security policy and Dependabot configuration are in
+place for the first OSS release.
 
 ## Findings
 
@@ -102,8 +102,8 @@ Evidence:
 - `package.json` has repository, bugs, homepage, author, license and Node
   engine metadata.
 - `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,
-  `MAINTAINERS.md`, `ROADMAP.md`, issue templates and a pull request template
-  are present.
+  `MAINTAINERS.md`, `ROADMAP.md`, issue templates, a pull request template and
+  a GitHub Actions CI workflow are present.
 - `README.md` points to the MIT license and the current Catalyst repository.
 
 Impact:
@@ -206,28 +206,30 @@ Recommendation:
 For third-party production use, consider a full session-cookie + CSRF design or
 a frontend bundle split that supports a stricter CSP/Trusted Types posture.
 
-### OSR-009: Solana Pay manual-transfer fallback remains deferred
+### OSR-009: Solana Pay manual-transfer fallback is gated
 
-Severity: Medium / postponed by owner
+Severity: Resolved with operator caveat
 
 Evidence:
 
-- `src/billing/solana-pay.js` still has a fallback that searches recent merchant
-  transactions and matches by amount/time when the Solana Pay `reference`
-  lookup does not find a transaction.
-- Owner explicitly asked not to change this path in the current security pass
-  because the project is paused.
+- `src/billing/solana-pay.js` now performs reference-based Solana Pay
+  verification by default.
+- The manual-transfer amount/time fallback runs only when
+  `SOLANA_PAY_MANUAL_FALLBACK=1` is explicitly configured.
+- `.env.example`, `SECURITY.md` and `ROADMAP.md` describe the fallback as
+  operator-only and disabled by default.
 
 Impact:
 
-Reference-based Solana Pay verification is safer. Amount/time matching can be
-ambiguous when several users pay the same amount around the same time, and it
-is harder to reason about during disputes or replay-like edge cases.
+Reference-based Solana Pay verification remains the safe default. Amount/time
+matching can still be ambiguous if an operator enables the fallback, so that
+mode should be treated as higher risk and monitored manually.
 
 Recommendation:
 
-Before re-enabling or promoting paid plans, either remove the amount-matching
-fallback or gate it behind an explicit manual-review/operator workflow.
+Keep `SOLANA_PAY_MANUAL_FALLBACK=0` for normal deployments. Before promoting
+paid plans broadly, decide whether the fallback should be removed entirely or
+kept as a documented manual-review workflow.
 
 ### OSR-010: Public repository presentation is prepared
 
@@ -239,7 +241,8 @@ Evidence:
   OpenAI/GPT usage, Codex-assisted maintenance workflow, setup, deployment,
   contribution flow, security policy and roadmap.
 - `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `MAINTAINERS.md`,
-  `ROADMAP.md`, issue templates and a pull request template are present.
+  `ROADMAP.md`, issue templates, a pull request template and CI workflow are
+  present.
 - `package.json` now has repository, bugs, homepage, author and Node engine
   metadata.
 
@@ -260,7 +263,8 @@ application fields, especially the API-credit and maintainer-workflow answers.
 2. Keep the sanitized working tree on `main`.
 3. Re-scan the GitHub repository with gitleaks or TruffleHog.
 4. Verify GitHub Dependabot alerts after dependency updates land.
-5. Prepare and submit the Codex for OSS application.
+5. Verify the GitHub Actions CI workflow after the next push.
+6. Prepare and submit the Codex for OSS application.
 
 ## Proposed Public Exclude List
 
@@ -287,6 +291,8 @@ Custom scans performed before and after local history rewrite:
 - GitHub Dependabot alerts: enabled, 10 open alerts before local dependency
   cleanup.
 - GitHub Dependabot security updates: enabled.
+- Pull request template: `.github/pull_request_template.md`.
+- GitHub Actions CI workflow: `.github/workflows/ci.yml`.
 - Local `npm audit --omit=dev` after dependency cleanup: 0 vulnerabilities.
 - GitHub repository visibility: public.
 - GitHub secret scanning: enabled.

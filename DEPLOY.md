@@ -318,7 +318,7 @@ sqlite3 /tmp/restore.db "PRAGMA integrity_check;"
 
 ```bash
 cd /opt/catalyst
-docker compose stop app
+docker compose stop catalyst
 ```
 
 **Step 6 — Replace DB file (safe variant — сохраняем старый)**
@@ -345,8 +345,8 @@ chown "$ORIG_OWNER" "$VOLUME_PATH/catalyst.db"
 **Step 7 — Start container**
 
 ```bash
-docker compose start app
-docker compose logs -f app  # check startup is clean
+docker compose start catalyst
+docker compose logs -f catalyst  # check startup is clean
 ```
 
 **Step 8 — Smoke check**
@@ -492,7 +492,7 @@ ssh root@<new-ip> "certbot --nginx -d catalyst.example.com -d www.catalyst.examp
 - `curl https://catalyst.example.com/api/health` → 200
 - Дашборд в браузере → видны trends/users из бэкапа
 - Бот → `/start` → отвечает
-- `docker compose logs -f app` → чисто, без ошибок старта
+- `docker compose logs -f catalyst` → чисто, без ошибок старта
 
 **Step 9 — WORKLOG**
 
@@ -617,7 +617,7 @@ Each secret has a lifetime. Bundle #17 (2026-06-05) documents the recommended ro
 
 1. **Generate** new key on the provider side (keep old key active for now)
 2. **Edit `.env`** on VPS: `ssh root@catalyst.example.com "nano /opt/catalyst/.env"` — replace old value with new
-3. **Restart**: `ssh root@catalyst.example.com "cd /opt/catalyst && docker compose restart app"`
+3. **Restart**: `ssh root@catalyst.example.com "cd /opt/catalyst && docker compose restart catalyst"`
 4. **Verify** using the test from the schedule table above
 5. **Revoke old key** on the provider side (only AFTER verification — otherwise risk downtime if new key doesn't work)
 6. **Log** in your private operator notes:
@@ -674,17 +674,17 @@ What to watch for the first week:
 
 ## 13. Common troubleshooting
 
-Быстрый incident-response по частым проблемам. Команды предполагают Docker-деплой (`docker compose` из `/opt/catalyst`); для systemd-варианта замени `docker compose logs app` на `journalctl -u catalyst`.
+Быстрый incident-response по частым проблемам. Команды предполагают Docker-деплой (`docker compose` из `/opt/catalyst`); для systemd-варианта замени `docker compose logs catalyst` на `journalctl -u catalyst`.
 
 ### Бот не отвечает на `/start`
 
 ```bash
-docker compose logs --tail 100 app | grep -iE "polling|telegram|401|409"
+docker compose logs --tail 100 catalyst | grep -iE "polling|telegram|401|409"
 ```
 
 - `401 Unauthorized` → протух/неверный `TELEGRAM_BOT_TOKEN` (ротация — §10.1).
 - `409 Conflict` → два инстанса с одним токеном (старый контейнер не умер, или локальный dev параллельно). `docker ps`, убей дубликат.
-- Тишина в логах → процесс умер: `docker compose ps`, затем `docker compose restart app`.
+- Тишина в логах → процесс умер: `docker compose ps`, затем `docker compose restart catalyst`.
 
 ### Dashboard отдаёт 502 / не открывается
 
@@ -694,13 +694,13 @@ docker compose ps
 ```
 
 - `health` 200 локально, но снаружи 502 → проблема в nginx: `nginx -t`, `systemctl status nginx`, `tail /var/log/nginx/error.log`.
-- `health` не отвечает локально → app лежит: `docker compose logs --tail 50 app`, рестарт.
+- `health` не отвечает локально → service лежит: `docker compose logs --tail 50 catalyst`, рестарт.
 - TLS-ошибка в браузере → серт протух, см. §4.2.
 
 ### Apify quota exceeded (X/TikTok сбор встал)
 
 ```bash
-docker compose logs app | grep -iE "apify|quota|429"
+docker compose logs catalyst | grep -iE "apify|quota|429"
 ```
 
 - Кончился лимит Apify → сбор X/TikTok тихо деградирует, **Reddit + Google Trends продолжают работать** (они без Apify). Проверь баланс на console.apify.com.
@@ -708,7 +708,7 @@ docker compose logs app | grep -iE "apify|quota|429"
 ### Один коллектор в краш-лупе
 
 ```bash
-docker compose logs app | grep -iE "collector|crash|unhandled"
+docker compose logs catalyst | grep -iE "collector|crash|unhandled"
 ```
 
 - Источник кидает ошибку каждый цикл → отключи его в дашборде (как admin-юзер) → страница `/sources`, разберись с ключом/лимитом, включи обратно. Остальные коллекторы изолированы и продолжают работать.
@@ -717,10 +717,10 @@ docker compose logs app | grep -iE "collector|crash|unhandled"
 
 ```bash
 docker stats --no-stream catalyst-app
-docker compose logs app | grep -iE "oom|heap"
+docker compose logs catalyst | grep -iE "oom|heap"
 ```
 
-- Норма — стабильно <300MB. Постоянный рост → подозревай Map-leak (см. §12). Временный фикс: `docker compose restart app`. Лимит памяти контейнера — 1GB (docker-compose).
+- Норма — стабильно <300MB. Постоянный рост → подозревай Map-leak (см. §12). Временный фикс: `docker compose restart catalyst`. Лимит памяти контейнера — 1GB (docker-compose).
 
 ### `database is locked` / SQLITE_BUSY в логах
 

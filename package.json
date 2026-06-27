@@ -8,7 +8,8 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "check:spa": "node scripts/check-dashboard-spa.cjs && node scripts/check-admin-spa.cjs",
-    "check": "npm run check:spa"
+    "check": "npm run check:spa",
+    "test": "node --test \"test/*.test.mjs\""
   },
   "keywords": [
     "trends",

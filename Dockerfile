@@ -75,7 +75,7 @@ USER node
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:7357/api/health || exit 1
+    CMD curl -f http://localhost:8080/api/health || exit 1
 
 # Переменные окружения по умолчанию
 ENV NODE_ENV=production \

@@ -1,5 +1,5 @@
 /**
- * Catalyst Admin Panel — Port 8080
+ * Catalyst Admin Panel — Port 8081
  * Управление пользователями, подписками, статистикой и ботом
  */
 
@@ -123,7 +123,7 @@ class AdminServer {
     // settings card but the live-stats block hides itself with "scheduler not
     // wired" so dev-runs without index.js still work.
     this.alertScheduler = extras.alertScheduler || null;
-    this.port = parseInt(process.env.ADMIN_PORT || '8080');
+    this.port = parseInt(process.env.ADMIN_PORT || '8081');
     this.host = process.env.ADMIN_HOST || '127.0.0.1';
     this.adminKey = process.env.ADMIN_API_KEY || '';
     this.server = null;
@@ -2748,7 +2748,7 @@ const PIPELINE_STAGES = [
   { id: 'collect',  icon: '📡', label: 'Collect',  hint: 'Apify scrapers'                                          },
   { id: 'dedupe',   icon: '🧩', label: 'Dedupe',   hint: 'Aggregator + cheap exact-dupe collapse'                  },
   // Stage 0: text + visual enrichment (nano + gemini). Never filters/scores.
-  { id: 'prestage', icon: '🎨', label: 'Stage 0',  hint: 'PreStage: gpt-5.4-nano + Gemini Flash'                   },
+  { id: 'prestage', icon: '🎨', label: 'Stage 0',  hint: 'PreStage: gpt-5.4-nano + Gemini vision'                  },
   { id: 'cluster',  icon: '🗂',  label: 'Cluster',  hint: 'Multi-signal: embeddings + image hash + entities + junk' },
   { id: 'stage1',   icon: '🧠', label: 'Stage 1',  hint: 'Base scoring (GPT/Grok)'                                 },
   { id: 'stage2',   icon: '🔍', label: 'Stage 2',  hint: 'Grok + x_search'                                         },
@@ -3108,8 +3108,8 @@ function ScannerConfigSection() {
     ),
 
     // TikTok scraper picker — same UX as Twitter. Each actor has its own
-    // Apify token (APIFY_API for clockworks default, APIFY_API_APIDOJO for the
-    // cheaper apidojo). Output fields differ slightly but the collector
+    // Apify token (APIFY_API_KEY for clockworks default, APIFY_API_APIDOJO for
+    // the cheaper apidojo). Output fields differ slightly but the collector
     // _normalize chain absorbs both.
     h('div', { className: 'scfg-section' },
       h('h4', { className: 'scfg-h4' }, '🎵 TikTok scraper'),

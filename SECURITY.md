@@ -44,8 +44,10 @@ and Dependabot alerts on your fork.
   git.
 - The pre-publication audit is tracked in
   [docs/open-source-readiness.md](docs/open-source-readiness.md).
-- The Solana Pay manual-transfer fallback is a known deferred risk. See
-  [ROADMAP.md](ROADMAP.md).
+- Solana Pay verification is reference-based by default. The manual-transfer
+  amount/time fallback is disabled unless the operator explicitly sets
+  `SOLANA_PAY_MANUAL_FALLBACK=1`; treat that mode as higher risk and monitor
+  payments manually.
 
 ## Disclosure Expectations
 

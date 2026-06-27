@@ -124,7 +124,7 @@ async function testNano() {
 
 // ── Test 2: GeminiCaptioner (image) ────────────────────────────────────────
 async function testGeminiImage() {
-  bar('TEST 2 — GeminiCaptioner (image via OpenRouter → Gemini Flash)');
+  bar('TEST 2 — GeminiCaptioner (image via Google AI, OpenRouter fallback)');
   const gemini = new GeminiCaptioner({}, logger);
 
   if (!gemini.enabled) {

@@ -34,6 +34,7 @@ class SolanaPayMonitor {
     this.onPaymentConfirmed = onPaymentConfirmed; // async (userId, planName) => void
     this.rpcUrl = this.config.rpcUrl || 'https://api.mainnet-beta.solana.com';
     this.merchantWallet = this.config.merchantWallet;
+    this.manualFallback = this.config.manualFallback === true;
     this.enabled = !!this.merchantWallet;
     this._timer = null;
     this._running = false;
@@ -190,7 +191,9 @@ class SolanaPayMonitor {
       }
     }
 
-    // 2. Fallback: Search by amount matching (Option 2: Manual Transfer)
+    // 2. Optional fallback: search by amount matching for manual transfers.
+    if (!this.manualFallback) return null;
+
     try {
       const merchantSigs = await this._rpc('getSignaturesForAddress', [
         this.merchantWallet,
